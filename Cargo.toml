@@ -1,0 +1,48 @@
+[workspace]
+members = ["src-tauri"]
+
+[package]
+name = "cys-terminal"
+version = "0.2.0"
+edition = "2021"
+description = "cys — the CYSJavis terminal: bidirectional socket IPC, multi-agent OS (CYSJavis Pack), governance, heartbeat"
+license = "MIT"
+
+[lib]
+name = "cys"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cysd"
+path = "src/bin/cysd/main.rs"
+
+[[bin]]
+name = "cys"
+path = "src/bin/cys.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal", "process"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+portable-pty = "0.9"
+vt100 = "0.15"
+clap = { version = "4", features = ["derive"] }
+regex = "1"
+sysinfo = "0.33"
+strip-ansi-escapes = "0.2"
+dirs = "6"
+libc = "0.2"
+chrono = "0.4"
+rusqlite = { version = "0.32", features = ["bundled"] }
+sha2 = "0.10"
+
+# Windows 전용: named pipe에 owner-only DACL을 박아 UDS 0o600 단일-UID 봉인과 대칭화한다.
+# (기본 named pipe DACL은 같은 머신의 임의 로컬 사용자에게 read/write를 허용 — 인증 없는
+#  제어 채널(send_text·send_key·ledger.kill)이 노출되는 권한 우회 비대칭을 막는다.)
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Pipes",
+] }

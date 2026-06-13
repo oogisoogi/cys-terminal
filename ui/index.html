@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <title>cys — CYSJavis Terminal</title>
+  <link rel="stylesheet" href="./xterm.css" />
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <header id="topbar">
+    <span id="brand">cys</span>
+    <span id="daemon-info">daemon: connecting…</span>
+    <span class="spacer"></span>
+    <button id="btn-new" title="새 surface (⌘T)">+ New</button>
+    <button id="btn-split-h" title="오른쪽 분할 (⌘D)">Split →</button>
+    <button id="btn-split-v" title="아래 분할 (⌘⇧D)">Split ↓</button>
+    <button id="btn-close" title="pane 닫기 — 자식 트리 강제 종료 (⌘W)">Close</button>
+    <button id="btn-feed" title="승인 Feed">Feed <span id="feed-badge" class="badge" hidden>0</span></button>
+    <button id="btn-files" title="파일 트리 (선택한 surface의 폴더)">Files</button>
+    <button id="btn-update" title="업데이트 확인">Update <span id="update-badge" class="badge" hidden>!</span></button>
+  </header>
+  <div id="body-row">
+    <nav id="wsbar">
+      <div id="wsbar-head"><span>워크스페이스</span><button id="btn-ws-new" title="새 워크스페이스">＋</button></div>
+      <div id="ws-tabs"></div>
+    </nav>
+    <aside id="ft-panel" hidden>
+      <div id="ft-head"><span id="ft-root-label">파일</span><button id="btn-ft-close">×</button></div>
+      <div id="ft-body"></div>
+    </aside>
+    <main id="root"></main>
+    <aside id="feed-panel" hidden>
+      <div id="feed-panel-head">승인 Feed <button id="btn-feed-close">×</button></div>
+      <div id="feed-items"></div>
+    </aside>
+  </div>
+  <div id="toasts"></div>
+  <script type="module" src="./main.js"></script>
+</body>
+</html>

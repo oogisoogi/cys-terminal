@@ -1,0 +1,47 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "cys",
+  "version": "0.2.0",
+  "identifier": "com.cysjavis.terminal",
+  "build": {
+    "frontendDist": "../ui/dist",
+    "beforeBuildCommand": "sh ../scripts/bundle-prep.sh"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "cys — CYSJavis Terminal",
+        "width": 1280,
+        "height": 820
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "createUpdaterArtifacts": true,
+    "targets": [
+      "app",
+      "dmg"
+    ],
+    "externalBin": [
+      "binaries/cysd",
+      "binaries/cys"
+    ],
+    "icon": [
+      "icons/icon.icns",
+      "icons/icon.png"
+    ]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDM5RTYwQTcwMjk0OUQ2QzMKUldURDFra3BjQXJtT1dvZVBUdHk5VnlvKzBJeVNneE11UzdpWFQzVHFoMDFtUG4wZWpkdGlHZ0wK",
+      "endpoints": [
+        "https://github.com/idoforgod/cys-terminal/releases/latest/download/latest.json"
+      ]
+    }
+  }
+}

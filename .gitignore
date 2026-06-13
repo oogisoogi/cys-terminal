@@ -1,0 +1,50 @@
+target/
+ui/node_modules/
+ui/dist/
+ui/bun.lock
+src-tauri/gen/
+src-tauri/icons/android/
+src-tauri/icons/ios/
+src-tauri/binaries/
+
+scripts/win/*.exe
+scripts/win/*-result.txt
+dist-win/*.msi
+dist-win/*.zip
+dist-win/zip/
+dist-mac/*.dmg
+dist-update/
+*.key
+*.key.pub
+
+# OS·에디터 노이즈
+.DS_Store
+**/.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# 서명·비밀 (이중 안전망)
+*.pem
+.env
+.env.*
+
+# self-correction 작업 로그
+_round/
+
+# Python 캐시
+__pycache__/
+*.pyc
+
+# 로컬 MCP 설정 (개인 절대경로·환경 의존 — 배포 제외)
+.mcp.json
+.mcp.json.bak-*
+
+# Playwright MCP 테스트 캡처 (세션·계정 식별자 노출 — 배포 제외)
+.playwright-mcp/
+
+# 작업 스크래치·리뷰 스냅샷 (내부 작업 내용 — 배포 제외)
+scratch/
+
+# 제품 스크린샷 (개인 이메일 노출 — 마스킹본 교체 전까지 제외)
+cys-design-preview.png
