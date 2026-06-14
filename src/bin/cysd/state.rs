@@ -20,8 +20,14 @@ pub const DEFAULT_COLS: u16 = 120;
 pub enum WriteReq {
     /// 그대로 쓰기 (키 입력·텍스트·DSR 응답)
     Data(Vec<u8>),
-    /// 원자적 2단 주입: bracketed paste → cr_delay_ms 대기 → CR (동시 주입 병합 차단)
-    Inject { text: String, cr_delay_ms: u64 },
+    /// 원자적 주입: (clear_first면 Ctrl-U 선정리 → settle) → bracketed paste → cr_delay_ms 대기 → CR.
+    /// 전부 한 writer arm에서 처리 = 다른 WriteReq의 끼어듦 차단(동시 주입 병합·부분 전달 차단).
+    /// clear_first=권위 전달: 잔존 미제출 텍스트를 지운 깨끗한 라인에 명령을 원자적으로 꽂고 제출한다.
+    Inject {
+        text: String,
+        cr_delay_ms: u64,
+        clear_first: bool,
+    },
 }
 
 /// 청크 경계 상태: 미완성 ESC/UTF-8 꼬리·\r 덮어쓰기·진행 중 라인
@@ -862,6 +868,15 @@ impl Daemon {
 /// ③이 없으면 자력 종료 surface의 write_tx가 맵 속 Arc에 영구 잔존해 recv()가 영영
 /// 반환되지 않고 writer 스레드·PTY writer fd가 단조 누수된다(24/365 데몬의 fd 고갈).
 /// recv_timeout 폴링은 stop을 주기적으로 관측하기 위한 것 — 평시 동작·순서는 불변이다.
+/// clear_first 주입의 Ctrl-U 후 settle(ms) — TUI가 라인 정리를 반영할 짬. 기본 150
+/// (기존 cys.rs --clear-first의 클라측 sleep 값 계승). CYS_CLEAR_SETTLE_MS로 조정.
+fn clear_settle_ms() -> u64 {
+    std::env::var("CYS_CLEAR_SETTLE_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(150)
+}
+
 fn run_writer_loop<W: Write>(
     mut writer: W,
     write_rx: std::sync::mpsc::Receiver<WriteReq>,
@@ -881,12 +896,26 @@ fn run_writer_loop<W: Write>(
         };
         let res = match req {
             WriteReq::Data(bytes) => writer.write_all(&bytes).and_then(|_| writer.flush()),
-            WriteReq::Inject { text, cr_delay_ms } => writer
-                .write_all(format!("\x1b[200~{text}\x1b[201~").as_bytes())
-                .and_then(|_| writer.flush())
-                .map(|_| std::thread::sleep(std::time::Duration::from_millis(cr_delay_ms)))
-                .and_then(|_| writer.write_all(b"\r"))
-                .and_then(|_| writer.flush()),
+            WriteReq::Inject {
+                text,
+                cr_delay_ms,
+                clear_first,
+            } => (if clear_first {
+                // Ctrl-U(0x15) 선정리 → settle: 잔존 미제출 텍스트를 지우고 TUI가 처리할 짬을 준다.
+                // paste·CR과 같은 arm에 묶여 다른 주입이 끼어들 수 없다(원자). 키 의미 게이트는
+                // 호출자(send_text)가 agent 등록 pane으로 제한한다(TUI별 Ctrl-U 의미 상이).
+                writer
+                    .write_all(b"\x15")
+                    .and_then(|_| writer.flush())
+                    .map(|_| std::thread::sleep(std::time::Duration::from_millis(clear_settle_ms())))
+            } else {
+                Ok(())
+            })
+            .and_then(|_| writer.write_all(format!("\x1b[200~{text}\x1b[201~").as_bytes()))
+            .and_then(|_| writer.flush())
+            .map(|_| std::thread::sleep(std::time::Duration::from_millis(cr_delay_ms)))
+            .and_then(|_| writer.write_all(b"\r"))
+            .and_then(|_| writer.flush()),
         };
         if res.is_err() {
             break; // PTY 닫힘 — 이후 send는 disconnected로 호출자에 드러난다
@@ -1064,6 +1093,133 @@ mod tests {
                 .recv_timeout(std::time::Duration::from_secs(3))
                 .is_ok(),
             "모든 sender drop 시 writer 루프가 종료돼야 한다"
+        );
+    }
+
+    /// 불변식 박제: clear_first Inject은 한 writer arm에서 Ctrl-U(선정리)→bracketed paste→CR을
+    /// 순서대로 한 단위로 쓴다. 다른 WriteReq가 끼어들 수 없고(원자), 부분 전달(clear만/text만)이
+    /// 구조적으로 불가능함을 바이트 순서로 검증한다.
+    #[test]
+    fn inject_clear_first_emits_ctrl_u_before_paste_then_cr() {
+        use std::sync::mpsc::sync_channel;
+        struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for SharedBuf {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let (tx, rx) = sync_channel::<WriteReq>(2);
+        let stop = Arc::new(AtomicBool::new(false));
+        let w = SharedBuf(Arc::clone(&buf));
+        let handle = std::thread::spawn(move || run_writer_loop(w, rx, stop));
+        tx.send(WriteReq::Inject {
+            text: "hi".into(),
+            cr_delay_ms: 0,
+            clear_first: true,
+        })
+        .unwrap();
+        drop(tx); // Disconnected → 루프 종료
+        handle.join().ok();
+
+        let out = buf.lock().unwrap().clone();
+        let s = String::from_utf8_lossy(&out);
+        let cu = out
+            .iter()
+            .position(|&b| b == 0x15)
+            .expect("Ctrl-U(0x15) 선정리가 있어야 한다");
+        let paste = s.find("\x1b[200~").expect("bracketed paste 시작이 있어야 한다");
+        assert!(cu < paste, "Ctrl-U는 paste보다 먼저여야 한다(클린 라인 보장)");
+        assert!(
+            s.contains("\x1b[200~hi\x1b[201~"),
+            "텍스트가 bracketed paste로 감싸져야 한다 (출력: {s:?})"
+        );
+        assert!(out.ends_with(b"\r"), "CR로 제출돼야 한다 (출력: {s:?})");
+    }
+
+    /// 원자성(비끼어듦) 박제: 같은 채널에 경쟁 WriteReq(Data "X")를 함께 적재해도, clear_first
+    /// Inject의 한 줄(Ctrl-U … 첫 CR)은 통째로 연속 — 단일 소비자 writer가 한 req를 끝까지
+    /// 처리하므로 경쟁 바이트가 그 사이에 끼어들 수 없다(부분 전달·라인 오염 구조적 차단).
+    #[test]
+    fn inject_clear_first_is_not_interleaved_by_competing_writereq() {
+        use std::sync::mpsc::sync_channel;
+        struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for SharedBuf {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let (tx, rx) = sync_channel::<WriteReq>(2);
+        let stop = Arc::new(AtomicBool::new(false));
+        let w = SharedBuf(Arc::clone(&buf));
+        let handle = std::thread::spawn(move || run_writer_loop(w, rx, stop));
+        // 경쟁 적재: clear_first Inject 직후 Data("X")를 같은 채널에 넣는다.
+        tx.send(WriteReq::Inject {
+            text: "hi".into(),
+            cr_delay_ms: 0,
+            clear_first: true,
+        })
+        .unwrap();
+        tx.send(WriteReq::Data(b"X".to_vec())).unwrap();
+        drop(tx);
+        handle.join().ok();
+
+        let out = buf.lock().unwrap().clone();
+        let s = String::from_utf8_lossy(&out);
+        let cu = out.iter().position(|&b| b == 0x15).expect("Ctrl-U");
+        let cr = out.iter().position(|&b| b == b'\r').expect("CR");
+        // Inject의 한 줄(\x15 … 첫 \r)에 경쟁 Data('X')가 끼면 안 된다.
+        assert!(
+            !out[cu..=cr].contains(&b'X'),
+            "경쟁 Data가 clear_first Inject의 한 줄 사이에 끼어들었다 — 원자성 위반 (출력: {s:?})"
+        );
+        assert!(
+            out.ends_with(b"X"),
+            "경쟁 Data는 Inject 완료 후에 와야 한다 (출력: {s:?})"
+        );
+    }
+
+    /// 대조: clear_first=false면 Ctrl-U를 절대 쓰지 않는다(현행 queued/스케줄 동작 보존).
+    #[test]
+    fn inject_without_clear_first_never_emits_ctrl_u() {
+        use std::sync::mpsc::sync_channel;
+        struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for SharedBuf {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let (tx, rx) = sync_channel::<WriteReq>(2);
+        let stop = Arc::new(AtomicBool::new(false));
+        let w = SharedBuf(Arc::clone(&buf));
+        let handle = std::thread::spawn(move || run_writer_loop(w, rx, stop));
+        tx.send(WriteReq::Inject {
+            text: "hi".into(),
+            cr_delay_ms: 0,
+            clear_first: false,
+        })
+        .unwrap();
+        drop(tx);
+        handle.join().ok();
+
+        let out = buf.lock().unwrap().clone();
+        assert!(
+            !out.contains(&0x15),
+            "clear_first=false인데 Ctrl-U가 새어나왔다 — 현행 동작 회귀"
         );
     }
 

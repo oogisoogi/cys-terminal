@@ -100,7 +100,7 @@ cys attach surface:1                          # 출력 미러 (read-only)
 | T3-10 | **원샷 타이머**: 상대시간 1회 발화 후 job 자동 삭제 (+fresh TTL `--close-after`) | `cys schedule add --id x --in 20m --text ... --to role` |
 | T3-11 | **역할 글롭 브로드캐스트** | `cys send --to 'reviewer-*' "..."` |
 | T3-12 | **feed aging 재알림**: pending 승인 무음 적체 차단 | `feed.item.aging` (기본 5분 주기) |
-| T3-13 | **입력 안전**: ①타이핑 가드 — 사람이 입력 중인 pane에 원격 직접 주입 거부(`--queued`는 허용) ②`send --clear-first`(어댑터 등록 pane 한정 Ctrl-U 선정리) | `typing_guard` 에러 |
+| T3-13 | **입력 안전**: ①타이핑 가드 — 사람이 입력 중인 pane에 원격 직접 주입 거부(`--queued`는 허용) ②`send --clear-first`(어댑터 등록 pane 한정) = **원자 권위 전달**: Ctrl-U 선정리 → paste → **자동 제출(CR)**을 한 단위로(별도 `send-key Return` 금지 — 이중 제출). 직접 전송 전용(`--queued`와 결합 불가) | `typing_guard`·`clear_first_unsupported` 에러 |
 | T3-14 | **델타 읽기·완료 대기**: 단조 라인 커서 + 데몬측 블로킹 regex 감시 (★plain-line 마커 규약 — 주입 텍스트의 에코도 매칭되므로 마커는 본문에 그대로 넣지 말 것) | `cys read-screen --since N` · `cys watch --until <re>` |
 | T4-15 | **kill-switch**: 큐 배달·스케줄 발화 동결 + feed wait 타이머 동결 + preflight 게이트. ★한계: '조직 간 신경 차단'이지 실행 중 에이전트의 행동 정지가 아님 | `cys pause/resume` · `cys gate-check`(exit 4=paused) · `cys queue list/clear` |
 | T4-16 | **승인 격상**: agents.json `approval_patterns` 화면 스캔→이벤트+feed 항목. ★자동 응답 절대 없음 — 판단은 master | `approval.request` |

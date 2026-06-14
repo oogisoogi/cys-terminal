@@ -448,6 +448,7 @@ fn inject(daemon: &Arc<Daemon>, sid: u64, text: &str) -> Result<(), String> {
         .try_send(crate::state::WriteReq::Inject {
             text: text.to_string(),
             cr_delay_ms: 500,
+            clear_first: false, // 스케줄 발화는 현행 동작 보존
         })
         .map_err(|e| match e {
             std::sync::mpsc::TrySendError::Full(_) => {

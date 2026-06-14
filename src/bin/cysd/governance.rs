@@ -1050,6 +1050,7 @@ fn deliver_queued(daemon: &Arc<Daemon>, depth_alerted: &mut HashMap<u64, f64>) {
             let req = crate::state::WriteReq::Inject {
                 text: text.clone(),
                 cr_delay_ms: 400,
+                clear_first: false, // queued 배달은 quiet 대기 후라 선정리 불필요(현행 동작 보존)
             };
             if s.write_tx.try_send(req).is_err() {
                 continue; // 인계 실패 — 메시지 보존, 다음 틱 재시도

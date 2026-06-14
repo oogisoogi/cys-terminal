@@ -102,6 +102,7 @@
 #### T3-13. 입력 안전 주입
 - **불편**: 입력 버퍼 잔존 → `/clear` 실패 ×2회(2026-05-12). 사람 타이핑 중 push 도착 → 입력 오염.
 - **기능**: ①`--clear-first`(Ctrl-U 선행)는 **agents.json 등록 에이전트 한정**(포그라운드 앱마다 Ctrl-U 의미가 달라 무차별 제공 금지, red-team 지적) ②타이핑 충돌 가드 — UI 키입력도 데몬 경유이므로(검증 완료) 최근 N초 내 사람 입력 감지 시 원격 주입을 강제 큐잉.
+- **구현(2026-06-14 원자화)**: `--clear-first`를 데몬 단일 `WriteReq::Inject{clear_first}`로 집행 — Ctrl-U 선정리 → settle(`CYS_CLEAR_SETTLE_MS`,기본150) → bracketed paste → CR을 **한 writer arm에서 원자 처리**(다른 주입 비끼어듦·부분 전달 차단). 구 클라측 2-RPC(send_key C-u+150ms sleep+send_text, 비원자)는 폐기. **권위 전달은 자동 제출(CR 포함)** — 별도 Return 금지(이중 제출). agent 등록 게이트는 데몬 집행(`clear_first_unsupported`), `--queued`와 결합 불가(`invalid_params`). 잔존텍스트 오염·비원자 split·race를 동시 제거. RLM·surface·SOT 모델 불변(transport 계층 한정).
 
 #### T3-14. 델타 읽기·완료 대기 — `read-screen --since` + `cys watch --until`
 - **기능**: surface별 단조 라인 카운터 신설(메모리 scrollback FIFO엔 안정 커서 없음 — red-team 지적 반영) + 데몬측 블로킹 regex 대기. **plain-line 마커 규약 전제 명시**: `\r` 리드로우 줄은 라인 스트림에 없으므로 완료 마커는 echo 줄로 출력하도록 디렉티브에 규약화. parity #4(tmux 호환 wait-for 상당)와 통합.

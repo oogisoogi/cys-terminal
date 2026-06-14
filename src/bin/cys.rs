@@ -806,20 +806,12 @@ fn run(command: Command) -> i32 {
                 let from = cys::env_compat(ENV_SURFACE_ID).and_then(|s| parse_surface_ref(&s));
                 let multi = sids.len() > 1;
                 for sid in sids {
-                    // T3-13 입력 버퍼 선정리: 어댑터 등록 에이전트 pane 한정 (TUI별 Ctrl-U 의미 상이)
-                    if clear_first {
-                        let entry = surface_entry(sid)?;
-                        if entry["agent"].as_str().is_none() {
-                            return Err(format!(
-                                "--clear-first는 launch-agent로 등록된 에이전트 pane 한정 (surface:{sid}에 agent 메타 없음)"
-                            ));
-                        }
-                        request("surface.send_key", json!({"surface_id": sid, "key": "C-u"}))?;
-                        std::thread::sleep(std::time::Duration::from_millis(150));
-                    }
+                    // T3-13 권위 전달: clear_first는 데몬이 원자적으로(Ctrl-U 선정리 → paste → CR)
+                    // 집행한다. 클라측 C-u·150ms sleep·게이트는 제거 — 비원자 split·race를 없앤다.
+                    // agent 등록 pane 게이트는 데몬 send_text가 집행(clear_first_unsupported).
                     let r = request(
                         "surface.send_text",
-                        json!({"surface_id": sid, "text": text.join(" "), "from": from, "queued": queued}),
+                        json!({"surface_id": sid, "text": text.join(" "), "from": from, "queued": queued, "clear_first": clear_first}),
                     )?;
                     let tag = if multi { format!(" → surface:{sid}") } else { String::new() };
                     if queued {

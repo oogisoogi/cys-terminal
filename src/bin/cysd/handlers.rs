@@ -463,6 +463,34 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             if human {
                 *surface.last_human_input.lock().unwrap() = Some(std::time::Instant::now());
             }
+            // T3-13 권위 전달(clear_first): 잔존 미제출 텍스트를 Ctrl-U로 지운 깨끗한 라인에
+            // 명령을 원자적으로 꽂고 제출한다(아래 Inject 경로). 게이트를 데몬에서 집행한다.
+            let clear_first = params
+                .get("clear_first")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if clear_first {
+                // 원자 clear+paste+submit은 직접 전송 전용 — 큐 배달(quiet 대기)과 결합 불가.
+                if params
+                    .get("queued")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    return Reply::Single(err_response(
+                        &id,
+                        "invalid_params",
+                        "clear_first is for direct authoritative delivery; cannot combine with --queued",
+                    ));
+                }
+                // Ctrl-U 의미는 TUI별 상이 → launch-agent 등록 pane 한정(무차별 C-u 금지).
+                if surface.agent_meta.lock().unwrap().is_none() {
+                    return Reply::Single(err_response(
+                        &id,
+                        "clear_first_unsupported",
+                        "clear_first requires a launch-agent-registered pane (Ctrl-U semantics vary by TUI)",
+                    ));
+                }
+            }
             // followup 모드: 대상이 조용해질 때 배달자(watchdog 틱)가 순서대로 주입
             if params
                 .get("queued")
@@ -514,8 +542,19 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     }
                 }
             }
-            let bytes = text.as_bytes().to_vec();
-            if let Some(err) = try_write(&surface, crate::state::WriteReq::Data(bytes), &id) {
+            // clear_first면 원자 Inject(Ctrl-U 선정리 → paste → CR 제출)로, 아니면 현행 Data(원시
+            // 바이트, 제출은 별도 send_key Return)로. 단일 try_send이라 부분 전달(clear만 들어가고
+            // text 유실)이 구조적으로 불가능하다.
+            let write_req = if clear_first {
+                crate::state::WriteReq::Inject {
+                    text: text.clone(),
+                    cr_delay_ms: 400,
+                    clear_first: true,
+                }
+            } else {
+                crate::state::WriteReq::Data(text.as_bytes().to_vec())
+            };
+            if let Some(err) = try_write(&surface, write_req, &id) {
                 return Reply::Single(err);
             }
             if !human {
@@ -2390,6 +2429,91 @@ mod tests {
             .lock()
             .unwrap()
             .insert(pid, (Some(sid), crate::state::now_epoch(), None));
+    }
+
+    /// 게이트 박제: clear_first(원자 Ctrl-U 선정리)는 launch-agent 등록 pane 한정 —
+    /// Ctrl-U 의미가 TUI별 상이하므로 agent_meta 없는 pane엔 거부, 있으면 통과.
+    #[test]
+    fn send_text_clear_first_requires_agent_pane() {
+        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let (daemon, dir) =
+            daemon_with_acl("clearfirst-gate", r#"{"default":"allow","rules":[]}"#);
+        let s = daemon
+            .create_surface(None, Some("sleep 30".into()), None, None, 24, 80)
+            .expect("create surface");
+        daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        let caller = 990_100_u32;
+        bind_caller(&daemon, caller, s.id);
+
+        // agent_meta 없음 → 거부
+        let req = Request {
+            id: json!(1),
+            method: "surface.send_text".into(),
+            params: json!({ "surface_id": s.id, "text": "go", "clear_first": true }),
+        };
+        let Reply::Single(resp) = dispatch(&daemon, req, Some(caller)) else {
+            panic!("expected single reply");
+        };
+        assert_eq!(
+            resp["error"]["code"], json!("clear_first_unsupported"),
+            "agent 미등록 pane의 clear_first는 거부돼야 한다 (응답: {resp})"
+        );
+
+        // agent_meta 설정 → 통과
+        *daemon.surfaces.lock().unwrap()[&s.id]
+            .agent_meta
+            .lock()
+            .unwrap() = Some(("claude".into(), "claude".into()));
+        let req = Request {
+            id: json!(2),
+            method: "surface.send_text".into(),
+            params: json!({ "surface_id": s.id, "text": "go", "clear_first": true }),
+        };
+        let Reply::Single(resp) = dispatch(&daemon, req, Some(caller)) else {
+            panic!("expected single reply");
+        };
+        assert_eq!(
+            resp["result"]["sent"], json!(true),
+            "agent 등록 pane의 clear_first는 통과해야 한다 (응답: {resp})"
+        );
+
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 결합 거부 박제: 원자 clear+paste+submit은 직접 전송 전용 — quiet 대기 큐 배달과
+    /// 결합 불가(clear_first + queued는 invalid_params).
+    #[test]
+    fn send_text_clear_first_rejects_queued_combo() {
+        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let (daemon, dir) =
+            daemon_with_acl("clearfirst-combo", r#"{"default":"allow","rules":[]}"#);
+        let s = daemon
+            .create_surface(None, Some("sleep 30".into()), None, None, 24, 80)
+            .expect("create surface");
+        daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        *daemon.surfaces.lock().unwrap()[&s.id]
+            .agent_meta
+            .lock()
+            .unwrap() = Some(("claude".into(), "claude".into()));
+        let caller = 990_200_u32;
+        bind_caller(&daemon, caller, s.id);
+
+        let req = Request {
+            id: json!(1),
+            method: "surface.send_text".into(),
+            params: json!({ "surface_id": s.id, "text": "go", "clear_first": true, "queued": true }),
+        };
+        let Reply::Single(resp) = dispatch(&daemon, req, Some(caller)) else {
+            panic!("expected single reply");
+        };
+        assert_eq!(
+            resp["error"]["code"], json!("invalid_params"),
+            "clear_first + queued 결합은 거부돼야 한다 (응답: {resp})"
+        );
+
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn claim(daemon: &Arc<Daemon>, role: &str, surface_id: u64, caller_pid: Option<u32>) -> Value {
