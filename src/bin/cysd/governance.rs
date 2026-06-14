@@ -37,6 +37,7 @@ pub fn spawn_watchdog(daemon: Arc<Daemon>) {
                 check_idle(&daemon);
                 deliver_queued(&daemon, &mut queue_depth_alerted);
                 reap_orphan_ledger(&daemon, &sys);
+                reap_exited_surfaces(&daemon);
                 check_agent_death(&daemon, &sys, &mut restart_counts);
                 check_feed_aging(&daemon, &mut feed_reminded);
                 check_master_deadman(&daemon, &mut deadman_last_alert);
@@ -682,6 +683,69 @@ fn reap_orphan_ledger(daemon: &Daemon, sys: &System) {
         let mut ledger = daemon.ledger.lock().unwrap();
         for pid in to_remove {
             ledger.remove(&pid);
+        }
+    }
+}
+
+/// reap 기능 on/off — 기본 on, `CYS_REAP_EXITED=0`으로만 비활성(다른 노브 컨벤션과 동일).
+fn reap_exited_enabled() -> bool {
+    std::env::var("CYS_REAP_EXITED")
+        .map(|v| v != "0")
+        .unwrap_or(true)
+}
+
+/// 종료 후 경과초가 grace 이상이면 회수 대상. grace는 비정상 크래시의 포렌식·노드복구
+/// 윈도우 — 역할 노드(worker/cso/reviewer/master)는 길게(기본 60초), 비역할(스크래치·
+/// one-shot)은 짧게(기본 10초). 경계값을 박제하기 위해 순수 함수로 분리한다.
+fn exited_surface_due(has_role: bool, elapsed_secs: u64) -> bool {
+    let grace = if has_role {
+        env_u64("CYS_REAP_EXITED_GRACE_SECS", 60)
+    } else {
+        env_u64("CYS_REAP_EXITED_NONROLE_GRACE_SECS", 10)
+    };
+    elapsed_secs >= grace
+}
+
+/// 자력종료(셸 EOF) surface 회수: `exited=true`인데 close_surface를 거치지 않아
+/// (state.rs가 exited만 세움) 레지스트리에 영구 잔존하는 죽은 surface를, 종료 후
+/// grace가 지나면 close_surface로 정리한다. grace는 비정상 크래시의 포렌식(마지막 화면)·
+/// 노드복구(surface.exited 구독자) 윈도우 — 역할 노드(worker/cso/reviewer/master)는 길게,
+/// 비역할(스크래치·one-shot)은 짧게. close_surface는 이미 reap된 자식에도 안전(kill/wait
+/// 에러 무시)하므로 신규 종료 로직 없이 '언제 부를지'만 추가한다.
+fn reap_exited_surfaces(daemon: &Arc<Daemon>) {
+    if !reap_exited_enabled() {
+        return;
+    }
+    // (id, role) 수집은 surfaces Arc 클론으로 — surfaces 락을 짧게 잡고 즉시 놓는다
+    // (check_agent_death와 동일 패턴). close_surface는 surfaces 락을 새로 잡으므로
+    // 수집과 회수를 분리해 재진입을 피한다.
+    let mut to_reap: Vec<(u64, Option<String>)> = Vec::new();
+    {
+        let surfaces: Vec<Arc<crate::state::Surface>> =
+            daemon.surfaces.lock().unwrap().values().cloned().collect();
+        for s in surfaces {
+            if !s.exited.load(Ordering::Relaxed) {
+                continue;
+            }
+            let Some(exited_at) = *s.exited_at.lock().unwrap() else {
+                continue; // exited지만 stamp 직전(찰나) — 다음 틱에
+            };
+            let role = s.role.lock().unwrap().clone();
+            if exited_surface_due(role.is_some(), exited_at.elapsed().as_secs()) {
+                to_reap.push((s.id, role));
+            }
+        }
+    }
+    for (id, role) in to_reap {
+        // 경쟁(이미 닫힘)은 Err — 무시. 성공 시에만 reaped 이벤트.
+        if close_surface(daemon, id).is_ok() {
+            daemon.bus.publish(
+                "surface.reaped",
+                "surface",
+                Some(id),
+                json!({"surface_ref": cys::surface_ref(id),
+                       "reason": "exited_grace_elapsed", "role": role}),
+            );
         }
     }
 }
@@ -1371,5 +1435,18 @@ mod tests {
                 ),
             }
         }
+    }
+
+    /// reap 경계: exited 후 grace 미만이면 보존(포렌식·복구 윈도우), 이상이면 회수.
+    /// 역할 노드는 60초, 비역할은 10초로 더 빨리 정리 — 자력종료 surface 누수 차단의 핵심 불변식.
+    #[test]
+    fn exited_surface_due_respects_role_grace() {
+        use super::exited_surface_due;
+        // 역할 노드: 기본 60초 grace — 경계 직전 보존, 경계에서 회수
+        assert!(!exited_surface_due(true, 59), "역할 노드는 grace 내(59s)에 보존돼야");
+        assert!(exited_surface_due(true, 60), "역할 노드는 grace 경계(60s)에서 회수돼야");
+        // 비역할(스크래치·one-shot): 기본 10초 grace — 더 빨리 정리
+        assert!(!exited_surface_due(false, 9), "비역할은 grace 내(9s)에 보존돼야");
+        assert!(exited_surface_due(false, 10), "비역할은 grace 경계(10s)에서 회수돼야");
     }
 }

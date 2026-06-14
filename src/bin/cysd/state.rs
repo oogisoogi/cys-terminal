@@ -40,6 +40,8 @@ pub struct Surface {
     pub pid: u32,
     pub created_at: f64,
     pub exited: AtomicBool,
+    /// 자력종료(셸 EOF) 시각 — watchdog reap의 grace 측정 기준 (exited와 함께 stamp)
+    pub exited_at: Mutex<Option<Instant>>,
     /// PTY 쓰기는 전용 writer 스레드만 수행 — async 경로는 유한 채널 try_send.
     /// 정체된 pane의 블로킹 write가 tokio 워커·watchdog을 멈추는 경로를 원천 차단한다.
     pub write_tx: std::sync::mpsc::SyncSender<WriteReq>,
@@ -512,6 +514,7 @@ impl Daemon {
             pid,
             created_at: now_epoch(),
             exited: AtomicBool::new(false),
+            exited_at: Mutex::new(None),
             write_tx,
             master: Mutex::new(pair.master),
             child: Mutex::new(child),
@@ -628,6 +631,8 @@ impl Daemon {
                 }
             }
             surf.exited.store(true, Ordering::Relaxed);
+            // 종료 시각 stamp — watchdog reap_exited_surfaces가 grace 경과를 이 시점 기준으로 잰다.
+            *surf.exited_at.lock().unwrap() = Some(Instant::now());
             // writer 스레드 종료 신호 — 자력 종료(셸 EOF)는 close_surface를 거치지 않아
             // write_tx가 맵 속 Arc에 영구 잔존하므로, 여기서 stop을 세워 recv_timeout 루프가
             // 좀비 writer 스레드와 PTY writer fd를 회수하게 한다 (24/365 데몬 fd 누수 차단).
