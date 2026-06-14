@@ -3,6 +3,8 @@
 use std::path::PathBuf;
 
 pub const ENV_PACK_DIR: &str = "CYS_PACK_DIR";
+/// cys 전용 CLAUDE_CONFIG_DIR 오버라이드(주로 테스트 격리용). 미설정 시 pack_dir 형제(~/.cys/claude).
+pub const ENV_CONFIG_DIR: &str = "CYS_CONFIG_DIR";
 
 /// (상대경로, 내용) — init-jarvis 가 설치한다.
 pub const PACK: &[(&str, &str)] = &[
@@ -137,6 +139,51 @@ pub fn pack_dir() -> PathBuf {
         .join(".cys/pack")
 }
 
+/// cys 전용 CLAUDE_CONFIG_DIR — 사용자 ~/.claude(외부 터미널 체계·구 마스터지침 오염 가능)와 **격리**한다.
+/// cys가 띄우는 claude는 이 디렉터리만 읽으므로, 사용자 프로필이 오염돼 있어도 영향받지 않고
+/// 사용자 프로필을 건드리지도(읽지도·지우지도) 않는다. macOS 인증은 계정 단위 Keychain이라
+/// 격리해도 로그인이 유지된다(우리 DMG는 macOS 전용). pack_dir 형제(~/.cys/claude).
+pub fn config_dir() -> PathBuf {
+    if let Some(d) = crate::env_compat(ENV_CONFIG_DIR) {
+        return PathBuf::from(d);
+    }
+    pack_dir()
+        .parent()
+        .map(|p| p.join("claude"))
+        .unwrap_or_else(|| PathBuf::from(".cys/claude"))
+}
+
+/// 격리 config dir 셋업: cys 라우터(CLAUDE.md)와 SessionStart hook(settings.json)을 설치한다.
+/// ★보존 모드 — 기존 파일은 덮지 않는다(사용자 커스터마이즈 불가침). best-effort(실패해도
+/// pack 설치 자체는 유효). 사용자 ~/.claude 는 절대 건드리지 않는다(격리의 핵심).
+fn setup_isolated_config_dir() {
+    let cfg = config_dir();
+    if std::fs::create_dir_all(&cfg).is_err() {
+        return;
+    }
+    // 라우터: 임베드 CLAUDE.md.template → <cfg>/CLAUDE.md (없을 때만 — 역할선언→~/.cys/pack 라우팅)
+    let claude_md = cfg.join("CLAUDE.md");
+    if !claude_md.exists() {
+        if let Some((_, tmpl)) = PACK.iter().find(|(rel, _)| *rel == "CLAUDE.md.template") {
+            let _ = std::fs::write(&claude_md, tmpl);
+        }
+    }
+    // hook: <cfg>/settings.json 에 SessionStart → session-start.sh (없을 때만)
+    let settings = cfg.join("settings.json");
+    if !settings.exists() {
+        let hook = format!(
+            "sh {}",
+            pack_dir().join("hooks/session-start.sh").display()
+        );
+        let json = serde_json::json!({
+            "hooks": { "SessionStart": [ { "hooks": [ { "type": "command", "command": hook } ] } ] }
+        });
+        if let Ok(s) = serde_json::to_string_pretty(&json) {
+            let _ = std::fs::write(&settings, s);
+        }
+    }
+}
+
 /// 설치 매니페스트: rel → 설치 당시 내용의 sha256. "지금 디스크에 있는 파일이 우리가
 /// 설치한 그대로인가(=사용자 비수정)"를 판정하는 유일한 근거다.
 const INSTALL_MANIFEST: &str = ".install-manifest.json";
@@ -201,6 +248,9 @@ pub fn install(force: bool) -> Result<(usize, usize), String> {
     if let Ok(json) = serde_json::to_string_pretty(&manifest) {
         let _ = std::fs::write(&manifest_path, json);
     }
+    // cys 전용 CLAUDE_CONFIG_DIR 격리 셋업(박사님 2026-06-15) — 사용자 ~/.claude 오염으로부터
+    // cys 마스터를 분리한다. best-effort·보존 모드라 깨끗한 환경에서도 회귀 0.
+    setup_isolated_config_dir();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -378,17 +428,32 @@ mod tests {
     fn install_writes_core_and_skills_to_fresh_dir() {
         let _g = PACK_ENV_LOCK.lock().unwrap();
         let saved = std::env::var(ENV_PACK_DIR).ok();
+        let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
         let td = std::env::temp_dir().join(format!("cys-pack-install-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&td);
+        let cfgdir = td.join("cysclaude"); // 격리 config dir(테스트 밀폐 — td와 함께 정리)
         std::env::set_var(ENV_PACK_DIR, &td);
+        std::env::set_var(ENV_CONFIG_DIR, &cfgdir);
         let result = install(false);
         match saved {
             Some(v) => std::env::set_var(ENV_PACK_DIR, v),
             None => std::env::remove_var(ENV_PACK_DIR),
         }
+        match saved_cfg {
+            Some(v) => std::env::set_var(ENV_CONFIG_DIR, v),
+            None => std::env::remove_var(ENV_CONFIG_DIR),
+        }
         let (written, kept) = result.expect("install 실패");
         assert_eq!(kept, 0, "빈 디렉터리인데 kept>0");
         assert_eq!(written, PACK.len() + PACK_SKILLS.len(), "임베드 전수 설치 아님");
+        // ★격리 config dir 셋업(박사님 2026-06-15): cys 라우터+hook이 전용 dir에 설치되고,
+        // 사용자 ~/.claude 와 분리된다. 라우터는 ~/.cys/pack 디렉티브로 라우팅해야 한다.
+        let router = std::fs::read_to_string(cfgdir.join("CLAUDE.md")).expect("격리 CLAUDE.md 미설치");
+        assert!(router.contains("~/.cys/pack/directives"), "격리 라우터가 pack 디렉티브로 안 보냄");
+        assert!(router.contains("외부 터미널 체계 아님") || router.contains("외부 터미널 체계"), "격리 라우터에 cys 환경선언 부재");
+        let cfg_settings = std::fs::read_to_string(cfgdir.join("settings.json")).expect("격리 settings.json 미설치");
+        assert!(cfg_settings.contains("SessionStart") && cfg_settings.contains("session-start.sh"),
+                "격리 settings.json에 SessionStart hook 부재");
         for probe in [
             "skills/korean-humanizer/SKILL.md",
             "skills/kosis-stats/scripts/run_kosis_stats.py",
@@ -431,9 +496,11 @@ mod tests {
     fn install_upgrades_unmodified_keeps_user_modified() {
         let _g = PACK_ENV_LOCK.lock().unwrap();
         let saved = std::env::var(ENV_PACK_DIR).ok();
+        let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
         let td = std::env::temp_dir().join(format!("cys-pack-upgrade-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&td);
         std::env::set_var(ENV_PACK_DIR, &td);
+        std::env::set_var(ENV_CONFIG_DIR, td.join("cysclaude")); // 격리(밀폐)
 
         let (rel_a, content_a) = PACK[0]; // 비수정·구버전 → 갱신 대상
         let (rel_b, content_b) = PACK[1]; // 사용자 수정 → 보존 대상
@@ -483,6 +550,10 @@ mod tests {
         match saved {
             Some(v) => std::env::set_var(ENV_PACK_DIR, v),
             None => std::env::remove_var(ENV_PACK_DIR),
+        }
+        match saved_cfg {
+            Some(v) => std::env::set_var(ENV_CONFIG_DIR, v),
+            None => std::env::remove_var(ENV_CONFIG_DIR),
         }
         assert_eq!(w2, 0, "멱등 위반: 재실행이 {w2}개를 다시 씀");
         assert_eq!(std::fs::read_to_string(td.join(rel_b)).unwrap(), "USER-MODIFIED");
