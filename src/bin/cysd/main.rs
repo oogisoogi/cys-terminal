@@ -587,7 +587,7 @@ async fn handle_connection(daemon: Arc<Daemon>, stream: Stream, caller_pid: Opti
                     let (lines, start) = {
                         // ★레이스 차단: scrollback 락을 먼저 잡고 그 안에서 line_count를 읽는다
                         // (writer가 push·fetch_add를 같은 락 아래 수행 — total/sb.len 일관 관측).
-                        let sb = surface.scrollback.lock().unwrap();
+                        let sb = surface.scrollback.lock().unwrap_or_else(|e| e.into_inner());
                         let total = surface
                             .line_count
                             .load(std::sync::atomic::Ordering::Relaxed);
@@ -727,7 +727,7 @@ async fn run_attach<W: AsyncWrite + Unpin>(
     // parser 락 아래에서 구독+스냅샷 — 그 사이 도착한 청크가 스냅샷과 live 양쪽에
     // 중복 배달되는 창을 닫는다 (reader 스레드는 parser 락에서 직렬화됨)
     let (mut rx, snapshot) = {
-        let parser = surface.parser.lock().unwrap();
+        let parser = surface.parser.lock().unwrap_or_else(|e| e.into_inner());
         let rx = surface.out_tx.subscribe();
         (rx, parser.screen().contents_formatted())
     };
@@ -844,7 +844,7 @@ mod attach_race_tests {
                     }
                     // ── run_attach와 동일: parser 락 아래 subscribe + 스냅샷 ──
                     let (mut rx, snapshot_markers) = {
-                        let parser = surf.parser.lock().unwrap();
+                        let parser = surf.parser.lock().unwrap_or_else(|e| e.into_inner());
                         let rx = surf.out_tx.subscribe();
                         let snap = parser.screen().contents();
                         (rx, parse_markers(snap.as_bytes()))

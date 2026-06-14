@@ -367,7 +367,7 @@ fn check_approvals(daemon: &Arc<Daemon>, debounce: &mut HashMap<(u64, String), f
         if patterns.is_empty() {
             continue;
         }
-        let screen = s.parser.lock().unwrap().screen().contents();
+        let screen = s.parser.lock().unwrap_or_else(|e| e.into_inner()).screen().contents();
         for p in patterns {
             let (Some(name), Some(pattern)) = (p["name"].as_str(), p["pattern"].as_str()) else {
                 continue;

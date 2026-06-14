@@ -614,12 +614,29 @@ impl Daemon {
                         // run_attach 주석의 불변식(중복 배달 창 봉쇄)이 실제로 성립한다.
                         // DSR 커서 위치도 같은 락 아래에서 읽어(재진입 락 회피) 일관성을 유지한다.
                         let dsr_resp = {
-                            let mut parser = surf.parser.lock().unwrap();
-                            parser.process(chunk);
-                            let resp = needs_dsr.then(|| {
-                                let (r, c) = parser.screen().cursor_position();
-                                format!("\x1b[{};{}R", r + 1, c + 1)
-                            });
+                            // poison된 락도 복구 — 단일 패닉이 데몬 전체를 마비시키지 않게 한다.
+                            let mut parser = surf.parser.lock().unwrap_or_else(|e| e.into_inner());
+                            // vt100 0.15.2(row.rs:89 등) 내부 인덱스 패닉이 parser 락을 poison시켜
+                            // 데몬 요청처리 전체를 마비시키던 연쇄를 차단: process를 catch_unwind로 격리.
+                            let resp = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                                || {
+                                    parser.process(chunk);
+                                    needs_dsr.then(|| {
+                                        let (r, c) = parser.screen().cursor_position();
+                                        format!("\x1b[{};{}R", r + 1, c + 1)
+                                    })
+                                },
+                            )) {
+                                Ok(resp) => resp,
+                                Err(_) => {
+                                    eprintln!(
+                                        "[cysd] surface {} vt100 process panic contained ({} bytes)",
+                                        surf.id,
+                                        chunk.len()
+                                    );
+                                    None
+                                }
+                            };
                             let _ = surf.out_tx.send(chunk.to_vec());
                             resp
                         };
@@ -725,7 +742,7 @@ impl Daemon {
         }
         drop(st);
         if !completed.is_empty() {
-            let mut sb = surface.scrollback.lock().unwrap();
+            let mut sb = surface.scrollback.lock().unwrap_or_else(|e| e.into_inner());
             for line in &completed {
                 if sb.len() >= SCROLLBACK_LINES {
                     sb.pop_front();

@@ -699,7 +699,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 // ★레이스 차단: scrollback 락을 먼저 잡고 그 안에서 line_count를 읽는다.
                 // writer(state.rs)가 push(N)과 fetch_add(N)을 같은 락 아래에서 수행하므로,
                 // 락 보유 중 읽으면 (sb.len, total)이 항상 일관 — oldest/skip 오프셋 어긋남 차단.
-                let sb = surface.scrollback.lock().unwrap();
+                let sb = surface.scrollback.lock().unwrap_or_else(|e| e.into_inner());
                 let total = surface.line_count.load(Ordering::Relaxed);
                 let oldest = total.saturating_sub(sb.len() as u64); // sb[0]의 라인 번호
                 let truncated = since < oldest; // 요청 구간 일부가 FIFO에서 퇴출됨
@@ -717,7 +717,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             }
             let text = if let Some(lines) = param_u64(&params, "lines") {
                 // Tail of the stripped scrollback line buffer.
-                let sb = surface.scrollback.lock().unwrap();
+                let sb = surface.scrollback.lock().unwrap_or_else(|e| e.into_inner());
                 let n = sb.len();
                 let start = n.saturating_sub(lines as usize);
                 sb.iter()
@@ -727,7 +727,12 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     .join("\n")
             } else {
                 // Accurate visible screen, reconstructed by the vt100 grid.
-                surface.parser.lock().unwrap().screen().contents()
+                surface
+                    .parser
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .screen()
+                    .contents()
             };
             Reply::Single(ok_response(
                 &id,
@@ -749,7 +754,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             };
             // 미제공 시 현재 크기 유지 (surface 조회 후 fallback 계산)
             let (cur_rows, cur_cols) = {
-                let parser = surface.parser.lock().unwrap();
+                let parser = surface.parser.lock().unwrap_or_else(|e| e.into_inner());
                 parser.screen().size()
             };
             let rows = match param_dim(&params, "rows", cur_rows, MAX_ROWS) {
@@ -772,7 +777,11 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 });
             match res {
                 Ok(()) => {
-                    surface.parser.lock().unwrap().set_size(rows, cols);
+                    surface
+                        .parser
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .set_size(rows, cols);
                     Reply::Single(ok_response(
                         &id,
                         json!({"surface_id": sid, "rows": rows, "cols": cols}),
