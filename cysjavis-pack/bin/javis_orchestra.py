@@ -58,10 +58,76 @@ import shutil
 import subprocess
 import sys
 
-# 4차 앵커4-1: 프로젝트 상주 의무 노드(grok은 선택). check가 이 4종 생존을 판정한다.
+# 4차 앵커4-1: 프로젝트 상주 의무 노드(grok은 선택). 이것은 *표준(Tier-2 이상) 기본 로스터*다.
+# ★check 가 실제로 검증하는 것은 effective_required_roles()(=감지 폴백 적용) — REQUIRED_ROLES 는
+# 계약·문서용 표준 상수로 보존한다. agy/codex 미감지 시 리뷰어 슬롯은 Claude 대체로 치환된다.
 REQUIRED_ROLES = ["cso", "worker", "reviewer-gemini", "reviewer-codex"]
 OPTIONAL_ROLES = ["reviewer-grok"]
 MAX_ROUNDS = 10  # 앵커4 5-8: 맥킨지급 도달 또는 10R 완료 시 멈춤
+
+# ★리뷰어 슬롯 + 무구독 폴백(박사님 2026-06-14): agy(reviewer-gemini)·codex(reviewer-codex)는
+# '기본 전제'일 뿐 절대 전제가 아니다 — 사용자가 다른 임무를 줄 수도, 구독·CLI가 없을 수도 있다.
+# master 부트 후 리뷰어를 '호출하는 단계'에서 감지하지 못하면 멈추지 말고 곧바로 Claude 대체
+# 리뷰어로 폴백한다. 감지는 LLM 자연어 재추론이 아니라 아래 결정론 함수만이 사실이다(§12).
+# 각 슬롯: (네이티브 역할, 네이티브 agent, 대체 역할, 대체 agent=claude).
+REVIEWER_SLOTS = [
+    ("reviewer-gemini", "gemini", "reviewer-claude-1", "claude"),
+    ("reviewer-codex",  "codex",  "reviewer-claude-2", "claude"),
+]
+
+
+def _agents_json():
+    try:
+        with open(os.path.join(pack_dir(), "agents.json"), encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def reviewer_launch_binary(agent, agents=None):
+    """agents.json 의 'cmd' 첫 토큰 = 그 agent 의 기동 바이너리(하드코딩 금지·진실원천)."""
+    agents = agents if agents is not None else _agents_json()
+    cmd = ((agents.get(agent) or {}).get("cmd") or "").strip()
+    if not cmd:
+        return None
+    return os.path.expanduser(cmd.split()[0])
+
+
+def detect_reviewer(agent, agents=None):
+    """★결정론 1차 감지(박사님 '가장 중요한 전제') — 그 리뷰어 CLI 가 *호출 가능*한가.
+    바이너리가 절대경로로 실재·실행가능하거나 PATH 에서 해석되면 available.
+    인증·구독 유무는 여기서 판정하지 않는다(미인증은 부트 시 set-status ack 부재로
+    boot-reviewers 가 2차 폴백한다). claude 는 시스템 전제. 반환: (available, reason)."""
+    binp = reviewer_launch_binary(agent, agents)
+    if not binp:
+        return False, "agents.json 에 %s.cmd 없음" % agent
+    if os.path.sep in binp:
+        ok = os.path.isfile(binp) and os.access(binp, os.X_OK)
+        return ok, ("실행가능 %s" % binp if ok else "바이너리 부재/실행불가 %s" % binp)
+    resolved = shutil.which(binp)
+    return (bool(resolved), ("PATH 발견 %s" % resolved) if resolved else ("PATH 미발견 %s" % binp))
+
+
+def reviewer_roster(detect=None, agents=None):
+    """감지에 따른 *유효* 리뷰어 로스터. 각 항목: {role, agent, native, substituted_for, reason}.
+    detect/agents 주입 가능(self-test 밀폐)."""
+    detect = detect or detect_reviewer
+    agents = agents if agents is not None else _agents_json()
+    roster = []
+    for nrole, nagent, srole, sagent in REVIEWER_SLOTS:
+        ok, why = detect(nagent, agents)
+        if ok:
+            roster.append({"role": nrole, "agent": nagent, "native": True,
+                           "substituted_for": None, "reason": why})
+        else:
+            roster.append({"role": srole, "agent": sagent, "native": False,
+                           "substituted_for": nagent, "reason": why})
+    return roster
+
+
+def effective_required_roles(detect=None, agents=None):
+    """check 가 검증할 유효 의무 역할 = cso·worker + 유효 리뷰어 로스터(감지 폴백 적용)."""
+    return ["cso", "worker"] + [e["role"] for e in reviewer_roster(detect, agents)]
 
 
 def pack_dir():
@@ -138,19 +204,28 @@ def cmd_check(args):
     if status is None:
         print("[orchestra check] cys status 수집 실패(데몬 미가동?) — `cys ping` 확인 후 재실행")
         return 2
+    # ★유효 의무 역할 = cso·worker + 감지 폴백 적용 리뷰어 로스터(agy/codex 미감지 시 Claude 대체).
+    roster = reviewer_roster()
+    required = ["cso", "worker"] + [e["role"] for e in roster]
     alive = live_roles(status)
-    # 워커는 복수 인스턴스(worker, worker-2 …) — 하나라도 생존이면 REQUIRED_ROLES의 'worker' 요건을
-    # 충족시킨다(접두 수용). 데몬이 둘째 워커부터 worker-N으로 dedup하므로 'worker' 키가 없을 수 있다.
+    # 워커는 복수 인스턴스(worker, worker-2 …) — 하나라도 생존이면 'worker' 요건을 충족(접두 수용).
+    # 데몬이 둘째 워커부터 worker-N으로 dedup하므로 'worker' 키가 없을 수 있다.
     if any(v for k, v in alive.items() if k == "worker" or k.startswith("worker-")):
         alive["worker"] = True
     # 각성 이력 있는 idle 노드(set-status 노후화·agent_alive None 으로 굳음)만 '생존추정'으로 보강.
     # ★프로세스 단독 인증 아님(각성이력=status.state 필수·surface_ref 결박) — codex R1 결함5·R2 결함1·5 정합.
-    still_missing = [r for r in REQUIRED_ROLES if not alive.get(r)]
+    still_missing = [r for r in required if not alive.get(r)]
     estimated = _quiet_alive_roles(status, still_missing) if still_missing else {}
     alive.update(estimated)
     print("LLM orchestrating 노드 점검 (4종 의무 + grok 선택):")
+    # 리뷰어 대체 고지(박사님 2026-06-14 — 정직한 라벨링: 보편적이나 벤더 다양성은 약함)
+    for e in roster:
+        if not e["native"]:
+            print("  ⚠ %s 미감지(%s) → %s(Claude 대체) — 보편적이나 벤더 다양성 약함, "
+                  "페르소나/렌즈/익명화로 보완(REVIEWER_DIRECTIVE §6)"
+                  % (e["substituted_for"], e["reason"], e["role"]))
     missing = []
-    for r in REQUIRED_ROLES:
+    for r in required:
         if alive.get(r):
             if estimated.get(r):
                 # fresh 각성이 아니라 '각성이력+프로세스' 추정 — 재각성(헬퍼) 권장 신호.
@@ -164,11 +239,59 @@ def cmd_check(args):
         print("  %s %s — %s" % ("✓" if alive.get(r) else "·", r,
                                 "생존" if alive.get(r) else "미설치/미기동(선택)"))
     if missing:
-        print("종합: 필수 %d/%d 생존 — 부재: %s → `cys boot`로 기동하라"
-              % (len(REQUIRED_ROLES) - len(missing), len(REQUIRED_ROLES), ", ".join(missing)))
+        only_rev = all(m.startswith("reviewer") for m in missing)
+        howto = ("javis_orchestra.py boot-reviewers (리뷰어 감지·자동 폴백)" if only_rev
+                 else "cys boot")
+        print("종합: 필수 %d/%d 생존 — 부재: %s → `%s`로 기동하라"
+              % (len(required) - len(missing), len(required), ", ".join(missing), howto))
         return 1
-    print("종합: 4종 의무 노드 전부 생존 — LLM orchestrating READY")
+    print("종합: %d종 의무 노드 전부 생존 — LLM orchestrating READY" % len(required))
     return 0
+
+
+# ── boot-reviewers: 리뷰어 감지→기동, 미감지 시 Claude 대체 자동 폴백(멈춤 없음) ──
+def _boot_one_node(role, agent, timeout=130):
+    """javis_boot_node.py 로 단일 노드 결정론 부트. rc==0(각성확정) → True."""
+    bn = os.path.join(os.path.dirname(os.path.abspath(__file__)), "javis_boot_node.py")
+    try:
+        r = subprocess.run([sys.executable, bn, "--role", role, "--agent", agent],
+                           timeout=timeout)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def cmd_boot_reviewers(args):
+    """★박사님 2026-06-14: master 부트 후 리뷰어(agy·codex)를 '호출하는 단계'.
+    감지를 못하면 멈추지 말고 곧바로 Claude 대체 리뷰어로 폴백 기동한다.
+    2층 감지: (1) 바이너리 미설치 → 즉시 대체(detect_reviewer). (2) 설치됐으나 부트가
+    각성(set-status ack)에 실패(미인증·깨짐) → 대체로 2차 폴백. 절대 halt 하지 않는다."""
+    roster = reviewer_roster()
+    print("[boot-reviewers] 리뷰어 슬롯 기동 (미감지/각성실패 시 Claude 대체로 자동 폴백):")
+    results = []
+    for (nrole, nagent, srole, sagent), e in zip(REVIEWER_SLOTS, roster):
+        role, agent = e["role"], e["agent"]
+        if not e["native"]:
+            print("  ⚠ %s 미감지(%s) — %s(Claude) 대체 기동" % (nagent, e["reason"], srole))
+        if args.plan:
+            print("  · PLAN %-18s ← %s%s" % (role, agent,
+                  "" if e["native"] else " (대체: %s 부재)" % nagent))
+            results.append("plan")
+            continue
+        ok = _boot_one_node(role, agent)
+        if not ok and e["native"]:
+            # 설치됐으나 각성 실패(미인증·깨짐) — 2차 폴백: Claude 대체로 전환
+            print("  ⚠ %s 기동/각성 실패 — %s(Claude) 대체로 2차 폴백" % (role, srole))
+            role, agent, ok = srole, sagent, _boot_one_node(srole, sagent)
+        print("  %s %-18s ← %s" % ("✓" if ok else "✗", role, agent))
+        results.append("awake" if ok else "failed")
+    awoke = sum(1 for s in results if s in ("awake", "plan"))
+    if args.plan:
+        print("종합(PLAN): 리뷰어 %d슬롯 — 감지 폴백 적용 로스터 출력(기동 안 함)" % len(results))
+        return 0
+    print("종합: 리뷰어 %d/2 각성 (Claude 대체 포함)%s"
+          % (awoke, "" if awoke >= 2 else " — 부족: master 가 점검·수동 재기동"))
+    return 0 if awoke >= 2 else 1
 
 
 # ── review-prompt: 제약을 항상 포함한 리뷰 의뢰 프롬프트 ──
@@ -787,6 +910,36 @@ def cmd_self_test(args):
             for mark in RULE_MARKERS:
                 assert any(mark in pin or pin in mark for pin in worker_pins), \
                     "마커 '%s'가 WORKER C03 핀에 비커버 — 폴백 강등 원인을 preflight가 못 본다" % mark
+        # ── 리뷰어 감지·무구독 폴백 배터리(박사님 2026-06-14 · 밀폐 가짜 감지기) ──
+        # 표준 슬롯 계약 고정: agy/codex 네이티브 + claude 대체 2슬롯(변형 시 폴백 붕괴).
+        assert [s[1] for s in REVIEWER_SLOTS] == ["gemini", "codex"], "표준 리뷰어 슬롯 변형"
+        assert [s[3] for s in REVIEWER_SLOTS] == ["claude", "claude"], "대체 agent 는 claude 여야 함"
+        # detect_reviewer: 절대경로 부재·미정의 agent 는 unavailable, 첫토큰만 본다(인자 무시 안 함)
+        synth_ag = {"gemini": {"cmd": "/no/such/dir/agy --dangerously-skip-permissions"},
+                    "codex": {"cmd": "codex --x"}, "claude": {"cmd": "bash /x/a.sh"}}
+        assert detect_reviewer("gemini", synth_ag)[0] is False, "절대경로 부재 바이너리 available 오탐"
+        assert detect_reviewer("zzz", synth_ag)[0] is False, "미정의 agent available 오탐"
+        assert reviewer_launch_binary("gemini", synth_ag).endswith("/agy"), "cmd 첫토큰 추출 오류"
+        # 미감지 → Claude 대체 로스터(멈춤 금지), 감지 → 네이티브 로스터
+        no = lambda a, ag=None: (False, "테스트:미설치")
+        yes = lambda a, ag=None: (True, "테스트:있음")
+        rno = reviewer_roster(detect=no, agents=synth_ag)
+        assert [e["role"] for e in rno] == ["reviewer-claude-1", "reviewer-claude-2"], \
+            "미감지 시 Claude 대체 로스터 미생성(멈춤 위험)"
+        assert all(e["agent"] == "claude" and not e["native"] for e in rno), "대체 슬롯 agent/native 오류"
+        assert [e["substituted_for"] for e in rno] == ["gemini", "codex"], "대체 대상 추적 오류"
+        ryes = reviewer_roster(detect=yes, agents=synth_ag)
+        assert [e["role"] for e in ryes] == ["reviewer-gemini", "reviewer-codex"] and \
+            all(e["native"] for e in ryes), "감지 시 네이티브 로스터 오류"
+        # 혼합(gemini만 있음): 네이티브 1 + 대체 1
+        mix = lambda a, ag=None: (a == "gemini", "mix")
+        rmix = reviewer_roster(detect=mix, agents=synth_ag)
+        assert [e["role"] for e in rmix] == ["reviewer-gemini", "reviewer-claude-2"], "혼합 로스터 오류"
+        # effective_required_roles: 미감지 시 의무 역할이 Claude 대체로 치환(check 가 영영 부재 보고 안 함)
+        assert effective_required_roles(detect=no, agents=synth_ag) == \
+            ["cso", "worker", "reviewer-claude-1", "reviewer-claude-2"], "유효 의무역할 치환 오류"
+        assert effective_required_roles(detect=yes, agents=synth_ag) == REQUIRED_ROLES, \
+            "감지 시 유효 의무역할이 표준과 불일치"
     except AssertionError as e:
         print("javis_orchestra self-test FAIL: %s" % e, file=sys.stderr)
         return 1
@@ -803,6 +956,10 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("check", help="4종 의무 노드 생존 판정")
+
+    br = sub.add_parser("boot-reviewers",
+                        help="리뷰어(agy·codex) 감지→기동. 미감지/각성실패 시 Claude 대체로 자동 폴백(멈춤 없음)")
+    br.add_argument("--plan", action="store_true", help="기동 없이 감지 결과 로스터만 출력(dry-run)")
 
     rp = sub.add_parser("review-prompt", help="제약 포함 리뷰 의뢰 프롬프트 생성")
     rp.add_argument("--task", required=True)
@@ -847,6 +1004,7 @@ def main():
     args = ap.parse_args()
     return {
         "check": cmd_check,
+        "boot-reviewers": cmd_boot_reviewers,
         "review-prompt": cmd_review_prompt,
         "task-prompt": cmd_task_prompt,
         "phase-plan": cmd_phase_plan,

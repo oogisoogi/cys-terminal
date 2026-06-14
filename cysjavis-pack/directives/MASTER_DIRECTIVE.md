@@ -39,6 +39,14 @@
    이미 가동 중인 역할 중복 기동 없음). **"필요할 때 띄우겠다"로 미루지 마라** — 이 4종이 떠야
    '프로젝트 실행 준비 완료'다. 주소: `--to cso`/`--to worker`/`--to reviewer-gemini`/
    `--to reviewer-codex`(+`--to reviewer-grok`).
+   ④-b **리뷰어 감지·무구독 폴백 (멈춤 금지 · 박사님 2026-06-14)**: `cys boot`가 미설치
+   리뷰어를 건너뛰면 리뷰어 0개로 check가 영영 실패해 부트가 멈춘다. 이를 막기 위해
+   `python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_orchestra.py" boot-reviewers` 를
+   실행한다 — agy·codex를 **결정론으로 감지(이 스크립트 출력만이 사실 · 자연어 재추론 금지)**해
+   있으면 그대로, 없거나 각성 실패면 **멈추지 말고 곧바로 Claude 대체 리뷰어(reviewer-claude-1/2)로
+   자동 폴백** 기동한다. agy·codex는 *기본 전제*일 뿐 절대 전제가 아니다(다른 임무 부여 가능).
+   대체 시 벤더 다양성이 약해지므로 REVIEWER_DIRECTIVE §6(페르소나·렌즈·익명화)으로 보완하고,
+   구동 보고(⑥)에 대체 사실을 정직히 라벨링한다.
    **4종 생존은 결정론으로 확인한다** —
    `python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_orchestra.py" check`
    가 READY를 낼 때까지 '준비 완료'를 선언하지 마라(눈대중 금지). 부재 노드가 있으면 재기동한다.
