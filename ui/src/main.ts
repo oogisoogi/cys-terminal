@@ -606,6 +606,68 @@ function attachDividerDrag(
   });
 }
 
+// ---------- 정렬: 역할(role) 기반 고정 배치 ----------
+// 현재 워크스페이스의 살아있는 surface를 역할별 표준 자리로 재배치한다:
+//   · 왼쪽 끝 컬럼  = master(위) / cso(아래), 세로 5:1
+//   · 가운데        = worker·미분류 surface를 같은 폭 컬럼으로 균등 분배(좌→우 순서 보존)
+//   · 오른쪽 끝 컬럼 = reviewer-gemini(agy, 위) / reviewer-codex(codex, 아래), 세로 1:1
+// 트리 위상만 새로 짜고 attachDividerDrag는 건드리지 않으므로 수동 크기 조절은 그대로 보존된다
+// (정렬 후에도 divider를 다시 끌 수 있다 — 현재 크기만 표준 배치로 리셋될 뿐이다).
+// divider 1px·pane 헤더 등으로 컬럼 폭엔 셀 1칸 이내 잔차가 있을 수 있다.
+function evenComb(nodes: Node[], dir: "row" | "col"): Node {
+  let acc = nodes[nodes.length - 1];
+  for (let i = nodes.length - 2; i >= 0; i--) {
+    acc = { type: "split", dir, ratio: 1 / (nodes.length - i), a: nodes[i], b: acc };
+  }
+  return acc;
+}
+
+function firstWithRole(sids: number[], roleOf: Map<number, string | null>, role: string): number | null {
+  for (const sid of sids) if (roleOf.get(sid) === role) return sid;
+  return null;
+}
+
+function roleLayout(sids: number[], roleOf: Map<number, string | null>): Node {
+  const master = firstWithRole(sids, roleOf, "master");
+  const cso = firstWithRole(sids, roleOf, "cso");
+  const agy = firstWithRole(sids, roleOf, "reviewer-gemini"); // 안티그래피티
+  const codex = firstWithRole(sids, roleOf, "reviewer-codex");
+  const corners = new Set([master, cso, agy, codex].filter((x): x is number => x != null));
+  const middle = sids.filter((sid) => !corners.has(sid)); // worker·미분류 전부 가운데
+  const pane = (sid: number): Node => ({ type: "pane", sid });
+
+  const columns: Node[] = [];
+  // 왼쪽 끝: master(위) / cso(아래) = 5:1 (누락 시 있는 쪽이 컬럼 전체)
+  if (master != null && cso != null) columns.push({ type: "split", dir: "col", ratio: 5 / 6, a: pane(master), b: pane(cso) });
+  else if (master != null) columns.push(pane(master));
+  else if (cso != null) columns.push(pane(cso));
+  // 가운데: worker·미분류 균등 컬럼
+  for (const sid of middle) columns.push(pane(sid));
+  // 오른쪽 끝: agy(위) / codex(아래) = 1:1 (누락 시 있는 쪽이 컬럼 전체)
+  if (agy != null && codex != null) columns.push({ type: "split", dir: "col", ratio: 1 / 2, a: pane(agy), b: pane(codex) });
+  else if (agy != null) columns.push(pane(agy));
+  else if (codex != null) columns.push(pane(codex));
+
+  return evenComb(columns, "row"); // 컬럼들을 같은 폭으로 가로 배치
+}
+
+async function actionEqualize() {
+  const ws = current();
+  if (!ws?.tree) return;
+  const live = collectSids(ws.tree).filter((sid) => panes.has(sid)); // 죽은/placeholder 노드 제외
+  if (live.length < 2) return; // 0~1개는 정렬할 대상이 없음
+  // 역할은 데몬 surface.list에서 조회 (UI 생성 pane은 role=null → 가운데로)
+  const roleOf = new Map<number, string | null>();
+  try {
+    const r = (await invoke("list_surfaces")) as { surfaces: { surface_id: number; role: string | null }[] };
+    for (const s of r.surfaces) roleOf.set(s.surface_id, s.role);
+  } catch {
+    /* 데몬 일시 미응답: role 없이 진행 → 전부 가운데 균등 */
+  }
+  ws.tree = roleLayout(live, roleOf);
+  render(); // 새 트리로 DOM 재구성 + fitPane→resize_surface + saveLayout
+}
+
 // ---------- workspace tabs ----------
 
 // ws별 고유색 (id 기반 — 세션 복원에도 같은 ws는 같은 색)
@@ -1195,6 +1257,7 @@ async function start() {
 document.getElementById("btn-new")!.addEventListener("click", actionNew);
 document.getElementById("btn-split-h")!.addEventListener("click", () => actionSplit("row"));
 document.getElementById("btn-split-v")!.addEventListener("click", () => actionSplit("col"));
+document.getElementById("btn-equalize")!.addEventListener("click", actionEqualize);
 document.getElementById("btn-close")!.addEventListener("click", actionClose);
 document.getElementById("btn-feed")!.addEventListener("click", () => setFeedOpen(!feedOpen));
 document.getElementById("btn-feed-close")!.addEventListener("click", () => setFeedOpen(false));
