@@ -1,4 +1,4 @@
-# cys-terminal : A Dedicated Terminal for the CYSJavis System (core daemon + CLI + CYSJavis Pack)
+# cys-terminal — CYSJavis Dedicated Terminal (core daemon + CLI + CYSJavis Pack)
 
 > Independently written **from scratch**, referencing only the protocol design ideas of 외부 터미널 체계 (외부 프로젝트) — no GPL code used. Cross-platform: macOS & Windows.
 

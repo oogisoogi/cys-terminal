@@ -1,4 +1,4 @@
-# cys-terminal : CYSJavis 시스템을 위한 전용 Terminal (코어 데몬 + CLI + CYSJavis Pack)
+# cys-terminal — CYSJavis 전용 Terminal (코어 데몬 + CLI + CYSJavis Pack)
 
 > 진정한 AI 자비스 시스템 운용을 위한 터미널. 외부 터미널 체계(외부 프로젝트) 전수조사에서 프로토콜 설계 사상만 참고해
 > **처음부터 새로 작성**한 독자 구현 (GPL 코드 미사용). 맥·윈도우 크로스플랫폼.
