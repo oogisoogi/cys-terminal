@@ -281,7 +281,7 @@ FALLBACK_RULES = [
 ]
 
 
-def build_task_ticket(task, scope, success, to_role, rules):
+def build_task_ticket(task, scope, success, to_role, rules, output_format=None):
     """위임 티켓 본문 생성. rules는 필수 — 호출자가 추출 성패를 알고 명시 주입한다
     (기본값 경유의 무경고 폴백 경로 제거 · self-test는 rules 주입으로 밀폐 검증)."""
     bullets = rules
@@ -291,6 +291,8 @@ def build_task_ticket(task, scope, success, to_role, rules):
     lines.append("범위(이 파일/범위만 — 무관 파일·repo 배회 금지): %s" % scope)
     if success:
         lines.append("성공 기준(완료 보고는 이 기준 대비 검증 결과를 포함하라): %s" % success)
+    if output_format:
+        lines.append("산출 형식(이 형식·구조로 산출하라 — W8 4-part output-format): %s" % output_format)
     lines.append("")
     lines.append("절대 강조 4규칙 (WORKER_DIRECTIVE §3 — 모든 작업에 적용·위반 금지):")
     lines.extend("  " + b for b in bullets)
@@ -345,7 +347,8 @@ def cmd_task_prompt(args):
               "마커 불완전 — 하드 폴백(FALLBACK_RULES)으로 주입한다. 디렉티브를 점검하라"
               "(preflight C03).", file=sys.stderr)
         rules = FALLBACK_RULES
-    print(build_task_ticket(args.task, args.scope, args.success, args.to, rules=rules))
+    print(build_task_ticket(args.task, args.scope, args.success, args.to, rules=rules,
+                            output_format=getattr(args, "output_format", None)))
     return 0
 
 
@@ -810,6 +813,8 @@ def main():
     tp.add_argument("--scope", required=True, help="작업 대상 파일/범위")
     tp.add_argument("--success", default=None, help="성공 기준 (완료 보고의 검증 기준)")
     tp.add_argument("--to", default="worker", help="위임 대상 역할 (기본 worker)")
+    tp.add_argument("--output-format", default=None,
+                    help="산출 형식·구조 (W8 4-part output-format 슬롯 — 예: 'JSON {필드}', '마크다운 표', '보고서 PDF')")
 
     pp = sub.add_parser("phase-plan",
                         help="Task를 자기완결 Phase 티켓으로 분해 (영상 N6 — Task/Phase 순차)")
