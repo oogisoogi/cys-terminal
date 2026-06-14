@@ -711,8 +711,27 @@ mod tests {
 
     #[test]
     fn claude_window_default_and_1m_variant() {
+        // ★테스트 격리: 런타임 환경(예: Claude Code 세션)이 CYS_CLAUDE_CTX_WINDOW(또는
+        // JAVIS_/AITERM_ 호환 별칭)을 설정하면 env 오버라이드가 모델 기본값을 덮어 이 핀이
+        // 거짓 실패한다. 모델 기반 분기만 검증하도록 해당 env를 제거 후 단언하고 복원한다.
+        let keys = [
+            "CYS_CLAUDE_CTX_WINDOW",
+            "JAVIS_CLAUDE_CTX_WINDOW",
+            "AITERM_CLAUDE_CTX_WINDOW",
+        ];
+        let saved: Vec<(&str, Option<String>)> =
+            keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+        for k in keys {
+            std::env::remove_var(k);
+        }
         assert_eq!(claude_ctx_window("claude-fable-5"), 200_000);
         assert_eq!(claude_ctx_window("claude-sonnet-4-6[1m]"), 1_000_000);
+        for (k, v) in saved {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
     }
 
     // ── codex 파서: 실측 스키마(2026-06-13, codex-cli 0.139.0) 핀 ──
