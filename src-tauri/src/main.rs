@@ -375,7 +375,7 @@ async fn check_update(app: AppHandle) -> Result<Option<Value>, String> {
     }
 }
 
-/// 데몬 핸드오프 정책(박사님 결정): 살아있는 세션 0개면 데몬 종료까지 자동,
+/// 데몬 핸드오프 정책(오너 결정): 살아있는 세션 0개면 데몬 종료까지 자동,
 /// 있으면 거부하고 세션 수를 알려 UI가 확인을 받게 한다(force=true면 강행).
 /// 반환: 종료된 세션 수.
 #[tauri::command]
@@ -396,7 +396,7 @@ async fn live_session_count() -> Result<u64, String> {
 /// force=false: 살아있는 세션이 있으면 설치 전에 거부(UI가 확인 후 force=true로 재호출).
 #[tauri::command]
 async fn install_update(app: AppHandle, force: bool) -> Result<(), String> {
-    // 1) 세션 가드 (박사님 정책: 없으면 자동·있으면 확인)
+    // 1) 세션 가드 (오너 정책: 없으면 자동·있으면 확인)
     let sessions = live_session_count().await.unwrap_or(0);
     if sessions > 0 && !force {
         return Err(format!("live_sessions:{sessions}"));

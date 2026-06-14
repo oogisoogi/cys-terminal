@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """javis_docsdiff — 변경된 줄만 모은 docs-diff 생성기 (하네스 7기법 N5).
 
-출처: 외부 수집 지식(YouTube 4JtB_QvKT8w·바이브마피아 최수민) — 박사님 SOT 아님.
+출처: 외부 수집 지식(YouTube 4JtB_QvKT8w·바이브마피아 최수민) — 오너 SOT 아님.
 
 영상 원리: Task 첫 단계는 무조건 "문서 업데이트". 업데이트 후 스크립트로 "변경된 정확한
 내용"만 취합해 docs-diff 파일을 만들고("삭제된 내용은 없고 248번째 줄에 이 내용이 추가됐다"),
@@ -151,7 +151,7 @@ def build_docs_diff(root, base, paths):
     lines.append("# docs-diff (변경/추가된 줄만 — base: %s)" % base)
     lines.append("")
     lines.append("> 출처 기법: 외부 수집 지식(영상 4JtB_QvKT8w·바이브마피아 최수민) — "
-                 "박사님 SOT 아님. 이후 단계는 이 변경분만 콤팩트 참조해 spec-drift를 차단한다.")
+                 "오너 SOT 아님. 이후 단계는 이 변경분만 콤팩트 참조해 spec-drift를 차단한다.")
     lines.append("")
     any_change = False
     for rel, added in sections:

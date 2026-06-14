@@ -17,7 +17,7 @@ import sys
 import time
 
 SOCK = os.environ.get("CYS_E2E_SOCK", "/tmp/cys-e2e-usage-r3.sock")
-ROOT = "/Users/cys/Desktop/CYSjavis/cys-terminal"
+ROOT = "/Users/user/Desktop/CYSjavis/cys-terminal"
 CLAUDE_TX = "/tmp/cys-e2e-claude.jsonl"
 CODEX_TX = "/tmp/cys-e2e-rollout.jsonl"
 

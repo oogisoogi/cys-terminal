@@ -782,10 +782,10 @@ mod tests {
 
     #[test]
     fn munge_matches_observed_directory_names() {
-        // 실측: /Users/cys/Desktop/CYSjavis/cys-terminal → -Users-cys-Desktop-CYSjavis-cys-terminal
+        // 실측: /Users/user/Desktop/CYSjavis/cys-terminal → -Users-user-Desktop-CYSjavis-cys-terminal
         assert_eq!(
-            claude_project_component("/Users/cys/Desktop/CYSjavis/cys-terminal"),
-            "-Users-cys-Desktop-CYSjavis-cys-terminal"
+            claude_project_component("/Users/user/Desktop/CYSjavis/cys-terminal"),
+            "-Users-user-Desktop-CYSjavis-cys-terminal"
         );
         // 비ASCII·특수문자는 각각 '-' (보수 구현 — 휴리스틱 폴백 전용)
         assert_eq!(claude_project_component("/tmp/a.b_c"), "-tmp-a-b-c");

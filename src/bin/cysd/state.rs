@@ -786,7 +786,7 @@ impl Daemon {
         }
     }
 
-    /// 박사님 완화책 ①: scrollback 패턴 룰 — 매칭 시 health.alert를 push한다 (폴링 불필요).
+    /// 오너 완화책 ①: scrollback 패턴 룰 — 매칭 시 health.alert를 push한다 (폴링 불필요).
     /// T4-17: 에코 제외(주입 직후 2초 라인은 매칭 제외 — 주입 문자열 에코로 인한
     /// 자기/타기 DoS 차단) + 조치 바인딩(60초 창 연속 매칭 게이트 통과 시에만 발동).
     fn run_health_rules(&self, surface: &Surface, lines: &[String]) {
@@ -988,7 +988,7 @@ fn default_shell() -> String {
     }
 }
 
-/// 박사님 완화책 ① 기본 내장 룰: 로그인 만료·401·토큰 만료를 즉시 감지한다.
+/// 오너 완화책 ① 기본 내장 룰: 로그인 만료·401·토큰 만료를 즉시 감지한다.
 fn default_health_rules() -> Vec<HealthRule> {
     let defaults: &[(&str, &str)] = &[
         ("not_logged_in", r"(?i)not logged in"),

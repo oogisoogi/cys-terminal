@@ -30,7 +30,7 @@
 sudo ln -sf /Applications/cys.app/Contents/MacOS/cys  /usr/local/bin/cys
 sudo ln -sf /Applications/cys.app/Contents/MacOS/cysd /usr/local/bin/cysd
 ```
-(pane *안*에서는 PATH가 자동 주입되므로 이 단계는 박사님이 **앱 밖 터미널**에서 `cys`를 칠 때만 필요)
+(pane *안*에서는 PATH가 자동 주입되므로 이 단계는 오너이 **앱 밖 터미널**에서 `cys`를 칠 때만 필요)
 
 ### C. 24/365 상시 가동 (선택 — 헤드리스/무인 운영)
 재부팅 후에도 데몬이 자동으로 살아 있게 launchd에 등록:

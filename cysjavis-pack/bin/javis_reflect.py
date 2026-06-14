@@ -3,7 +3,7 @@
 """javis_reflect — 반복신호 light scan (자기교정 ① Capture 자동화).
 
 외부 /reflect shadow mode의 javis판. Stop·SessionEnd hook이 세션 transcript를
-1회 가볍게 훑어, 사람(박사님)이 master를 교정·반려한 '마찰 신호'를 카운트한다.
+1회 가볍게 훑어, 사람(오너)이 master를 교정·반려한 '마찰 신호'를 카운트한다.
 한 세션(transcript)에서 임계(기본 3) 이상 누적되면 RSI_LEDGER.md(① Capture)에
 SHADOW 후보 1줄을 append 한다 — 자동 적용은 0(shadow). 적재된 후보는
 inject-context.sh가 startup/resume에 RSI 자산으로 주입하므로 master 눈에 들어와

@@ -3,7 +3,7 @@
 # 설계: _round/PERSISTENCE_ARCHITECTURE.md §6 G1
 # 역할: 압축·종료 직전 SESSION_STATE '최종 갱신' 타임스탬프 갱신 + .state_log append.
 #        (본문은 master가 채운 것 보존 — 자동화는 타임스탬프·로그 세이프가드만)
-# 전수: ROOT 경로는 박사님 환경 실례. 제3자는 자기 경로로 치환(또는 cwd 상향탐색이 우선 동작).
+# 경로: ROOT는 환경변수 CYS_ROOT로 오버라이드 가능(미설정 시 $HOME). cwd 상향탐색이 우선 동작.
 # 안전: graceful, 반드시 exit 0
 set +e
 
@@ -17,7 +17,7 @@ try:
  d=json.load(sys.stdin); print(d.get('hook_event_name', d.get('trigger','event')))
 except Exception: print('event')" 2>/dev/null)
 
-ROOT="/Users/cys/Desktop/CYSjavis"
+ROOT="${CYS_ROOT:-$HOME}"
 DIR="$CWD"; RD=""; PREV=""
 while [ -n "$DIR" ] && [ "$DIR" != "/" ] && [ "$DIR" != "$PREV" ]; do
   if [ -d "$DIR/_round" ]; then RD="$DIR/_round"; break; fi

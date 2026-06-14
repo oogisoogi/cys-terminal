@@ -1359,9 +1359,10 @@ class Preflight:
             warns.append("pack 스킬 %d종 미설치(%s…) — init-pack 재실행 필요"
                          % (len(missing), missing[0]))
         # (b) 네이티브 Claude Code(/goal) 발견용 프로필 심링크 (기계 --fix)
-        profiles = [os.path.expanduser(p) for p in
-                    ("~/.claude", "~/.claude-cysinsight", "~/.claude-ysfuture")]
-        profiles = [p for p in profiles if os.path.isdir(p)]
+        _home = os.path.expanduser("~")
+        profiles = sorted(os.path.join(_home, d) for d in os.listdir(_home)
+                          if (d == ".claude" or d.startswith(".claude-"))
+                          and os.path.isdir(os.path.join(_home, d)))
         linked_profiles = 0
         for prof in profiles:
             sdir = os.path.join(prof, "skills")
@@ -1541,9 +1542,10 @@ class Preflight:
             warns.append("pack 스킬 %d종 미설치(%s…) — init-pack 재실행"
                          % (len(missing), missing[0]))
         # (b) 프로필 심링크 (네이티브/goal 발견 — C26과 동일 규약)
-        profiles = [p for p in (os.path.expanduser("~/.claude"),
-                                os.path.expanduser("~/.claude-cysinsight"),
-                                os.path.expanduser("~/.claude-ysfuture")) if os.path.isdir(p)]
+        _home = os.path.expanduser("~")
+        profiles = sorted(os.path.join(_home, d) for d in os.listdir(_home)
+                          if (d == ".claude" or d.startswith(".claude-"))
+                          and os.path.isdir(os.path.join(_home, d)))
         linked = 0
         for prof in profiles:
             sdir = os.path.join(prof, "skills")
@@ -1668,9 +1670,10 @@ class Preflight:
         if missing:
             warns.append("pack 스킬 미설치(%s) — init-pack 재실행" % ", ".join(missing))
         # (b) 프로필 심링크 (네이티브 스킬 발견 — C26/C27과 동일 규약)
-        profiles = [p for p in (os.path.expanduser("~/.claude"),
-                                os.path.expanduser("~/.claude-cysinsight"),
-                                os.path.expanduser("~/.claude-ysfuture")) if os.path.isdir(p)]
+        _home = os.path.expanduser("~")
+        profiles = sorted(os.path.join(_home, d) for d in os.listdir(_home)
+                          if (d == ".claude" or d.startswith(".claude-"))
+                          and os.path.isdir(os.path.join(_home, d)))
         linked = 0
         for prof in profiles:
             sdir = os.path.join(prof, "skills")

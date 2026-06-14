@@ -1692,7 +1692,7 @@ fn run_init_pack(force: bool, no_install_hook: bool, claude_settings: Option<Str
 }
 
 /// Claude Code 설정 파일 자동 탐색: $HOME 직하의 `.claude*` 디렉터리에 있는 settings.json 전부.
-/// (멀티 프로필 환경 — 예: .claude / .claude-ysfuture / .claude-cysinsight — 을 한 번에 커버.)
+/// (멀티 프로필 환경 — 예: .claude / .claude-* — 을 한 번에 커버.)
 /// 결정론: 존재하는 파일만, 사전순 정렬로 반환한다.
 fn discover_claude_settings() -> Vec<String> {
     let Some(home) = dirs::home_dir() else {

@@ -1,6 +1,6 @@
 # T5 사용량 관측 — Phase 2·3 구현 계획서 (재접속 진입점)
 
-> 작성: 2026-06-13 (Phase 1 완료 직후) · 박사님 지시 "재접속 시 이어갈 수 있게 저장"
+> 작성: 2026-06-13 (Phase 1 완료 직후) · 오너 지시 "재접속 시 이어갈 수 있게 저장"
 > Phase 1 커밋 체인: b8b5aa7(본체) · e699105(boot 틸드) · ab726f1(env scrub)
 > 이 문서 = 재접속 후 Phase 2 착수의 **단일 실행 명세**. SESSION_STATE.md가 이 문서를 가리킨다.
 
@@ -124,7 +124,7 @@ claude가 statusline을 실행할 때마다 stdin JSON을 받아 cysd에 push하
   - 라이브: settings 설치 → claude 노드 재기동 → 배지에 `CTX n% · 5h n% · 7d n%` 등장 실측.
 
 ### 1.3 리스크·결정 사항
-- statusline 설치가 settings.json을 건드림 → 박사님 **이미 승인**(preflight --fix 편입). 멀티 프로필
+- statusline 설치가 settings.json을 건드림 → 오너 **이미 승인**(preflight --fix 편입). 멀티 프로필
   7개 전부 설치 시 첫 배포에서 기존 statusLine 충돌 점검 필요(현재 미설정 실측 — 충돌 없을 가능성 높음).
 - claude는 transcript(Phase 1)로 이미 ctx%가 나오므로, statusline이 추가하는 순가치는 **rate limit + 정밀 ctx + cost**. 즉 Phase 2-A 없이도 ctx 배지는 작동(현 상태).
 
@@ -181,7 +181,7 @@ curl -s -X POST ".../RetrieveUserQuotaSummary" -H 'content-type: application/jso
 
 ### 3.1 목적
 pane별 배지(Phase 1)는 "지금 이 작업"용. 대시보드는 **전 계정 잔량을 한눈에** — 다중 터미널에서
-"어느 계정이 곧 소진되나"를 작업 전환 없이 파악(박사님 원래 고통의 핵심).
+"어느 계정이 곧 소진되나"를 작업 전환 없이 파악(오너 원래 고통의 핵심).
 
 ### 3.2 설계
 - [ ] **(1) 데이터**: `org.status`의 각 surface `usage`를 **에이전트(계정)별 그룹핑**.
@@ -196,7 +196,7 @@ pane별 배지(Phase 1)는 "지금 이 작업"용. 대시보드는 **전 계정 
 - [ ] **(4) 빌드·검증**: `sh ui/build.sh` → cys-app 재빌드 → 번들 교체 → 앱 재시작 후 육안 확인.
   - playwright-mcp로 스크린샷 회귀(`.playwright-mcp/` 이미 있음).
 
-### 3.3 결정 사항 (재접속 시 박사님께)
+### 3.3 결정 사항 (재접속 시 오너께)
 - claude 멀티 프로필(7개) 어떻게 보여줄까 — 합산 vs 프로필별 행. rate limit은 **계정(구독)별**이라
   같은 구독을 쓰는 프로필은 같은 5h 윈도우 공유. 프로필↔계정 매핑을 어떻게 아는가? → 미해결.
   1차는 "프로필별 행"으로 단순하게, 중복은 나중에.

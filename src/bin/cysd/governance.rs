@@ -1,4 +1,4 @@
-//! 자원 거버넌스 — 박사님 3대 완화책의 1급 구현.
+//! 자원 거버넌스 — 오너 3대 완화책의 1급 구현.
 //! 프로세스 원장(ledger) + watchdog(loadavg·자식 수·중복 서버 감지) + idle 감지.
 //! 외부 터미널 체계에 없던 기능: surface가 낳은 자식 프로세스 트리를 데몬이 직접 추적·강제 종료한다.
 
@@ -1080,9 +1080,9 @@ mod tests {
     fn cmdline_matches_agent_covers_npm_wrapper_forms() {
         use super::cmdline_matches_agent as m;
         // gemini의 실존 3형태: bin 심링크 직접 / node 옵션 끼움 + .js 번들 / 패키지 경로 실행
-        assert!(m("node /Users/cys/.npm-global/bin/gemini", "gemini"));
+        assert!(m("node /Users/user/.npm-global/bin/gemini", "gemini"));
         assert!(m(
-            "node --no-warnings /Users/cys/.npm-global/lib/node_modules/@google/gemini-cli/bundle/gemini.js",
+            "node --no-warnings /Users/user/.npm-global/lib/node_modules/@google/gemini-cli/bundle/gemini.js",
             "gemini"
         ));
         assert!(m(

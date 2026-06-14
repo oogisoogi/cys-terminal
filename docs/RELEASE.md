@@ -106,7 +106,7 @@ gh release create v0.2.0 --draft --title "cys 0.2.0" --notes-file docs/RELEASE_N
 - 버튼 클릭 → 세션이 0개면 자동 설치, 세션이 있으면 "N개 종료됩니다" 확인 후 설치.
 - 설치 = 새 `.app` 교체 + 구 데몬 SIGTERM + 앱 재시작(새 cysd 자동 기동). **재설치 불필요.**
 
-⚠ **`git push`·`gh release`·`gh repo create`는 외부 발행(비가역)** — 박사님 명시 승인 후에만 실행.
+⚠ **`git push`·`gh release`·`gh repo create`는 외부 발행(비가역)** — 오너 명시 승인 후에만 실행.
 본 문서의 명령은 절차 기록일 뿐, 에이전트가 임의 실행하지 않는다.
 
 ## 5. 서명 키 백업 (중요)

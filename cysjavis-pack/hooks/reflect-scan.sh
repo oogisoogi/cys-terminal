@@ -8,7 +8,7 @@ set +e
 
 INPUT=$(cat 2>/dev/null)
 PACK="${CYS_PACK_DIR:-$HOME/.cys/pack}"
-ROOT="/Users/cys/Desktop/CYSjavis"
+ROOT="${CYS_ROOT:-$HOME}"
 
 TRANSCRIPT=$(printf '%s' "$INPUT" | python3 -c "import json,sys
 try: print(json.load(sys.stdin).get('transcript_path',''))

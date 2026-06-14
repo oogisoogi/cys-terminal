@@ -3,7 +3,7 @@
 # 설계: _round/PERSISTENCE_ARCHITECTURE.md §5·§8.1
 # 역할: source(startup/resume/clear/compact) 분기 → L0 soul ANCHOR + L2 SESSION_STATE 주입 + 복원 신호
 # 안전: 모든 단계 graceful, 반드시 exit 0 (hook 실패가 세션을 깨지 않게)
-# 전수: ROOT·SOUL 경로는 박사님 환경 실례. 제3자는 자기 경로로 치환.
+# 경로: SOUL·ROOT는 환경변수(CYS_SOUL·CYS_ROOT)로 오버라이드 가능. 미설정 시 portable 기본값(아래).
 set +e
 
 INPUT=$(cat 2>/dev/null)
@@ -18,8 +18,9 @@ try: print(json.load(sys.stdin).get('cwd',''))
 except Exception: print('')" 2>/dev/null)
 case "$CWD" in /*) ;; *) CWD="" ;; esac  # 절대경로만 상향탐색 (상대·빈값은 fallback으로 — 무한루프 방지)
 
-SOUL="$HOME/.claude-ysfuture/soul.md"
-ROOT="/Users/cys/Desktop/CYSjavis"
+SOUL="${CYS_SOUL:-$HOME/.claude/soul.md}"
+[ -f "$SOUL" ] || SOUL="$HOME/.cys/pack/soul.md"   # 배포 기본 soul (일반 사용자)
+ROOT="${CYS_ROOT:-$HOME}"
 OUT=""
 
 # ---------- L0: soul ANCHOR 전문 (startup/resume에서 풍요 주입) ----------
@@ -81,7 +82,7 @@ case "$SOURCE" in
   compact)        OUT="${OUT}▶ 압축 직후(source=compact): 작업기억 보충 완료. 진행 중 작업 계속.\n";;
 esac
 
-# ---------- RSI 자산 자동 주입 (박사님 자동트리거 · startup/resume · master 결정 D1=4·D2=포인터) ----------
+# ---------- RSI 자산 자동 주입 (오너 자동트리거 · startup/resume · master 결정 D1=4·D2=포인터) ----------
 if { [ "$SOURCE" = "startup" ] || [ "$SOURCE" = "resume" ]; } && [ -n "$STATE" ]; then
   RSI_DIR="$(dirname "$STATE")"   # ledger 는 SESSION_STATE 와 동일 _round (STATE_DIR 은 master 에서 프로젝트루트라 부적합)
   RSI_LEDGER="$RSI_DIR/RSI_LEDGER.md"

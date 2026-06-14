@@ -176,7 +176,7 @@ async fn accept_loop(daemon: Arc<Daemon>, socket_path: &std::path::Path) {
     let listener = tokio::net::UnixListener::bind(socket_path)
         .unwrap_or_else(|e| panic!("bind {} failed: {e}", socket_path.display()));
     // 소켓 파일은 소유자만 read/write — 인증 없는 제어 채널을 같은 UID로 한정한다.
-    // (master·worker·gemini·codex 노드는 모두 박사님 UID로 도는 단일 사용자 구조)
+    // (master·worker·gemini·codex 노드는 모두 오너 UID로 도는 단일 사용자 구조)
     let _ = std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600));
 
     loop {
