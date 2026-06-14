@@ -21,6 +21,24 @@ cys   CLI: the equal-node client used by the AI inside each pane
 
 Every pane process gets `CYS_SURFACE_ID`, `CYS_SURFACE_REF`, `CYS_SOCKET` injected automatically — the AI inside a pane learns its own address instantly via `cys identify`.
 
+## Installing git (needed for source build / contributing)
+
+The GUI app (DMG/MSI) needs no git. But **cloning/building from source, contributing**,
+harness-creator toolchain auto-install, and RSI self-improvement require git (the boot
+preflight `C30.git` checks for it deterministically).
+
+```bash
+# macOS — Xcode Command Line Tools (recommended) or Homebrew
+xcode-select --install          # or: brew install git
+# Linux
+sudo apt install git            # Debian/Ubuntu
+sudo dnf install git            # Fedora/RHEL
+# Windows — official installer: https://git-scm.com/download/win
+git --version                   # verify
+
+git clone https://github.com/idoforgod/cys-terminal
+```
+
 ## Quick Start
 
 ```bash

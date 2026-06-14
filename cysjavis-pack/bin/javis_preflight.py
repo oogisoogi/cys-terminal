@@ -1709,7 +1709,7 @@ class Preflight:
         else:
             self.add(cid, FIXED if fixed else PASS, detail)
 
-    # ── C30 git 결정론 점검 (박사님 2026-06-14 — git 온보딩) ──
+    # ── C30 git 결정론 점검 (오너 2026-06-14 — git 온보딩) ──
     # git은 기여자 clone·harness-creator(C21) 툴체인 자동설치·RSI 자기개선 push에 필요하다.
     # 일반 .dmg 사용자 기본 기능엔 불필요 → 부재는 FAIL이 아니라 WARN(기능별 필수).
     def c30_git(self):

@@ -32,6 +32,23 @@ pane 안의 AI는 `cys identify`로 자기 주소를 즉시 안다.
 - Windows: `cys-0.2.0-windows-{x64,arm64}.msi` (CLI+데몬 중심).
 - 24/365 상시 가동(선택): `cys daemon install` (launchd KeepAlive / 작업 스케줄러).
 
+## git 설치 (소스 빌드·기여 시 필요)
+
+GUI 앱(DMG/MSI)만 쓰면 git이 필요 없다. 다만 **소스 클론·빌드·기여**, harness-creator 툴체인
+자동설치, RSI 자기개선에는 git이 필요하다(부트 프리플라이트 `C30.git`이 결정론으로 점검·안내).
+
+```bash
+# macOS — Xcode Command Line Tools(권장) 또는 Homebrew
+xcode-select --install          # 또는: brew install git
+# Linux
+sudo apt install git            # Debian/Ubuntu
+sudo dnf install git            # Fedora/RHEL
+# Windows — 공식 인스톨러: https://git-scm.com/download/win
+git --version                   # 설치 확인
+
+git clone https://github.com/idoforgod/cys-terminal
+```
+
 ## 빠른 시작 (소스 빌드)
 
 ```bash

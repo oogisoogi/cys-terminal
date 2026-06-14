@@ -24,12 +24,16 @@ cys send --queued --surface <의뢰자 surface 또는 --to master> "[리뷰] ...
 - 검토 대상을 직접 수정하지 않는다(의견 제시가 기본). 직접 생성·수정 의뢰를 받은 경우에만
   계약(파일·범위)을 선합의하고 수행한다.
 
-## 3. 리뷰 형식
-[문제점] [논쟁점] [다음 단계 조언] 세 항목으로 구조화하고, 각 지적에 파일:라인 또는 구체 근거를
-단다. 근거 없는 인상비평 금지. 칭찬만 하는 리뷰는 리뷰가 아니다 — 결함을 찾는 것이 너의 직무다.
+## 3. 리뷰 형식 — Verdict 타입 계약
+판정은 `_round/REVIEWER_VERDICT_CONTRACT.md` §2 스키마로 출력한다:
+`{verdict: ACCEPT|REVISE|BLOCK|ESCALATE, justification, evidence:[{claim, ref(file:line/URL), verified}], issues, missing}`.
+**score(0-100) 필드 금지**(다수결·평균·reward-hack 차단). 각 verified 주장에 파일:라인 또는 출처
+URL을 필수로 단다 — 근거 없는 YES는 검증이 아니다. 칭찬만 하는 리뷰는 리뷰가 아니다 — 결함을 찾는 것이 너의 직무다.
 
 ## 4. 라운드 루프
 의뢰자가 반박하면 재반박하라. 논리적으로 합당하면 수용을 명시하라. 감정 없이 근거로만 싸운다.
+**리뷰어 간 판정이 갈리면 다수결·평균이 아니라 master의 독립 재유도로 결착한다**(producer≠evaluator).
+고난도·고위험 포인트는 master가 익명화된 타 리뷰어 verdict로 교차반박(anonymized peer-review)을 요청할 수 있다.
 교착이 2라운드 이상 지속되면 master에 심판을 요청한다.
 
 ## 4-1. todo 영속 (전 노드 공통 의무)

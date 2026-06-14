@@ -39,7 +39,7 @@
    이미 가동 중인 역할 중복 기동 없음). **"필요할 때 띄우겠다"로 미루지 마라** — 이 4종이 떠야
    '프로젝트 실행 준비 완료'다. 주소: `--to cso`/`--to worker`/`--to reviewer-gemini`/
    `--to reviewer-codex`(+`--to reviewer-grok`).
-   ④-b **리뷰어 감지·무구독 폴백 (멈춤 금지 · 박사님 2026-06-14)**: `cys boot`가 미설치
+   ④-b **리뷰어 감지·무구독 폴백 (멈춤 금지 · 오너 2026-06-14)**: `cys boot`가 미설치
    리뷰어를 건너뛰면 리뷰어 0개로 check가 영영 실패해 부트가 멈춘다. 이를 막기 위해
    `python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_orchestra.py" boot-reviewers` 를
    실행한다 — agy·codex를 **결정론으로 감지(이 스크립트 출력만이 사실 · 자연어 재추론 금지)**해
@@ -73,6 +73,7 @@
 - 위임 전 성공 기준을 명시하고, 다단계 작업은 계획(단계→검증 방법)을 먼저 세운다.
 
 ## 2. 노드 생성·각성 (지침 주입이 작업 티켓보다 선행)
+- **★'새 워커/병렬 작업' 지시 = 기존 노드 유지 + 새 surface 추가 (2026-06-14 오너 명령·심각 실수 재발방지)**: "또 다른 워커를 띄워라"·"새 워커로 X 시작"은 **기존 워커·작업을 그대로 두고 새 surface에 워커를 추가**하라는 뜻이다 — 기존 워커를 죽이거나 교체하는 게 절대 아니다(cys는 worker role 복수 surface 허용 — 동시 운영 가능). 동시에 도착한 지시들의 **대상 노드를 혼동하지 마라**(별개 surface·별개 미션). ★**파괴적·비가역 행동**(worker SIGKILL·kill·close-surface·작업 중단·노드 교체) **전에는 반드시 의도를 명시 확인**한다(절대 강조 4규칙 c) — 정당한 교착 재기동이라도 그 노드의 미션이 '중단'인지 '유지·재개'인지 먼저 확정한다. 추측으로 비가역 실행 절대 금지. 상세 `feedback_new_worker_adds_surface`.
 - 노드 기동은 `cys launch-agent --role worker|cso|reviewer-gemini|reviewer-codex --agent <cli>`
   — 지침이 자동 주입된다. ⚠리뷰어 역할명은 **에이전트별**(reviewer-gemini·reviewer-codex)로
   쓴다 — generic `reviewer`로 기동·등록하면 orchestra check의 4종 생존 판정이 실패한다.

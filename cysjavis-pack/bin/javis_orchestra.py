@@ -65,7 +65,7 @@ REQUIRED_ROLES = ["cso", "worker", "reviewer-gemini", "reviewer-codex"]
 OPTIONAL_ROLES = ["reviewer-grok"]
 MAX_ROUNDS = 10  # 앵커4 5-8: 맥킨지급 도달 또는 10R 완료 시 멈춤
 
-# ★리뷰어 슬롯 + 무구독 폴백(박사님 2026-06-14): agy(reviewer-gemini)·codex(reviewer-codex)는
+# ★리뷰어 슬롯 + 무구독 폴백(오너 2026-06-14): agy(reviewer-gemini)·codex(reviewer-codex)는
 # '기본 전제'일 뿐 절대 전제가 아니다 — 사용자가 다른 임무를 줄 수도, 구독·CLI가 없을 수도 있다.
 # master 부트 후 리뷰어를 '호출하는 단계'에서 감지하지 못하면 멈추지 말고 곧바로 Claude 대체
 # 리뷰어로 폴백한다. 감지는 LLM 자연어 재추론이 아니라 아래 결정론 함수만이 사실이다(§12).
@@ -94,7 +94,7 @@ def reviewer_launch_binary(agent, agents=None):
 
 
 def detect_reviewer(agent, agents=None):
-    """★결정론 1차 감지(박사님 '가장 중요한 전제') — 그 리뷰어 CLI 가 *호출 가능*한가.
+    """★결정론 1차 감지(오너 '가장 중요한 전제') — 그 리뷰어 CLI 가 *호출 가능*한가.
     바이너리가 절대경로로 실재·실행가능하거나 PATH 에서 해석되면 available.
     인증·구독 유무는 여기서 판정하지 않는다(미인증은 부트 시 set-status ack 부재로
     boot-reviewers 가 2차 폴백한다). claude 는 시스템 전제. 반환: (available, reason)."""
@@ -218,7 +218,7 @@ def cmd_check(args):
     estimated = _quiet_alive_roles(status, still_missing) if still_missing else {}
     alive.update(estimated)
     print("LLM orchestrating 노드 점검 (4종 의무 + grok 선택):")
-    # 리뷰어 대체 고지(박사님 2026-06-14 — 정직한 라벨링: 보편적이나 벤더 다양성은 약함)
+    # 리뷰어 대체 고지(오너 2026-06-14 — 정직한 라벨링: 보편적이나 벤더 다양성은 약함)
     for e in roster:
         if not e["native"]:
             print("  ⚠ %s 미감지(%s) → %s(Claude 대체) — 보편적이나 벤더 다양성 약함, "
@@ -262,7 +262,7 @@ def _boot_one_node(role, agent, timeout=130):
 
 
 def cmd_boot_reviewers(args):
-    """★박사님 2026-06-14: master 부트 후 리뷰어(agy·codex)를 '호출하는 단계'.
+    """★오너 2026-06-14: master 부트 후 리뷰어(agy·codex)를 '호출하는 단계'.
     감지를 못하면 멈추지 말고 곧바로 Claude 대체 리뷰어로 폴백 기동한다.
     2층 감지: (1) 바이너리 미설치 → 즉시 대체(detect_reviewer). (2) 설치됐으나 부트가
     각성(set-status ack)에 실패(미인증·깨짐) → 대체로 2차 폴백. 절대 halt 하지 않는다."""
@@ -910,7 +910,7 @@ def cmd_self_test(args):
             for mark in RULE_MARKERS:
                 assert any(mark in pin or pin in mark for pin in worker_pins), \
                     "마커 '%s'가 WORKER C03 핀에 비커버 — 폴백 강등 원인을 preflight가 못 본다" % mark
-        # ── 리뷰어 감지·무구독 폴백 배터리(박사님 2026-06-14 · 밀폐 가짜 감지기) ──
+        # ── 리뷰어 감지·무구독 폴백 배터리(오너 2026-06-14 · 밀폐 가짜 감지기) ──
         # 표준 슬롯 계약 고정: agy/codex 네이티브 + claude 대체 2슬롯(변형 시 폴백 붕괴).
         assert [s[1] for s in REVIEWER_SLOTS] == ["gemini", "codex"], "표준 리뷰어 슬롯 변형"
         assert [s[3] for s in REVIEWER_SLOTS] == ["claude", "claude"], "대체 agent 는 claude 여야 함"

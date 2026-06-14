@@ -31,6 +31,7 @@ EXCLUDES=(
   --exclude '*.pyc'
   --exclude 'round/'          # _round 작업로그 (.gitignore와 정합)
   --exclude 'agents.json'     # 환경전용(개인 절대경로) — 정본은 제네릭 템플릿 유지
+  --exclude '.install-manifest.json'  # 생성 아티팩트(배포본 해시 — repo 제네릭 파일과 불일치)
 )
 
 flags=(-rlpt --itemize-changes "${EXCLUDES[@]}")

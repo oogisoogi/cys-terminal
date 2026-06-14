@@ -59,3 +59,6 @@ cysjavis-pack/memory/*
 # 개인 백업본 (agents.json.bak-* 등 — 개인 절대경로·계정 잔존 위험)
 *.bak-*
 **/*.bak-*
+
+# 설치 매니페스트 (생성 아티팩트 — 배포본 해시라 repo 제네릭 파일과 불일치)
+cysjavis-pack/.install-manifest.json
