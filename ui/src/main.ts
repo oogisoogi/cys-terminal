@@ -890,6 +890,23 @@ async function actionClose() {
   if (focusedSid != null) setFocus(focusedSid);
 }
 
+// 데몬에서 사라진(종료·닫힘·reap) surface의 UI pane을 자동 제거 — 멱등(이미 없으면 무동작).
+// 데몬이 close_surface 하지 않은 자력종료라도 즉시 정리해 죽은 pane이 쌓이지 않게 한다.
+// 복구는 보존: 60s grace 내 node-recover로 surface가 되살아나면 refreshPaneTitles 폴링이 재입양한다.
+function removeDeadPane(sid: number) {
+  const inLayout = workspaces.some((w) => w.tree != null && collectSids(w.tree).includes(sid));
+  if (!panes.has(sid) && !inLayout) return; // 이미 정리됨
+  destroyPaneRuntime(sid);
+  for (const ws of workspaces) {
+    if (ws.tree != null && collectSids(ws.tree).includes(sid)) {
+      ws.tree = replaceNode(ws.tree, sid, () => null);
+    }
+  }
+  if (focusedSid === sid) focusedSid = collectSids(current()?.tree ?? null)[0] ?? null;
+  render();
+  if (focusedSid != null) setFocus(focusedSid);
+}
+
 // ---------- feed panel ----------
 
 interface FeedItem {
@@ -1158,9 +1175,9 @@ function onDaemonEvent(event: Record<string, unknown>) {
       if (payload.wait === true) setFeedOpen(true);
     }
     refreshFeed();
-  } else if (name === "surface.exited" || name === "surface.closed") {
-    const rt = panes.get(Number(sid));
-    if (rt) rt.titleEl.textContent += " [exited]";
+  } else if (name === "surface.exited" || name === "surface.closed" || name === "surface.reaped") {
+    // 종료 즉시 죽은 pane 자동 제거 (A안) — 데몬 reap을 기다리지 않는다. 멱등.
+    removeDeadPane(Number(sid));
   }
 }
 
