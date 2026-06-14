@@ -1,4 +1,4 @@
-# aiterm — A Terminal Built for AI (core daemon + CLI)
+# aiterm — A Terminal Built for Operating the AI Jarvis System (core daemon + CLI)
 
 > Independently written **from scratch**, referencing only the protocol design ideas of 외부 터미널 체계 (외부 프로젝트) — no GPL code used. Cross-platform: macOS & Windows.
 
