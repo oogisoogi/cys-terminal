@@ -1709,6 +1709,23 @@ class Preflight:
         else:
             self.add(cid, FIXED if fixed else PASS, detail)
 
+    # ── C30 git 결정론 점검 (박사님 2026-06-14 — git 온보딩) ──
+    # git은 기여자 clone·harness-creator(C21) 툴체인 자동설치·RSI 자기개선 push에 필요하다.
+    # 일반 .dmg 사용자 기본 기능엔 불필요 → 부재는 FAIL이 아니라 WARN(기능별 필수).
+    def c30_git(self):
+        cid = "C30.git"
+        if self.skipped(cid):
+            return
+        p = shutil.which("git")
+        if p:
+            self.add(cid, PASS, "%s (기여자 clone·harness-creator·RSI 자기개선에 사용)" % p)
+        else:
+            self.add(cid, WARN,
+                     "git 미설치 — 기여자 clone·harness-creator(C21)·RSI 자기개선이 막힌다. "
+                     "설치: macOS `xcode-select --install`(또는 brew install git) · "
+                     "Windows git-scm.org · Linux `apt/dnf install git`. "
+                     "(일반 .dmg 사용자 기본기능엔 불필요 — 기능별 필수)")
+
     def run(self):
         self.c01_pack_dir()
         self.c02_directives()
@@ -1741,6 +1758,7 @@ class Preflight:
         self.c27_appbuild()
         self.c28_self_correction()
         self.c29_harness_engineering()
+        self.c30_git()
         return self.results
 
 

@@ -16,6 +16,27 @@
 
 → 따라서 GUI만 쓰는 사용자는 **앱을 더블클릭하면 끝**입니다.
 
+## 선행조건 — git (기능별 필수)
+
+기본 사용(DMG/MSI 설치 → 앱 더블클릭)에는 git이 **필요 없습니다**. 다만 아래 기능을 쓰려면 git이 있어야 합니다:
+
+- **소스 기여·직접 빌드**: `git clone https://github.com/idoforgod/cys-terminal`
+- **harness-creator 툴체인 자동 설치**: 부트 프리플라이트(`javis_preflight.py --fix`)가 git으로 자동 클론합니다.
+- **RSI 자기개선/자동 발행**: 라운드 산출물의 로컬 커밋·외부 push에 git을 씁니다.
+
+프리플라이트가 git 유무를 결정론으로 점검합니다(`C30.git` — 부재 시 WARN으로 안내). 설치:
+
+```bash
+# macOS — Xcode Command Line Tools(권장) 또는 Homebrew
+xcode-select --install        # 또는: brew install git
+# Linux
+sudo apt install git          # Debian/Ubuntu
+sudo dnf install git          # Fedora/RHEL
+# Windows — 공식 인스톨러
+#   https://git-scm.com/download/win  (설치 후 새 터미널에서 git --version)
+git --version                 # 설치 확인
+```
+
 ## macOS
 
 ### A. 설치파일 (DMG) — 권장
