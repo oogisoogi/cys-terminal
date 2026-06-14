@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Hardened Runtime 호환 entitlements (Apple 공증 필수).
+       cys.app은 사이드카(cysd·cys)를 spawn하고 WKWebView를 쓰므로 아래가 필요하다. -->
+
+  <!-- WKWebView JIT (Tauri/시스템 웹뷰) -->
+  <key>com.apple.security.cs.allow-jit</key>
+  <true/>
+  <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+  <true/>
+
+  <!-- 사이드카(externalBin: cysd·cys)·동적 라이브러리 로드 허용
+       (라이브러리 검증을 끄지 않으면 nested 바이너리 로드가 hardened runtime에서 차단될 수 있다) -->
+  <key>com.apple.security.cs.disable-library-validation</key>
+  <true/>
+
+  <!-- 자식 프로세스가 부모 entitlements를 상속(데몬 spawn) -->
+  <key>com.apple.security.inherit</key>
+  <true/>
+</dict>
+</plist>

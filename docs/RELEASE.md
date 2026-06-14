@@ -36,14 +36,42 @@ sh scripts/make-update-manifest.sh 0.2.0 <OWNER> cys-terminal
 `beforeBuildCommand`(scripts/bundle-prep.sh)가 UI 번들 + cys/cysd 릴리스 빌드 + `externalBin` 배치를
 자동 수행합니다. Intel 빌드가 필요하면 `--target x86_64-apple-darwin` 추가(manifest의 `darwin-x86_64`에 키 추가).
 
-### 서명·공증 (배포 신뢰성 — 미서명이면 사용자가 Gatekeeper 우회 필요)
+### ★Apple 서명·공증 (다른 맥 배포의 유일한 정공법 — 2026-06-15)
+
+**왜 필수인가**: ad-hoc 서명 빌드는 *빌드한 맥*에선 우클릭→열기로 되지만, **다른 맥으로
+전송하면** 파일에 `com.apple.quarantine`가 붙고 macOS(Sequoia+)가 **ad-hoc·미공증 앱을
+"손상됨"으로 차단**한다(실측 2026-06-15: `spctl -a`=rejected). 공증해야만 어떤 맥에서도
+경고/손상됨 없이 열린다.
+
+**1회 셋업 (사람 단계)**:
+1. **Apple Developer Program 가입**($99/년, developer.apple.com)
+2. **Developer ID Application 인증서** 발급 → Keychain 설치
+   (Xcode > Settings > Accounts > Manage Certificates > + > Developer ID Application,
+    또는 developer.apple.com > Certificates)
+3. **notarytool 자격증명** — 둘 중 하나:
+   - app-specific password: appleid.apple.com > 로그인 및 보안 > 앱 암호 생성
+   - 또는 App Store Connect API key(.p8 + Key ID + Issuer ID)
+4. **Team ID** 확인: developer.apple.com > Membership
+
+**빌드 (자격증명 env + 헬퍼 스크립트가 자동 codesign+공증+staple+검증)**:
 ```sh
-# Developer ID 인증서 보유 시
-codesign --deep --force --options runtime --sign "Developer ID Application: <NAME>" \
-  target/release/bundle/macos/cys.app
-xcrun notarytool submit dist-mac/cys-0.2.0-macos-arm64.dmg --keychain-profile <PROFILE> --wait
-xcrun stapler staple dist-mac/cys-0.2.0-macos-arm64.dmg
+export APPLE_SIGNING_IDENTITY="Developer ID Application: NAME (TEAMID)"
+export APPLE_ID="you@example.com" APPLE_PASSWORD="xxxx-xxxx-xxxx-xxxx" APPLE_TEAM_ID="TEAMID"
+#   (또는 API key: APPLE_API_KEY_PATH=…/AuthKey_XXXX.p8 APPLE_API_KEY=KEYID APPLE_API_ISSUER=ISSUER)
+export TAURI_SIGNING_PRIVATE_KEY="$(cat ~/.tauri/cys-updater.key)" TAURI_SIGNING_PRIVATE_KEY_PASSWORD=""
+
+sh scripts/build-macos-signed.sh    # env 검증 → tauri build(자동 공증) → spctl/stapler 검증 → dist-mac + manifest
 ```
+- 배선: `tauri.conf.json > bundle.macOS.entitlements = entitlements.plist`(hardened runtime +
+  사이드카 cysd·cys 로드 허용). Tauri가 빌드 중 Developer ID codesign + notarytool 제출 +
+  staple 을 자동 수행한다(별도 `codesign`/`notarytool` 수동 호출 불요).
+- **검증 통과 기준**: `spctl -a -vv cys.app` = **accepted**. (rejected면 공증 실패 — 빌드
+  로그의 notarization 결과 확인.)
+- 공증 빌드는 **ad-hoc 재서명·`xattr` 우회가 전혀 불필요**하다.
+
+> 인증서가 없을 때(개발용): env 없이 `bun x @tauri-apps/cli build` → ad-hoc 빌드. 이 빌드는
+> **다른 맥 전송 시 "손상됨"**이 뜨므로, 받은 맥에서 `xattr -dr com.apple.quarantine
+> /Applications/cys.app` 로만 우회 가능(배포용 아님).
 
 ## 2. Windows 빌드 (MSI + ZIP)
 
