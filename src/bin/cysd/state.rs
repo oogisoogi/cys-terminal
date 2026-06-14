@@ -195,6 +195,84 @@ fn env_f64(key: &str, default: f64) -> f64 {
 /// start_time(없으면 None)은 pid 재사용 식별자 — 같은 pid라도 incarnation이 다르면 재해석한다.
 type CallerCacheEntry = (Option<u64>, f64, Option<u64>);
 
+/// 워커 인스턴스 dedup: 복수 워커가 같은 역할명(→같은 todo 파일)을 공유하지 않도록,
+/// "worker" 요청에 충돌 없는 고유 역할명(worker, worker-2, worker-3 …)을 배정한다.
+/// 슬롯은 roles에 없거나 점유자가 죽은(없거나 exited) 경우 '빈' 것으로 본다 →
+/// 단일 워커가 재시작하면 죽은 'worker' 슬롯을 재사용해 같은 todo 파일을 이어간다(이력 보존).
+/// 비-worker 역할(master/cso/reviewer-*)은 그대로 반환 — 단일·latest-wins 유지.
+/// 호출자는 surfaces·roles 락을 surfaces→roles 순서로 보유한 상태여야 한다(데드락 회피).
+pub fn dedup_worker_role(
+    requested: &str,
+    roles: &HashMap<String, u64>,
+    is_alive: impl Fn(u64) -> bool,
+    my_id: u64,
+) -> String {
+    if requested != "worker" {
+        return requested.to_string();
+    }
+    let mut n: u32 = 1;
+    loop {
+        let name = if n == 1 {
+            "worker".to_string()
+        } else {
+            format!("worker-{n}")
+        };
+        match roles.get(&name) {
+            None => return name,                        // 미점유 → 사용
+            Some(&h) if h == my_id => return name,       // 이미 내 것(재진입)
+            Some(&h) if !is_alive(h) => return name,     // 죽은 슬롯 재사용(재시작 연속성)
+            Some(_) => {}                                // 살아있는 점유 → 다음 번호
+        }
+        n += 1;
+    }
+}
+
+#[cfg(test)]
+mod dedup_tests {
+    use super::dedup_worker_role;
+    use std::collections::HashMap;
+
+    fn roles(pairs: &[(&str, u64)]) -> HashMap<String, u64> {
+        pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+    }
+
+    #[test]
+    fn non_worker_passthrough() {
+        let r = roles(&[("master", 1)]);
+        assert_eq!(dedup_worker_role("master", &r, |_| true, 9), "master");
+        assert_eq!(dedup_worker_role("reviewer-gemini", &r, |_| true, 9), "reviewer-gemini");
+    }
+
+    #[test]
+    fn first_worker_is_plain() {
+        let r = roles(&[]);
+        assert_eq!(dedup_worker_role("worker", &r, |_| true, 1), "worker");
+    }
+
+    #[test]
+    fn second_and_third_live_workers_increment() {
+        let r = roles(&[("worker", 1)]);
+        assert_eq!(dedup_worker_role("worker", &r, |_| true, 2), "worker-2");
+        let r2 = roles(&[("worker", 1), ("worker-2", 2)]);
+        assert_eq!(dedup_worker_role("worker", &r2, |_| true, 3), "worker-3");
+    }
+
+    #[test]
+    fn dead_slot_is_reclaimed() {
+        // worker(id=1) 죽음, worker-2(id=2) 생존 → 새 워커는 'worker' 슬롯 재사용(이력 연속)
+        let r = roles(&[("worker", 1), ("worker-2", 2)]);
+        let alive = |h: u64| h == 2; // 1은 죽음
+        assert_eq!(dedup_worker_role("worker", &r, alive, 3), "worker");
+    }
+
+    #[test]
+    fn own_slot_reentry() {
+        // 자기 자신이 이미 'worker'를 보유하면 같은 이름 반환(재진입 idempotent)
+        let r = roles(&[("worker", 7)]);
+        assert_eq!(dedup_worker_role("worker", &r, |_| true, 7), "worker");
+    }
+}
+
 pub struct Daemon {
     pub surfaces: Mutex<HashMap<u64, Arc<Surface>>>,
     pub next_id: AtomicU64,
@@ -549,12 +627,32 @@ impl Daemon {
             ctx_threshold_armed: AtomicBool::new(true),
         });
 
-        self.surfaces.lock().unwrap().insert(id, surface.clone());
-        if let Some(r) = &role {
+        {
             // surfaces 등록 '이후'에 역할 공개 — resolve_role 직후 get_surface가
             // 실패해 스케줄러가 역할 부재로 오판하는 창을 닫는다.
-            // 같은 역할 재등록은 최신 surface가 승리 (재기동 시 자연 갱신)
-            self.roles.lock().unwrap().insert(r.clone(), id);
+            // 락 순서는 surfaces→roles→surface.role (close_surface와 동일 — AB-BA 데드락 차단).
+            let mut surfaces = self.surfaces.lock().unwrap();
+            surfaces.insert(id, surface.clone());
+            if let Some(r) = &role {
+                let mut roles = self.roles.lock().unwrap();
+                // worker면 충돌 없는 고유 역할명 배정(worker-N) — 복수 워커 todo 충돌 방지.
+                // 비-worker는 기존 latest-wins(같은 역할 재등록=최신 승리).
+                let final_role = dedup_worker_role(
+                    r,
+                    &roles,
+                    |h| {
+                        surfaces
+                            .get(&h)
+                            .map(|s| !s.exited.load(Ordering::Relaxed))
+                            .unwrap_or(false)
+                    },
+                    id,
+                );
+                *surface.role.lock().unwrap() = Some(final_role.clone());
+                roles.insert(final_role, id);
+            }
+        }
+        if role.is_some() {
             crate::governance::persist_topology(self);
         }
         self.bus.publish(

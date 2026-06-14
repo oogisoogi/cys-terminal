@@ -329,6 +329,8 @@ enum Command {
         #[arg(long)]
         cwd: Option<String>,
     },
+    /// Print (creating if absent) this surface's role-specific TODO file path — 복수 워커가 같은 파일을 공유하지 않도록 역할별 고유 경로를 결정론적으로 산출
+    TodoPath,
 }
 
 #[derive(Subcommand)]
@@ -1089,6 +1091,7 @@ fn run(command: Command) -> i32 {
 
         Command::LaunchAgent { role, agent, cwd } => return run_launch_agent(&role, &agent, cwd),
         Command::Boot { cwd } => return run_boot(cwd),
+        Command::TodoPath => return run_todo_path(),
 
         Command::Resize { surface, rows, cols } => target_surface(&surface, &None).and_then(|sid| {
             request("surface.resize", json!({"surface_id": sid, "rows": rows, "cols": cols}))
@@ -2117,6 +2120,51 @@ fn boot_agent_on_surface(
 }
 
 /// 에이전트 기동 + 역할 지침 자동 주입 (어댑터: agents.json).
+/// 워커 todo 경로 결정론 산출: 자기 surface의 (데몬 권위) 역할 → `<pack>/round/<ROLE>_TODO.md`.
+/// 역할은 데몬 roles 맵(dedup된 worker-N 포함)에서 읽으므로 LLM 치환·env 스냅샷에 의존하지 않는다.
+/// 복수 워커는 각자 distinct 역할 → distinct 파일 → 충돌 0. 파일이 없으면 골격을 만들어 둔다.
+fn run_todo_path() -> i32 {
+    let Some(sref) = cys::env_compat(ENV_SURFACE_ID) else {
+        eprintln!("CYS_SURFACE_ID 없음 — 데몬이 띄운 pane 안에서만 동작한다");
+        return 1;
+    };
+    let Some(my_sid) = parse_surface_ref(&sref) else {
+        eprintln!("CYS_SURFACE_ID 파싱 실패: {sref}");
+        return 1;
+    };
+    let role = match request("surface.list", json!({})) {
+        Ok(r) => r["surfaces"].as_array().and_then(|arr| {
+            arr.iter()
+                .find(|s| s["surface_id"].as_u64() == Some(my_sid))
+                .and_then(|s| s["role"].as_str().map(|x| x.to_string()))
+        }),
+        Err(e) => {
+            eprintln!("surface.list 실패: {e}");
+            return 1;
+        }
+    };
+    let Some(role) = role else {
+        eprintln!("이 surface에 역할 미등록 — todo-path는 역할 노드(claim-role/launch-agent) 전용");
+        return 1;
+    };
+    let pack = cys::env_compat("CYS_PACK_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".cys/pack")))
+        .unwrap_or_else(|| std::path::PathBuf::from(".cys/pack"));
+    let round = pack.join("round");
+    if let Err(e) = std::fs::create_dir_all(&round) {
+        eprintln!("round 디렉터리 생성 실패: {e}");
+        return 1;
+    }
+    let fname = format!("{}_TODO.md", role.to_uppercase().replace('-', "_"));
+    let path = round.join(&fname);
+    if !path.exists() {
+        let _ = std::fs::write(&path, format!("# {role} TODO — 영속 todo (절대지침 7)\n\n"));
+    }
+    println!("{}", path.display());
+    0
+}
+
 fn run_launch_agent(role: &str, agent: &str, cwd: Option<String>) -> i32 {
     run_launch_agent_opts(role, agent, cwd, false)
 }

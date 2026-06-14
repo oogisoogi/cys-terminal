@@ -886,6 +886,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             // 멤버십 확인 + 역할 전이를 surfaces 락 아래 한 임계영역에서 수행 —
             // 동시 close/claim과의 경합으로 dangling 역할 주소가 남는 것을 차단.
             // 락 순서 규약: surfaces → roles → surface.role (close_surface와 동일)
+            let claimed_role; // worker dedup 결과를 블록 밖 event/reply로 전달 (블록 내 단일 대입)
             {
                 let surfaces = daemon.surfaces.lock().unwrap();
                 let Some(surface) = surfaces.get(&sid) else {
@@ -925,23 +926,37 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         }
                     }
                 }
+                // worker면 충돌 없는 고유 역할명(worker-N) 배정 — 복수 워커 todo·주소 충돌 방지.
+                // 비-worker는 그대로(master/cso는 위 가드, reviewer-* 등은 latest-wins).
+                let final_role = crate::state::dedup_worker_role(
+                    &role,
+                    &roles,
+                    |h| {
+                        surfaces
+                            .get(&h)
+                            .map(|s| !s.exited.load(Ordering::Relaxed))
+                            .unwrap_or(false)
+                    },
+                    sid,
+                );
                 let mut srole = surface.role.lock().unwrap();
                 if let Some(old) = srole.clone() {
                     if roles.get(&old) == Some(&sid) {
                         roles.remove(&old);
                     }
                 }
-                roles.insert(role.clone(), sid);
-                *srole = Some(role.clone());
+                roles.insert(final_role.clone(), sid);
+                *srole = Some(final_role.clone());
+                claimed_role = final_role;
             }
             daemon.bus.publish(
                 "role.claimed",
                 "system",
                 Some(sid),
-                json!({"role": role, "surface_ref": surface_ref(sid)}),
+                json!({"role": claimed_role, "surface_ref": surface_ref(sid)}),
             );
             crate::governance::persist_topology(daemon);
-            Reply::Single(ok_response(&id, json!({"role": role, "surface_id": sid})))
+            Reply::Single(ok_response(&id, json!({"role": claimed_role, "surface_id": sid})))
         }
 
         // 역할 주소 해석: --to <role> 의 서버측 구현

@@ -139,6 +139,10 @@ def cmd_check(args):
         print("[orchestra check] cys status 수집 실패(데몬 미가동?) — `cys ping` 확인 후 재실행")
         return 2
     alive = live_roles(status)
+    # 워커는 복수 인스턴스(worker, worker-2 …) — 하나라도 생존이면 REQUIRED_ROLES의 'worker' 요건을
+    # 충족시킨다(접두 수용). 데몬이 둘째 워커부터 worker-N으로 dedup하므로 'worker' 키가 없을 수 있다.
+    if any(v for k, v in alive.items() if k == "worker" or k.startswith("worker-")):
+        alive["worker"] = True
     # 각성 이력 있는 idle 노드(set-status 노후화·agent_alive None 으로 굳음)만 '생존추정'으로 보강.
     # ★프로세스 단독 인증 아님(각성이력=status.state 필수·surface_ref 결박) — codex R1 결함5·R2 결함1·5 정합.
     still_missing = [r for r in REQUIRED_ROLES if not alive.get(r)]
