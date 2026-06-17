@@ -307,6 +307,8 @@ pub struct Daemon {
     pub recall_tx: Mutex<std::sync::mpsc::Sender<crate::recall::LineRecord>>,
     /// T6 Control Center 소비 트래커 (claude 메시지 누적 — 오늘·최근창·12h 스파크라인).
     pub consumption: Mutex<Consumption>,
+    /// T7 E1-3 영속 분석 저장소(analytics.db) — open 실패 시 None(graceful degrade).
+    pub analytics: Mutex<Option<rusqlite::Connection>>,
 }
 
 /// T6 Control Center 소비 트래커 — in-memory(재시작 리셋, 가동시간 의미론과 동일).
@@ -498,7 +500,9 @@ impl Daemon {
                     v["reason"].as_str().unwrap_or("").to_string(),
                 )
             });
-        Arc::new(Daemon {
+        // T7 E1-3: 영속 분석 DB는 socket_path가 struct로 move되기 전에 연다.
+        let analytics_conn = crate::analytics::open(&socket_path);
+        let daemon = Arc::new(Daemon {
             surfaces: Mutex::new(HashMap::new()),
             // 영속 트랜스크립트(transcripts.db)의 최대 id 이후부터 발급 — 재시작 시
             // 무관 세션이 같은 surface_id로 recall에 합쳐지는 것을 차단
@@ -522,7 +526,11 @@ impl Daemon {
             socket_path,
             started_at: now_epoch(),
             consumption: Mutex::new(Consumption::default()),
-        })
+            analytics: Mutex::new(analytics_conn),
+        });
+        // 재시작에도 오늘 소비/비용/모델믹스/스파크라인 보존 — 최근 12h usage_records 리플레이.
+        crate::analytics::seed_consumption(&daemon);
+        daemon
     }
 
     /// 데몬 내부용 non-wait feed 항목 생성 (T4-16 승인 격상 등) — push 경로의 축약판.

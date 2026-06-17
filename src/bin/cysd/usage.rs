@@ -286,6 +286,7 @@ fn collect_for(
             let today = chrono::Local::now().format("%Y-%m-%d").to_string();
             let sess = path.to_string_lossy().into_owned();
             let mut c = daemon.consumption.lock().unwrap();
+            let alog = daemon.analytics.lock().unwrap(); // 일관 락 순서: consumption→analytics
             for m in msgs {
                 let cost = crate::cost::calculate_cost(
                     m.input_tokens, m.output, m.cache_creation, m.cache_read, &m.model,
@@ -294,6 +295,13 @@ fn collect_for(
                 c.record_message(
                     &sess, m.input_tokens + m.cache_creation, m.output, cost, &m.model, now, &today,
                 );
+                // T7 E1-3: 영속 — 재시작에도 보존(부트 시 리플레이). 실패는 무해.
+                if let Some(conn) = alog.as_ref() {
+                    crate::analytics::record_usage(
+                        conn, &sess, agent, &m.model, m.input_tokens, m.output,
+                        m.cache_creation, m.cache_read, cost, now,
+                    );
+                }
             }
         }
     }
