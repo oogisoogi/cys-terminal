@@ -62,6 +62,7 @@ async fn main() {
     governance::spawn_watchdog(Arc::clone(&daemon));
     schedule::spawn_scheduler(Arc::clone(&daemon));
     usage::spawn_usage_collector(Arc::clone(&daemon));
+    usage::spawn_agy_collector(Arc::clone(&daemon));
     // 셧다운 경로: 원장은 메모리 전용이라 데몬이 죽으면 scoped 프로세스를 아무도 회수하지
     // 못한다 — SIGTERM/SIGINT 때 scoped 그룹을 전부 정리한 뒤 종료한다.
     #[cfg(unix)]
