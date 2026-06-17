@@ -109,8 +109,9 @@ let ccTimer: number | null = null;
 let ccClockTimer: number | null = null;
 let ccUptimeBase = 0;
 let ccUptimeFetchedAt = 0;
-let ccTab: "live" | "eff" = "live";
+let ccTab: "live" | "eff" | "skills" = "live";
 let ccEffWindow = "today";
+let ccSkillsWindow = "today";
 
 const CC_ROLE_COLOR: Record<string, string> = {
   master: "#3b82f6", cso: "#8b5cf6", worker: "#00e676",
@@ -190,6 +191,7 @@ async function refreshControlCenter() {
     /* 데몬 일시 부재 — 다음 틱 재시도 */
   }
   if (ccTab === "eff") refreshEfficiency();
+  if (ccTab === "skills") refreshSkills();
 }
 
 async function refreshEfficiency() {
@@ -200,14 +202,24 @@ async function refreshEfficiency() {
   }
 }
 
-function setCcTab(view: "live" | "eff") {
+async function refreshSkills() {
+  try {
+    renderSkills(await invoke("control_skills", { window: ccSkillsWindow }));
+  } catch {
+    /* graceful */
+  }
+}
+
+function setCcTab(view: "live" | "eff" | "skills") {
   ccTab = view;
   document.getElementById("cc-view-live")!.hidden = view !== "live";
   document.getElementById("cc-view-eff")!.hidden = view !== "eff";
+  document.getElementById("cc-view-skills")!.hidden = view !== "skills";
   document.querySelectorAll("#cc-tabs .cc-tab").forEach((b) =>
     b.classList.toggle("active", (b as HTMLElement).dataset.view === view),
   );
   if (view === "eff") refreshEfficiency();
+  if (view === "skills") refreshSkills();
 }
 
 function renderEfficiency(a: any) {
@@ -280,6 +292,74 @@ function renderEfficiency(a: any) {
   )
     .map(([n, v, sub]) => `<div class="cc-stat"><div class="cc-stat-t">${ccEsc(n)}</div><div class="cc-stat-v">${v}</div><div class="cc-stat-sub">${ccEsc(sub)}</div></div>`)
     .join("");
+}
+
+// E3 스킬·에이전트 — 실패율 색상(0=초록, ≥10%=경고, ≥30%=위험)
+const ccFailSev = (rate: number) => (rate >= 0.3 ? "crit" : rate >= 0.1 ? "warn" : "");
+// 호출 TOP 바 1줄 — 라벨·바(점유율)·calls·실패배지
+function ccCallRow(name: string, calls: number, max: number, fail: number, rate: number | null): string {
+  const pct = max > 0 ? (calls / max) * 100 : 0;
+  const badge = fail > 0 && rate != null
+    ? `<span class="cc-fail-badge ${ccFailSev(rate)}">✗${fail} ${Math.round(rate * 100)}%</span>`
+    : "";
+  return `<div class="cc-mix-row"><span class="cc-mix-name" title="${ccEsc(name)}">${ccEsc(name)}</span><span class="cc-tbar-track"><span class="cc-tbar-fill cc-mix-fill" style="width:${pct}%"></span></span><span class="cc-call-n">${calls}</span>${badge}</div>`;
+}
+
+function renderSkills(a: any) {
+  const s = a?.summary ?? {};
+  const t = s.totals ?? {};
+
+  document.getElementById("cc-skills-kpi")!.innerHTML = (
+    [
+      ["툴 호출", String(t.tool_calls ?? 0), "PRE_TOOL"],
+      ["스킬 호출", String(t.skill_calls ?? 0), "Skill 툴"],
+      ["위임", String(t.agent_calls ?? 0), "서브에이전트"],
+      ["🔥실패율", `${Math.round((t.fail_rate ?? 0) * 100)}%`, `✗ ${t.fail_calls ?? 0}건`],
+    ] as [string, string, string][]
+  )
+    .map(([n, v, sub], i) => {
+      const sev = i === 3 ? ccFailSev(t.fail_rate ?? 0) : "";
+      return `<div class="cc-card ${sev}"><div class="cc-card-val">${v}</div><div class="cc-card-reset">${ccEsc(sub)}</div><div class="cc-card-name">${ccEsc(n)}</div></div>`;
+    })
+    .join("");
+
+  // 🔥 반복 실패 — fail desc
+  const fails: any[] = s.failures ?? [];
+  const failMax = Math.max(1, ...fails.map((x) => x.fail ?? 0));
+  document.getElementById("cc-skills-fail")!.innerHTML =
+    fails.length === 0
+      ? `<div class="cc-empty">실패 이벤트 없음 ✓</div>`
+      : fails.map((x) => ccCallRow(x.name ?? "?", x.fail ?? 0, failMax, x.fail ?? 0, x.fail_rate ?? 0)).join("");
+
+  // 스킬 호출 TOP
+  const skills: any[] = s.by_skill ?? [];
+  const skMax = Math.max(1, ...skills.map((x) => x.calls ?? 0));
+  document.getElementById("cc-skills-skills")!.innerHTML =
+    skills.length === 0
+      ? `<div class="cc-empty">스킬 호출 없음</div>`
+      : skills.map((x) => ccCallRow(x.name ?? "?", x.calls ?? 0, skMax, x.fail ?? 0, x.fail_rate ?? 0)).join("");
+
+  // 툴 호출 TOP
+  const tools: any[] = s.by_tool ?? [];
+  const tlMax = Math.max(1, ...tools.map((x) => x.calls ?? 0));
+  document.getElementById("cc-skills-tools")!.innerHTML =
+    tools.length === 0
+      ? `<div class="cc-empty">데이터 없음</div>`
+      : tools.map((x) => ccCallRow(x.name ?? "?", x.calls ?? 0, tlMax, x.fail ?? 0, x.fail_rate ?? 0)).join("");
+
+  // 서브에이전트 위임 — calls + 호출 역할
+  const agents: any[] = s.by_agent ?? [];
+  const agMax = Math.max(1, ...agents.map((x) => x.calls ?? 0));
+  document.getElementById("cc-skills-agents")!.innerHTML =
+    agents.length === 0
+      ? `<div class="cc-empty">위임 없음</div>`
+      : agents
+          .map((x) => {
+            const roles = (x.by_role ?? []).map((r: any) => `${ccEsc(r.role)}×${r.count}`).join(" · ");
+            const pct = agMax > 0 ? ((x.calls ?? 0) / agMax) * 100 : 0;
+            return `<div class="cc-mix-row"><span class="cc-mix-name" title="${ccEsc(x.name ?? "")}">${ccEsc(x.name ?? "?")}</span><span class="cc-tbar-track"><span class="cc-tbar-fill cc-mix-fill" style="width:${pct}%"></span></span><span class="cc-call-n">${x.calls ?? 0}</span><span class="cc-agent-roles">${roles}</span></div>`;
+          })
+          .join("");
 }
 
 function renderControlCenter(d: any) {
@@ -1566,6 +1646,13 @@ document.querySelectorAll("#cc-eff-win .cc-win").forEach((b) =>
     ccEffWindow = (b as HTMLElement).dataset.window!;
     document.querySelectorAll("#cc-eff-win .cc-win").forEach((x) => x.classList.toggle("active", x === b));
     refreshEfficiency();
+  }),
+);
+document.querySelectorAll("#cc-skills-win .cc-win").forEach((b) =>
+  b.addEventListener("click", () => {
+    ccSkillsWindow = (b as HTMLElement).dataset.window!;
+    document.querySelectorAll("#cc-skills-win .cc-win").forEach((x) => x.classList.toggle("active", x === b));
+    refreshSkills();
   }),
 );
 document.getElementById("btn-update")!.addEventListener("click", () => promptInstall());

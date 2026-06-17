@@ -114,7 +114,17 @@ stale 마커(정의 변경 시 재계산). 보존 정책(기본 60일·`retentio
 > - 프런트: Control Center **Live/비용·효율 탭** 전환 + 윈도우 선택(오늘/7일/전체) + KPI 카드·토큰 스택바·
 >   모델별 비용 바·에이전트 믹스·생산성 카드. Tauri `control_analytics` 커맨드.
 > - 검증: cargo 209/209(신규 `summarize_costs_and_productivity`) · E2E 17/17(`docs/analytics_e2e.py`) · UI 번들 OK.
-> - **다음 = E3**(스킬·에이전트 탭 — 호출 TOP·🔥실패율·미사용 — 관측 도구 미구현 실패율 선점).
+>
+> **E3 스킬·에이전트 탭 완료**(로컬 커밋·미배포):
+> - 백엔드: `analytics.rs` `summarize_skills`(순수)·`skills_summary` + `control.skills` RPC. events 롤업 —
+>   호출 TOP(by_skill·by_tool, calls=PRE_TOOL)·🔥실패율(by_tool fail=POST_TOOL exit≠0)·스킬×역할·
+>   서브에이전트 위임(by_agent + by_role)·🔥반복실패 TOP(failures, fail desc)·totals(fail_rate).
+> - 프런트: Control Center **스킬·에이전트 탭** + 윈도우 선택 + KPI(툴/스킬/위임/🔥실패율)·🔥반복실패·
+>   스킬 TOP·툴 TOP·위임 — 실패율 색상 배지(0초록/≥10%경고/≥30%위험). Tauri `control_skills`.
+> - **정직 범위**: duration p50·미사용 4주 diff는 현재 미수집(events.duration_ms NULL·4주 축적 필요) — 후속.
+>   slash 명령 UNION도 캡처 경로(UserPromptSubmit) 미구현 — Skill 툴 기반만.
+> - 검증: cargo 210/210(신규 `summarize_skills_calls_and_failrate`) · E2E 15/15(`docs/skills_e2e.py`) · UI 번들 OK.
+> - **다음 = E4**(세션 타임라인·전사 탭) 또는 E6(경보 — 반복실패/이상감지, E3 실패율 직결).
 
 ### E1 — 영속 분석 기반 (척추) 【선행·필수】
 - **백엔드**: `analytics.db` 스키마 생성(state.rs init) · `ingest.rs`(hook 이벤트→events/messages 적재) ·

@@ -244,6 +244,13 @@ html, body {
 .cc-leg-dot { width: 9px; height: 9px; border-radius: 2px; flex: none; }
 .cc-leg-pct { color: #e2e8f0; font-variant-numeric: tabular-nums; }
 .cc-empty { font-size: 12px; color: #475569; text-align: center; padding: 8px 0; }
+/* E3 스킬·에이전트 탭 */
+.cc-call-n { color: #e2e8f0; font-variant-numeric: tabular-nums; min-width: 28px; text-align: right; font-size: 12px; }
+.cc-fail-badge { font-size: 11px; font-weight: 700; padding: 1px 7px; border-radius: 9px; font-variant-numeric: tabular-nums;
+  background: rgba(34,197,94,.16); color: #22c55e; }
+.cc-fail-badge.warn { background: rgba(245,158,11,.18); color: #f59e0b; }
+.cc-fail-badge.crit { background: rgba(239,68,68,.18); color: #ef4444; }
+.cc-agent-roles { font-size: 11px; color: #64748b; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 160px; }
 .pane .pane-close { opacity: .5; cursor: pointer; }
 .pane .pane-close:hover { opacity: 1; color: var(--error); }
 .pane .pane-title { cursor: grab; }

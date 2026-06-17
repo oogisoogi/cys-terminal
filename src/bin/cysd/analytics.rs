@@ -322,6 +322,142 @@ pub fn analytics_summary(conn: &Connection, since: f64) -> serde_json::Value {
     summarize(&load_summary_rows(conn, since))
 }
 
+// ───────────────────────── E3 스킬·에이전트 집계 (control.skills) ─────────────────────────
+
+/// (event_type, role, tool_name, is_skill, skill_name, is_agent, agent_type, exit_code, ts)
+pub type EventRow = (String, String, String, bool, String, bool, String, Option<i64>, f64);
+
+/// since 이후 툴 events 전 행. 실패는 빈 벡터.
+fn load_event_rows(conn: &Connection, since: f64) -> Vec<EventRow> {
+    let mut stmt = match conn.prepare(
+        "SELECT event_type, role, tool_name, is_skill, skill_name, is_agent, agent_type, exit_code, ts
+         FROM events WHERE ts >= ?1 AND event_type IN ('PRE_TOOL','POST_TOOL')",
+    ) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let rows = stmt.query_map(rusqlite::params![since], |r| {
+        Ok((
+            r.get::<_, String>(0).unwrap_or_default(),
+            r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+            r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+            r.get::<_, Option<i64>>(3)?.unwrap_or(0) != 0,
+            r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+            r.get::<_, Option<i64>>(5)?.unwrap_or(0) != 0,
+            r.get::<_, Option<String>>(6)?.unwrap_or_default(),
+            r.get::<_, Option<i64>>(7)?,
+            r.get::<_, f64>(8)?,
+        ))
+    });
+    match rows {
+        Ok(it) => it.filter_map(|x| x.ok()).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// 이벤트 행을 스킬·툴·에이전트 호출 TOP과 🔥실패율로 롤업(순수 — 테스트 가능).
+/// calls = PRE_TOOL(호출 시도) 기준 · fail = POST_TOOL exit_code≠0 기준(둘은 PRE/POST 쌍으로 근사 정합).
+/// duration p50·미사용 4주 diff는 현재 미수집(events.duration_ms NULL·축적 필요) — 후속.
+pub fn summarize_skills(rows: &[EventRow]) -> serde_json::Value {
+    use serde_json::{json, Value};
+    use std::collections::HashMap;
+    // name → [calls, fail]; roles는 별도 맵
+    let mut tools: HashMap<String, [u64; 2]> = HashMap::new();
+    let mut skills: HashMap<String, [u64; 2]> = HashMap::new();
+    let mut skill_roles: HashMap<String, HashMap<String, u64>> = HashMap::new();
+    let mut agents: HashMap<String, u64> = HashMap::new();
+    let mut agent_roles: HashMap<String, HashMap<String, u64>> = HashMap::new();
+    let (mut tool_calls, mut skill_calls, mut agent_calls, mut fail_calls) = (0u64, 0u64, 0u64, 0u64);
+    for (etype, role, tool, is_skill, skill, is_agent, atype, exit, _ts) in rows {
+        let role_key = if role.is_empty() { "?".to_string() } else { role.clone() };
+        if etype == "PRE_TOOL" {
+            if !tool.is_empty() {
+                tools.entry(tool.clone()).or_insert([0, 0])[0] += 1;
+                tool_calls += 1;
+            }
+            if *is_skill && !skill.is_empty() {
+                skills.entry(skill.clone()).or_insert([0, 0])[0] += 1;
+                *skill_roles.entry(skill.clone()).or_default().entry(role_key.clone()).or_insert(0) += 1;
+                skill_calls += 1;
+            }
+            if *is_agent && !atype.is_empty() {
+                *agents.entry(atype.clone()).or_insert(0) += 1;
+                *agent_roles.entry(atype.clone()).or_default().entry(role_key).or_insert(0) += 1;
+                agent_calls += 1;
+            }
+        } else if etype == "POST_TOOL" && matches!(exit, Some(c) if *c != 0) {
+            if !tool.is_empty() {
+                tools.entry(tool.clone()).or_insert([0, 0])[1] += 1;
+            }
+            if *is_skill && !skill.is_empty() {
+                skills.entry(skill.clone()).or_insert([0, 0])[1] += 1;
+            }
+            fail_calls += 1;
+        }
+    }
+    let rate = |fail: u64, calls: u64| if calls > 0 { fail as f64 / calls as f64 } else { 0.0 };
+    let roles_val = |m: Option<&HashMap<String, u64>>| -> Value {
+        match m {
+            Some(rm) => {
+                let mut v: Vec<Value> = rm.iter().map(|(r, c)| json!({"role": r, "count": c})).collect();
+                v.sort_by(|a, b| b["count"].as_u64().unwrap_or(0).cmp(&a["count"].as_u64().unwrap_or(0)));
+                Value::Array(v)
+            }
+            None => Value::Array(vec![]),
+        }
+    };
+    // calls desc, 동률은 이름 asc (결정론)
+    let sort_by_calls = |list: &mut Vec<Value>| {
+        list.sort_by(|a, b| {
+            b["calls"].as_u64().unwrap_or(0).cmp(&a["calls"].as_u64().unwrap_or(0))
+                .then_with(|| a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or("")))
+        });
+    };
+    let mut by_skill: Vec<Value> = skills
+        .iter()
+        .map(|(name, v)| json!({
+            "name": name, "calls": v[0], "fail": v[1], "fail_rate": rate(v[1], v[0]),
+            "roles": roles_val(skill_roles.get(name)),
+        }))
+        .collect();
+    sort_by_calls(&mut by_skill);
+    let mut by_tool: Vec<Value> = tools
+        .iter()
+        .map(|(name, v)| json!({"name": name, "calls": v[0], "fail": v[1], "fail_rate": rate(v[1], v[0])}))
+        .collect();
+    sort_by_calls(&mut by_tool);
+    let mut by_agent: Vec<Value> = agents
+        .iter()
+        .map(|(name, c)| json!({"name": name, "calls": c, "by_role": roles_val(agent_roles.get(name))}))
+        .collect();
+    sort_by_calls(&mut by_agent);
+    // 🔥반복실패 TOP — 툴 단위 fail>0, fail desc(관측 도구 미구현 선점)
+    let mut failures: Vec<Value> = tools
+        .iter()
+        .filter(|(_, v)| v[1] > 0)
+        .map(|(name, v)| json!({"name": name, "calls": v[0], "fail": v[1], "fail_rate": rate(v[1], v[0])}))
+        .collect();
+    failures.sort_by(|a, b| {
+        b["fail"].as_u64().unwrap_or(0).cmp(&a["fail"].as_u64().unwrap_or(0))
+            .then_with(|| a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or("")))
+    });
+    json!({
+        "totals": {
+            "tool_calls": tool_calls, "skill_calls": skill_calls,
+            "agent_calls": agent_calls, "fail_calls": fail_calls, "fail_rate": rate(fail_calls, tool_calls),
+        },
+        "by_skill": by_skill,
+        "by_tool": by_tool,
+        "by_agent": by_agent,
+        "failures": failures,
+    })
+}
+
+/// control.skills 본체 — since 이후 events를 롤업. conn 없으면 호출부가 빈 summarize_skills 사용.
+pub fn skills_summary(conn: &Connection, since: f64) -> serde_json::Value {
+    summarize_skills(&load_event_rows(conn, since))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,5 +552,47 @@ mod tests {
         let empty = summarize(&[]);
         assert_eq!(empty["totals"]["msgs"], 0);
         assert_eq!(empty["productivity"]["tokens_per_turn"], 0.0);
+    }
+
+    #[test]
+    fn summarize_skills_calls_and_failrate() {
+        // Bash 2호출 1실패, Skill(commit) 1호출 PRE+POST 성공, Task→Explore 위임 1.
+        let ev = |t: &str, role: &str, tool: &str, sk: bool, skn: &str, ag: bool, at: &str, ex: Option<i64>| -> EventRow {
+            (t.into(), role.into(), tool.into(), sk, skn.into(), ag, at.into(), ex, 1000.0)
+        };
+        let rows: Vec<EventRow> = vec![
+            ev("PRE_TOOL", "worker", "Bash", false, "", false, "", None),
+            ev("POST_TOOL", "worker", "Bash", false, "", false, "", Some(1)), // 실패
+            ev("PRE_TOOL", "worker", "Bash", false, "", false, "", None),
+            ev("POST_TOOL", "worker", "Bash", false, "", false, "", Some(0)), // 성공
+            ev("PRE_TOOL", "master", "Skill", true, "commit", false, "", None),
+            ev("POST_TOOL", "master", "Skill", true, "commit", false, "", Some(0)),
+            ev("PRE_TOOL", "master", "Task", false, "", true, "Explore", None),
+        ];
+        let s = summarize_skills(&rows);
+        let t = &s["totals"];
+        assert_eq!(t["tool_calls"], 4, "PRE_TOOL: Bash2+Skill1+Task1");
+        assert_eq!(t["skill_calls"], 1);
+        assert_eq!(t["agent_calls"], 1);
+        assert_eq!(t["fail_calls"], 1, "POST exit≠0 1건");
+        assert!((t["fail_rate"].as_f64().unwrap() - 0.25).abs() < 1e-9, "1/4");
+        // by_tool: Bash 1위(calls 2), fail 1, fail_rate 0.5
+        assert_eq!(s["by_tool"][0]["name"], "Bash");
+        assert_eq!(s["by_tool"][0]["calls"], 2);
+        assert!((s["by_tool"][0]["fail_rate"].as_f64().unwrap() - 0.5).abs() < 1e-9);
+        // by_skill: commit, 실패 0
+        assert_eq!(s["by_skill"][0]["name"], "commit");
+        assert_eq!(s["by_skill"][0]["fail"], 0);
+        assert_eq!(s["by_skill"][0]["roles"][0]["role"], "master");
+        // by_agent: Explore 위임
+        assert_eq!(s["by_agent"][0]["name"], "Explore");
+        assert_eq!(s["by_agent"][0]["by_role"][0]["role"], "master");
+        // 🔥failures: Bash만(fail>0)
+        assert_eq!(s["failures"].as_array().unwrap().len(), 1);
+        assert_eq!(s["failures"][0]["name"], "Bash");
+        // 빈 입력 안전
+        let empty = summarize_skills(&[]);
+        assert_eq!(empty["totals"]["tool_calls"], 0);
+        assert_eq!(empty["totals"]["fail_rate"], 0.0);
     }
 }

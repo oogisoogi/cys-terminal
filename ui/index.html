@@ -46,6 +46,7 @@
       <div id="cc-tabs">
         <button class="cc-tab active" data-view="live">Live</button>
         <button class="cc-tab" data-view="eff">비용·효율</button>
+        <button class="cc-tab" data-view="skills">스킬·에이전트</button>
       </div>
       <div id="cc-body">
         <div id="cc-view-live">
@@ -81,6 +82,18 @@
           <div class="cc-section"><div class="cc-h">모델별 비용</div><div id="cc-eff-models"></div></div>
           <div class="cc-section"><div class="cc-h">에이전트 믹스</div><div id="cc-eff-agents"></div></div>
           <div class="cc-section"><div class="cc-h">생산성</div><div class="cc-token-stats" id="cc-eff-prod"></div></div>
+        </div>
+        <div id="cc-view-skills" hidden>
+          <div class="cc-eff-win" id="cc-skills-win">
+            <button class="cc-win active" data-window="today">오늘</button>
+            <button class="cc-win" data-window="7d">7일</button>
+            <button class="cc-win" data-window="all">전체</button>
+          </div>
+          <div class="cc-kpi" id="cc-skills-kpi"></div>
+          <div class="cc-section"><div class="cc-h">🔥 반복 실패 (exit≠0)</div><div id="cc-skills-fail"></div></div>
+          <div class="cc-section"><div class="cc-h">스킬 호출 TOP</div><div id="cc-skills-skills"></div></div>
+          <div class="cc-section"><div class="cc-h">툴 호출 TOP</div><div id="cc-skills-tools"></div></div>
+          <div class="cc-section"><div class="cc-h">서브에이전트 위임</div><div id="cc-skills-agents"></div></div>
         </div>
         <div id="cc-footer"></div>
       </div>
