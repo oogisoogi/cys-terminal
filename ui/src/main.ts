@@ -237,13 +237,30 @@ function renderControlCenter(d: any) {
   const c = d.consumption ?? {};
   document.getElementById("cc-token-stats")!.innerHTML = (
     [
-      ["최근 1시간", ccFmtTokens(c.last_1h_tokens ?? 0), ""],
+      ["오늘 비용", `$${(c.today_cost_usd ?? 0).toFixed(2)}`, "추정"],
+      ["최근 1시간", ccFmtTokens(c.last_1h_tokens ?? 0), "토큰"],
       ["오늘 소비", ccFmtTokens(c.today_tokens ?? 0), `입력 ${ccFmtTokens(c.today_input ?? 0)}`],
       ["세션 수", String(c.session_count ?? 0), `메시지 ${c.today_msgs ?? 0}`],
     ] as [string, string, string][]
   )
     .map(([t, v, sub]) => `<div class="cc-stat"><div class="cc-stat-t">${t}</div><div class="cc-stat-v">${v}</div><div class="cc-stat-sub">${sub}</div></div>`)
     .join("");
+
+  // 모델 믹스 — 모델별 토큰 점유율 (claude/codex/agy 어느 모델에 얼마나)
+  const mix = (c.model_mix ?? {}) as Record<string, number>;
+  const mixRows = Object.entries(mix).sort((a, b) => b[1] - a[1]);
+  const mixTotal = mixRows.reduce((s, [, v]) => s + v, 0) || 1;
+  document.getElementById("cc-model-mix")!.innerHTML =
+    mixRows.length === 0
+      ? ""
+      : `<div class="cc-mix-h">모델 믹스</div>` +
+        mixRows
+          .map(([m, v]) => {
+            const pct = Math.round((v / mixTotal) * 100);
+            const short = (m || "?").replace(/^claude-/, "").replace(/\[1m\]$/, "");
+            return `<div class="cc-mix-row"><span class="cc-mix-name">${ccEsc(short || "?")}</span><span class="cc-tbar-track"><span class="cc-tbar-fill cc-mix-fill" style="width:${pct}%"></span></span><span class="cc-mix-pct">${pct}%</span></div>`;
+          })
+          .join("");
 
   const spark: number[] = d.sparkline ?? [];
   const max = Math.max(1, ...spark);

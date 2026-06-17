@@ -209,11 +209,17 @@ html, body {
 .cc-tbar-fill.crit { background: #ef4444; }
 .cc-tbar-pct { color: #e2e8f0; font-variant-numeric: tabular-nums; min-width: 70px; text-align: right; }
 .cc-tbar-reset { color: #64748b; min-width: 66px; }
-.cc-token-stats { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin: 12px 0; }
+.cc-token-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin: 12px 0; }
 .cc-stat { background: rgba(255,255,255,.03); border-radius: 8px; padding: 10px; text-align: center; }
 .cc-stat-t { font-size: 11px; color: #64748b; }
 .cc-stat-v { font-size: 18px; font-weight: 700; color: #00d4ff; font-variant-numeric: tabular-nums; }
 .cc-stat-sub { font-size: 10px; color: #64748b; }
+.cc-mix { margin: 0 0 12px; }
+.cc-mix-h { font-size: 11px; color: #64748b; margin-bottom: 6px; }
+.cc-mix-row { display: flex; align-items: center; gap: 10px; margin-bottom: 5px; font-size: 12px; }
+.cc-mix-name { flex: 0 0 150px; color: #94a3b8; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cc-mix-fill { background: linear-gradient(90deg, #00d4ff, #00A8FF); }
+.cc-mix-pct { color: #e2e8f0; font-variant-numeric: tabular-nums; min-width: 40px; text-align: right; }
 .cc-spark { display: flex; align-items: flex-end; gap: 8px; }
 .cc-spark-label { font-size: 11px; color: #64748b; }
 .cc-spark-bars { flex: 1; display: flex; align-items: flex-end; gap: 2px; height: 48px; }
