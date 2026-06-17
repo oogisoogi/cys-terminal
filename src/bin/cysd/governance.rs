@@ -1,6 +1,6 @@
 //! 자원 거버넌스 — 오너 3대 완화책의 1급 구현.
 //! 프로세스 원장(ledger) + watchdog(loadavg·자식 수·중복 서버 감지) + idle 감지.
-//! 외부 터미널 체계에 없던 기능: surface가 낳은 자식 프로세스 트리를 데몬이 직접 추적·강제 종료한다.
+//! 핵심 기능: surface가 낳은 자식 프로세스 트리를 데몬이 직접 추적·강제 종료한다.
 
 use crate::state::{now_epoch, Daemon};
 use serde_json::json;
@@ -877,7 +877,7 @@ fn prune_surface_health_keys(
 }
 
 /// Close a surface: kill the entire descendant process tree, then the shell itself.
-/// 외부 터미널 체계의 치명 단점(고아 서버 누적)을 원천 차단하는 지점.
+/// 고아 서버 누적(load 폭주의 원인)을 원천 차단하는 지점.
 pub fn close_surface(daemon: &Arc<Daemon>, id: u64) -> Result<(), String> {
     // 멤버십 제거 + 역할 정리를 surfaces 락 아래 한 임계영역에서 —
     // claim_role과 동일한 락 순서(surfaces → roles → surface.role)로 AB-BA 데드락 차단.

@@ -1,7 +1,7 @@
-# Control Center 극대화 설계안 — 관측 도구 추출 무기 전체 적용
+# Control Center 극대화 설계안
 
-> 작성 2026-06-17. 근거: 관측 도구(관측 도구) 1·2차 전수조사
-> (memory `control-center-관측 도구-weapons`). 목표: 현 T6 Control Center(실시간 관제)를
+> 작성 2026-06-17. 근거: 팀 단위 관측·분석 도구 1·2차 전수조사.
+> 목표: 현 T6 Control Center(실시간 관제)를
 > **실시간 관제 + 영속 분석 + 효율 최적화 + 자동 거버넌스** 단일 네이티브 플랫폼으로 격상.
 > 철학: 로컬 우선(데이터 머신 밖으로 안 나감)·추가 인프라 0(cysd 내장 SQLite)·에이전트 0ms 지연.
 
@@ -13,7 +13,7 @@
 Tauri 풀 패널(플릿·rate 5h/7d·CPU/MEM·소비·12h 스파크라인·가동시간). **휘발성**(in-memory·재시작 소실),
 **양(volume)만** 측정. 툴/스킬/에이전트 호출·비용·세션 전사·추세 영속 없음.
 
-**목표**: 관측 도구가 팀에 준 것을 **로컬 멀티-노드 플릿**(master·CSO·worker·reviewer)에 적용 —
+**목표**: 팀 단위 관측 도구가 준 것을 **로컬 멀티-노드 플릿**(master·CSO·worker·reviewer)에 적용 —
 "누가/무엇을 얼마나 효율적으로" + "어디서 막히나" + "곧 소진/이상" 자동 경보 + "성공 세션 재현".
 
 ---
@@ -45,7 +45,7 @@ SubagentStop ─┘                  └─ SQLite analytics.db (영속)        
 -- 세션 메타 (claude/codex 1세션 = 1행)
 CREATE TABLE sessions (
   session_id   TEXT PRIMARY KEY,
-  role         TEXT,            -- master|cso|worker|reviewer-* (노드=관측 도구의 user 대응)
+  role         TEXT,            -- master|cso|worker|reviewer-* (노드 = 사용자 단위 대응)
   agent        TEXT,            -- claude|codex|gemini
   cwd          TEXT,
   started_at   REAL, ended_at REAL,
@@ -60,7 +60,7 @@ CREATE TABLE usage_records (
 );
 CREATE INDEX ix_usage_ts ON usage_records(ts);
 CREATE INDEX ix_usage_session ON usage_records(session_id);
--- 호출 이벤트 (툴·스킬·에이전트 — 관측 도구 events 대응)
+-- 호출 이벤트 (툴·스킬·에이전트)
 CREATE TABLE events (
   id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, agent TEXT,
   event_type TEXT,            -- PRE_TOOL|POST_TOOL|STOP|SUBAGENT_STOP|SLASH
@@ -77,7 +77,7 @@ CREATE TABLE messages (
   content TEXT,               -- 50k 절단
   tool_name TEXT, tool_use_id TEXT, duration_ms INT, ts REAL
 );
--- 일별 롤업 캐시 (관측 도구 daily_project_stats 대응 — 과거=캐시, 오늘=live)
+-- 일별 롤업 캐시 (과거=캐시, 오늘=live)
 CREATE TABLE daily_rollups (
   date TEXT PRIMARY KEY,
   session_count INT, turn_count INT, active_roles_json TEXT,
@@ -89,7 +89,7 @@ CREATE TABLE daily_rollups (
 CREATE TABLE stars (session_id TEXT PRIMARY KEY, note TEXT, starred_at REAL); -- 성공 세션 즐겨찾기
 ```
 
-설계 원칙(관측 도구 이식): 토큰 4분해·결정론 정렬(`count DESC, name ASC`)·lazy 캐시(과거 DB·오늘 live 30s)·
+설계 원칙: 토큰 4분해·결정론 정렬(`count DESC, name ASC`)·lazy 캐시(과거 DB·오늘 live 30s)·
 stale 마커(정의 변경 시 재계산). 보존 정책(기본 60일·`retention` 설정).
 
 ---
@@ -199,7 +199,7 @@ stale 마커(정의 변경 시 재계산). 보존 정책(기본 60일·`retentio
 ### E3 — 스킬·에이전트 탭
 - **지표**: 호출 TOP(스킬=Skill툴 events ∪ `/slash` UNION)·🔥실패율(`exit_code!=0`)·🔥duration p50·미사용(4주 diff)·스킬×역할(노드) 분포·서브에이전트 위임트리(master→worker→subagent).
 - **백엔드**: `control.skills` RPC. **프런트**: TOP 바·실패율 배지·duration 히트맵·위임 트리.
-- **산출**: "무엇이 효과적/방치/반복실패"인지 — 관측 도구 미구현 실패율을 **선점**.
+- **산출**: "무엇이 효과적/방치/반복실패"인지 — 실패율 추적을 **선점**.
 
 ### E4 — 세션 타임라인·전사 탭
 - **기능**: 세션 리스트(필터: 역할·agent·기간·⭐)·자동 title/summary·**활동 리본**(8px 색상 strip)·전사 뷰어(HUMAN/ASSISTANT/TOOL + tool input/output/duration)·⭐즐겨찾기(성공 세션 재현=온보딩).
@@ -248,7 +248,7 @@ stale 마커(정의 변경 시 재계산). 보존 정책(기본 60일·`retentio
 ### 성능·정확도
 - **영속성**: 재시작·셧다운에도 추세·소비·세션 보존(현재 휘발 → 무손실).
 - **정밀 비용**: 토큰→$ 모델별 환산 — 자원 거버넌스를 **금액으로** 측정(현재 0).
-- **실시간 유지 + 영속 분석 동시**(관측 도구는 세션종료 후 확정이라 실시간 약함 → 우리만의 조합).
+- **실시간 유지 + 영속 분석 동시**(세션종료 후 확정 방식은 실시간이 약함 → 우리만의 조합).
 - **결정론 집계**(정렬·롤업 캐시) — UI 일관성·부하↓.
 
 ### 신규 기능 (사용자가 새로 얻는 것)
@@ -265,12 +265,12 @@ stale 마커(정의 변경 시 재계산). 보존 정책(기본 60일·`retentio
 ### 전략적 효과
 - **"모니터 → 최적화 → 거버넌스"** 격상: 우리가 AI를 **효율적으로** 쓰는지 정량 측정·자동 경보.
 - **플릿 자기개선 신호**: 효율 리더·반복실패·진척도 = RSI 입력.
-- **관측 도구 추월점**: 실시간성(우리 강점) + 반복실패율·이상감지·ROI(관측 도구 미구현) + 로컬우선 프라이버시.
+- **차별화 포인트**: 실시간성(우리 강점) + 반복실패율·이상감지·ROI + 로컬우선 프라이버시.
 
 ---
 
 ## 7. 비기능·리스크
-- **에이전트 0ms 지연**: hook은 fire-and-forget 즉시 exit(관측 도구 ADR-005/006). 절대 claude/codex 안 막음.
+- **에이전트 0ms 지연**: hook은 fire-and-forget 즉시 exit. 절대 claude/codex 안 막음.
 - **로컬 우선**: 데이터 머신 밖으로 안 나감(E9 다머신은 명시적 옵트인).
 - **부하**: 일별 롤업 lazy·오늘 live 30s 캐시·인덱스. SQLite WAL.
 - **프라이버시**: 전사 50k 절단·보존 정책·(E9) RBAC VIEWER 집계만.

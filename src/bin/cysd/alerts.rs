@@ -120,7 +120,7 @@ pub fn evaluate(snap: &Snapshot, cfg: &AlertConfig) -> Vec<Alert> {
             detail: json!({"tokens": snap.weekly_tokens, "limit": cfg.weekly_tokens}),
         });
     }
-    // 3. 반복 실패 (관측 도구 미구현 선점 — fail수·실패율·최소표본 동시 충족)
+    // 3. 반복 실패 (fail수·실패율·최소표본 동시 충족)
     for (tool, calls, fail, rate) in &snap.tool_failures {
         if *fail >= cfg.fail_count && *calls >= cfg.fail_min_calls && *rate >= cfg.fail_rate {
             out.push(Alert {

@@ -3,7 +3,7 @@
   "claude": {
     "cmd": "CLAUDE_CONFIG_DIR=\"$HOME/.cys/claude\" claude --dangerously-skip-permissions",
     "inject_delay_secs": 10,
-    "notes": "Claude Code. cys 전용 CLAUDE_CONFIG_DIR(~/.cys/claude)로 기동 — 사용자 ~/.claude(외부 터미널 체계·구 마스터지침 오염 가능)와 격리(읽지도 지우지도 않음). macOS 인증은 계정 단위 Keychain이라 격리해도 로그인 유지. ready_marker(❯) 감지 후 주입. 폴더 신뢰 프롬프트는 launch-agent가 자동 확인한다.",
+    "notes": "Claude Code. cys 전용 CLAUDE_CONFIG_DIR(~/.cys/claude)로 기동 — 사용자 ~/.claude(외부 터미널 체계·구 지침 오염 가능)와 격리(읽지도 지우지도 않음). macOS 인증은 계정 단위 Keychain이라 격리해도 로그인 유지. ready_marker(❯) 감지 후 주입. 폴더 신뢰 프롬프트는 launch-agent가 자동 확인한다.",
     "ready_marker": "❯",
     "clear_cmd": "/clear",
     "resume_arg": "--continue",
@@ -39,7 +39,7 @@
   "grok": {
     "cmd": "grok",
     "inject_delay_secs": 12,
-    "notes": "Grok CLI — 독립 설치 필요(xAI). 외부 터미널 체계.app 번들의 grok은 내부 래퍼라 단독 사용 불가.",
+    "notes": "Grok CLI — 독립 설치 필요(xAI). 외부 터미널 앱 번들의 grok은 내부 래퍼라 단독 사용 불가.",
     "approval_patterns": [
       { "name": "allow-execution", "pattern": "Allow execution" }
     ]

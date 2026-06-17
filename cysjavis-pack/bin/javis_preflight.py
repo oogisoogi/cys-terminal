@@ -1856,7 +1856,7 @@ class Preflight:
 
     # ── C31 config dir 격리 + 오염 감지 (박사님 2026-06-15) ──
     # cys 마스터는 전용 CLAUDE_CONFIG_DIR(~/.cys/claude)로 격리 기동돼 사용자 ~/.claude 의
-    # 외부 터미널 체계·구 마스터지침 오염에 영향받지 않는다. 이 체크는 ①격리 라우터 설치 확인 ②사용자
+    # 외부 터미널 체계·구 지침 오염에 영향받지 않는다. 이 체크는 ①격리 라우터 설치 확인 ②사용자
     # 프로필 오염 감지(경고만 — 자동삭제 절대 안 함, 사용자 데이터 불가침)다.
     def c31_config_isolation(self):
         cid = "C31.config-isolation"
@@ -1870,7 +1870,7 @@ class Preflight:
                      "cys 전용 config dir 라우터 부재(%s) — `cys init-pack` 재실행 권장 "
                      "(격리 없으면 사용자 ~/.claude 오염에 노출)" % router)
             return
-        # 사용자 ~/.claude* 에 외부 터미널 체계를 '명령'으로 쓰는 구체계/구 마스터지침 잔재 감지
+        # 사용자 ~/.claude* 에 외부 터미널 체계 명령을 쓰는 구체계/구 지침 잔재 감지 (패턴은 레거시 식별자 유지)
         contaminated = []
         try:
             entries = [n for n in os.listdir(home)
@@ -1890,11 +1890,11 @@ class Preflight:
                     contaminated.append(p)
         if contaminated:
             self.add(cid, WARN,
-                     "사용자 프로필에 외부 터미널 체계/구 마스터지침 %d건 감지 — cys는 전용 config dir로 격리돼 "
+                     "사용자 프로필에 외부 터미널 체계/구 지침 %d건 감지 — cys는 전용 config dir로 격리돼 "
                      "영향 없으나, 정리하려면 **백업 후 직접 제거**(cys는 자동삭제 안 함): %s"
                      % (len(contaminated), ", ".join(contaminated[:3])))
             return
-        self.add(cid, PASS, "격리 config dir 라우터 설치됨 · 사용자 프로필 외부 터미널 체계 오염 없음")
+        self.add(cid, PASS, "격리 config dir 라우터 설치됨 · 사용자 프로필 외부 체계 오염 없음")
 
     def run(self):
         self.c01_pack_dir()

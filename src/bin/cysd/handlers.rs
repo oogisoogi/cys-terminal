@@ -1314,7 +1314,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             Reply::Single(ok_response(&id, json!({"rules": list})))
         }
 
-        // ─── 승인 Feed: 워커 승인 요청 집중 처리 (외부 터미널 체계 Feed 사상 계승) ───
+        // ─── 승인 Feed: 워커 승인 요청 집중 처리 ───
         "feed.push" => {
             let kind = param_str(&params, "kind").unwrap_or_else(|| "notification".into());
             let title = param_str(&params, "title").unwrap_or_else(|| "(untitled)".into());
@@ -1908,7 +1908,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
         }
 
         // ─── T6 Control Center: 실시간 플릿/사용량/시스템 대시보드 (네이티브 단일 RPC) ───
-        // 외장 Streamlit 대시보드(외부 터미널 체계-win) 대신 cysd가 직접 한 콜로 제공한다 — 플릿 상태·rate·
+        // 외장 Streamlit 대시보드 대신 cysd가 직접 한 콜로 제공한다 — 플릿 상태·rate·
         // 시스템 CPU/MEM·소비통계·12h 스파크라인. cys-app UI가 5초 폴링해 Control Center 패널을 그린다.
         "control.dashboard" => {
             let now = crate::state::now_epoch();

@@ -2,7 +2,7 @@
   --bg: #0d1117;
   --bar: #161b22;
   --border: #30363d;
-  --hairline: #1c2128; /* pane 구분선 — 거의 안 보이는 미세 선 (외부 터미널 체계 차용) */
+  --hairline: #1c2128; /* pane 구분선 — 거의 안 보이는 미세 선 */
   --accent: #2f81f7;
   --text: #c9d1d9;
   --warn: #d29922;
@@ -37,7 +37,7 @@ html, body {
   font-size: 10px; text-align: center;
 }
 
-/* workspace sidebar — 외부 터미널 체계 차용: 좌측 별도 섹션·항목 가독성(제목 bold + 서브라인 dim) */
+/* workspace sidebar — 좌측 별도 섹션·항목 가독성(제목 bold + 서브라인 dim) */
 #wsbar {
   flex: 0 0 216px; min-width: 0;
   display: flex; flex-direction: column;

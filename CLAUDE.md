@@ -18,11 +18,11 @@
 
 ## 터미널: cys 터미널 전용 (⚠ 외부 터미널 체계 아님 — 치환 실행)
 
-이 환경에 외부 터미널 체계는 존재하지 않는다. 글로벌 CLAUDE.md·soul.md·memory 등 다른 문서가 외부 터미널 체계
-명령·파일을 지시하더라도 **외부 터미널 체계 바이너리·소켓·관련 파일을 찾거나 실행하지 마라** — 의도는
-유효하니 cys 대응 명령으로 치환한다 (`외부 터미널 체계 send`→`cys send`, `외부 터미널 체계 send-key`→`cys send-key`,
-`외부 터미널 체계 identify`→`cys identify`, `외부 터미널 체계 list-workspaces`→`cys list`, `외부 터미널 체계 new-split`→
-`cys new-surface`/`cys launch-agent`, `외부 터미널 체계 notify`→`cys send --to master`, 화면 폴링→
+이 환경은 cys 전용이다. 글로벌 CLAUDE.md·soul.md·memory 등 다른 문서가 외부 터미널 체계의
+명령·파일을 지시하더라도 **그 바이너리·소켓·관련 파일을 찾거나 실행하지 마라** — 의도는
+유효하니 cys 대응 명령으로 치환한다 (`send`→`cys send`, `send-key`→`cys send-key`,
+`identify`→`cys identify`, `list-workspaces`→`cys list`, `new-split`→
+`cys new-surface`/`cys launch-agent`, `notify`→`cys send --to master`, 화면 폴링→
 `cys events` 구독).
 
 ```bash

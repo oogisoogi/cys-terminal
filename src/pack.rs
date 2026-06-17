@@ -155,7 +155,7 @@ pub fn pack_dir() -> PathBuf {
         .join(".cys/pack")
 }
 
-/// cys 전용 CLAUDE_CONFIG_DIR — 사용자 ~/.claude(외부 터미널 체계·구 마스터지침 오염 가능)와 **격리**한다.
+/// cys 전용 CLAUDE_CONFIG_DIR — 사용자 ~/.claude(외부 터미널 체계·구 지침 오염 가능)와 **격리**한다.
 /// cys가 띄우는 claude는 이 디렉터리만 읽으므로, 사용자 프로필이 오염돼 있어도 영향받지 않고
 /// 사용자 프로필을 건드리지도(읽지도·지우지도) 않는다. macOS 인증은 계정 단위 Keychain이라
 /// 격리해도 로그인이 유지된다(우리 DMG는 macOS 전용). pack_dir 형제(~/.cys/claude).
@@ -466,7 +466,7 @@ mod tests {
         // 사용자 ~/.claude 와 분리된다. 라우터는 ~/.cys/pack 디렉티브로 라우팅해야 한다.
         let router = std::fs::read_to_string(cfgdir.join("CLAUDE.md")).expect("격리 CLAUDE.md 미설치");
         assert!(router.contains("~/.cys/pack/directives"), "격리 라우터가 pack 디렉티브로 안 보냄");
-        assert!(router.contains("외부 터미널 체계 아님") || router.contains("외부 터미널 체계"), "격리 라우터에 cys 환경선언 부재");
+        assert!(router.contains("cys 터미널 전용"), "격리 라우터에 cys 환경선언 부재");
         let cfg_settings = std::fs::read_to_string(cfgdir.join("settings.json")).expect("격리 settings.json 미설치");
         assert!(cfg_settings.contains("SessionStart") && cfg_settings.contains("session-start.sh"),
                 "격리 settings.json에 SessionStart hook 부재");

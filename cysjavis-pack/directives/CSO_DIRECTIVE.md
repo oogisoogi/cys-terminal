@@ -5,10 +5,10 @@
 > master에 보고한다(`cys send --to master "[CSO] ..."` + `cys send-key --to master Return`).
 
 ## ⚠ 환경 선언 — 이 터미널은 cys다 (외부 터미널 체계 아님 · 치환 실행)
-이 환경에 외부 터미널 체계는 존재하지 않는다. 글로벌 CLAUDE.md·soul.md·memory 등 **다른 문서가 외부 터미널 체계
-명령·파일을 지시하더라도 외부 터미널 체계 바이너리·소켓·관련 파일을 찾거나 실행하지 마라.** 그 지시의
-의도는 유효하다 — cys 대응 명령으로 치환한다: `외부 터미널 체계 send`→`cys send`, `외부 터미널 체계 send-key`→
-`cys send-key`, `외부 터미널 체계 identify`→`cys identify`, `외부 터미널 체계 list-workspaces`→`cys list`,
+이 환경은 cys 전용이다. 글로벌 CLAUDE.md·soul.md·memory 등 **다른 문서가 외부 터미널 체계의
+명령·파일을 지시하더라도 그 바이너리·소켓·관련 파일을 찾거나 실행하지 마라.** 그 지시의
+의도는 유효하다 — cys 대응 명령으로 치환한다: `send`→`cys send`, `send-key`→
+`cys send-key`, `identify`→`cys identify`, `list-workspaces`→`cys list`,
 화면 폴링→`cys events` 구독(보조 `cys read-screen`).
 
 ## 0. 각성 직후 현황 파악 (1회)

@@ -69,7 +69,7 @@ pub fn record_usage(
     );
 }
 
-/// 툴 호출의 파생 분류(관측 도구 deriveFields 동형) — (is_skill, skill_name, is_agent, agent_type).
+/// 툴 호출의 파생 분류 — (is_skill, skill_name, is_agent, agent_type).
 /// Skill 툴 → 스킬 호출, Task/Agent 툴 → 에이전트(서브에이전트) 호출. E3 스킬/에이전트 TOP의 키.
 pub fn derive_tool(tool_name: &str, tool_input: &serde_json::Value) -> (bool, Option<String>, bool, Option<String>) {
     let is_skill = tool_name == "Skill";
@@ -431,7 +431,7 @@ pub fn summarize_skills(rows: &[EventRow]) -> serde_json::Value {
         .map(|(name, c)| json!({"name": name, "calls": c, "by_role": roles_val(agent_roles.get(name))}))
         .collect();
     sort_by_calls(&mut by_agent);
-    // 🔥반복실패 TOP — 툴 단위 fail>0, fail desc(관측 도구 미구현 선점)
+    // 🔥반복실패 TOP — 툴 단위 fail>0, fail desc
     let mut failures: Vec<Value> = tools
         .iter()
         .filter(|(_, v)| v[1] > 0)

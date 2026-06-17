@@ -73,7 +73,7 @@ pub fn surface_ref(id: u64) -> String {
     format!("surface:{id}")
 }
 
-/// Map a named key (외부 터미널 체계-compatible vocabulary) to the byte sequence
+/// Map a named key name to the byte sequence
 /// written to the PTY. Supports C- (ctrl), M- (alt/meta) prefixes.
 pub fn key_to_bytes(key: &str) -> Option<Vec<u8>> {
     // Modifier prefixes
@@ -244,7 +244,7 @@ mod tests {
         assert_eq!(key_to_bytes("Down"), Some(b"\x1b[B".to_vec()));
         assert_eq!(key_to_bytes("Right"), Some(b"\x1b[C".to_vec()));
         assert_eq!(key_to_bytes("Left"), Some(b"\x1b[D".to_vec()));
-        // 별칭 동치 (외부 터미널 체계 호환 어휘)
+        // 별칭 동치 (Return=Enter 등 호환 어휘)
         assert_eq!(key_to_bytes("Return"), key_to_bytes("Enter"));
         assert_eq!(key_to_bytes("Esc"), key_to_bytes("Escape"));
         assert_eq!(key_to_bytes("BTab"), key_to_bytes("BackTab"));

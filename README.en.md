@@ -1,6 +1,6 @@
 # cys-terminal — CYSJavis Dedicated Terminal (core daemon + CLI + CYSJavis Pack)
 
-> Independently written **from scratch**, referencing only the protocol design ideas of 외부 터미널 체계 (외부 프로젝트) — no GPL code used. Cross-platform: macOS & Windows.
+> Independently written **from scratch** — bidirectional sockets and resource governance as first-class features. Cross-platform: macOS & Windows.
 
 ## Design Principles (ABSOLUTE)
 
@@ -8,7 +8,7 @@
    Every pane on the same socket is an **equal node** that can actively push to any other pane by surface ID.
    `cys send --surface surface:31 "..."` + `send-key Return` → injected directly into the target pane's **PTY stdin** → arrives as a new user turn.
    Server→client direction is the `cys events` push stream (sequence numbers, resume on reconnect).
-2. **Resource governance as a first-class feature** — built-in mitigation for 외부 터미널 체계's fatal flaw (orphan server accumulation → load explosion → 401/hang).
+2. **Resource governance as a first-class feature** — built-in mitigation for orphan server accumulation (→ load explosion → 401/hang).
 3. **Core/UI separation** — the daemon (cysd) runs independently of any UI. Even if the UI hangs, the socket control channel stays alive (out-of-band recovery).
 
 ## Architecture

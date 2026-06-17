@@ -192,7 +192,7 @@ pane별 배지(Phase 1)는 "지금 이 작업"용. 대시보드는 **전 계정 
   - `ui/src/main.ts`: refreshPaneTitles(3초)가 이미 list_surfaces 폴링 → 그 데이터로 대시보드 갱신.
   - 계정별 행: `claude  5h ▓▓▓▓░ 41%  7d ▓░ 12%` + reset 상대시각(`↻2h13m`).
   - 색상: Phase 1 sevClass 재사용(70/90). 가장 임박한 reset 강조.
-- [ ] **(3) 스타일**: `ui/src/style.css`에 `.usage-dashboard` — 사이드바 톤과 일치(헤어라인 등 외부 터미널 체계 차용 톤).
+- [ ] **(3) 스타일**: `ui/src/style.css`에 `.usage-dashboard` — 사이드바 톤과 일치(헤어라인 등 기존 톤).
 - [ ] **(4) 빌드·검증**: `sh ui/build.sh` → cys-app 재빌드 → 번들 교체 → 앱 재시작 후 육안 확인.
   - playwright-mcp로 스크린샷 회귀(`.playwright-mcp/` 이미 있음).
 

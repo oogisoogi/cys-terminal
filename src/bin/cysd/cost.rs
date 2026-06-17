@@ -1,11 +1,11 @@
-//! T7 비용 엔진 — 모델별 단가표로 토큰→USD 환산 (관측 도구 `cost.ts`+`pricing.ts` 동형 이식).
+//! T7 비용 엔진 — 모델별 단가표로 토큰→USD 환산.
 //!
 //! 단가 출처(환각0):
 //! - claude input/output: claude-api 스킬 Current Models 표(2026-06-04 캐시·권위).
 //!   Opus 4.8 $5/$25 · Sonnet 4.6 $3/$15 · Haiku 4.5 $1/$5 · Fable 5 $10/$50 (per 1M).
 //! - claude 캐시 단가: 표준 경제(prompt-caching 문서) — write(5m)=1.25×input, read=0.1×input.
-//!   (관측 도구 추출 opus/sonnet/haiku 행과 정확히 일치 — 교차검증됨.)
-//! - codex(gpt) 단가: 관측 도구 pricing.ts 추출값.
+//!   (opus/sonnet/haiku 행은 공개 단가표와 교차검증됨.)
+//! - codex(gpt) 단가: 공개 모델 단가표 기준.
 //! 미상 모델은 default(Sonnet). 구독 요금제는 실제 청구와 다를 수 있어 "추정"으로만 노출한다.
 
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
@@ -26,7 +26,7 @@ const GPT55: Pricing = Pricing { input_per_m: 5.0, output_per_m: 30.0, cache_wri
 const GPT54: Pricing = Pricing { input_per_m: 2.5, output_per_m: 15.0, cache_write_per_m: 0.0, cache_read_per_m: 0.25 };
 const GPT54MINI: Pricing = Pricing { input_per_m: 0.75, output_per_m: 4.5, cache_write_per_m: 0.0, cache_read_per_m: 0.075 };
 
-/// 미상 모델 폴백 — Sonnet 단가(관측 도구 default 동일).
+/// 미상 모델 폴백 — Sonnet 단가.
 pub const DEFAULT_PRICING: Pricing = SONNET;
 
 /// 정규화 모델명 prefix → 단가. **most-specific 우선**(first-match wins): 4-8 행이 4 행보다 앞.
@@ -81,7 +81,7 @@ pub fn pricing_for(model: &str) -> Pricing {
     DEFAULT_PRICING
 }
 
-/// 4-팩터 비용 공식(USD) — 관측 도구 calculateCost 동형. cache_read는 컨텍스트 재사용 할인 단가.
+/// 4-팩터 비용 공식(USD). cache_read는 컨텍스트 재사용 할인 단가.
 pub fn calculate_cost(
     input_tokens: u64,
     output_tokens: u64,

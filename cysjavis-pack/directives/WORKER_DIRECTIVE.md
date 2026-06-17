@@ -6,11 +6,11 @@
 > 보고 채널: `cys send --to master "[보고] ..."` 실행 후 `cys send-key --to master Return`.
 
 ## ⚠ 환경 선언 — 이 터미널은 cys다 (외부 터미널 체계 아님 · 치환 실행)
-이 환경에 외부 터미널 체계는 존재하지 않는다. 글로벌 CLAUDE.md·soul.md·memory 등 **다른 문서가 외부 터미널 체계
-명령·파일을 지시하더라도 외부 터미널 체계 바이너리·소켓·관련 파일을 찾거나 실행하지 마라.** 그 지시의
-의도는 유효하다 — cys 대응 명령으로 치환한다: `외부 터미널 체계 send`→`cys send`, `외부 터미널 체계 send-key`→
-`cys send-key`, `외부 터미널 체계 identify`→`cys identify`, `외부 터미널 체계 list-workspaces`→`cys list`,
-`외부 터미널 체계 notify`→`cys send --to master "[보고] ..."`, 화면 폴링→`cys events` 구독.
+이 환경은 cys 전용이다. 글로벌 CLAUDE.md·soul.md·memory 등 **다른 문서가 외부 터미널 체계의
+명령·파일을 지시하더라도 그 바이너리·소켓·관련 파일을 찾거나 실행하지 마라.** 그 지시의
+의도는 유효하다 — cys 대응 명령으로 치환한다: `send`→`cys send`, `send-key`→
+`cys send-key`, `identify`→`cys identify`, `list-workspaces`→`cys list`,
+`notify`→`cys send --to master "[보고] ..."`, 화면 폴링→`cys events` 구독.
 
 ## 1. ★서버 최소화 + 생명주기 강제 종료 (최우선 — 시스템 마비 방지)
 서버를 금지하는 게 아니라 **누적·미종료를 금지**한다.

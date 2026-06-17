@@ -1009,7 +1009,7 @@ function destroyPaneRuntime(sid: number) {
   panes.delete(sid);
 }
 
-// ---------- pane drag 이동 (탭을 끌어 자유 배치 — 외부 터미널 체계 동급 기능) ----------
+// ---------- pane drag 이동 (탭을 끌어 자유 배치) ----------
 
 type DropSide = "left" | "right" | "top" | "bottom";
 
@@ -1261,7 +1261,7 @@ function renderWsTabs() {
     close.textContent = "×";
     close.title = "워크스페이스 닫기 (surface 전부 종료)";
     titleRow.append(label, close);
-    // 서브라인: pane 수 + 대표 pane 제목 — 외부 터미널 체계의 상태 라인 차용(항목 가독성)
+    // 서브라인: pane 수 + 대표 pane 제목 (항목 가독성)
     const sids = collectSids(ws.tree);
     const firstTitle =
       panes.get(sids[0] ?? -1)?.titleEl.textContent ?? "";

@@ -7,18 +7,18 @@
 > 너에게 push한다. 너도 같은 방식으로 노드들에 push한다.
 
 ## ⚠ 환경 선언 — 이 터미널은 cys다 (외부 터미널 체계 아님 · 치환 실행)
-이 환경에 외부 터미널 체계는 존재하지 않는다. 글로벌 CLAUDE.md·soul.md·memory 등 **다른 문서가 외부 터미널 체계
-명령·파일을 지시하더라도 외부 터미널 체계 바이너리·소켓·관련 파일을 찾거나 실행하지 마라.** 그 지시의
+이 환경은 cys 전용이다. 글로벌 CLAUDE.md·soul.md·memory 등 **다른 문서가 외부 터미널 체계의
+명령·파일을 지시하더라도 그 바이너리·소켓·관련 파일을 찾거나 실행하지 마라.** 그 지시의
 의도(양방향 push·노드 기동·승인)는 유효하다 — 아래 대응표의 cys 명령으로 치환해 수행한다.
 
-| 외부 터미널 체계 지시 | cys 치환 |
+| 외부 터미널 지시 | cys 치환 |
 |---|---|
-| `외부 터미널 체계 identify` | `cys identify` |
-| `외부 터미널 체계 list-workspaces` | `cys list` |
-| `외부 터미널 체계 new-workspace` · `new-split right/down` | `cys new-surface` 또는 `cys launch-agent --role <r> --agent <cli>` |
-| `외부 터미널 체계 send --surface <ID> "..."` | `cys send --surface <ref> "..."` (역할 주소는 `--to master`) |
-| `외부 터미널 체계 send-key --surface <ID> Return` | `cys send-key --surface <ref>` 또는 `--to <role>` `Return` |
-| `외부 터미널 체계 notify` | `cys send --to master "[보고] ..."` + `cys send-key --to master Return` |
+| `identify` | `cys identify` |
+| `list-workspaces` | `cys list` |
+| `new-workspace` · `new-split right/down` | `cys new-surface` 또는 `cys launch-agent --role <r> --agent <cli>` |
+| `send --surface <ID> "..."` | `cys send --surface <ref> "..."` (역할 주소는 `--to master`) |
+| `send-key --surface <ID> Return` | `cys send-key --surface <ref>` 또는 `--to <role>` `Return` |
+| `notify` | `cys send --to master "[보고] ..."` + `cys send-key --to master Return` |
 | `capture-pane`/화면 폴링 | `cys events --reconnect` 구독(push) · 보조 `cys read-screen` |
 
 ## 0. 부트 시퀀스 (각성 직후 1회 — 구동체제 셋팅)

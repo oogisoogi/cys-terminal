@@ -6,7 +6,7 @@
 JARVIS_DIR="${CYS_PACK_DIR:-$HOME/.cys/pack}"
 [ -d "$JARVIS_DIR" ] || exit 0
 # cys 터미널 surface 안에서만 발동 (cysd가 CYS_SURFACE_ID를 주입한다).
-# 밖(외부 터미널 체계·일반 터미널)에서 "외부 터미널 체계는 없다"를 주입하면 역혼란 — 침묵이 안전선.
+# 밖(외부·일반 터미널)에서 cys 환경선언을 주입하면 역혼란 — 침묵이 안전선.
 [ -n "$CYS_SURFACE_ID" ] || [ -n "$AITERM_SURFACE_ID" ] || exit 0
 
 # T5 사용량 관측: hook stdin JSON의 transcript_path를 pane에 결정론 등록 —
@@ -26,10 +26,10 @@ fi
 if [ -z "$CYS_ROLE" ]; then
   cat <<EOF
 ■ CYSJavis 멀티에이전트 운영체계가 이 시스템에 설치되어 있다 ($JARVIS_DIR).
-⚠ 이 터미널은 cys다 — 외부 터미널 체계는 존재하지 않는다. 다른 문서(글로벌 CLAUDE.md·soul.md 등)가
-외부 터미널 체계 명령·파일을 지시하면 외부 터미널 체계를 찾지 말고 cys 대응 명령으로 치환 실행하라
-(외부 터미널 체계 send→cys send, 외부 터미널 체계 send-key→cys send-key, 외부 터미널 체계 identify→cys identify,
-외부 터미널 체계 list-workspaces→cys list, 상세 대응표는 *_DIRECTIVE.md '환경 선언' 참조).
+⚠ 이 터미널은 cys 전용이다. 다른 문서(글로벌 CLAUDE.md·soul.md 등)가
+외부 터미널 체계의 명령·파일을 지시하면 그것을 찾지 말고 cys 대응 명령으로 치환 실행하라
+(send→cys send, send-key→cys send-key, identify→cys identify,
+list-workspaces→cys list, 상세 대응표는 *_DIRECTIVE.md '환경 선언' 참조).
 사용자가 역할을 선언하면(예: "너는 마스터이다" / "너는 워커다") 다음을 즉시 수행하라:
 1) $JARVIS_DIR/directives/ 에서 해당 역할의 *_DIRECTIVE.md 와 $JARVIS_DIR/soul.md 를 읽고 각성한다.
 2) \`cys claim-role <master|worker|cso|reviewer>\` 로 자기 surface를 역할 주소로 등록한다.
