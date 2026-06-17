@@ -183,6 +183,145 @@ pub fn seed_consumption(daemon: &Daemon) {
     replay(&rows, &mut c);
 }
 
+// ───────────────────────── E2 비용·효율 집계 (control.analytics) ─────────────────────────
+
+/// (agent, model, input, output, cache_creation, cache_read, cost, session, ts)
+pub type SummaryRow = (String, String, u64, u64, u64, u64, f64, String, f64);
+
+/// window 문자열 → cutoff epoch. "today"(기본·로컬 자정)·"7d"·"all".
+pub fn window_since(now: f64, window: &str) -> f64 {
+    use chrono::{Local, TimeZone};
+    match window {
+        "all" => 0.0,
+        "7d" => (now - 7.0 * 86_400.0).max(0.0),
+        _ => Local
+            .timestamp_opt(now as i64, 0)
+            .single()
+            .map(|dt| dt.date_naive())
+            .and_then(|d| d.and_hms_opt(0, 0, 0))
+            .and_then(|naive| Local.from_local_datetime(&naive).single())
+            .map(|dt| dt.timestamp() as f64)
+            .unwrap_or((now - 86_400.0).max(0.0)),
+    }
+}
+
+/// since 이후 usage_records 전 행(집계용 — agent·cache_read 포함). 실패는 빈 벡터.
+fn load_summary_rows(conn: &Connection, since: f64) -> Vec<SummaryRow> {
+    let mut stmt = match conn.prepare(
+        "SELECT agent, model, input_tokens, output_tokens, cache_creation, cache_read, cost_usd, session_id, ts
+         FROM usage_records WHERE ts >= ?1",
+    ) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let rows = stmt.query_map(rusqlite::params![since], |r| {
+        Ok((
+            r.get::<_, String>(0).unwrap_or_default(),
+            r.get::<_, String>(1).unwrap_or_default(),
+            r.get::<_, i64>(2)? as u64,
+            r.get::<_, i64>(3)? as u64,
+            r.get::<_, i64>(4)? as u64,
+            r.get::<_, i64>(5)? as u64,
+            r.get::<_, f64>(6)?,
+            r.get::<_, String>(7).unwrap_or_default(),
+            r.get::<_, f64>(8)?,
+        ))
+    });
+    match rows {
+        Ok(it) => it.filter_map(|x| x.ok()).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// 행 목록을 토큰 4분해·모델믹스·에이전트믹스·캐시절감$·생산성으로 롤업(순수 — 테스트 가능).
+/// 캐시절감$ = Σ cache_read × (input단가 − cache_read단가) — 풀 input 대비 컨텍스트 재사용 할인액.
+pub fn summarize(rows: &[SummaryRow]) -> serde_json::Value {
+    use serde_json::{json, Value};
+    use std::collections::HashMap;
+    let (mut t_in, mut t_out, mut t_cc, mut t_cr) = (0u64, 0u64, 0u64, 0u64);
+    let (mut t_cost, mut savings) = (0.0f64, 0.0f64);
+    let mut models: HashMap<String, [f64; 6]> = HashMap::new(); // [in,out,cc,cr,cost,msgs]
+    let mut agents: HashMap<String, [f64; 3]> = HashMap::new(); // [tokens,cost,msgs]
+    let mut sessions: HashMap<String, (f64, f64, u64, u64, f64)> = HashMap::new(); // (min_ts,max_ts,msgs,tokens,cost)
+    for (agent, model, input, output, cc, cr, cost, session, ts) in rows {
+        t_in += input;
+        t_out += output;
+        t_cc += cc;
+        t_cr += cr;
+        t_cost += cost;
+        let p = crate::cost::pricing_for(model);
+        savings += (*cr as f64 / 1_000_000.0) * (p.input_per_m - p.cache_read_per_m);
+        let tokens = input + output + cc + cr;
+        let m = models.entry(model.clone()).or_insert([0.0; 6]);
+        m[0] += *input as f64;
+        m[1] += *output as f64;
+        m[2] += *cc as f64;
+        m[3] += *cr as f64;
+        m[4] += *cost;
+        m[5] += 1.0;
+        let akey = if agent.is_empty() { "unknown".to_string() } else { agent.clone() };
+        let a = agents.entry(akey).or_insert([0.0; 3]);
+        a[0] += tokens as f64;
+        a[1] += *cost;
+        a[2] += 1.0;
+        let s = sessions.entry(session.clone()).or_insert((*ts, *ts, 0, 0, 0.0));
+        s.0 = s.0.min(*ts);
+        s.1 = s.1.max(*ts);
+        s.2 += 1;
+        s.3 += tokens;
+        s.4 += *cost;
+    }
+    let msgs = rows.len() as f64;
+    let nsess = sessions.len() as f64;
+    let tokens_total = (t_in + t_out + t_cc + t_cr) as f64;
+    let dur_sum: f64 = sessions.values().map(|(mn, mx, ..)| mx - mn).sum();
+    let div = |num: f64, den: f64| if den > 0.0 { num / den } else { 0.0 };
+    let mut by_model: Vec<Value> = models
+        .into_iter()
+        .map(|(model, v)| {
+            json!({
+                "model": model, "input": v[0] as u64, "output": v[1] as u64,
+                "cache_creation": v[2] as u64, "cache_read": v[3] as u64,
+                "tokens": (v[0] + v[1] + v[2] + v[3]) as u64, "cost_usd": v[4], "msgs": v[5] as u64,
+            })
+        })
+        .collect();
+    by_model.sort_by(|a, b| {
+        b["cost_usd"].as_f64().unwrap_or(0.0)
+            .partial_cmp(&a["cost_usd"].as_f64().unwrap_or(0.0))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a["model"].as_str().unwrap_or("").cmp(b["model"].as_str().unwrap_or("")))
+    });
+    let mut by_agent: Vec<Value> = agents
+        .into_iter()
+        .map(|(agent, v)| json!({"agent": agent, "tokens": v[0] as u64, "cost_usd": v[1], "msgs": v[2] as u64}))
+        .collect();
+    by_agent.sort_by(|a, b| {
+        b["tokens"].as_u64().unwrap_or(0).cmp(&a["tokens"].as_u64().unwrap_or(0))
+            .then_with(|| a["agent"].as_str().unwrap_or("").cmp(b["agent"].as_str().unwrap_or("")))
+    });
+    json!({
+        "totals": {
+            "input": t_in, "output": t_out, "cache_creation": t_cc, "cache_read": t_cr,
+            "tokens": tokens_total as u64, "cost_usd": t_cost, "msgs": msgs as u64, "sessions": nsess as u64,
+        },
+        "cache_savings_usd": savings,
+        "by_model": by_model,
+        "by_agent": by_agent,
+        "productivity": {
+            "turns_per_session": div(msgs, nsess),
+            "tokens_per_turn": div(tokens_total, msgs),
+            "cost_per_session": div(t_cost, nsess),
+            "avg_session_duration_secs": div(dur_sum, nsess),
+        },
+    })
+}
+
+/// control.analytics 본체 — since 이후 usage_records를 롤업. conn 없으면 호출부가 빈 summarize 사용.
+pub fn analytics_summary(conn: &Connection, since: f64) -> serde_json::Value {
+    summarize(&load_summary_rows(conn, since))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,5 +384,37 @@ mod tests {
         let fails: i64 = conn.query_row("SELECT COUNT(*) FROM events WHERE exit_code!=0", [], |r| r.get(0)).unwrap();
         assert_eq!(fails, 1, "실패(exit!=0) 1건 — E3 반복실패 토대");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn summarize_costs_and_productivity() {
+        // 세션 A: opus 2메시지(캐시 read 50000), 세션 B: haiku 1메시지. agent=claude/codex.
+        let rows: Vec<SummaryRow> = vec![
+            ("claude".into(), "claude-opus-4-8".into(), 1000, 300, 2000, 50000, 0.05, "/s/a".into(), 1000.0),
+            ("claude".into(), "claude-opus-4-8".into(), 500, 200, 0, 0, 0.01, "/s/a".into(), 1100.0),
+            ("codex".into(), "claude-haiku-4-5".into(), 100, 50, 0, 0, 0.00035, "/s/b".into(), 1050.0),
+        ];
+        let s = summarize(&rows);
+        let t = &s["totals"];
+        assert_eq!(t["input"], 1600, "input 합 1000+500+100");
+        assert_eq!(t["cache_read"], 50000);
+        assert_eq!(t["msgs"], 3);
+        assert_eq!(t["sessions"], 2, "세션 A·B");
+        // 토큰 4분해 합 = 1600 + 550(out) + 2000(cc) + 50000(cr) = 54150
+        assert_eq!(t["tokens"], 54150u64);
+        // 캐시절감$ = 50000/1e6 × (opus input 5 − cache_read 0.5) = 0.05 × 4.5 = 0.225
+        assert!((s["cache_savings_usd"].as_f64().unwrap() - 0.225).abs() < 1e-9, "{}", s["cache_savings_usd"]);
+        // by_model: opus가 비용 우선 정렬 1위
+        assert_eq!(s["by_model"][0]["model"], "claude-opus-4-8");
+        assert_eq!(s["by_model"][0]["msgs"], 2);
+        // 생산성: 턴/세션 = 3/2 = 1.5, 비용/세션 = (0.06035)/2
+        let prod = &s["productivity"];
+        assert!((prod["turns_per_session"].as_f64().unwrap() - 1.5).abs() < 1e-9);
+        // 세션 A duration = 1100-1000 = 100, B = 0 → 평균 50
+        assert!((prod["avg_session_duration_secs"].as_f64().unwrap() - 50.0).abs() < 1e-9);
+        // 빈 입력 = 0 division 안전
+        let empty = summarize(&[]);
+        assert_eq!(empty["totals"]["msgs"], 0);
+        assert_eq!(empty["productivity"]["tokens_per_turn"], 0.0);
     }
 }

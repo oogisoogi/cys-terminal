@@ -127,6 +127,11 @@ async fn control_dashboard() -> Result<Value, String> {
 }
 
 #[tauri::command]
+async fn control_analytics(window: Option<String>) -> Result<Value, String> {
+    rpc("control.analytics", json!({ "window": window })).await
+}
+
+#[tauri::command]
 async fn create_surface(
     cwd: Option<String>,
     title: Option<String>,
@@ -496,6 +501,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             daemon_status,
             list_surfaces,
+            control_analytics,
             control_dashboard,
             create_surface,
             send_input,

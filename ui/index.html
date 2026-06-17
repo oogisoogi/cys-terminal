@@ -43,27 +43,45 @@
         <span id="cc-clock"></span>
         <button id="btn-cc-close" title="닫기">×</button>
       </div>
+      <div id="cc-tabs">
+        <button class="cc-tab active" data-view="live">Live</button>
+        <button class="cc-tab" data-view="eff">비용·효율</button>
+      </div>
       <div id="cc-body">
-        <div class="cc-gauges">
-          <div class="cc-radar" id="cc-radar">
-            <span class="cc-radar-sweep"></span>
-            <span class="cc-radar-val" id="cc-radar-val">0%</span>
-            <span class="cc-radar-sub" id="cc-radar-sub">0/0 활성</span>
+        <div id="cc-view-live">
+          <div class="cc-gauges">
+            <div class="cc-radar" id="cc-radar">
+              <span class="cc-radar-sweep"></span>
+              <span class="cc-radar-val" id="cc-radar-val">0%</span>
+              <span class="cc-radar-sub" id="cc-radar-sub">0/0 활성</span>
+            </div>
+            <div class="cc-uptime">
+              <span class="cc-uptime-val" id="cc-uptime-val">00:00:00</span>
+              <span class="cc-sub">가동시간</span>
+            </div>
           </div>
-          <div class="cc-uptime">
-            <span class="cc-uptime-val" id="cc-uptime-val">00:00:00</span>
-            <span class="cc-sub">가동시간</span>
+          <div class="cc-kpi" id="cc-kpi"></div>
+          <div class="cc-section"><div class="cc-h">플릿 현황</div><div id="cc-fleet"></div></div>
+          <div class="cc-section"><div class="cc-h">토큰 · 비용</div>
+            <div id="cc-token-bars"></div>
+            <div class="cc-token-stats" id="cc-token-stats"></div>
+            <div class="cc-mix" id="cc-model-mix"></div>
+            <div class="cc-spark" id="cc-spark"></div>
           </div>
+          <div class="cc-section"><div class="cc-h">시스템</div><div id="cc-sys"></div></div>
         </div>
-        <div class="cc-kpi" id="cc-kpi"></div>
-        <div class="cc-section"><div class="cc-h">플릿 현황</div><div id="cc-fleet"></div></div>
-        <div class="cc-section"><div class="cc-h">토큰 · 비용</div>
-          <div id="cc-token-bars"></div>
-          <div class="cc-token-stats" id="cc-token-stats"></div>
-          <div class="cc-mix" id="cc-model-mix"></div>
-          <div class="cc-spark" id="cc-spark"></div>
+        <div id="cc-view-eff" hidden>
+          <div class="cc-eff-win" id="cc-eff-win">
+            <button class="cc-win active" data-window="today">오늘</button>
+            <button class="cc-win" data-window="7d">7일</button>
+            <button class="cc-win" data-window="all">전체</button>
+          </div>
+          <div class="cc-kpi" id="cc-eff-kpi"></div>
+          <div class="cc-section"><div class="cc-h">토큰 4분해</div><div id="cc-eff-tokens"></div></div>
+          <div class="cc-section"><div class="cc-h">모델별 비용</div><div id="cc-eff-models"></div></div>
+          <div class="cc-section"><div class="cc-h">에이전트 믹스</div><div id="cc-eff-agents"></div></div>
+          <div class="cc-section"><div class="cc-h">생산성</div><div class="cc-token-stats" id="cc-eff-prod"></div></div>
         </div>
-        <div class="cc-section"><div class="cc-h">시스템</div><div id="cc-sys"></div></div>
         <div id="cc-footer"></div>
       </div>
     </aside>

@@ -106,7 +106,15 @@ stale 마커(정의 변경 시 재계산). 보존 정책(기본 60일·`retentio
 >   →`usage.event` RPC→`events` 테이블. `derive_tool`(Skill→스킬·Task/Agent→에이전트 파생)·`record_event`·
 >   PostToolUse `tool_response.is_error`→exit_code(E3 반복실패 토대). pack 임베드·preflight C33(멱등 등록).
 >   cargo 208/208(신규 2종) · E2E 7/7(`docs/event_capture_e2e.py`) · C33 격리 검증(등록·체인보존·멱등).
-> - **다음 = E2**(비용·효율 탭).
+>
+> **E2 비용·효율 탭 완료**(로컬 커밋·미배포):
+> - 백엔드: `analytics.rs` `summarize`(순수)·`analytics_summary`·`window_since`(today/7d/all) + `control.analytics` RPC.
+>   토큰 4분해 totals·🔥캐시절감$(Σ cache_read×(input−cache_read 단가))·by_model(비용정렬)·by_agent(토큰정렬)·
+>   생산성(턴/세션·토큰/턴·비용/세션·평균 세션길이).
+> - 프런트: Control Center **Live/비용·효율 탭** 전환 + 윈도우 선택(오늘/7일/전체) + KPI 카드·토큰 스택바·
+>   모델별 비용 바·에이전트 믹스·생산성 카드. Tauri `control_analytics` 커맨드.
+> - 검증: cargo 209/209(신규 `summarize_costs_and_productivity`) · E2E 17/17(`docs/analytics_e2e.py`) · UI 번들 OK.
+> - **다음 = E3**(스킬·에이전트 탭 — 호출 TOP·🔥실패율·미사용 — 관측 도구 미구현 실패율 선점).
 
 ### E1 — 영속 분석 기반 (척추) 【선행·필수】
 - **백엔드**: `analytics.db` 스키마 생성(state.rs init) · `ingest.rs`(hook 이벤트→events/messages 적재) ·

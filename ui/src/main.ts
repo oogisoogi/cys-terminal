@@ -109,6 +109,8 @@ let ccTimer: number | null = null;
 let ccClockTimer: number | null = null;
 let ccUptimeBase = 0;
 let ccUptimeFetchedAt = 0;
+let ccTab: "live" | "eff" = "live";
+let ccEffWindow = "today";
 
 const CC_ROLE_COLOR: Record<string, string> = {
   master: "#3b82f6", cso: "#8b5cf6", worker: "#00e676",
@@ -121,6 +123,12 @@ const CC_STATE: Record<string, { cls: string; label: string }> = {
 const ccEsc = (s: string) =>
   s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]!);
 const ccFmtTokens = (n: number) => (n >= 10000 ? `${(n / 10000).toFixed(1)}만` : n.toLocaleString());
+// 비용: $1 미만은 4자리(소액 가시), 이상은 2자리.
+const ccMoney = (v: number) => `$${v > 0 && v < 1 ? v.toFixed(4) : v.toFixed(2)}`;
+const CC_TOK_SEG: [string, string, string][] = [
+  ["input", "입력", "#3b82f6"], ["output", "출력", "#00e676"],
+  ["cache_creation", "캐시생성", "#ffa726"], ["cache_read", "캐시읽기", "#8b5cf6"],
+];
 
 function ccUptimeStr(s: number): string {
   const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
@@ -176,13 +184,102 @@ function tickCc() {
 
 async function refreshControlCenter() {
   if (!ccOpen) return;
-  let d: any;
   try {
-    d = await invoke("control_dashboard");
+    renderControlCenter(await invoke("control_dashboard"));
   } catch {
-    return;
+    /* 데몬 일시 부재 — 다음 틱 재시도 */
   }
-  renderControlCenter(d);
+  if (ccTab === "eff") refreshEfficiency();
+}
+
+async function refreshEfficiency() {
+  try {
+    renderEfficiency(await invoke("control_analytics", { window: ccEffWindow }));
+  } catch {
+    /* graceful */
+  }
+}
+
+function setCcTab(view: "live" | "eff") {
+  ccTab = view;
+  document.getElementById("cc-view-live")!.hidden = view !== "live";
+  document.getElementById("cc-view-eff")!.hidden = view !== "eff";
+  document.querySelectorAll("#cc-tabs .cc-tab").forEach((b) =>
+    b.classList.toggle("active", (b as HTMLElement).dataset.view === view),
+  );
+  if (view === "eff") refreshEfficiency();
+}
+
+function renderEfficiency(a: any) {
+  const s = a?.summary ?? {};
+  const t = s.totals ?? {};
+  const prod = s.productivity ?? {};
+  const winLab = a?.window === "7d" ? "최근 7일" : a?.window === "all" ? "전체" : "오늘";
+
+  document.getElementById("cc-eff-kpi")!.innerHTML = (
+    [
+      ["총 비용", ccMoney(t.cost_usd ?? 0), winLab],
+      ["🔥캐시 절감", ccMoney(s.cache_savings_usd ?? 0), "재사용 할인"],
+      ["메시지", String(t.msgs ?? 0), `세션 ${t.sessions ?? 0}`],
+      ["토큰", ccFmtTokens(t.tokens ?? 0), "4분해 합"],
+    ] as [string, string, string][]
+  )
+    .map(([n, v, sub]) => `<div class="cc-card"><div class="cc-card-val">${v}</div><div class="cc-card-reset">${ccEsc(sub)}</div><div class="cc-card-name">${ccEsc(n)}</div></div>`)
+    .join("");
+
+  // 토큰 4분해 — 가로 스택 바 + 범례
+  const tokTotal = CC_TOK_SEG.reduce((acc, [k]) => acc + (t[k] ?? 0), 0) || 1;
+  const stack = CC_TOK_SEG.map(([k, , color]) => {
+    const v = t[k] ?? 0;
+    const pct = (v / tokTotal) * 100;
+    return pct > 0 ? `<span class="cc-stack-seg" style="width:${pct}%;background:${color}" title="${ccEsc(k)} ${ccFmtTokens(v)}"></span>` : "";
+  }).join("");
+  const legend = CC_TOK_SEG.map(([k, lab, color]) => {
+    const v = t[k] ?? 0;
+    const pct = Math.round((v / tokTotal) * 100);
+    return `<span class="cc-leg"><span class="cc-leg-dot" style="background:${color}"></span>${lab} ${ccFmtTokens(v)} <span class="cc-leg-pct">${pct}%</span></span>`;
+  }).join("");
+  document.getElementById("cc-eff-tokens")!.innerHTML =
+    `<div class="cc-stack">${stack}</div><div class="cc-legend">${legend}</div>`;
+
+  // 모델별 비용 — 비용 점유율 바
+  const models: any[] = s.by_model ?? [];
+  const costMax = Math.max(1e-9, ...models.map((m) => m.cost_usd ?? 0));
+  document.getElementById("cc-eff-models")!.innerHTML =
+    models.length === 0
+      ? `<div class="cc-empty">데이터 없음</div>`
+      : models
+          .map((m) => {
+            const short = (m.model || "?").replace(/^claude-/, "").replace(/\[1m\]$/, "");
+            const pct = ((m.cost_usd ?? 0) / costMax) * 100;
+            return `<div class="cc-mix-row"><span class="cc-mix-name" title="${ccEsc(m.model ?? "")}">${ccEsc(short || "?")}</span><span class="cc-tbar-track"><span class="cc-tbar-fill cc-mix-fill" style="width:${pct}%"></span></span><span class="cc-mix-pct">${ccMoney(m.cost_usd ?? 0)}</span></div>`;
+          })
+          .join("");
+
+  // 에이전트 믹스 — 토큰 점유율 바
+  const agents: any[] = s.by_agent ?? [];
+  const agTotal = agents.reduce((acc, x) => acc + (x.tokens ?? 0), 0) || 1;
+  document.getElementById("cc-eff-agents")!.innerHTML =
+    agents.length === 0
+      ? `<div class="cc-empty">데이터 없음</div>`
+      : agents
+          .map((x) => {
+            const pct = Math.round(((x.tokens ?? 0) / agTotal) * 100);
+            return `<div class="cc-mix-row"><span class="cc-mix-name">${ccEsc(x.agent ?? "?")}</span><span class="cc-tbar-track"><span class="cc-tbar-fill cc-mix-fill" style="width:${pct}%"></span></span><span class="cc-mix-pct">${pct}%</span></div>`;
+          })
+          .join("");
+
+  // 생산성
+  document.getElementById("cc-eff-prod")!.innerHTML = (
+    [
+      ["턴/세션", (prod.turns_per_session ?? 0).toFixed(1), "메시지/세션"],
+      ["토큰/턴", ccFmtTokens(Math.round(prod.tokens_per_turn ?? 0)), "메시지당"],
+      ["비용/세션", ccMoney(prod.cost_per_session ?? 0), "세션당"],
+      ["세션 길이", ccUptimeStr(Math.round(prod.avg_session_duration_secs ?? 0)), "평균"],
+    ] as [string, string, string][]
+  )
+    .map(([n, v, sub]) => `<div class="cc-stat"><div class="cc-stat-t">${ccEsc(n)}</div><div class="cc-stat-v">${v}</div><div class="cc-stat-sub">${ccEsc(sub)}</div></div>`)
+    .join("");
 }
 
 function renderControlCenter(d: any) {
@@ -1461,6 +1558,16 @@ document.getElementById("btn-files")!.addEventListener("click", () => setFtOpen(
 document.getElementById("btn-ft-close")!.addEventListener("click", () => setFtOpen(false));
 document.getElementById("btn-cc")!.addEventListener("click", () => setCcOpen(!ccOpen));
 document.getElementById("btn-cc-close")!.addEventListener("click", () => setCcOpen(false));
+document.querySelectorAll("#cc-tabs .cc-tab").forEach((b) =>
+  b.addEventListener("click", () => setCcTab((b as HTMLElement).dataset.view as "live" | "eff")),
+);
+document.querySelectorAll("#cc-eff-win .cc-win").forEach((b) =>
+  b.addEventListener("click", () => {
+    ccEffWindow = (b as HTMLElement).dataset.window!;
+    document.querySelectorAll("#cc-eff-win .cc-win").forEach((x) => x.classList.toggle("active", x === b));
+    refreshEfficiency();
+  }),
+);
 document.getElementById("btn-update")!.addEventListener("click", () => promptInstall());
 document.getElementById("btn-ws-new")!.addEventListener("click", () => addWorkspace());
 

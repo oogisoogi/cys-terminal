@@ -1989,6 +1989,29 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             ))
         }
 
+        // ─── T7 E2: 비용·효율 집계 (Control Center 비용·효율 탭) ───
+        "control.analytics" => {
+            let now = crate::state::now_epoch();
+            let window = param_str(&params, "window").unwrap_or_else(|| "today".to_string());
+            let since = crate::analytics::window_since(now, &window);
+            let summary = {
+                let guard = daemon.analytics.lock().unwrap();
+                match guard.as_ref() {
+                    Some(conn) => crate::analytics::analytics_summary(conn, since),
+                    None => crate::analytics::summarize(&[]),
+                }
+            };
+            Reply::Single(ok_response(
+                &id,
+                json!({
+                    "now": now,
+                    "window": window,
+                    "since": since,
+                    "summary": summary,
+                }),
+            ))
+        }
+
         // ─── T2-5 에이전트 메타 등록 (launch-agent가 호출 — 사망 감지·status 보드의 기반) ───
         "surface.set_meta" => {
             let Some(sid) = resolve_surface_id(&params) else {

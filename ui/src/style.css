@@ -225,6 +225,25 @@ html, body {
 .cc-spark-bars { flex: 1; display: flex; align-items: flex-end; gap: 2px; height: 48px; }
 .cc-spark-bar { flex: 1; background: linear-gradient(180deg, #00d4ff, #00A8FF); border-radius: 2px 2px 0 0; min-height: 2px; opacity: .85; }
 #cc-footer { text-align: center; font-size: 11px; color: #475569; padding: 4px 0 12px; font-variant-numeric: tabular-nums; }
+/* E2 비용·효율 탭 */
+#cc-tabs { position: sticky; top: 49px; z-index: 2; display: flex; gap: 4px; padding: 8px 20px 0;
+  background: rgba(10,10,10,.85); backdrop-filter: blur(16px); border-bottom: 1px solid rgba(255,255,255,.10); }
+.cc-tab { background: none; border: none; color: #64748b; font-size: 13px; font-weight: 600; cursor: pointer;
+  padding: 8px 14px; border-bottom: 2px solid transparent; }
+.cc-tab:hover { color: #cbd5e1; }
+.cc-tab.active { color: #00d4ff; border-bottom-color: #00d4ff; }
+.cc-eff-win { display: flex; gap: 6px; justify-content: flex-end; }
+.cc-win { background: rgba(255,255,255,.05); border: 1px solid rgba(255,255,255,.10); color: #94a3b8;
+  font-size: 12px; padding: 5px 12px; border-radius: 8px; cursor: pointer; }
+.cc-win:hover { color: #e2e8f0; }
+.cc-win.active { background: rgba(0,212,255,.16); border-color: rgba(0,212,255,.45); color: #00d4ff; }
+.cc-stack { display: flex; height: 16px; border-radius: 6px; overflow: hidden; background: rgba(255,255,255,.06); }
+.cc-stack-seg { height: 100%; transition: width .4s ease; }
+.cc-legend { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 10px; font-size: 12px; color: #94a3b8; }
+.cc-leg { display: flex; align-items: center; gap: 5px; }
+.cc-leg-dot { width: 9px; height: 9px; border-radius: 2px; flex: none; }
+.cc-leg-pct { color: #e2e8f0; font-variant-numeric: tabular-nums; }
+.cc-empty { font-size: 12px; color: #475569; text-align: center; padding: 8px 0; }
 .pane .pane-close { opacity: .5; cursor: pointer; }
 .pane .pane-close:hover { opacity: 1; color: var(--error); }
 .pane .pane-title { cursor: grab; }
