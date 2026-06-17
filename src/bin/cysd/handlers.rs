@@ -346,6 +346,41 @@ pub(crate) fn maybe_fire_context_threshold(
         .publish("context.threshold", "watchdog", Some(surface.id), payload);
 }
 
+/// T6 Control Center 노드 상태 도출 — 스크롤백 최근 라인의 키워드(문서 로직)로 working/idle 판정,
+/// 키워드 없으면 출력 활동(idle_secs)로 폴백. error/offline은 호출처에서 별도 판정한다.
+fn derive_node_state(scrollback: &std::collections::VecDeque<String>, idle_secs: u64) -> &'static str {
+    const LIVE: &[&str] = &[
+        "esc to interrupt", "working", "running", "processing", "generating", "thinking",
+        "reading file", "writing file", "editing", "creating", "분석 중", "작업 중", "모니터링",
+    ];
+    const IDLE: &[&str] = &[
+        "? for shortcuts", "bypass permissions", "waiting", "idle", "대기",
+        "분석 완료", "작업 완료", "각성 완료", "worked for",
+    ];
+    let recent = scrollback
+        .iter()
+        .rev()
+        .take(8)
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_lowercase();
+    if recent.trim().is_empty() {
+        return if idle_secs > 60 { "idle" } else { "working" };
+    }
+    if LIVE.iter().any(|k| recent.contains(k)) {
+        return "working";
+    }
+    if IDLE.iter().any(|k| recent.contains(k)) {
+        return "idle";
+    }
+    if idle_secs > 30 {
+        "idle"
+    } else {
+        "working"
+    }
+}
+
 pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> Reply {
     let id = req.id.clone();
     let params = req.params;
@@ -1818,6 +1853,85 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     "feed": {"pending": pending, "oldest_pending_age_secs": oldest_age},
                     "health_recent": health_recent,
                     "todo": todo,
+                }),
+            ))
+        }
+
+        // ─── T6 Control Center: 실시간 플릿/사용량/시스템 대시보드 (네이티브 단일 RPC) ───
+        // 외장 Streamlit 대시보드(외부 터미널 체계-win) 대신 cysd가 직접 한 콜로 제공한다 — 플릿 상태·rate·
+        // 시스템 CPU/MEM·소비통계·12h 스파크라인. cys-app UI가 5초 폴링해 Control Center 패널을 그린다.
+        "control.dashboard" => {
+            let now = crate::state::now_epoch();
+            // 시스템 CPU/MEM — cpu_usage는 두 refresh 사이 측정이라 짧은 간격 샘플(0 방지).
+            let (cpu_pct, mem_used, mem_total) = {
+                let mut sys = sysinfo::System::new();
+                sys.refresh_memory();
+                sys.refresh_cpu_usage();
+                std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
+                sys.refresh_cpu_usage();
+                (sys.global_cpu_usage(), sys.used_memory(), sys.total_memory())
+            };
+            // 최근 health 에러(노드 state=error 판정) — 30초 창
+            let err_surfaces: std::collections::HashSet<u64> = daemon
+                .recent_health
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| now - e["ts"].as_f64().unwrap_or(0.0) < 30.0)
+                .filter_map(|e| e["surface_id"].as_u64())
+                .collect();
+            let surfaces = daemon.surfaces.lock().unwrap();
+            let mut fleet: Vec<Value> = surfaces
+                .values()
+                .map(|s| {
+                    let exited = s.exited.load(Ordering::Relaxed);
+                    let idle_secs = s.last_output.lock().unwrap().elapsed().as_secs();
+                    let agent = s.agent_meta.lock().unwrap().as_ref().map(|(n, _)| n.clone());
+                    let state = if exited {
+                        "offline"
+                    } else if err_surfaces.contains(&s.id) {
+                        "error"
+                    } else {
+                        derive_node_state(&s.scrollback.lock().unwrap(), idle_secs)
+                    };
+                    json!({
+                        "surface_id": s.id,
+                        "role": s.role.lock().unwrap().clone(),
+                        "agent": agent,
+                        "state": state,
+                        "idle_secs": idle_secs,
+                        "usage": s.observed_usage.lock().unwrap().clone()
+                            .and_then(|u| serde_json::to_value(u).ok()),
+                    })
+                })
+                .collect();
+            drop(surfaces);
+            fleet.sort_by_key(|v| v["surface_id"].as_u64().unwrap_or(0));
+            let (today_tokens, today_input, today_msgs, session_count, last_1h, spark) = {
+                let c = daemon.consumption.lock().unwrap();
+                (
+                    c.today_tokens,
+                    c.today_input,
+                    c.today_msgs,
+                    c.sessions.len() as u64,
+                    c.recent_tokens(now, 3600.0),
+                    c.sparkline(now, 24, 43_200.0),
+                )
+            };
+            Reply::Single(ok_response(
+                &id,
+                json!({
+                    "now": now,
+                    "uptime_secs": (now - daemon.started_at).max(0.0) as u64,
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "fleet": fleet,
+                    "system": {"cpu_pct": cpu_pct, "mem_used": mem_used, "mem_total": mem_total},
+                    "consumption": {
+                        "today_tokens": today_tokens, "today_input": today_input,
+                        "today_msgs": today_msgs, "session_count": session_count,
+                        "last_1h_tokens": last_1h,
+                    },
+                    "sparkline": spark,
                 }),
             ))
         }
@@ -3414,6 +3528,19 @@ mod tests {
         assert_eq!(evs.len(), 1, "statusline 교차에서 정확히 1회 발화돼야 한다");
         assert_eq!(evs[0]["payload"]["source"].as_str(), Some("statusline"));
         assert_eq!(evs[0]["payload"]["context_pct"].as_u64(), Some(75));
+    }
+
+    /// T6 Control Center: 노드 상태 키워드 도출 — live/idle 키워드 우선, 없으면 활동시간 폴백.
+    #[test]
+    fn derive_node_state_keywords() {
+        use std::collections::VecDeque;
+        let sb = |lines: &[&str]| -> VecDeque<String> { lines.iter().map(|s| s.to_string()).collect() };
+        assert_eq!(derive_node_state(&sb(&["esc to interrupt"]), 0), "working");
+        assert_eq!(derive_node_state(&sb(&["? for shortcuts"]), 0), "idle");
+        assert_eq!(derive_node_state(&sb(&["작업 중입니다"]), 999), "working", "한글 live 키워드");
+        assert_eq!(derive_node_state(&sb(&["random output line"]), 999), "idle", "키워드 없음+오래 idle");
+        assert_eq!(derive_node_state(&sb(&[]), 0), "working", "빈 스크롤백+최근 활동");
+        assert_eq!(derive_node_state(&sb(&[]), 999), "idle", "빈 스크롤백+장시간 무출력");
     }
 
     fn threshold_events(daemon: &Arc<Daemon>, sid: u64) -> Vec<Value> {

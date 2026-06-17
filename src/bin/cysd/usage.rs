@@ -274,6 +274,24 @@ fn collect_for(
             _ => {}
         }
     }
+
+    // T6 Control Center 소비 누적 — claude 새 메시지의 (input, output)을 데몬 트래커에 적재.
+    // tail은 새 라인을 1회만 읽으므로 이중계수 없음(첫 attach 창만 경미한 초기 중복 가능).
+    if agent == "claude" {
+        let ios: Vec<(u64, u64)> = lines
+            .iter()
+            .filter_map(|l| parse_claude_message_io(l))
+            .collect();
+        if !ios.is_empty() {
+            let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+            let sess = path.to_string_lossy().into_owned();
+            let mut c = daemon.consumption.lock().unwrap();
+            for (i, o) in ios {
+                c.record_message(&sess, i, o, now, &today);
+            }
+        }
+    }
+
     let Some(new) = next else {
         return;
     };
@@ -552,6 +570,30 @@ pub fn parse_claude_line(line: &str) -> Option<(u64, String)> {
     }
     let model = v["message"]["model"].as_str().unwrap_or("").to_string();
     Some((ctx, model))
+}
+
+/// T6 Control Center 소비 누적용 — 어시스턴트 메시지 1건의 (input, output) 토큰.
+/// output은 메시지당 가산이라 누적 합이 "오늘 소비"로 모호성 없이 정의된다(ctx와 별개 층위).
+/// cache_read는 컨텍스트 재사용이라 소비로 치지 않는다(생성·입력만). 비대상 라인은 None.
+pub fn parse_claude_message_io(line: &str) -> Option<(u64, u64)> {
+    if !line.contains("\"assistant\"") || !line.contains("\"usage\"") {
+        return None;
+    }
+    let v: Value = serde_json::from_str(line).ok()?;
+    if v["type"].as_str() != Some("assistant") || v["isSidechain"].as_bool() == Some(true) {
+        return None;
+    }
+    let u = &v["message"]["usage"];
+    if !u.is_object() {
+        return None;
+    }
+    let g = |k: &str| u[k].as_u64().unwrap_or(0);
+    let input = g("input_tokens") + g("cache_creation_input_tokens");
+    let output = g("output_tokens");
+    if input == 0 && output == 0 {
+        return None;
+    }
+    Some((input, output))
 }
 
 /// claude 컨텍스트 윈도우 추정: 기본 200k, 1M 모델([1m])은 1M. CYS_CLAUDE_CTX_WINDOW로
@@ -1098,5 +1140,39 @@ mod tests {
             {"displayName":"Claude and GPT models","buckets":[
                 {"bucketId":"3p-5h","window":"5h","remainingFraction":1.0}]}]}});
         assert!(parse_agy_quota(&only3p).is_empty());
+    }
+
+    /// T6: 메시지별 (input, output) — cache_read는 소비 아님(제외), sidechain·0/0은 None.
+    #[test]
+    fn claude_message_io_input_output() {
+        let line = r#"{"type":"assistant","isSidechain":false,"message":{"model":"x","usage":{"input_tokens":1000,"cache_creation_input_tokens":2000,"cache_read_input_tokens":50000,"output_tokens":300}}}"#;
+        assert_eq!(parse_claude_message_io(line), Some((3000, 300)), "input+cache_creation=3000(cache_read 제외), output=300");
+        let sc = line.replace("\"isSidechain\":false", "\"isSidechain\":true");
+        assert_eq!(parse_claude_message_io(&sc), None, "sidechain 제외");
+        assert_eq!(
+            parse_claude_message_io(r#"{"type":"assistant","message":{"usage":{"input_tokens":0,"output_tokens":0}}}"#),
+            None,
+            "0/0은 None"
+        );
+    }
+
+    /// T6: 소비 트래커 — 오늘 누적·세션 집계·최근창·스파크라인·날짜변경 리셋.
+    #[test]
+    fn consumption_today_recent_sparkline_reset() {
+        use crate::state::Consumption;
+        let mut c = Consumption::default();
+        let now = 1_000_000.0;
+        c.record_message("/s/a.jsonl", 100, 50, now - 7200.0, "2026-06-17");
+        c.record_message("/s/a.jsonl", 200, 100, now - 1800.0, "2026-06-17");
+        c.record_message("/s/b.jsonl", 10, 5, now, "2026-06-17");
+        assert_eq!(c.today_msgs, 3);
+        assert_eq!(c.today_tokens, 100 + 50 + 200 + 100 + 10 + 5);
+        assert_eq!(c.today_input, 100 + 200 + 10);
+        assert_eq!(c.sessions.len(), 2, "세션 a,b 2개");
+        assert_eq!(c.recent_tokens(now, 3600.0), 300 + 15, "최근 1h = 30m전(300)+now(15)");
+        assert_eq!(c.sparkline(now, 12, 43200.0).iter().sum::<u64>(), 150 + 300 + 15, "12h 전부 포함");
+        c.record_message("/s/c.jsonl", 1, 1, now + 100.0, "2026-06-18");
+        assert_eq!(c.today_msgs, 1, "날짜 변경 시 오늘 카운터 리셋");
+        assert_eq!(c.sessions.len(), 1, "세션도 리셋");
     }
 }

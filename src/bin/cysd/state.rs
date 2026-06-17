@@ -305,6 +305,74 @@ pub struct Daemon {
     pub started_at: f64,
     /// 세션 트랜스크립트 FTS 영속 채널 (전용 writer 스레드)
     pub recall_tx: Mutex<std::sync::mpsc::Sender<crate::recall::LineRecord>>,
+    /// T6 Control Center 소비 트래커 (claude 메시지 누적 — 오늘·최근창·12h 스파크라인).
+    pub consumption: Mutex<Consumption>,
+}
+
+/// T6 Control Center 소비 트래커 — in-memory(재시작 리셋, 가동시간 의미론과 동일).
+/// output_tokens는 메시지당 가산이라 누적 모호성이 없다. 수집기가 새 어시스턴트 메시지마다 적재.
+#[derive(Default)]
+pub struct Consumption {
+    pub today_date: String,
+    pub today_tokens: u64,
+    pub today_input: u64,
+    pub today_msgs: u64,
+    pub sessions: std::collections::HashSet<String>,
+    pub buckets: std::collections::VecDeque<(f64, u64)>,
+}
+
+impl Consumption {
+    /// 새 어시스턴트 메시지 1건 적재 — 날짜가 바뀌면 오늘 카운터를 리셋한다.
+    pub fn record_message(&mut self, session: &str, input: u64, output: u64, now: f64, today: &str) {
+        if self.today_date != today {
+            self.today_date = today.to_string();
+            self.today_tokens = 0;
+            self.today_input = 0;
+            self.today_msgs = 0;
+            self.sessions.clear();
+        }
+        let total = input + output;
+        self.today_tokens += total;
+        self.today_input += input;
+        self.today_msgs += 1;
+        if !session.is_empty() {
+            self.sessions.insert(session.to_string());
+        }
+        self.buckets.push_back((now, total));
+        while let Some(&(t, _)) = self.buckets.front() {
+            if now - t > 43_200.0 {
+                self.buckets.pop_front();
+            } else {
+                break;
+            }
+        }
+        while self.buckets.len() > 20_000 {
+            self.buckets.pop_front();
+        }
+    }
+
+    /// 최근 `secs`초 토큰 합.
+    pub fn recent_tokens(&self, now: f64, secs: f64) -> u64 {
+        self.buckets.iter().filter(|(t, _)| now - t <= secs).map(|(_, v)| v).sum()
+    }
+
+    /// 최근 `span`초를 `bins`개 구간으로 집계한 스파크라인(과거→현재).
+    pub fn sparkline(&self, now: f64, bins: usize, span: f64) -> Vec<u64> {
+        let mut out = vec![0u64; bins];
+        if bins == 0 {
+            return out;
+        }
+        let w = span / bins as f64;
+        for (t, v) in &self.buckets {
+            let age = now - t;
+            if !(0.0..=span).contains(&age) {
+                continue;
+            }
+            let idx = (((span - age) / w) as usize).min(bins - 1);
+            out[idx] += v;
+        }
+        out
+    }
 }
 
 pub fn now_epoch() -> f64 {
@@ -435,6 +503,7 @@ impl Daemon {
             recall_tx: Mutex::new(crate::recall::spawn_writer(socket_path.clone())),
             socket_path,
             started_at: now_epoch(),
+            consumption: Mutex::new(Consumption::default()),
         })
     }
 

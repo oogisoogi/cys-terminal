@@ -170,6 +170,168 @@ function renderUsageDashboard(surfaces: { exited: boolean; usage?: ObservedUsage
   }
 }
 
+// ---------- T6 Control Center (전용 풀 패널 — 네이티브 실시간 모니터링) ----------
+let ccOpen = false;
+let ccTimer: number | null = null;
+let ccClockTimer: number | null = null;
+let ccUptimeBase = 0;
+let ccUptimeFetchedAt = 0;
+
+const CC_ROLE_COLOR: Record<string, string> = {
+  master: "#3b82f6", cso: "#8b5cf6", worker: "#00e676",
+  "reviewer-gemini": "#ffa726", "reviewer-codex": "#00d4ff",
+};
+const CC_STATE: Record<string, { cls: string; label: string }> = {
+  working: { cls: "working", label: "작업중" }, idle: { cls: "idle", label: "대기" },
+  error: { cls: "error", label: "오류" }, offline: { cls: "offline", label: "오프라인" },
+};
+const ccEsc = (s: string) =>
+  s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]!);
+const ccFmtTokens = (n: number) => (n >= 10000 ? `${(n / 10000).toFixed(1)}만` : n.toLocaleString());
+
+function ccUptimeStr(s: number): string {
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+  return [h, m, sec].map((x) => String(x).padStart(2, "0")).join(":");
+}
+function ccReset(label: string, epoch: number | null): string {
+  if (!epoch) return "";
+  const d = new Date(epoch * 1000);
+  const p = (x: number) => String(x).padStart(2, "0");
+  return label === "7d"
+    ? `리셋 ${p(d.getMonth() + 1)}/${p(d.getDate())}`
+    : `리셋 ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+function ccAggRate(fleet: any[]): Record<string, { used: number; reset: number | null }> {
+  const agg: Record<string, { used: number; reset: number | null }> = {};
+  for (const f of fleet) {
+    for (const w of f.usage?.rate ?? []) {
+      const cur = agg[w.label] ?? { used: 0, reset: null };
+      if (w.used_pct > cur.used) cur.used = w.used_pct;
+      if (w.resets_at != null && (cur.reset == null || w.resets_at < cur.reset)) cur.reset = w.resets_at;
+      agg[w.label] = cur;
+    }
+  }
+  return agg;
+}
+
+function setCcOpen(open: boolean) {
+  ccOpen = open;
+  document.getElementById("cc-panel")!.hidden = !open;
+  if (open) {
+    refreshControlCenter();
+    tickCc();
+    if (ccTimer == null) ccTimer = setInterval(refreshControlCenter, 5000) as unknown as number;
+    if (ccClockTimer == null) ccClockTimer = setInterval(tickCc, 1000) as unknown as number;
+  } else {
+    if (ccTimer != null) { clearInterval(ccTimer); ccTimer = null; }
+    if (ccClockTimer != null) { clearInterval(ccClockTimer); ccClockTimer = null; }
+  }
+}
+
+function tickCc() {
+  const p = (x: number) => String(x).padStart(2, "0");
+  const clk = document.getElementById("cc-clock");
+  if (clk) {
+    const n = new Date();
+    clk.textContent = `${n.getFullYear()}.${p(n.getMonth() + 1)}.${p(n.getDate())} ${p(n.getHours())}:${p(n.getMinutes())}:${p(n.getSeconds())}`;
+  }
+  const up = document.getElementById("cc-uptime-val");
+  if (up && ccUptimeFetchedAt) {
+    up.textContent = ccUptimeStr(ccUptimeBase + Math.floor(Date.now() / 1000 - ccUptimeFetchedAt));
+  }
+}
+
+async function refreshControlCenter() {
+  if (!ccOpen) return;
+  let d: any;
+  try {
+    d = await invoke("control_dashboard");
+  } catch {
+    return;
+  }
+  renderControlCenter(d);
+}
+
+function renderControlCenter(d: any) {
+  const fleet: any[] = d.fleet ?? [];
+  const active = fleet.filter((f) => f.state === "working");
+  const online = fleet.filter((f) => f.state !== "offline");
+  const ratio = online.length ? Math.round((active.length / online.length) * 100) : 0;
+  const live = active.length > 0;
+
+  const badge = document.getElementById("cc-livebadge")!;
+  badge.textContent = live ? "LIVE" : "IDLE";
+  badge.className = "cc-badge " + (live ? "live" : "idle");
+
+  const radar = document.getElementById("cc-radar")!;
+  radar.classList.toggle("active", live);
+  document.getElementById("cc-radar-val")!.textContent = `${ratio}%`;
+  document.getElementById("cc-radar-sub")!.textContent = `${active.length}/${online.length} 활성`;
+  (radar as HTMLElement).style.setProperty("--ratio", String(ratio));
+
+  ccUptimeBase = d.uptime_secs ?? 0;
+  ccUptimeFetchedAt = Date.now() / 1000;
+
+  const agg = ccAggRate(fleet);
+  document.getElementById("cc-kpi")!.innerHTML = ["5h", "7d"]
+    .map((lab) => {
+      const w = agg[lab];
+      const used = w ? Math.round(w.used) : 0;
+      const name = lab === "5h" ? "세션 (5h)" : "주간 (7d)";
+      return `<div class="cc-card ${sevClass(used, 60, 80)}"><div class="cc-card-val">${used}%</div><div class="cc-card-reset">${w ? ccReset(lab, w.reset) : ""}</div><div class="cc-card-name">${name}</div></div>`;
+    })
+    .join("");
+
+  document.getElementById("cc-fleet")!.innerHTML = fleet
+    .map((f) => {
+      const role = f.role ?? "?";
+      const color = CC_ROLE_COLOR[role] ?? "#64748b";
+      const st = CC_STATE[f.state] ?? CC_STATE.idle;
+      const ctx = f.usage?.ctx_pct != null ? `CTX ${f.usage.ctx_pct}%` : "";
+      return `<div class="cc-fleet-row" style="--rc:${color}"><span class="cc-fleet-name">${ccEsc(role)}</span><span class="cc-fleet-agent">${ccEsc(f.agent ?? "")}</span><span class="cc-fleet-ctx">${ctx}</span><span class="cc-dot ${st.cls}"></span><span class="cc-fleet-state">${st.label}</span></div>`;
+    })
+    .join("");
+
+  document.getElementById("cc-token-bars")!.innerHTML = ["5h", "7d"]
+    .map((lab) => {
+      const w = agg[lab];
+      const used = w ? Math.round(w.used) : 0;
+      const name = lab === "5h" ? "세션" : "주간";
+      return `<div class="cc-tbar"><span class="cc-tbar-lab">${name}</span><span class="cc-tbar-track"><span class="cc-tbar-fill ${sevClass(used, 60, 80)}" style="width:${Math.min(100, used)}%"></span></span><span class="cc-tbar-pct">${used}%</span><span class="cc-tbar-reset">${w ? ccReset(lab, w.reset) : ""}</span></div>`;
+    })
+    .join("");
+
+  const c = d.consumption ?? {};
+  document.getElementById("cc-token-stats")!.innerHTML = (
+    [
+      ["최근 1시간", ccFmtTokens(c.last_1h_tokens ?? 0), ""],
+      ["오늘 소비", ccFmtTokens(c.today_tokens ?? 0), `입력 ${ccFmtTokens(c.today_input ?? 0)}`],
+      ["세션 수", String(c.session_count ?? 0), `메시지 ${c.today_msgs ?? 0}`],
+    ] as [string, string, string][]
+  )
+    .map(([t, v, sub]) => `<div class="cc-stat"><div class="cc-stat-t">${t}</div><div class="cc-stat-v">${v}</div><div class="cc-stat-sub">${sub}</div></div>`)
+    .join("");
+
+  const spark: number[] = d.sparkline ?? [];
+  const max = Math.max(1, ...spark);
+  document.getElementById("cc-spark")!.innerHTML =
+    `<div class="cc-spark-label">12h</div><div class="cc-spark-bars">` +
+    spark.map((v) => `<span class="cc-spark-bar" style="height:${Math.max(2, Math.round((v / max) * 100))}%" title="${ccFmtTokens(v)}"></span>`).join("") +
+    `</div>`;
+
+  const sys = d.system ?? {};
+  const cpu = Math.round(sys.cpu_pct ?? 0);
+  const memU = sys.mem_used ?? 0;
+  const memT = sys.mem_total ?? 1;
+  const memPct = Math.round((memU / memT) * 100);
+  const gb = (b: number) => (b / 1024 / 1024 / 1024).toFixed(1);
+  document.getElementById("cc-sys")!.innerHTML =
+    `<div class="cc-tbar"><span class="cc-tbar-lab">CPU</span><span class="cc-tbar-track"><span class="cc-tbar-fill ${sevClass(cpu, 60, 85)}" style="width:${Math.min(100, cpu)}%"></span></span><span class="cc-tbar-pct">${cpu}%</span></div>` +
+    `<div class="cc-tbar"><span class="cc-tbar-lab">MEM</span><span class="cc-tbar-track"><span class="cc-tbar-fill ${sevClass(memPct, 70, 90)}" style="width:${Math.min(100, memPct)}%"></span></span><span class="cc-tbar-pct">${gb(memU)}/${gb(memT)}G</span></div>`;
+
+  document.getElementById("cc-footer")!.textContent = `cys Control Center · v${d.version ?? ""} · 5초 새로고침`;
+}
+
 let fontSize = Number(localStorage.getItem("cys-font-size") || 13);
 function applyZoom(delta: number | null) {
   fontSize = delta === null ? 13 : Math.min(32, Math.max(8, fontSize + delta));
@@ -1348,6 +1510,8 @@ document.getElementById("btn-feed")!.addEventListener("click", () => setFeedOpen
 document.getElementById("btn-feed-close")!.addEventListener("click", () => setFeedOpen(false));
 document.getElementById("btn-files")!.addEventListener("click", () => setFtOpen(!ftOpen));
 document.getElementById("btn-ft-close")!.addEventListener("click", () => setFtOpen(false));
+document.getElementById("btn-cc")!.addEventListener("click", () => setCcOpen(!ccOpen));
+document.getElementById("btn-cc-close")!.addEventListener("click", () => setCcOpen(false));
 document.getElementById("btn-update")!.addEventListener("click", () => promptInstall());
 document.getElementById("btn-ws-new")!.addEventListener("click", () => addWorkspace());
 

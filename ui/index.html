@@ -18,6 +18,7 @@
     <button id="btn-close" title="pane 닫기 — 자식 트리 강제 종료 (⌘W)">Close</button>
     <button id="btn-feed" title="승인 Feed">Feed <span id="feed-badge" class="badge" hidden>0</span></button>
     <button id="btn-files" title="파일 트리 (선택한 surface의 폴더)">Files</button>
+    <button id="btn-cc" title="Control Center — 실시간 플릿·사용량·시스템 모니터링">Control Center</button>
     <button id="btn-update" title="업데이트 확인">Update <span id="update-badge" class="badge" hidden>!</span></button>
   </header>
   <div id="body-row">
@@ -37,6 +38,37 @@
     <aside id="feed-panel" hidden>
       <div id="feed-panel-head">승인 Feed <button id="btn-feed-close">×</button></div>
       <div id="feed-items"></div>
+    </aside>
+    <aside id="cc-panel" hidden>
+      <div id="cc-header">
+        <span class="cc-pulse"></span>
+        <span class="cc-title">JARVIS Control Center</span>
+        <span id="cc-livebadge" class="cc-badge idle">IDLE</span>
+        <span id="cc-clock"></span>
+        <button id="btn-cc-close" title="닫기">×</button>
+      </div>
+      <div id="cc-body">
+        <div class="cc-gauges">
+          <div class="cc-radar" id="cc-radar">
+            <span class="cc-radar-sweep"></span>
+            <span class="cc-radar-val" id="cc-radar-val">0%</span>
+            <span class="cc-radar-sub" id="cc-radar-sub">0/0 활성</span>
+          </div>
+          <div class="cc-uptime">
+            <span class="cc-uptime-val" id="cc-uptime-val">00:00:00</span>
+            <span class="cc-sub">가동시간</span>
+          </div>
+        </div>
+        <div class="cc-kpi" id="cc-kpi"></div>
+        <div class="cc-section"><div class="cc-h">플릿 현황</div><div id="cc-fleet"></div></div>
+        <div class="cc-section"><div class="cc-h">토큰 사용량</div>
+          <div id="cc-token-bars"></div>
+          <div class="cc-token-stats" id="cc-token-stats"></div>
+          <div class="cc-spark" id="cc-spark"></div>
+        </div>
+        <div class="cc-section"><div class="cc-h">시스템</div><div id="cc-sys"></div></div>
+        <div id="cc-footer"></div>
+      </div>
     </aside>
   </div>
   <div id="toasts"></div>
