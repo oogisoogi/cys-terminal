@@ -2070,16 +2070,22 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             let now = crate::state::now_epoch();
             let window = param_str(&params, "window").unwrap_or_else(|| "7d".to_string());
             let since = crate::analytics::window_since(now, &window);
-            let result = {
+            // E9 RBAC: redact 파라미터 OR 환경변수 CYS_CONTROL_REDACT=1 → session_id(경로 PII) 가림(집계는 보존).
+            let redact = params.get("redact").and_then(|v| v.as_bool()).unwrap_or(false)
+                || std::env::var("CYS_CONTROL_REDACT").map(|v| v == "1").unwrap_or(false);
+            let mut result = {
                 let guard = daemon.analytics.lock().unwrap();
                 match guard.as_ref() {
                     Some(conn) => crate::analytics::session_list(conn, since),
                     None => json!({ "sessions": [] }),
                 }
             };
+            if redact {
+                result = crate::analytics::redact_sessions(result);
+            }
             Reply::Single(ok_response(
                 &id,
-                json!({ "now": now, "window": window, "since": since, "sessions": result["sessions"] }),
+                json!({ "now": now, "window": window, "since": since, "redacted": redact, "sessions": result["sessions"] }),
             ))
         }
 

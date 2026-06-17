@@ -170,7 +170,17 @@ stale 마커(정의 변경 시 재계산). 보존 정책(기본 60일·`retentio
 >   브랜치에 먼저 박제(retention=비가역 삭제 차단)** 후 reset · 더티(추적변경)·비조상은 `--force` 없이 거부 · 자동
 >   `git reset --hard` 없음. autopilot kill-switch/self-clear 하만 **불간섭**(독립 도구).
 > - 검증: E2E 17/17(`docs/rsi_e2e.py` — 순수로직·checkpoint·progress·markers·dry-run 무실행·execute 백업보존·더티거부).
-> - **E8=기존 인프라 충족(감사 완료·신규 불요)·E9=박사님 큰결정(선택)** — Control Center(E1-E6)+E7 완결.
+>
+> **E9 RBAC(PII 차단) 완료 — 로컬 의미 부분만(로컬 커밋)**:
+> - `analytics.rs` `redact_session_id`(sha256→`sess-<8hex>`·안정적·경로 미노출)·`redact_sessions`(집계 보존).
+>   `control.sessions {redact}` 파라미터 OR 환경변수 `CYS_CONTROL_REDACT=1` → session_id 경로 PII 가림.
+>   UI 세션 탭 **🔒 PII 가림 토글**(켜면 집계만=드릴다운 비활성·"VIEWER=집계만" 충실 해석). Tauri 동형.
+> - 검증: cargo 217/217(신규 `redact_session_id_stable_and_pii_free`) · E2E 7/7(`docs/redact_e2e.py`).
+> - **★정직 분리(자율 구축 안 함)**: ▶보존(retention 자동삭제)=프로젝트 eval-driven "삭제 reward-hack 차단·
+>   retention hard gate" 원칙과 상충→미구현. ▶멀티머신 중앙 cysd·--api-url=네트워크/외부발행 경계+로컬우선
+>   철학 정면위배+존재하지 않는 멀티유저 시나리오용 투기 인프라→박사님 명시 결정 전까지 미구축.
+>
+> **▣ T7 Control Center 9페이즈 전부 처리: E1-E6 완결·배포 · E7 RSI 도구 · E8 감사충족 · E9 RBAC(로컬부분).**
 
 ### E1 — 영속 분석 기반 (척추) 【선행·필수】
 - **백엔드**: `analytics.db` 스키마 생성(state.rs init) · `ingest.rs`(hook 이벤트→events/messages 적재) ·

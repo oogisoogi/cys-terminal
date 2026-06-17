@@ -114,6 +114,7 @@ let ccEffWindow = "today";
 let ccSkillsWindow = "today";
 let ccSessionsWindow = "7d";
 let ccSessionsStarOnly = false;
+let ccSessionsRedact = false;
 let ccSessionSelected: string | null = null;
 
 const CC_ROLE_COLOR: Record<string, string> = {
@@ -236,7 +237,7 @@ async function refreshSkills() {
 
 async function refreshSessions() {
   try {
-    renderSessions((await invoke("control_sessions", { window: ccSessionsWindow })) as any);
+    renderSessions((await invoke("control_sessions", { window: ccSessionsWindow, redact: ccSessionsRedact })) as any);
   } catch {
     /* graceful */
   }
@@ -457,13 +458,17 @@ function renderSessions(a: any) {
         );
       })
       .join("");
-    // 행 클릭 → 상세, 별 클릭 → 토글
-    listEl.querySelectorAll(".cc-sess-row").forEach((row) =>
-      row.addEventListener("click", (e) => {
-        if ((e.target as HTMLElement).classList.contains("cc-star")) return;
-        openSessionDetail((row as HTMLElement).dataset.sid!);
-      }),
-    );
+    // 행 클릭 → 상세(★PII 가림 모드=집계만이라 드릴다운 비활성), 별 클릭 → 토글
+    if (!ccSessionsRedact) {
+      listEl.querySelectorAll(".cc-sess-row").forEach((row) =>
+        row.addEventListener("click", (e) => {
+          if ((e.target as HTMLElement).classList.contains("cc-star")) return;
+          openSessionDetail((row as HTMLElement).dataset.sid!);
+        }),
+      );
+    } else {
+      document.getElementById("cc-session-detail")!.hidden = true;
+    }
     listEl.querySelectorAll(".cc-star").forEach((btn) =>
       btn.addEventListener("click", async (e) => {
         e.stopPropagation();
@@ -1874,6 +1879,12 @@ document.querySelectorAll("#cc-sessions-win .cc-win[data-window]").forEach((b) =
 document.getElementById("cc-sessions-star-filter")!.addEventListener("click", (e) => {
   ccSessionsStarOnly = !ccSessionsStarOnly;
   (e.currentTarget as HTMLElement).classList.toggle("active", ccSessionsStarOnly);
+  refreshSessions();
+});
+document.getElementById("cc-sessions-redact")!.addEventListener("click", (e) => {
+  ccSessionsRedact = !ccSessionsRedact;
+  (e.currentTarget as HTMLElement).classList.toggle("active", ccSessionsRedact);
+  ccSessionSelected = null;
   refreshSessions();
 });
 document.getElementById("btn-update")!.addEventListener("click", () => promptInstall());

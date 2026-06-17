@@ -930,6 +930,31 @@ pub fn weekly_summary(conn: &Connection, now: f64) -> serde_json::Value {
     summarize_weekly(now, &load_weekly_usage(conn, since), &load_weekly_events(conn, since))
 }
 
+// ───────────────────────── E9 RBAC: PII 차단(집계만 뷰어) ─────────────────────────
+
+/// session_id(파일 경로=PII: 사용자 홈·프로젝트명 노출)를 안정적 해시로 가린다(순수).
+/// 같은 입력→같은 출력(세션 구분 유지)·경로 미노출. 대시보드 공유·스크린샷 시 PII 차단.
+pub fn redact_session_id(session_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(session_id.as_bytes());
+    let hex = format!("{:x}", h.finalize());
+    format!("sess-{}", &hex[..8])
+}
+
+/// control.sessions 결과의 session_id를 모두 가린다(집계 지표는 PII 아님 — 보존).
+pub fn redact_sessions(mut v: serde_json::Value) -> serde_json::Value {
+    if let Some(arr) = v.get_mut("sessions").and_then(|s| s.as_array_mut()) {
+        for s in arr.iter_mut() {
+            if let Some(sid) = s.get("session_id").and_then(|x| x.as_str()) {
+                let r = redact_session_id(sid);
+                s["session_id"] = serde_json::Value::String(r);
+            }
+        }
+    }
+    v
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1153,5 +1178,20 @@ mod tests {
         // 지난주 0 분모 가드: 빈 입력 delta null
         let empty = summarize_weekly(now, &[], &[]);
         assert!(empty["wow"]["tokens"]["delta_pct"].is_null());
+    }
+
+    #[test]
+    fn redact_session_id_stable_and_pii_free() {
+        let p = "/Users/cys/.claude/projects/secret-proj/abc-123.jsonl";
+        let r = redact_session_id(p);
+        assert!(r.starts_with("sess-") && r.len() == 13, "{r}");
+        assert!(!r.contains("cys") && !r.contains("secret") && !r.contains("/"), "PII 노출: {r}");
+        assert_eq!(r, redact_session_id(p), "같은 입력 안정적");
+        assert_ne!(r, redact_session_id("/other/path.jsonl"), "다른 입력 구분");
+        // redact_sessions: 배열의 session_id만 가리고 집계는 보존
+        let v = serde_json::json!({"sessions": [{"session_id": p, "tokens": 5000, "cost_usd": 0.1}]});
+        let red = redact_sessions(v);
+        assert_eq!(red["sessions"][0]["session_id"], serde_json::Value::String(r));
+        assert_eq!(red["sessions"][0]["tokens"], 5000, "집계 보존");
     }
 }

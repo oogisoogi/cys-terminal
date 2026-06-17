@@ -147,8 +147,8 @@ async fn control_weekly() -> Result<Value, String> {
 }
 
 #[tauri::command]
-async fn control_sessions(window: Option<String>) -> Result<Value, String> {
-    rpc("control.sessions", json!({ "window": window })).await
+async fn control_sessions(window: Option<String>, redact: Option<bool>) -> Result<Value, String> {
+    rpc("control.sessions", json!({ "window": window, "redact": redact })).await
 }
 
 #[tauri::command]
