@@ -1736,6 +1736,56 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             Reply::Single(ok_response(&id, json!({"surface_id": sid})))
         }
 
+        // ─── T7 E1-4: 툴·스킬·에이전트 호출 이벤트 캡처 (PreToolUse/PostToolUse hook → events) ───
+        // cys-hook.sh 래퍼가 hook stdin을 cys usage-event-stdin으로 흘려 이 RPC로 push. E3
+        // 스킬·에이전트 TOP·반복실패율(exit_code)의 데이터 소스. 소유 게이트는 usage.register 동형.
+        "usage.event" => {
+            let Some(sid) = resolve_surface_id(&params) else {
+                return Reply::Single(err_response(&id, "invalid_params", "missing surface_id"));
+            };
+            let Some(surface) = daemon.get_surface(sid) else {
+                return Reply::Single(err_response(
+                    &id,
+                    "not_found",
+                    &format!("surface {sid} not found"),
+                ));
+            };
+            let caller_sid = caller_pid.and_then(|p| resolve_caller_surface(daemon, p));
+            if let Some(cs) = caller_sid {
+                if cs != sid {
+                    return Reply::Single(err_response(
+                        &id,
+                        "usage_denied",
+                        &format!("usage.event denied: caller (surface {cs}) may only report its own surface, not {sid}"),
+                    ));
+                }
+            }
+            let event_type = param_str(&params, "event_type").unwrap_or_else(|| "PRE_TOOL".into());
+            let tool_name = param_str(&params, "tool_name").unwrap_or_default();
+            let tool_input = params.get("tool_input").cloned().unwrap_or_else(|| json!({}));
+            let exit_code = params.get("exit_code").and_then(|v| v.as_i64());
+            let agent_id = param_str(&params, "agent_id");
+            let session = param_str(&params, "session_id").unwrap_or_else(|| cys::surface_ref(sid));
+            let (is_skill, skill_name, is_agent, agent_type) =
+                crate::analytics::derive_tool(&tool_name, &tool_input);
+            let agent = surface
+                .agent_meta
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|(a, _)| a.clone())
+                .unwrap_or_default();
+            let role = surface.role.lock().unwrap().clone().unwrap_or_default();
+            if let Some(conn) = daemon.analytics.lock().unwrap().as_ref() {
+                crate::analytics::record_event(
+                    conn, &session, &role, &agent, &event_type, &tool_name, is_skill,
+                    skill_name.as_deref(), is_agent, agent_type.as_deref(), agent_id.as_deref(),
+                    exit_code, crate::state::now_epoch(),
+                );
+            }
+            Reply::Single(ok_response(&id, json!({"surface_id": sid})))
+        }
+
         // ─── T1-2 통합 관제 보드: read-screen 폴링 없이 1콜로 전 노드 상황 파악 ───
         "org.status" => {
             let now = crate::state::now_epoch();

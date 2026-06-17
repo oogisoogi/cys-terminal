@@ -104,6 +104,11 @@ enum Command {
         #[arg(long)]
         quiet: bool,
     },
+    /// T7 E1-4: PreToolUse/PostToolUse hook stdin을 읽어 usage.event로 push (cys-hook.sh 전용 plumbing)
+    UsageEventStdin {
+        #[arg(long)]
+        surface: Option<String>,
+    },
     /// T1-2 통합 관제 보드: 전 노드 상태를 1콜로 (read-screen 폴링 대체)
     Status {
         #[arg(long)]
@@ -900,6 +905,8 @@ fn run(command: Command) -> i32 {
         Command::UsageReportStdin { surface, quiet } => {
             return run_usage_report_stdin(&surface, quiet)
         }
+
+        Command::UsageEventStdin { surface } => return run_usage_event_stdin(&surface),
 
         Command::Status { json: as_json } => return run_status(as_json),
 
@@ -2548,6 +2555,61 @@ fn run_usage_report_stdin(surface: &Option<String>, quiet: bool) -> i32 {
     0
 }
 
+/// hook stdin JSON → usage.event 파라미터(surface 제외) — 순수 함수(테스트 핀).
+/// PreToolUse/PostToolUse/Stop/SubagentStop만 매핑, 그 외 hook은 None(무시).
+/// PostToolUse는 tool_response.is_error로 exit_code(실패 신호)를 best-effort 추출(E3 반복실패).
+fn hook_to_event_params(v: &Value) -> Option<Value> {
+    let event_type = match v.get("hook_event_name").and_then(|x| x.as_str())? {
+        "PreToolUse" => "PRE_TOOL",
+        "PostToolUse" => "POST_TOOL",
+        "Stop" => "STOP",
+        "SubagentStop" => "SUBAGENT_STOP",
+        _ => return None,
+    };
+    let mut p = json!({ "event_type": event_type });
+    if let Some(t) = v.get("tool_name").and_then(|x| x.as_str()) {
+        p["tool_name"] = json!(t);
+    }
+    if let Some(ti) = v.get("tool_input") {
+        p["tool_input"] = ti.clone();
+    }
+    if let Some(s) = v.get("session_id").and_then(|x| x.as_str()) {
+        p["session_id"] = json!(s);
+    }
+    if let Some(a) = v.get("agent_id").and_then(|x| x.as_str()) {
+        p["agent_id"] = json!(a);
+    }
+    if event_type == "POST_TOOL" {
+        let err = v
+            .get("tool_response")
+            .and_then(|r| r.get("is_error"))
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false);
+        p["exit_code"] = json!(if err { 1 } else { 0 });
+    }
+    Some(p)
+}
+
+/// cys-hook.sh 전용 — hook stdin을 읽어 usage.event로 push. ★불변: 절대 에이전트를 막지 않는다
+/// (빈 입력·파싱 실패·관심 없는 hook·surface 미해결·데몬 부재 전부 exit 0).
+fn run_usage_event_stdin(surface: &Option<String>) -> i32 {
+    let mut buf = String::new();
+    if std::io::stdin().read_to_string(&mut buf).is_err() || buf.trim().is_empty() {
+        return 0;
+    }
+    let Ok(v) = serde_json::from_str::<Value>(&buf) else {
+        return 0;
+    };
+    let Some(mut params) = hook_to_event_params(&v) else {
+        return 0;
+    };
+    if let Ok(sid) = target_surface(surface, &None) {
+        params["surface_id"] = json!(sid);
+        let _ = request("usage.event", params);
+    }
+    0
+}
+
 fn run_status(as_json: bool) -> i32 {
     let r = match request("org.status", json!({})) {
         Ok(r) => r,
@@ -3457,6 +3519,22 @@ mod tests {
         assert_eq!(statusline_human_line(&v), "Opus 4.8 · CTX 42% · 5h 41% · 7d 12%");
         let v2 = json!({"context_window": {"used_percentage": 8.0}});
         assert_eq!(statusline_human_line(&v2), "claude · CTX 8%");
+    }
+
+    /// T7 E1-4: hook stdin → usage.event 파라미터 매핑 핀.
+    #[test]
+    fn hook_event_params_mapping() {
+        let pre = json!({"hook_event_name":"PreToolUse","session_id":"s1","tool_name":"Skill","tool_input":{"skill":"commit"}});
+        let p = hook_to_event_params(&pre).unwrap();
+        assert_eq!(p["event_type"], json!("PRE_TOOL"));
+        assert_eq!(p["tool_name"], json!("Skill"));
+        assert_eq!(p["tool_input"]["skill"], json!("commit"));
+        assert_eq!(p["session_id"], json!("s1"));
+        let post = json!({"hook_event_name":"PostToolUse","tool_name":"Bash","tool_response":{"is_error":true}});
+        let pp = hook_to_event_params(&post).unwrap();
+        assert_eq!(pp["event_type"], json!("POST_TOOL"));
+        assert_eq!(pp["exit_code"], json!(1), "is_error→exit 1");
+        assert!(hook_to_event_params(&json!({"hook_event_name":"Notification"})).is_none(), "관심 없는 hook 무시");
     }
 
     #[test]

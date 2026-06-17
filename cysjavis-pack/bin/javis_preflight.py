@@ -715,6 +715,49 @@ class Preflight:
             self.add(cid, WARN, "statusLine 미등록 프로필: %s — --fix로 설치(claude 재시작 후 적용)"
                      % ", ".join(unregistered))
 
+    # ── C33 툴 이벤트 hook (T7 E1-④ — events 테이블 적재) ──
+    # PreToolUse/PostToolUse에 hooks/cys-hook.sh 등록 → 툴·스킬·에이전트 호출·exit_code를
+    # cysd events 테이블에 적재(E3 스킬 TOP·반복실패 토대). hook은 fail-open(에이전트 무차단)이라
+    # 무관 작업 불간섭. C32와 동일 규약(체인보존·symlink/파손 거부·원자적). FAIL 없음(미등록=WARN).
+    EVENT_HOOK = "cys-hook.sh"
+    EVENT_HOOK_EVENTS = ("PreToolUse", "PostToolUse")
+
+    def c33_event_hooks(self):
+        cid = "C33.event-hooks"
+        if self.skipped(cid):
+            return
+        script = os.path.join(pack_dir(), "hooks", self.EVENT_HOOK)
+        if not os.path.isfile(script):
+            if not (self.fix and self.repair_via_init_pack() and os.path.isfile(script)):
+                self.add(cid, WARN, "hooks/%s 없음 — `cys init-pack` 또는 --fix" % self.EVENT_HOOK)
+                return
+        targets = discover_claude_settings()
+        if not targets:
+            self.add(cid, WARN, "~/.claude*/settings.json 미발견 — claude 노드 기동 후 재실행")
+            return
+        # 프로필×이벤트 단위로 미등록 항목 수집
+        pending = [(t, ev) for t in targets for ev in self.EVENT_HOOK_EVENTS
+                   if not self._event_hook_registered(t, ev, self.EVENT_HOOK)]
+        if not pending:
+            self.add(cid, PASS,
+                     "%d개 프로필 PreToolUse/PostToolUse 이벤트 hook 등록됨 (claude 재시작 후 적용)"
+                     % len(targets))
+            return
+        if self.fix:
+            done, errs = [], []
+            for t, ev in pending:
+                err = self._register_event_hook(t, ev, self.EVENT_HOOK, matcher="")
+                errs.append("%s/%s: %s" % (os.path.basename(os.path.dirname(t)), ev, err)) \
+                    if err else done.append("%s/%s" % (os.path.basename(os.path.dirname(t)), ev))
+            if errs:
+                self.add(cid, WARN, "; ".join(errs)
+                         + (" | 등록 성공: %s" % ", ".join(done) if done else ""))
+            else:
+                self.add(cid, FIXED, "이벤트 hook 등록: %s — ★claude 재시작 후 적용" % ", ".join(done))
+        else:
+            self.add(cid, WARN, "이벤트 hook 미등록: %d건 — --fix로 설치(claude 재시작 후 적용)"
+                     % len(pending))
+
     # ── C09 round 핵심 문서 ──
     def c09_round_core(self):
         cid = "C09.round-core"
@@ -1888,6 +1931,7 @@ class Preflight:
         self.c30_git()
         self.c31_config_isolation()
         self.c32_statusline()
+        self.c33_event_hooks()
         return self.results
 
 

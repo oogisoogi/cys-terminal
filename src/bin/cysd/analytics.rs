@@ -69,6 +69,56 @@ pub fn record_usage(
     );
 }
 
+/// 툴 호출의 파생 분류(관측 도구 deriveFields 동형) — (is_skill, skill_name, is_agent, agent_type).
+/// Skill 툴 → 스킬 호출, Task/Agent 툴 → 에이전트(서브에이전트) 호출. E3 스킬/에이전트 TOP의 키.
+pub fn derive_tool(tool_name: &str, tool_input: &serde_json::Value) -> (bool, Option<String>, bool, Option<String>) {
+    let is_skill = tool_name == "Skill";
+    let skill_name = if is_skill {
+        tool_input
+            .get("skill")
+            .or_else(|| tool_input.get("command"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim_start_matches('/').to_string())
+    } else {
+        None
+    };
+    let is_agent = tool_name == "Task" || tool_name == "Agent";
+    let agent_type = if is_agent {
+        tool_input.get("subagent_type").and_then(|v| v.as_str()).map(String::from)
+    } else {
+        None
+    };
+    (is_skill, skill_name, is_agent, agent_type)
+}
+
+/// events 테이블에 hook 이벤트 1건 적재 — usage.event RPC가 호출. 실패는 무해히 무시.
+#[allow(clippy::too_many_arguments)]
+pub fn record_event(
+    conn: &Connection,
+    session: &str,
+    role: &str,
+    agent: &str,
+    event_type: &str,
+    tool_name: &str,
+    is_skill: bool,
+    skill_name: Option<&str>,
+    is_agent: bool,
+    agent_type: Option<&str>,
+    agent_id: Option<&str>,
+    exit_code: Option<i64>,
+    ts: f64,
+) {
+    let _ = conn.execute(
+        "INSERT INTO events(session_id, role, agent, event_type, tool_name, is_skill, skill_name,
+            is_slash, is_agent, agent_type, agent_id, exit_code, ts)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,0,?8,?9,?10,?11,?12)",
+        rusqlite::params![
+            session, role, agent, event_type, tool_name,
+            is_skill as i64, skill_name, is_agent as i64, agent_type, agent_id, exit_code, ts
+        ],
+    );
+}
+
 /// (session, model, input_tokens, cache_creation, output, cost, ts)
 type UsageRow = (String, String, u64, u64, u64, f64, f64);
 
@@ -164,6 +214,36 @@ mod tests {
         assert_eq!(c.today_tokens, (1000 + 2000 + 300) + (500 + 200));
         assert!((c.today_cost_usd - 0.43).abs() < 1e-9, "비용 보존 0.42+0.01");
         assert_eq!(c.model_tokens.get("claude-opus-4-8").copied(), Some((1000 + 2000 + 300) + (500 + 200)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn derive_and_record_event() {
+        use serde_json::json;
+        let (is_s, sn, is_a, at) = derive_tool("Skill", &json!({"skill": "commit"}));
+        assert!(is_s && sn.as_deref() == Some("commit") && !is_a && at.is_none());
+        let (is_s, _, is_a, at) = derive_tool("Task", &json!({"subagent_type": "Explore"}));
+        assert!(!is_s && is_a && at.as_deref() == Some("Explore"));
+        let (is_s, _, is_a, _) = derive_tool("Bash", &json!({"command": "ls"}));
+        assert!(!is_s && !is_a, "일반 툴은 skill/agent 아님");
+        let (_, sn, _, _) = derive_tool("Skill", &json!({"command": "/deep-research"}));
+        assert_eq!(sn.as_deref(), Some("deep-research"), "/slash 접두 제거");
+
+        let dir = std::env::temp_dir().join(format!("cys-ev-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = Connection::open(dir.join(format!("e-{}.db", line!()))).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE events(id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, agent TEXT,
+             event_type TEXT, tool_name TEXT, is_skill INTEGER, skill_name TEXT, is_slash INTEGER,
+             is_agent INTEGER, agent_type TEXT, agent_id TEXT, exit_code INTEGER, duration_ms INTEGER, ts REAL);",
+        )
+        .unwrap();
+        record_event(&conn, "/s/a", "worker", "claude", "PRE_TOOL", "Skill", true, Some("commit"), false, None, None, None, 1000.0);
+        record_event(&conn, "/s/a", "worker", "claude", "POST_TOOL", "Bash", false, None, false, None, None, Some(1), 1001.0);
+        let skills: i64 = conn.query_row("SELECT COUNT(*) FROM events WHERE is_skill=1", [], |r| r.get(0)).unwrap();
+        assert_eq!(skills, 1, "스킬 호출 1건");
+        let fails: i64 = conn.query_row("SELECT COUNT(*) FROM events WHERE exit_code!=0", [], |r| r.get(0)).unwrap();
+        assert_eq!(fails, 1, "실패(exit!=0) 1건 — E3 반복실패 토대");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -61,6 +61,10 @@ pub const PACK: &[(&str, &str)] = &[
         include_str!("../cysjavis-pack/hooks/cys-statusline.sh"),
     ),
     (
+        "hooks/cys-hook.sh",
+        include_str!("../cysjavis-pack/hooks/cys-hook.sh"),
+    ),
+    (
         "hooks/appbuild-gate.sh",
         include_str!("../cysjavis-pack/hooks/appbuild-gate.sh"),
     ),

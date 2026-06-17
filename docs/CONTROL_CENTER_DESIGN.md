@@ -1,0 +1,207 @@
+# Control Center 극대화 설계안 — 관측 도구 추출 무기 전체 적용
+
+> 작성 2026-06-17. 근거: 관측 도구(관측 도구) 1·2차 전수조사
+> (memory `control-center-관측 도구-weapons`). 목표: 현 T6 Control Center(실시간 관제)를
+> **실시간 관제 + 영속 분석 + 효율 최적화 + 자동 거버넌스** 단일 네이티브 플랫폼으로 격상.
+> 철학: 로컬 우선(데이터 머신 밖으로 안 나감)·추가 인프라 0(cysd 내장 SQLite)·에이전트 0ms 지연.
+
+---
+
+## 0. 현재 상태 vs 목표
+
+**현재(T5·T6)**: cysd가 claude `.jsonl`·codex rollout tail + agy RPC → `control.dashboard` RPC →
+Tauri 풀 패널(플릿·rate 5h/7d·CPU/MEM·소비·12h 스파크라인·가동시간). **휘발성**(in-memory·재시작 소실),
+**양(volume)만** 측정. 툴/스킬/에이전트 호출·비용·세션 전사·추세 영속 없음.
+
+**목표**: 관측 도구가 팀에 준 것을 **로컬 멀티-노드 플릿**(master·CSO·worker·reviewer)에 적용 —
+"누가/무엇을 얼마나 효율적으로" + "어디서 막히나" + "곧 소진/이상" 자동 경보 + "성공 세션 재현".
+
+---
+
+## 1. 아키텍처 — 분석 척추(spine)
+
+```
+[hooks 확장]                       [수집/저장 — cysd]                 [노출]                  [UI — cys-app]
+SessionStart ─┐                  ┌─ usage.rs collector (tail)        control.dashboard ──┐   Control Center
+PreToolUse  ──┤  cys hook ──push─┤  ingest.rs (event 적재)            control.analytics ─┼─→ 탭: Live / 비용·효율
+PostToolUse ──┤  (즉시 exit0,    ├─ cost.rs (모델단가→$)              control.sessions ──┤      / 스킬·에이전트
+Stop        ──┤   detached)      ├─ rollup.rs (일/주 롤업·lazy캐시)   control.skills ────┤      / 세션 / 추세·주간
+SubagentStop ─┘                  └─ SQLite analytics.db (영속)        control.alerts ────┘   + 경보 배지·master push
+                                       ↑ rusqlite (이미 보유)
+[5분 스케줄러] → 주간 다이제스트 push   [context.threshold 에지게이트] → 경보 push
+```
+
+**핵심 enabler 3가지**
+1. **SQLite 영속**(`analytics.db`) — cysd엔 이미 rusqlite(transcripts.db) → 추가 의존성 0. 휘발성 해소.
+2. **이벤트 캡처 hook 확장** — 현 SessionStart(transcript 등록)·statusline(rate) 위에 PreToolUse/PostToolUse/
+   Stop/SubagentStop 추가 → 툴·스킬·에이전트 호출·exit_code·duration·세션 메타 포착. fire-and-forget(에이전트 0ms).
+3. **엔진 3종** — cost(단가표)·rollup(일/주 집계 lazy 캐시)·metrics(효율 파생).
+
+---
+
+## 2. 데이터 모델 (cysd `analytics.db` — SQLite)
+
+```sql
+-- 세션 메타 (claude/codex 1세션 = 1행)
+CREATE TABLE sessions (
+  session_id   TEXT PRIMARY KEY,
+  role         TEXT,            -- master|cso|worker|reviewer-* (노드=관측 도구의 user 대응)
+  agent        TEXT,            -- claude|codex|gemini
+  cwd          TEXT,
+  started_at   REAL, ended_at REAL,
+  title        TEXT, summary TEXT,    -- transcript summary 라인/첫 HUMAN 200자
+  turn_count   INTEGER
+);
+-- 토큰 사용 (메시지/턴 단위 — 비용 환산 포함)
+CREATE TABLE usage_records (
+  id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, agent TEXT, model TEXT,
+  input_tokens INT, output_tokens INT, cache_read_tokens INT, cache_creation_tokens INT,
+  cost_usd REAL, is_subagent INT, ts REAL
+);
+CREATE INDEX ix_usage_ts ON usage_records(ts);
+CREATE INDEX ix_usage_session ON usage_records(session_id);
+-- 호출 이벤트 (툴·스킬·에이전트 — 관측 도구 events 대응)
+CREATE TABLE events (
+  id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, agent TEXT,
+  event_type TEXT,            -- PRE_TOOL|POST_TOOL|STOP|SUBAGENT_STOP|SLASH
+  tool_name TEXT, is_skill INT, skill_name TEXT, is_slash INT,
+  is_agent INT, agent_type TEXT, agent_id TEXT,
+  exit_code INT, duration_ms INT, ts REAL
+);
+CREATE INDEX ix_ev_skill ON events(is_skill, ts);
+CREATE INDEX ix_ev_agent ON events(is_agent, ts);
+-- 메시지 (전사 — 세션 상세/온보딩)
+CREATE TABLE messages (
+  id INTEGER PRIMARY KEY, session_id TEXT, seq INT,
+  role TEXT,                  -- HUMAN|ASSISTANT|TOOL
+  content TEXT,               -- 50k 절단
+  tool_name TEXT, tool_use_id TEXT, duration_ms INT, ts REAL
+);
+-- 일별 롤업 캐시 (관측 도구 daily_project_stats 대응 — 과거=캐시, 오늘=live)
+CREATE TABLE daily_rollups (
+  date TEXT PRIMARY KEY,
+  session_count INT, turn_count INT, active_roles_json TEXT,
+  input_tokens INT, output_tokens INT, cache_read_tokens INT, cache_creation_tokens INT,
+  cost_usd REAL,
+  skill_counts_json TEXT, agent_counts_json TEXT, model_tokens_json TEXT, role_stats_json TEXT,
+  computed_at REAL
+);
+CREATE TABLE stars (session_id TEXT PRIMARY KEY, note TEXT, starred_at REAL); -- 성공 세션 즐겨찾기
+```
+
+설계 원칙(관측 도구 이식): 토큰 4분해·결정론 정렬(`count DESC, name ASC`)·lazy 캐시(과거 DB·오늘 live 30s)·
+stale 마커(정의 변경 시 재계산). 보존 정책(기본 60일·`retention` 설정).
+
+---
+
+## 3. 페이즈별 설계 (E1 → E9)
+
+> **진행(2026-06-17)** — E1 ①②③④ 완료(로컬 커밋·미배포):
+> - ① 비용 엔진(7bafbee): `cost.rs`(단가표·`normalize_model_name`·`calculate_cost` 4팩터) +
+>   `Consumption.today_cost_usd`/`model_tokens` + `control.dashboard` 노출.
+> - ② 비용 UI(47ce67c): Control Center 토큰 섹션 `오늘 비용($)`·모델믹스 바.
+> - ③ SQLite 영속(d430320·척추): `analytics.rs`(`analytics.db`·`usage_records` 적재·부트 12h
+>   리플레이 seed) → 재시작 보존. cargo 206/206 · E2E 7/7(`docs/cost_persist_e2e.py`).
+> - ④ 이벤트 캡처(★): hook(PreToolUse/PostToolUse/Stop/SubagentStop)→`cys-hook.sh`→`cys usage-event-stdin`
+>   →`usage.event` RPC→`events` 테이블. `derive_tool`(Skill→스킬·Task/Agent→에이전트 파생)·`record_event`·
+>   PostToolUse `tool_response.is_error`→exit_code(E3 반복실패 토대). pack 임베드·preflight C33(멱등 등록).
+>   cargo 208/208(신규 2종) · E2E 7/7(`docs/event_capture_e2e.py`) · C33 격리 검증(등록·체인보존·멱등).
+> - **다음 = E2**(비용·효율 탭).
+
+### E1 — 영속 분석 기반 (척추) 【선행·필수】
+- **백엔드**: `analytics.db` 스키마 생성(state.rs init) · `ingest.rs`(hook 이벤트→events/messages 적재) ·
+  Stop 시 transcript 전체 파싱→usage_records/messages bulk(현 usage.rs 파서 재사용·`parse_claude_message_io` 확장) ·
+  `cost.rs`(MODEL_PRICING Rust 포트 + `normalize_model_name` + 4토큰 공식).
+- **hook**: pack에 `cys hook` 서브커맨드 + PreToolUse/PostToolUse/Stop/SubagentStop을 settings.json에
+  멱등 주입(preflight C33). statusline 래퍼와 동일 fire-and-forget(즉시 exit0).
+- **검증**: 단위(파서·cost·정규화) + E2E(가짜 hook→DB 적재) + 회귀.
+- **산출**: 세션·토큰·호출·메시지·비용이 **영속 저장**(재시작 무관).
+
+### E2 — 비용·효율 탭
+- **지표**: 비용$(오늘/세션/모델별)·🔥캐시절감$·모델믹스(claude/codex/gemini)·생산성(턴/세션·토큰/턴·비용/세션·세션 duration)·토큰 4분해 스택.
+- **백엔드**: `control.analytics` RPC(rollup 집계). **프런트**: Control Center 신규 탭 "비용·효율"(KPI 카드 + 스택 영역 + 모델 도넛).
+- **산출**: "지금 효율적으로 쓰고 있나"를 **금액·캐시·모델**로 정량화.
+
+### E3 — 스킬·에이전트 탭
+- **지표**: 호출 TOP(스킬=Skill툴 events ∪ `/slash` UNION)·🔥실패율(`exit_code!=0`)·🔥duration p50·미사용(4주 diff)·스킬×역할(노드) 분포·서브에이전트 위임트리(master→worker→subagent).
+- **백엔드**: `control.skills` RPC. **프런트**: TOP 바·실패율 배지·duration 히트맵·위임 트리.
+- **산출**: "무엇이 효과적/방치/반복실패"인지 — 관측 도구 미구현 실패율을 **선점**.
+
+### E4 — 세션 타임라인·전사 탭
+- **기능**: 세션 리스트(필터: 역할·agent·기간·⭐)·자동 title/summary·**활동 리본**(8px 색상 strip)·전사 뷰어(HUMAN/ASSISTANT/TOOL + tool input/output/duration)·⭐즐겨찾기(성공 세션 재현=온보딩).
+- **백엔드**: `control.sessions`(목록)·`control.session_detail`(전사) RPC. **프런트**: 바닐라 TS 리스트+상세(가상화 자체구현).
+- **산출**: "성공 세션 열람·공유"로 노드/사람 온보딩 가속.
+
+### E5 — 추세·주간 다이제스트 탭
+- **지표**: WoW% 델타(↑↓ 색상)·이번주 vs 지난주 오버레이·🔥효율 리더(노드/역할별 토큰·세션·스킬다양성·간결도)·위임 인사이트·스킬자산(신규/최다/휴면).
+- **백엔드**: 주간 롤업 + `control.weekly` RPC. **연동**: 기존 5분 스케줄러(`javis_report`) 확장 → **주간 다이제스트 master push**.
+- **산출**: 팀(=플릿) 차원 추세·인사이트 자동 보고.
+
+### E6 — 경보·이상감지·ROI
+- **기능**: 임계값 경고(주간 토큰/비용 한도·rate 90%)·🔥이상감지(노드 토큰 급증)·🔥반복실패 스킬 경고·스킬 ROI 패턴(예: commit→재edit 반복).
+- **백엔드**: `alerts.rs` — **context.threshold와 동일 에지게이트**로 1회 발화 → `cys send --to master` push + UI 배지. `alerts-config.json`(임계값).
+- **산출**: 수동 관찰→**능동 경보**. autopilot 자원 거버넌스와 직결.
+
+### E7 — RSI/autopilot 강화 (Control Center 외 트랙)
+- 🔥사전 HEAD 체크포인트 + 원자 rollback(라운드 시작 시 SHA→SESSION_STATE·실패 시 reset) · 🔥진척도 신호(eval-driven 점수 improved/regressed vs 이전 라운드) · marker SOT(커밋 trailer `iter-id`) · task phase 상태 파일.
+- **산출**: RSI 무결성·실패 복원력↑(eval-driven 원칙 강화).
+
+### E8 — 엔지니어링 품질 (횡단)
+- 컨텍스트 감지 `cys status`/boot(누락 단계만) · self-heal 원자쓰기 · hook 멱등+부트스트랩 · 설정 우선순위+stale 정리 · HTTP retry/timeout · HARD/SOFT 게이트.
+
+### E9 — (선택) 팀/멀티머신 확장
+- RBAC 4단(VIEWER=집계만·PII 차단) · 보존/redaction · self-host 다머신 집계(`--api-url`·중앙 cysd). **큰 결정**(로컬 우선 철학과 trade-off).
+
+---
+
+## 4. RPC 계약 (신규/확장)
+- `control.dashboard`(확장): 기존 + 비용$·캐시절감·모델믹스·생산성.
+- `control.analytics {from,to,group_by}`: 일/주 롤업(추세·드릴다운).
+- `control.skills {from,to}`: 스킬/에이전트 TOP·실패율·p50·미사용·분포.
+- `control.sessions {filter}` / `control.session_detail {session_id}`: 목록·전사.
+- `control.weekly {week}`: WoW·리더·인사이트.
+- `control.alerts` + `usage.alert` 이벤트(push).
+- Tauri 커맨드 동형 노출(`src-tauri/main.rs`).
+
+## 5. UI 정보구조 (Control Center 탭)
+`Live`(현 T6) · `비용·효율`(E2) · `스킬·에이전트`(E3) · `세션`(E4) · `추세·주간`(E5) · 상단 경보 배지(E6).
+바닐라 TS·차트 라이브러리 무의존(현 스파크라인·바·도넛 자체 SVG 확장).
+
+---
+
+## 6. 기대 업그레이드 (완료 시)
+
+### 성능·정확도
+- **영속성**: 재시작·셧다운에도 추세·소비·세션 보존(현재 휘발 → 무손실).
+- **정밀 비용**: 토큰→$ 모델별 환산 — 자원 거버넌스를 **금액으로** 측정(현재 0).
+- **실시간 유지 + 영속 분석 동시**(관측 도구는 세션종료 후 확정이라 실시간 약함 → 우리만의 조합).
+- **결정론 집계**(정렬·롤업 캐시) — UI 일관성·부하↓.
+
+### 신규 기능 (사용자가 새로 얻는 것)
+| 영역 | 추가 기능 |
+|---|---|
+| 비용·효율 | 비용$·캐시 절감액·모델 믹스·세션당 비용·생산성(턴/세션·토큰/턴)·duration p50 |
+| 스킬·에이전트 | 호출 TOP·**반복실패율**·미사용(휴면) 탐지·스킬×노드 분포·위임 트리 |
+| 세션 | 타임라인·활동 리본·전사 뷰어·자동 title/summary·⭐성공세션 재현(온보딩) |
+| 추세 | 주간 WoW%·이번주vs지난주·효율 리더(노드별)·위임/스킬자산 인사이트·주간 다이제스트 master push |
+| 경보 | 토큰/비용 임계·이상감지(급증)·반복실패·ROI 추천 → 능동 push |
+| RSI | 라운드 체크포인트 자동 rollback·진척도 신호·marker SOT |
+| 품질 | 컨텍스트 감지 setup·self-heal·멱등 hook·retry/timeout |
+
+### 전략적 효과
+- **"모니터 → 최적화 → 거버넌스"** 격상: 우리가 AI를 **효율적으로** 쓰는지 정량 측정·자동 경보.
+- **플릿 자기개선 신호**: 효율 리더·반복실패·진척도 = RSI 입력.
+- **관측 도구 추월점**: 실시간성(우리 강점) + 반복실패율·이상감지·ROI(관측 도구 미구현) + 로컬우선 프라이버시.
+
+---
+
+## 7. 비기능·리스크
+- **에이전트 0ms 지연**: hook은 fire-and-forget 즉시 exit(관측 도구 ADR-005/006). 절대 claude/codex 안 막음.
+- **로컬 우선**: 데이터 머신 밖으로 안 나감(E9 다머신은 명시적 옵트인).
+- **부하**: 일별 롤업 lazy·오늘 live 30s 캐시·인덱스. SQLite WAL.
+- **프라이버시**: 전사 50k 절단·보존 정책·(E9) RBAC VIEWER 집계만.
+- **마이그레이션**: analytics.db 스키마 버전·expand-contract.
+
+## 8. 권고 착수 순서
+**E1(척추) → E2(효율) → E6(경보) → E3(스킬·실패) → E5(주간) → E4(세션) → E8(품질) → E7(RSI) → E9(팀)**.
+E1 없이는 나머지 불가(영속·이벤트가 토대). E2·E6이 체감 가치 최고(비용·경보). E7은 독립 트랙(병행 가능).
