@@ -53,6 +53,36 @@ fn param_u64(params: &Value, key: &str) -> Option<u64> {
     })
 }
 
+fn param_f64(params: &Value, key: &str) -> Option<f64> {
+    params.get(key).and_then(|v| {
+        v.as_f64()
+            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+    })
+}
+
+/// statusline 보고(usage.report)의 rate 배열 파싱 — `[{label, used_pct, resets_at?}]`.
+/// 부재·비배열·필드 누락 항목은 안전하게 건너뛴다(빈 벡터 = rate 배지 없음).
+fn parse_report_rate(params: &Value) -> Vec<crate::usage::RateWindow> {
+    params
+        .get("rate")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|r| {
+                    let label = r.get("label").and_then(|v| v.as_str())?.to_string();
+                    let used_pct = r.get("used_pct").and_then(|v| v.as_f64())?;
+                    let resets_at = r.get("resets_at").and_then(|v| v.as_f64());
+                    Some(crate::usage::RateWindow {
+                        label,
+                        used_pct,
+                        resets_at,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// 현실적 PTY 치수 상한 — u16 절단 통과(0·65536+)와 vt100 grid 거대 할당(메모리 DoS)을 차단.
 const MAX_ROWS: u64 = 1000;
 const MAX_COLS: u64 = 4000;
@@ -278,6 +308,42 @@ fn threshold_from(raw: Option<String>) -> u8 {
     raw.and_then(|v| v.trim().parse::<u8>().ok())
         .filter(|v| (1..=100).contains(v))
         .unwrap_or(60)
+}
+
+/// context.threshold 에지 게이트 — 자기보고(status.set)·관측(usage.rs)·statusline(usage.report)
+/// **3 경로가 공유**하는 단일 발화 로직. ctx_threshold_armed 에지로 '미만→이상' 교차 시 1회만
+/// 발행하고, 임계 위 체류 중엔 재발행하지 않으며, 임계 아래로 내려가면 재무장된다. 경로마다
+/// 인라인 복제하면 같은 교차에 두 경로가 각각 발화해 master/CSO가 cycle-agent를 이중 집행한다.
+/// `source`=발화 출처("self-report"|"observed"|"statusline"), `agent`=관측·statusline 경로에서만 Some.
+pub(crate) fn maybe_fire_context_threshold(
+    daemon: &Arc<Daemon>,
+    surface: &Arc<crate::state::Surface>,
+    pct: u8,
+    source: &str,
+    agent: Option<&str>,
+) {
+    let threshold = context_threshold_pct();
+    if pct < threshold {
+        surface.ctx_threshold_armed.store(true, Ordering::Relaxed);
+        return;
+    }
+    if !surface.ctx_threshold_armed.swap(false, Ordering::Relaxed) {
+        return;
+    }
+    let mut payload = json!({
+        "role": surface.role.lock().unwrap().clone(),
+        "context_pct": pct,
+        "threshold": threshold,
+        "surface_ref": cys::surface_ref(surface.id),
+        "source": source,
+        "action": "cycle-agent(저장→검증→clear→복원) 집행 대상 — MASTER_DIRECTIVE §컨텍스트 사이클",
+    });
+    if let Some(a) = agent {
+        payload["agent"] = json!(a);
+    }
+    daemon
+        .bus
+        .publish("context.threshold", "watchdog", Some(surface.id), payload);
 }
 
 pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> Reply {
@@ -1489,19 +1555,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             // (cycle-agent 이중 집행)를 차단한다. master/CSO는 이 이벤트(watchdog)를 받아
             // cycle-agent를 집행한다.
             if let Some(pct) = context_pct {
-                let threshold = context_threshold_pct();
-                if pct < threshold {
-                    surface.ctx_threshold_armed.store(true, Ordering::Relaxed);
-                } else if surface.ctx_threshold_armed.swap(false, Ordering::Relaxed) {
-                    daemon.bus.publish(
-                        "context.threshold",
-                        "watchdog",
-                        Some(sid),
-                        json!({"role": role, "context_pct": pct, "threshold": threshold,
-                               "surface_ref": cys::surface_ref(sid), "source": "self-report",
-                               "action": "cycle-agent(저장→검증→clear→복원) 집행 대상 — MASTER_DIRECTIVE §컨텍스트 사이클"}),
-                    );
-                }
+                maybe_fire_context_threshold(daemon, &surface, pct, "self-report", None);
             }
             Reply::Single(ok_response(&id, json!({"surface_id": sid, "state": state})))
         }
@@ -1567,6 +1621,83 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 Some(sid),
                 json!({"transcript": path, "surface_ref": cys::surface_ref(sid)}),
             );
+            Reply::Single(ok_response(&id, json!({"surface_id": sid})))
+        }
+
+        // ─── T5 Phase 2-A: claude statusline 보고 (rate limit + 서버 진실 ctx — transcript 상위호환) ───
+        // claude의 5h/주간 rate limit 잔량은 로컬 파일 어디에도 없다 — 유일한 무간섭 채널이
+        // statusline stdin JSON이다. settings의 cys-statusline.sh 래퍼가 매 assistant 메시지마다
+        // 이 RPC로 push한다. 소유 게이트·usage.updated·임계 발화는 usage.register/관측 경로와 동형.
+        "usage.report" => {
+            let Some(sid) = resolve_surface_id(&params) else {
+                return Reply::Single(err_response(&id, "invalid_params", "missing surface_id"));
+            };
+            let Some(surface) = daemon.get_surface(sid) else {
+                return Reply::Single(err_response(
+                    &id,
+                    "not_found",
+                    &format!("surface {sid} not found"),
+                ));
+            };
+            // 소유 게이트 — usage.register와 동형: 발신 pane은 자기 surface에만 보고할 수 있다.
+            // 없으면 워커가 타 pane의 ctx·rate 배지를 위조해 60% 사이클을 오발·억제할 수 있다.
+            let caller_sid = caller_pid.and_then(|p| resolve_caller_surface(daemon, p));
+            if let Some(cs) = caller_sid {
+                if cs != sid {
+                    daemon.bus.publish(
+                        "usage.report_denied",
+                        "usage",
+                        Some(sid),
+                        json!({"requested_surface": sid,
+                               "caller_surface": cs, "caller_pid": caller_pid}),
+                    );
+                    return Reply::Single(err_response(
+                        &id,
+                        "usage_denied",
+                        &format!(
+                            "usage.report denied: caller (surface {cs}) may only report its own usage, not surface {sid}"
+                        ),
+                    ));
+                }
+            }
+            // used_percentage는 f64 — 반올림 후 0~100 클램프. rate 부재(무료·세션 첫 응답 전)는 빈 벡터.
+            let ctx_pct = param_f64(&params, "ctx_pct").map(|v| v.round().clamp(0.0, 100.0) as u8);
+            let ctx_tokens = param_u64(&params, "ctx_tokens");
+            let ctx_window = param_u64(&params, "ctx_window");
+            let rate = parse_report_rate(&params);
+            // agent는 surface 메타(agent_meta)가 진실 — 없으면 statusline은 claude 전용이므로 claude.
+            let agent = surface
+                .agent_meta
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|(a, _)| a.clone())
+                .unwrap_or_else(|| "claude".into());
+            *surface.observed_usage.lock().unwrap() = Some(crate::usage::ObservedUsage {
+                agent: agent.clone(),
+                ctx_tokens,
+                ctx_window,
+                ctx_pct,
+                rate: rate.clone(),
+                source: "statusline".into(),
+                session_file: param_str(&params, "session_file").unwrap_or_default(),
+                updated_at: crate::state::now_epoch(),
+            });
+            let role = surface.role.lock().unwrap().clone();
+            daemon.bus.publish(
+                "usage.updated",
+                "usage",
+                Some(sid),
+                json!({
+                    "surface_ref": cys::surface_ref(sid), "role": role, "agent": agent,
+                    "ctx_pct": ctx_pct, "ctx_tokens": ctx_tokens, "ctx_window": ctx_window,
+                    "rate": rate, "source": "statusline",
+                }),
+            );
+            // 공유 에지 게이트로 context.threshold 발화 — Phase 1과 동일 함수(이중발화 차단)
+            if let Some(pct) = ctx_pct {
+                maybe_fire_context_threshold(daemon, &surface, pct, "statusline", Some(&agent));
+            }
             Reply::Single(ok_response(&id, json!({"surface_id": sid})))
         }
 
@@ -3178,6 +3309,111 @@ mod tests {
                 "잘못된 경로가 통과했다: {bad:?} (응답: {resp})"
             );
         }
+    }
+
+    fn usage_report(
+        daemon: &Arc<Daemon>,
+        surface_id: u64,
+        extra: Value,
+        caller_pid: Option<u32>,
+    ) -> Value {
+        let mut params = json!({ "surface_id": surface_id });
+        if let Some(obj) = extra.as_object() {
+            for (k, v) in obj {
+                params[k] = v.clone();
+            }
+        }
+        let req = Request {
+            id: json!(1),
+            method: "usage.report".into(),
+            params,
+        };
+        let Reply::Single(resp) = dispatch(daemon, req, caller_pid) else {
+            panic!("expected single reply");
+        };
+        resp
+    }
+
+    /// T5 Phase 2-A 소유 게이트 — usage.register와 동형: 발신 pane이 타 surface usage를 위조하면
+    /// master/CSO가 보는 ctx·rate 배지가 거짓이 된다(60% 사이클 오발·억제). 타 surface 보고 거부 박제.
+    #[test]
+    fn usage_report_rejects_foreign_surface() {
+        let daemon = claim_daemon();
+        let attacker = make_surface(&daemon, Some("worker-1"));
+        let victim = make_surface(&daemon, Some("worker-2"));
+        let attacker_pid = 994_101_u32;
+        bind_caller(&daemon, attacker_pid, attacker);
+
+        let resp = usage_report(&daemon, victim, json!({"ctx_pct": 80}), Some(attacker_pid));
+        assert_eq!(
+            resp["ok"], json!(false),
+            "타 surface usage 보고가 통과했다 (응답: {resp})"
+        );
+        assert_eq!(resp["error"]["code"], json!("usage_denied"));
+        assert!(
+            daemon.surfaces.lock().unwrap()[&victim]
+                .observed_usage.lock().unwrap().is_none(),
+            "거부됐는데 victim usage가 오염됐다"
+        );
+    }
+
+    /// 자기 보고는 통과하고 observed_usage가 source:"statusline"로 저장된다 — ctx_pct 반올림·
+    /// rate 배열(resets_at 옵션) 파싱 핀. statusline은 transcript tail의 상위호환(rate limit 포함).
+    #[test]
+    fn usage_report_allows_self_and_stores_statusline() {
+        let daemon = claim_daemon();
+        let own = make_surface(&daemon, Some("worker-1"));
+        let own_pid = 994_201_u32;
+        bind_caller(&daemon, own_pid, own);
+
+        let resp = usage_report(
+            &daemon,
+            own,
+            json!({
+                "ctx_pct": 41.6, "ctx_tokens": 82000, "ctx_window": 200000,
+                "rate": [
+                    {"label": "5h", "used_pct": 41.0, "resets_at": 1781314865.0},
+                    {"label": "7d", "used_pct": 12.0}
+                ]
+            }),
+            Some(own_pid),
+        );
+        assert_eq!(resp["ok"], json!(true), "자기 보고가 막혔다 (응답: {resp})");
+        let guard = daemon.surfaces.lock().unwrap();
+        let u = guard[&own]
+            .observed_usage.lock().unwrap().clone()
+            .expect("usage가 저장되지 않았다");
+        assert_eq!(u.source, "statusline");
+        assert_eq!(u.ctx_pct, Some(42), "41.6은 42로 반올림돼야 한다");
+        assert_eq!(u.ctx_tokens, Some(82000));
+        assert_eq!(u.rate.len(), 2);
+        assert_eq!(u.rate[0].label, "5h");
+        assert_eq!(u.rate[0].resets_at, Some(1781314865.0));
+        assert_eq!(u.rate[1].resets_at, None, "resets_at 부재 항목은 None이어야 한다");
+    }
+
+    /// 익명(데몬 내부·미바인드 caller) 보고는 통과 — usage.register 익명 통과와 동형.
+    #[test]
+    fn usage_report_anonymous_passes() {
+        let daemon = claim_daemon();
+        let node = make_surface(&daemon, Some("worker-3"));
+        let resp = usage_report(&daemon, node, json!({"ctx_pct": 10}), None);
+        assert_eq!(resp["ok"], json!(true), "익명 usage 보고가 막혔다 (응답: {resp})");
+    }
+
+    /// statusline 보고도 자기보고·관측과 **같은 공유 에지 게이트**로 context.threshold를 발화한다 —
+    /// '미만→이상' 교차 시 1회, payload source="statusline". 세 경로 이중발화 차단의 통합 핀.
+    #[test]
+    fn usage_report_fires_context_threshold() {
+        let daemon = claim_daemon();
+        let node = make_surface(&daemon, Some("worker-ctx3"));
+        usage_report(&daemon, node, json!({"ctx_pct": 50}), None);
+        assert_eq!(threshold_events(&daemon, node).len(), 0, "50%에서 발화됐다");
+        usage_report(&daemon, node, json!({"ctx_pct": 75}), None);
+        let evs = threshold_events(&daemon, node);
+        assert_eq!(evs.len(), 1, "statusline 교차에서 정확히 1회 발화돼야 한다");
+        assert_eq!(evs[0]["payload"]["source"].as_str(), Some("statusline"));
+        assert_eq!(evs[0]["payload"]["context_pct"].as_u64(), Some(75));
     }
 
     fn threshold_events(daemon: &Arc<Daemon>, sid: u64) -> Vec<Value> {

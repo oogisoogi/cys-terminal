@@ -17,6 +17,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -629,6 +630,90 @@ class Preflight:
                 self.add(cid, FIXED, "hook 등록: %s" % ", ".join(done))
         else:
             self.add(cid, FAIL, "hook 미등록 프로필: %s" % ", ".join(unregistered))
+
+    # ── C32 statusline 래퍼 등록 (Claude 설정 — T5 Phase 2-A claude rate limit 채널) ──
+    # claude의 5h/주간 rate limit 잔량은 로컬 파일에 없다 — 유일한 무간섭 채널이 statusline
+    # stdin JSON이다. cys-statusline.sh가 매 메시지마다 usage.report로 push해 pane 배지에
+    # 5h/7d를 띄운다. 부가 기능이라(ctx 배지는 없어도 작동) 미설치는 WARN(READY 미차단).
+    def _statusline_registered(self, settings_path):
+        try:
+            data = json.load(open(settings_path, encoding="utf-8"))
+        except (OSError, ValueError):
+            return False
+        sl = data.get("statusLine")
+        return isinstance(sl, dict) and "cys-statusline.sh" in sl.get("command", "")
+
+    def _register_statusline(self, settings_path):
+        """statusLine 등록. 성공=None, 실패=사유 문자열. 기존 statusLine은 CYS_PREV_STATUSLINE로
+        래핑해 체인 보존(덮어쓰기 금지) — _register_hook과 동일한 symlink 거부·파싱 거부·최초
+        백업·원자적 쓰기 철학."""
+        if os.path.islink(settings_path):
+            return "symlink 거부(실파일만 허용): %s" % settings_path
+        script = os.path.join(pack_dir(), "hooks", "cys-statusline.sh")
+        runner = "bash " if os.name == "nt" else "sh "
+        if os.path.isfile(settings_path):
+            try:
+                data = json.load(open(settings_path, encoding="utf-8"))
+            except (OSError, ValueError) as e:
+                return ("기존 settings.json 파싱 실패 — 덮어쓰기 거부(수동 복구 필요): %s (%s)"
+                        % (settings_path, e))
+            if not isinstance(data, dict):
+                return "settings.json 루트가 객체가 아님 — 거부: %s" % settings_path
+            backup = settings_path + ".bak-preflight"
+            if not os.path.exists(backup):
+                shutil.copy2(settings_path, backup)
+        else:
+            data = {}
+            d = os.path.dirname(settings_path)
+            if d:
+                os.makedirs(d, exist_ok=True)
+        # 기존 statusLine(우리 것이 아니면) → CYS_PREV_STATUSLINE로 보존 체인(사람용 줄 위임).
+        prev = data.get("statusLine")
+        prev_cmd = prev.get("command", "") if isinstance(prev, dict) else ""
+        if prev_cmd and "cys-statusline.sh" not in prev_cmd:
+            cmd = "CYS_PREV_STATUSLINE=%s %s%s" % (shlex.quote(prev_cmd), runner, script)
+        else:
+            cmd = runner + script
+        data["statusLine"] = {"type": "command", "command": cmd}
+        tmp = settings_path + ".tmp"
+        open(tmp, "w", encoding="utf-8").write(
+            json.dumps(data, ensure_ascii=False, indent=2)
+        )
+        os.replace(tmp, settings_path)
+        return None
+
+    def c32_statusline(self):
+        cid = "C32.statusline"
+        if self.skipped(cid):
+            return
+        script = os.path.join(pack_dir(), "hooks", "cys-statusline.sh")
+        if not os.path.isfile(script):
+            if not (self.fix and self.repair_via_init_pack() and os.path.isfile(script)):
+                self.add(cid, FAIL, "hooks/cys-statusline.sh 없음 — `cys init-pack` 또는 --fix")
+                return
+        targets = discover_claude_settings()
+        if not targets:
+            self.add(cid, WARN, "~/.claude*/settings.json 미발견 — claude 노드 기동 후 재실행")
+            return
+        unregistered = [t for t in targets if not self._statusline_registered(t)]
+        if not unregistered:
+            self.add(cid, PASS,
+                     "%d개 프로필 statusLine 등록됨 (claude 재시작 후 5h/7d rate limit 배지 적용)"
+                     % len(targets))
+            return
+        if self.fix:
+            done, errs = [], []
+            for t in unregistered:
+                err = self._register_statusline(t)
+                errs.append(err) if err else done.append(t)
+            if errs:
+                self.add(cid, FAIL, "; ".join(errs)
+                         + (" | 등록 성공: %s" % ", ".join(done) if done else ""))
+            else:
+                self.add(cid, FIXED, "statusLine 등록: %s — ★claude 재시작 후 적용" % ", ".join(done))
+        else:
+            self.add(cid, WARN, "statusLine 미등록 프로필: %s — --fix로 설치(claude 재시작 후 적용)"
+                     % ", ".join(unregistered))
 
     # ── C09 round 핵심 문서 ──
     def c09_round_core(self):
@@ -1802,6 +1887,7 @@ class Preflight:
         self.c29_harness_engineering()
         self.c30_git()
         self.c31_config_isolation()
+        self.c32_statusline()
         return self.results
 
 

@@ -96,6 +96,14 @@ enum Command {
         #[arg(long)]
         surface: Option<String>,
     },
+    /// T5 Phase 2-A: claude statusline stdin JSON을 읽어 usage.report로 push (cys-statusline.sh 전용 plumbing)
+    UsageReportStdin {
+        #[arg(long)]
+        surface: Option<String>,
+        /// push만 하고 사람용 statusline 한 줄을 출력하지 않는다 (기존 statusline 체인 보존 시).
+        #[arg(long)]
+        quiet: bool,
+    },
     /// T1-2 통합 관제 보드: 전 노드 상태를 1콜로 (read-screen 폴링 대체)
     Status {
         #[arg(long)]
@@ -887,6 +895,10 @@ fn run(command: Command) -> i32 {
                 )
                 .map(|_| println!("OK"))
             })
+        }
+
+        Command::UsageReportStdin { surface, quiet } => {
+            return run_usage_report_stdin(&surface, quiet)
         }
 
         Command::Status { json: as_json } => return run_status(as_json),
@@ -2426,6 +2438,116 @@ fn fmt_secs(s: u64) -> String {
 }
 
 /// T1-2 관제 보드 렌더링: org.status 1콜 → 사람/AI 모두 읽는 표
+/// statusline stdin JSON에서 usage.report 파라미터(surface 제외)를 추출한다 — 순수 함수(테스트 핀).
+/// `context_window.used_percentage`(서버 진실 ctx%)·`context_window_size`·`current_usage` 합(ctx_tokens,
+/// input+cache_creation+cache_read = Phase 1 transcript 공식과 동일)·`rate_limits.five_hour/seven_day`
+/// → rate 배열. 누락 필드는 안전하게 생략(rate 부재=무료/세션 첫 응답 전이면 빈 벡터).
+fn statusline_to_report_params(v: &Value) -> Value {
+    let cw = v.get("context_window");
+    let ctx_pct = cw
+        .and_then(|c| c.get("used_percentage"))
+        .and_then(|x| x.as_f64());
+    let ctx_window = cw
+        .and_then(|c| c.get("context_window_size"))
+        .and_then(|x| x.as_u64());
+    let ctx_tokens = cw
+        .and_then(|c| c.get("current_usage"))
+        .map(|cu| {
+            let g = |k: &str| cu.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+            g("input_tokens") + g("cache_creation_input_tokens") + g("cache_read_input_tokens")
+        })
+        .filter(|&t| t > 0)
+        .or_else(|| {
+            cw.and_then(|c| c.get("total_input_tokens"))
+                .and_then(|x| x.as_u64())
+        });
+    let mut rate = Vec::new();
+    if let Some(rl) = v.get("rate_limits") {
+        for (key, label) in [("five_hour", "5h"), ("seven_day", "7d")] {
+            if let Some(used) = rl
+                .get(key)
+                .and_then(|w| w.get("used_percentage"))
+                .and_then(|x| x.as_f64())
+            {
+                let mut entry = json!({"label": label, "used_pct": used});
+                if let Some(r) = rl
+                    .get(key)
+                    .and_then(|w| w.get("resets_at"))
+                    .and_then(|x| x.as_f64())
+                {
+                    entry["resets_at"] = json!(r);
+                }
+                rate.push(entry);
+            }
+        }
+    }
+    let mut params = json!({ "rate": rate });
+    if let Some(p) = ctx_pct {
+        params["ctx_pct"] = json!(p);
+    }
+    if let Some(t) = ctx_tokens {
+        params["ctx_tokens"] = json!(t);
+    }
+    if let Some(w) = ctx_window {
+        params["ctx_window"] = json!(w);
+    }
+    params
+}
+
+/// statusline JSON → 사람이 읽는 한 줄 (`<model> · CTX n% · 5h n% · 7d n%`). rate는 있을 때만.
+/// claude UI statusline에 그대로 표시된다(pane 헤더 배지와 별개·추가 표면).
+fn statusline_human_line(v: &Value) -> String {
+    let model = v
+        .get("model")
+        .and_then(|m| m.get("display_name"))
+        .and_then(|x| x.as_str())
+        .unwrap_or("claude");
+    let mut parts = vec![model.to_string()];
+    if let Some(p) = v
+        .get("context_window")
+        .and_then(|c| c.get("used_percentage"))
+        .and_then(|x| x.as_f64())
+    {
+        parts.push(format!("CTX {p:.0}%"));
+    }
+    if let Some(rl) = v.get("rate_limits") {
+        for (key, label) in [("five_hour", "5h"), ("seven_day", "7d")] {
+            if let Some(u) = rl
+                .get(key)
+                .and_then(|w| w.get("used_percentage"))
+                .and_then(|x| x.as_f64())
+            {
+                parts.push(format!("{label} {u:.0}%"));
+            }
+        }
+    }
+    parts.join(" · ")
+}
+
+/// cys-statusline.sh 래퍼 전용 — stdin의 claude statusline JSON을 읽어 usage.report로 push하고,
+/// (quiet가 아니면) 사람용 statusline 한 줄을 stdout으로 출력한다.
+/// ★불변: statusline 경로는 **절대 claude를 막지 않는다** — 빈 입력·파싱 실패·surface 미해결·
+/// 데몬 부재 전부 exit 0으로 무해하게 흘린다.
+fn run_usage_report_stdin(surface: &Option<String>, quiet: bool) -> i32 {
+    let mut buf = String::new();
+    if std::io::stdin().read_to_string(&mut buf).is_err() || buf.trim().is_empty() {
+        return 0;
+    }
+    let Ok(v) = serde_json::from_str::<Value>(&buf) else {
+        return 0;
+    };
+    // push (surface 미해결·데몬 부재는 조용히 스킵 — 사람용 줄은 여전히 출력한다)
+    if let Ok(sid) = target_surface(surface, &None) {
+        let mut params = statusline_to_report_params(&v);
+        params["surface_id"] = json!(sid);
+        let _ = request("usage.report", params);
+    }
+    if !quiet {
+        println!("{}", statusline_human_line(&v));
+    }
+    0
+}
+
 fn run_status(as_json: bool) -> i32 {
     let r = match request("org.status", json!({})) {
         Ok(r) => r,
@@ -3273,6 +3395,68 @@ mod tests {
         // 잘못된 형식 → Err
         assert!(parse_explicit_surface(&Some("nope".into())).is_err());
         assert!(parse_explicit_surface(&Some("-1".into())).is_err());
+    }
+
+    /// T5 Phase 2-A: claude statusline stdin JSON → usage.report 파라미터 추출 핀.
+    /// 공식 stdin 스키마(used_percentage·current_usage 합·rate_limits)를 회귀 박제한다.
+    #[test]
+    fn statusline_params_full_schema() {
+        let v = json!({
+            "context_window": {
+                "context_window_size": 200000,
+                "used_percentage": 41.6,
+                "current_usage": {
+                    "input_tokens": 1000,
+                    "cache_creation_input_tokens": 2000,
+                    "cache_read_input_tokens": 80000,
+                    "output_tokens": 5000
+                }
+            },
+            "rate_limits": {
+                "five_hour": {"used_percentage": 41.0, "resets_at": 1781314865},
+                "seven_day": {"used_percentage": 12.0, "resets_at": 1781781650}
+            }
+        });
+        let p = statusline_to_report_params(&v);
+        assert_eq!(p["ctx_pct"].as_f64(), Some(41.6));
+        assert_eq!(p["ctx_window"].as_u64(), Some(200000));
+        // ctx_tokens = input + cache_creation + cache_read (output 제외) = 83000
+        assert_eq!(p["ctx_tokens"].as_u64(), Some(83000));
+        let rate = p["rate"].as_array().unwrap();
+        assert_eq!(rate.len(), 2);
+        assert_eq!(rate[0]["label"], json!("5h"));
+        assert_eq!(rate[0]["used_pct"].as_f64(), Some(41.0));
+        assert_eq!(rate[0]["resets_at"].as_f64(), Some(1781314865.0));
+        assert_eq!(rate[1]["label"], json!("7d"));
+    }
+
+    /// rate_limits 부재(무료/세션 첫 응답 전): ctx만 추출, rate는 빈 벡터 — ctx 배지만 작동.
+    #[test]
+    fn statusline_params_no_rate_limits() {
+        let v = json!({
+            "context_window": {"context_window_size": 1000000, "used_percentage": 8.0}
+        });
+        let p = statusline_to_report_params(&v);
+        assert_eq!(p["ctx_pct"].as_f64(), Some(8.0));
+        assert_eq!(p["ctx_window"].as_u64(), Some(1000000));
+        assert_eq!(p["rate"].as_array().unwrap().len(), 0);
+        assert!(p.get("ctx_tokens").is_none(), "current_usage·total 없으면 ctx_tokens 생략");
+    }
+
+    /// 사람용 statusline 한 줄 포맷 — rate는 있을 때만, 모델명 부재 시 "claude" 폴백.
+    #[test]
+    fn statusline_human_line_format() {
+        let v = json!({
+            "model": {"display_name": "Opus 4.8"},
+            "context_window": {"used_percentage": 42.0},
+            "rate_limits": {
+                "five_hour": {"used_percentage": 41.0},
+                "seven_day": {"used_percentage": 12.0}
+            }
+        });
+        assert_eq!(statusline_human_line(&v), "Opus 4.8 · CTX 42% · 5h 41% · 7d 12%");
+        let v2 = json!({"context_window": {"used_percentage": 8.0}});
+        assert_eq!(statusline_human_line(&v2), "claude · CTX 8%");
     }
 
     #[test]

@@ -36,6 +36,9 @@ const MAX_READ_PER_TICK: u64 = 4 * 1024 * 1024;
 const MAX_CARRY: usize = 8 * 1024 * 1024;
 /// 휴리스틱(비등록) 매핑의 재발견 주기 초 — 새 세션 파일(/clear 등) 전환 추적
 const REDISCOVER_SECS: f64 = 30.0;
+/// statusline 보고(usage.report) 신선도 창 초 — claude는 이 안에 statusline 보고가 있으면
+/// 트랜스크립트 tail이 ctx를 덮어써 rate limit을 유실시키지 않게 수집을 건너뛴다(우선순위 병합).
+const STATUSLINE_FRESH_SECS: f64 = 60.0;
 
 /// rate limit 윈도우 1개 (codex primary/secondary; Phase 2에서 claude 5h/7d 합류)
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
@@ -137,6 +140,17 @@ fn collect_for(
 ) {
     let registered = s.registered_transcript.lock().unwrap().clone();
     let now = now_epoch();
+
+    // T5 Phase 2-A 우선순위 병합 — claude는 statusline 보고(rate limit + 서버 진실 ctx)가
+    // 신선하면 트랜스크립트 tail이 ctx만 덮어써 rate를 유실시키지 않도록 수집을 건너뛴다.
+    // statusline이 끊기면(age > STATUSLINE_FRESH_SECS) 트랜스크립트로 graceful 폴백.
+    if agent == "claude" {
+        if let Some(prev) = s.observed_usage.lock().unwrap().as_ref() {
+            if prev.source == "statusline" && now - prev.updated_at < STATUSLINE_FRESH_SECS {
+                return;
+            }
+        }
+    }
 
     // ── 세션 파일 결정 (등록 > lsof > 휴리스틱) ──
     let desired: Option<(PathBuf, bool)> = if let Some(reg) = registered {
@@ -287,20 +301,7 @@ fn collect_for(
     // 로 발화한다. 분리된 에지 상태를 쓰면 같은 교차에 두 경로가 각각 발화해 master/CSO가
     // cycle-agent를 이중 집행한다. payload source:"observed"로 자기보고 발화와 구분.
     if let Some(p) = new.ctx_pct {
-        let threshold = crate::handlers::context_threshold_pct();
-        if p < threshold {
-            s.ctx_threshold_armed.store(true, Ordering::Relaxed);
-        } else if s.ctx_threshold_armed.swap(false, Ordering::Relaxed) {
-            daemon.bus.publish(
-                "context.threshold",
-                "watchdog",
-                Some(s.id),
-                json!({"role": s.role.lock().unwrap().clone(), "context_pct": p,
-                       "threshold": threshold, "surface_ref": cys::surface_ref(s.id),
-                       "source": "observed", "agent": new.agent,
-                       "action": "cycle-agent(저장→검증→clear→복원) 집행 대상 — MASTER_DIRECTIVE §컨텍스트 사이클"}),
-            );
-        }
+        crate::handlers::maybe_fire_context_threshold(daemon, s, p, "observed", Some(&new.agent));
     }
 }
 
