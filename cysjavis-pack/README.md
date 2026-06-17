@@ -1,4 +1,4 @@
-# CYSJavis Pack — aiterm 내장 멀티에이전트 운영체계
+# CYSJavis Pack — cys 내장 멀티에이전트 운영체계
 
 cys 터미널을 설치하고 AI CLI(Claude Code 등)를 연결하면 **master–worker–CSO–reviewer 멀티에이전트
 운영체계(자비스)**가 바로 구동되도록 하는 템플릿 팩이다. 터미널의 기계 기능(양방향 소켓·승인
