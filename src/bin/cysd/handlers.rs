@@ -2052,6 +2052,54 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             ))
         }
 
+        // ─── T7 E4: 세션 타임라인 (Control Center 세션 탭) ───
+        "control.sessions" => {
+            let now = crate::state::now_epoch();
+            let window = param_str(&params, "window").unwrap_or_else(|| "7d".to_string());
+            let since = crate::analytics::window_since(now, &window);
+            let result = {
+                let guard = daemon.analytics.lock().unwrap();
+                match guard.as_ref() {
+                    Some(conn) => crate::analytics::session_list(conn, since),
+                    None => json!({ "sessions": [] }),
+                }
+            };
+            Reply::Single(ok_response(
+                &id,
+                json!({ "now": now, "window": window, "since": since, "sessions": result["sessions"] }),
+            ))
+        }
+
+        "control.session_detail" => {
+            let Some(sid) = param_str(&params, "session_id") else {
+                return Reply::Single(err_response(&id, "invalid_params", "missing session_id"));
+            };
+            let detail = {
+                let guard = daemon.analytics.lock().unwrap();
+                match guard.as_ref() {
+                    Some(conn) => crate::analytics::session_detail(conn, &sid),
+                    None => json!({ "session_id": sid, "timeline": [], "summary": {} }),
+                }
+            };
+            Reply::Single(ok_response(&id, detail))
+        }
+
+        "control.session_star" => {
+            let Some(sid) = param_str(&params, "session_id") else {
+                return Reply::Single(err_response(&id, "invalid_params", "missing session_id"));
+            };
+            let starred = params.get("starred").and_then(|v| v.as_bool()).unwrap_or(true);
+            let note = param_str(&params, "note").unwrap_or_default();
+            let now = crate::state::now_epoch();
+            {
+                let guard = daemon.analytics.lock().unwrap();
+                if let Some(conn) = guard.as_ref() {
+                    crate::analytics::set_star(conn, &sid, starred, &note, now);
+                }
+            }
+            Reply::Single(ok_response(&id, json!({ "session_id": sid, "starred": starred })))
+        }
+
         // ─── T2-5 에이전트 메타 등록 (launch-agent가 호출 — 사망 감지·status 보드의 기반) ───
         "surface.set_meta" => {
             let Some(sid) = resolve_surface_id(&params) else {

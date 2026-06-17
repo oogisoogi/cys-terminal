@@ -136,7 +136,18 @@ stale 마커(정의 변경 시 재계산). 보존 정책(기본 60일·`retentio
 >   **이벤트 발화 + UI 배지**로 정합화(master PTY 주입은 kill-switch 위험·기존 패턴 위배라 회피).
 > - **정직 범위**: 노드 토큰 급증 이상감지·스킬 ROI 패턴(commit→재edit)은 per-node 시계열 베이스라인 미보존 → 후속.
 > - 검증: cargo 213/213(신규 alerts 3종) · E2E 7/7(`docs/alerts_e2e.py` — 핫로드·예산·반복실패·심각도·재무장) · UI 번들 OK.
-> - **다음 = E4**(세션 타임라인·전사) 또는 E5(주간 다이제스트).
+>
+> **E4 세션 타임라인 탭 완료**(로컬 커밋·미배포):
+> - 백엔드: `analytics.rs` `summarize_sessions`(순수·usage_records+events 병합)·`ribbon`(활동 24칸)·`session_list`·
+>   `session_detail`(이벤트 타임라인+토큰/비용 요약)·`starred_set`/`set_star`(stars 테이블). 세션별: agent·role·
+>   started/ended·duration·턴·토큰·비용·skill_calls(PRE만)·fail_calls(POST exit≠0)·top_skill·활동리본·⭐.
+>   `control.sessions`·`control.session_detail`·`control.session_star` RPC.
+> - 프런트: Control Center **세션 탭** + 윈도우(오늘/7일/전체)·⭐만 필터 + 세션 리스트(활동 리본 strip·역할 색·
+>   ⭐ 토글·턴/토큰/비용/실패) + 클릭 시 상세(이벤트 타임라인 ✓/✗/▸). Tauri 3커맨드.
+> - **정직 범위**: 전사 원문(HUMAN/ASSISTANT/TOOL 콘텐츠)·LLM title/summary는 데이터 미수집(messages 테이블
+>   미적재·recall은 surface_id 기준 스크롤백) → **이벤트 타임라인으로 대체**, title은 UI에서 메타로 합성. 후속.
+> - 검증: cargo 215/215(신규 `summarize_sessions`·`ribbon`) · E2E 16/16(`docs/sessions_e2e.py`) · UI 번들 OK.
+> - **다음 = E5**(주간 다이제스트) 또는 일괄 배포.
 
 ### E1 — 영속 분석 기반 (척추) 【선행·필수】
 - **백엔드**: `analytics.db` 스키마 생성(state.rs init) · `ingest.rs`(hook 이벤트→events/messages 적재) ·

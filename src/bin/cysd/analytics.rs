@@ -458,6 +458,286 @@ pub fn skills_summary(conn: &Connection, since: f64) -> serde_json::Value {
     summarize_skills(&load_event_rows(conn, since))
 }
 
+// ───────────────────────── E4 세션 타임라인 (control.sessions / session_detail) ─────────────────────────
+
+const RIBBON_BUCKETS: usize = 24; // 활동 리본 칸 수
+
+/// 세션 집계용 usage 행 — (session, agent, tokens(4분해합), cost, ts)
+type SessUsageRow = (String, String, u64, f64, f64);
+/// 세션 집계용 event 행 — (session, role, tool, is_skill, skill_name, is_agent, exit_code, event_type, ts)
+type SessEventRow = (String, String, String, bool, String, bool, Option<i64>, String, f64);
+
+fn load_session_usage(conn: &Connection, since: f64) -> Vec<SessUsageRow> {
+    let mut stmt = match conn.prepare(
+        "SELECT session_id, agent, input_tokens, output_tokens, cache_creation, cache_read, cost_usd, ts
+         FROM usage_records WHERE ts >= ?1",
+    ) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let rows = stmt.query_map(rusqlite::params![since], |r| {
+        Ok((
+            r.get::<_, String>(0).unwrap_or_default(),
+            r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+            (r.get::<_, i64>(2)? + r.get::<_, i64>(3)? + r.get::<_, i64>(4)? + r.get::<_, i64>(5)?) as u64,
+            r.get::<_, f64>(6)?,
+            r.get::<_, f64>(7)?,
+        ))
+    });
+    match rows {
+        Ok(it) => it.filter_map(|x| x.ok()).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn load_session_events(conn: &Connection, since: f64) -> Vec<SessEventRow> {
+    let mut stmt = match conn.prepare(
+        "SELECT session_id, role, tool_name, is_skill, skill_name, is_agent, exit_code, event_type, ts
+         FROM events WHERE ts >= ?1 AND event_type IN ('PRE_TOOL','POST_TOOL')",
+    ) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let rows = stmt.query_map(rusqlite::params![since], |r| -> rusqlite::Result<SessEventRow> {
+        Ok((
+            r.get::<_, String>(0).unwrap_or_default(),
+            r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+            r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+            r.get::<_, Option<i64>>(3)?.unwrap_or(0) != 0,
+            r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+            r.get::<_, Option<i64>>(5)?.unwrap_or(0) != 0,
+            r.get::<_, Option<i64>>(6)?,
+            r.get::<_, String>(7).unwrap_or_default(),
+            r.get::<_, f64>(8)?,
+        ))
+    });
+    match rows {
+        Ok(it) => it.filter_map(|x| x.ok()).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// 활동 리본 — [start,end]를 buckets칸으로 나눠 각 칸의 활동 수를 센다(순수).
+fn ribbon(ts_list: &[f64], start: f64, end: f64, buckets: usize) -> Vec<u64> {
+    let mut out = vec![0u64; buckets];
+    let span = (end - start).max(1e-9);
+    for &t in ts_list {
+        let mut idx = (((t - start) / span) * buckets as f64) as isize;
+        if idx < 0 {
+            idx = 0;
+        }
+        if idx as usize >= buckets {
+            idx = buckets as isize - 1;
+        }
+        out[idx as usize] += 1;
+    }
+    out
+}
+
+/// usage+event 행을 세션 단위로 병합·요약(순수·테스트). ended_at 내림차순(최신 먼저).
+pub fn summarize_sessions(
+    usage: &[SessUsageRow],
+    events: &[SessEventRow],
+    starred: &std::collections::HashSet<String>,
+) -> serde_json::Value {
+    use serde_json::json;
+    use std::collections::HashMap;
+    struct Agg {
+        agent: String,
+        role: String,
+        tokens: u64,
+        cost: f64,
+        msgs: u64,
+        tool_calls: u64,
+        skill_calls: u64,
+        agent_calls: u64,
+        fail_calls: u64,
+        min_ts: f64,
+        max_ts: f64,
+        ts_list: Vec<f64>,
+        skills: HashMap<String, u64>,
+    }
+    let mut m: HashMap<String, Agg> = HashMap::new();
+    let ensure = |m: &mut HashMap<String, Agg>, sid: &str, ts: f64| {
+        m.entry(sid.to_string()).or_insert_with(|| Agg {
+            agent: String::new(), role: String::new(), tokens: 0, cost: 0.0, msgs: 0,
+            tool_calls: 0, skill_calls: 0, agent_calls: 0, fail_calls: 0,
+            min_ts: ts, max_ts: ts, ts_list: Vec::new(), skills: HashMap::new(),
+        });
+    };
+    for (sid, agent, tokens, cost, ts) in usage {
+        ensure(&mut m, sid, *ts);
+        let a = m.get_mut(sid).unwrap();
+        if a.agent.is_empty() && !agent.is_empty() {
+            a.agent = agent.clone();
+        }
+        a.tokens += tokens;
+        a.cost += cost;
+        a.msgs += 1;
+        a.min_ts = a.min_ts.min(*ts);
+        a.max_ts = a.max_ts.max(*ts);
+        a.ts_list.push(*ts);
+    }
+    for (sid, role, _tool, is_skill, skill, is_agent, exit, etype, ts) in events {
+        ensure(&mut m, sid, *ts);
+        let a = m.get_mut(sid).unwrap();
+        if a.role.is_empty() && !role.is_empty() {
+            a.role = role.clone();
+        }
+        a.min_ts = a.min_ts.min(*ts);
+        a.max_ts = a.max_ts.max(*ts);
+        // PRE_TOOL/POST_TOOL 둘 다 ts_list엔 활동으로 — 리본은 활동 밀도이므로 무방.
+        a.ts_list.push(*ts);
+        // 호출 수는 PRE_TOOL(실제 호출 시도)만 — POST 중복 카운트 방지(control.skills와 일관).
+        if etype == "PRE_TOOL" {
+            a.tool_calls += 1;
+            if *is_skill {
+                a.skill_calls += 1;
+                if !skill.is_empty() {
+                    *a.skills.entry(skill.clone()).or_insert(0) += 1;
+                }
+            }
+            if *is_agent {
+                a.agent_calls += 1;
+            }
+        }
+        // 실패는 POST_TOOL exit_code≠0.
+        if matches!(exit, Some(c) if *c != 0) {
+            a.fail_calls += 1;
+        }
+    }
+    let mut sessions: Vec<serde_json::Value> = m
+        .into_iter()
+        .map(|(sid, a)| {
+            let top_skill = a
+                .skills
+                .iter()
+                .max_by(|x, y| x.1.cmp(y.1).then_with(|| y.0.cmp(x.0)))
+                .map(|(k, _)| k.clone());
+            json!({
+                "session_id": sid,
+                "agent": a.agent,
+                "role": a.role,
+                "started_at": a.min_ts,
+                "ended_at": a.max_ts,
+                "duration_secs": (a.max_ts - a.min_ts).max(0.0),
+                "msgs": a.msgs,
+                "tokens": a.tokens,
+                "cost_usd": a.cost,
+                "tool_activity": a.tool_calls,
+                "skill_calls": a.skill_calls,
+                "agent_calls": a.agent_calls,
+                "fail_calls": a.fail_calls,
+                "top_skill": top_skill,
+                "ribbon": ribbon(&a.ts_list, a.min_ts, a.max_ts, RIBBON_BUCKETS),
+                "starred": starred.contains(&sid),
+            })
+        })
+        .collect();
+    sessions.sort_by(|a, b| {
+        b["ended_at"].as_f64().unwrap_or(0.0)
+            .partial_cmp(&a["ended_at"].as_f64().unwrap_or(0.0))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a["session_id"].as_str().unwrap_or("").cmp(b["session_id"].as_str().unwrap_or("")))
+    });
+    json!({ "sessions": sessions })
+}
+
+/// ⭐ 즐겨찾기 세션 집합.
+pub fn starred_set(conn: &Connection) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    if let Ok(mut stmt) = conn.prepare("SELECT session_id FROM stars") {
+        if let Ok(it) = stmt.query_map([], |r| r.get::<_, String>(0)) {
+            out.extend(it.filter_map(|x| x.ok()));
+        }
+    }
+    out
+}
+
+/// ⭐ 토글 — starred=true면 upsert, false면 삭제. 실패는 무해히 무시.
+pub fn set_star(conn: &Connection, session_id: &str, starred: bool, note: &str, ts: f64) {
+    if starred {
+        let _ = conn.execute(
+            "INSERT INTO stars(session_id, note, starred_at) VALUES(?1,?2,?3)
+             ON CONFLICT(session_id) DO UPDATE SET note=?2",
+            rusqlite::params![session_id, note, ts],
+        );
+    } else {
+        let _ = conn.execute("DELETE FROM stars WHERE session_id = ?1", rusqlite::params![session_id]);
+    }
+}
+
+/// control.sessions 본체 — since 이후 세션 목록.
+pub fn session_list(conn: &Connection, since: f64) -> serde_json::Value {
+    let usage = load_session_usage(conn, since);
+    let events = load_session_events(conn, since);
+    summarize_sessions(&usage, &events, &starred_set(conn))
+}
+
+/// control.session_detail 본체 — 단일 세션의 이벤트 타임라인 + 토큰/비용/모델 요약.
+/// ★전사 원문(HUMAN/ASSISTANT/TOOL 콘텐츠)은 미수집(messages 테이블 미적재) — 이벤트 타임라인으로 대체.
+pub fn session_detail(conn: &Connection, session_id: &str) -> serde_json::Value {
+    use serde_json::json;
+    // 이벤트 타임라인 (ts 오름차순·원시 컬럼 그대로)
+    let mut timeline: Vec<serde_json::Value> = Vec::new();
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT ts, event_type, tool_name, is_skill, skill_name, is_agent, agent_type, exit_code, role
+         FROM events WHERE session_id = ?1 ORDER BY ts ASC LIMIT 2000",
+    ) {
+        if let Ok(it) = stmt.query_map(rusqlite::params![session_id], |r| {
+            Ok(json!({
+                "ts": r.get::<_, f64>(0)?,
+                "event_type": r.get::<_, String>(1).unwrap_or_default(),
+                "tool_name": r.get::<_, Option<String>>(2)?,
+                "is_skill": r.get::<_, Option<i64>>(3)?.unwrap_or(0) != 0,
+                "skill_name": r.get::<_, Option<String>>(4)?,
+                "is_agent": r.get::<_, Option<i64>>(5)?.unwrap_or(0) != 0,
+                "agent_type": r.get::<_, Option<String>>(6)?,
+                "exit_code": r.get::<_, Option<i64>>(7)?,
+                "role": r.get::<_, Option<String>>(8)?,
+            }))
+        }) {
+            timeline.extend(it.filter_map(|x| x.ok()));
+        }
+    }
+    // 토큰/비용/모델 요약 — 해당 세션 usage_records를 summarize 재사용
+    let urows = load_summary_rows_for_session(conn, session_id);
+    let summary = summarize(&urows);
+    json!({
+        "session_id": session_id,
+        "timeline": timeline,
+        "summary": summary,
+    })
+}
+
+/// 단일 세션의 usage_records를 summarize 입력 형태로 로드.
+fn load_summary_rows_for_session(conn: &Connection, session_id: &str) -> Vec<SummaryRow> {
+    let mut stmt = match conn.prepare(
+        "SELECT agent, model, input_tokens, output_tokens, cache_creation, cache_read, cost_usd, session_id, ts
+         FROM usage_records WHERE session_id = ?1",
+    ) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let rows = stmt.query_map(rusqlite::params![session_id], |r| {
+        Ok((
+            r.get::<_, String>(0).unwrap_or_default(),
+            r.get::<_, String>(1).unwrap_or_default(),
+            r.get::<_, i64>(2)? as u64,
+            r.get::<_, i64>(3)? as u64,
+            r.get::<_, i64>(4)? as u64,
+            r.get::<_, i64>(5)? as u64,
+            r.get::<_, f64>(6)?,
+            r.get::<_, String>(7).unwrap_or_default(),
+            r.get::<_, f64>(8)?,
+        ))
+    });
+    match rows {
+        Ok(it) => it.filter_map(|x| x.ok()).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -594,5 +874,54 @@ mod tests {
         let empty = summarize_skills(&[]);
         assert_eq!(empty["totals"]["tool_calls"], 0);
         assert_eq!(empty["totals"]["fail_rate"], 0.0);
+    }
+
+    #[test]
+    fn ribbon_buckets_activity() {
+        // [0,10] 10칸 — t=0→칸0, t=10(끝)→마지막 칸, t=5→중간
+        let r = ribbon(&[0.0, 5.0, 10.0], 0.0, 10.0, 10);
+        assert_eq!(r.len(), 10);
+        assert_eq!(r[0], 1);
+        assert_eq!(r[5], 1);
+        assert_eq!(r[9], 1, "끝 ts는 마지막 칸으로 클램프");
+        // span 0(단일 시점) 안전
+        let r2 = ribbon(&[3.0, 3.0], 3.0, 3.0, 4);
+        assert_eq!(r2.iter().sum::<u64>(), 2);
+    }
+
+    #[test]
+    fn summarize_sessions_merges_usage_and_events() {
+        let usage: Vec<SessUsageRow> = vec![
+            ("/s/a".into(), "claude".into(), 1000, 0.05, 1000.0),
+            ("/s/a".into(), "claude".into(), 500, 0.01, 1100.0),
+            ("/s/b".into(), "codex".into(), 200, 0.001, 1050.0),
+        ];
+        let events: Vec<SessEventRow> = vec![
+            ("/s/a".into(), "worker".into(), "Skill".into(), true, "commit".into(), false, None, "PRE_TOOL".into(), 1020.0),
+            ("/s/a".into(), "worker".into(), "Bash".into(), false, "".into(), false, Some(1), "POST_TOOL".into(), 1040.0), // 실패
+            ("/s/b".into(), "master".into(), "Task".into(), false, "".into(), true, None, "PRE_TOOL".into(), 1055.0),
+        ];
+        let mut starred = std::collections::HashSet::new();
+        starred.insert("/s/a".to_string());
+        let v = summarize_sessions(&usage, &events, &starred);
+        let s = v["sessions"].as_array().unwrap();
+        assert_eq!(s.len(), 2);
+        // ended_at 내림차순 — /s/a(max 1100) 먼저, /s/b(max 1055)
+        assert_eq!(s[0]["session_id"], "/s/a");
+        assert_eq!(s[0]["agent"], "claude");
+        assert_eq!(s[0]["role"], "worker");
+        assert_eq!(s[0]["msgs"], 2);
+        assert_eq!(s[0]["tokens"], 1500u64);
+        assert!((s[0]["cost_usd"].as_f64().unwrap() - 0.06).abs() < 1e-9);
+        assert_eq!(s[0]["skill_calls"], 1);
+        assert_eq!(s[0]["fail_calls"], 1);
+        assert_eq!(s[0]["top_skill"], "commit");
+        assert_eq!(s[0]["starred"], true);
+        assert!((s[0]["duration_secs"].as_f64().unwrap() - 100.0).abs() < 1e-9, "1100-1000");
+        assert_eq!(s[0]["ribbon"].as_array().unwrap().len(), RIBBON_BUCKETS);
+        // /s/b: codex·master·위임 1
+        assert_eq!(s[1]["session_id"], "/s/b");
+        assert_eq!(s[1]["agent_calls"], 1);
+        assert_eq!(s[1]["starred"], false);
     }
 }

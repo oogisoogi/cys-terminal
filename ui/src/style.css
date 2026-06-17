@@ -263,6 +263,27 @@ html, body {
 .cc-alert-row.crit { border-color: rgba(239,68,68,.45); background: rgba(239,68,68,.10); color: #fca5a5; }
 .cc-alert-icon { flex: none; }
 .cc-alert-msg { font-weight: 600; }
+/* E4 세션 타임라인 탭 */
+.cc-sess-row { display: flex; align-items: center; gap: 9px; padding: 8px 10px; margin-bottom: 4px; font-size: 12px;
+  border-left: 3px solid var(--rc, #64748b); border-radius: 6px; background: rgba(255,255,255,.025); cursor: pointer; }
+.cc-sess-row:hover { background: rgba(255,255,255,.06); }
+.cc-sess-row.sel { background: rgba(0,212,255,.10); }
+.cc-star { background: none; border: none; color: #f59e0b; font-size: 15px; cursor: pointer; line-height: 1; flex: none; padding: 0; }
+.cc-star[data-on="0"] { color: #475569; }
+.cc-sess-when { color: #94a3b8; font-variant-numeric: tabular-nums; flex: none; min-width: 78px; }
+.cc-sess-role { color: #e2e8f0; font-weight: 600; flex: none; min-width: 120px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cc-sess-meta { color: #64748b; margin-left: auto; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cc-ribbon { display: inline-flex; gap: 1px; height: 8px; flex: 0 0 auto; }
+.cc-ribbon-cell { width: 3px; height: 8px; background: #00d4ff; border-radius: 1px; }
+.cc-sess-detail-kpi { font-size: 13px; color: #e2e8f0; font-variant-numeric: tabular-nums; margin-bottom: 4px; }
+.cc-sess-note { font-size: 11px; color: #475569; margin-bottom: 10px; }
+.cc-timeline { display: flex; flex-direction: column; gap: 2px; max-height: 360px; overflow-y: auto; }
+.cc-tl-row { display: flex; align-items: center; gap: 9px; padding: 4px 8px; font-size: 12px; border-radius: 5px; background: rgba(255,255,255,.02); }
+.cc-tl-row.crit { background: rgba(239,68,68,.10); }
+.cc-tl-tag { flex: none; color: #22c55e; font-variant-numeric: tabular-nums; width: 14px; text-align: center; }
+.cc-tl-row.crit .cc-tl-tag { color: #ef4444; }
+.cc-tl-name { color: #e2e8f0; }
+.cc-tl-role { color: #64748b; margin-left: auto; font-size: 11px; }
 .pane .pane-close { opacity: .5; cursor: pointer; }
 .pane .pane-close:hover { opacity: 1; color: var(--error); }
 .pane .pane-title { cursor: grab; }

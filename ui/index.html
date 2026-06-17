@@ -48,6 +48,7 @@
         <button class="cc-tab active" data-view="live">Live</button>
         <button class="cc-tab" data-view="eff">비용·효율</button>
         <button class="cc-tab" data-view="skills">스킬·에이전트</button>
+        <button class="cc-tab" data-view="sessions">세션</button>
       </div>
       <div id="cc-body">
         <div id="cc-view-live">
@@ -96,6 +97,16 @@
           <div class="cc-section"><div class="cc-h">스킬 호출 TOP</div><div id="cc-skills-skills"></div></div>
           <div class="cc-section"><div class="cc-h">툴 호출 TOP</div><div id="cc-skills-tools"></div></div>
           <div class="cc-section"><div class="cc-h">서브에이전트 위임</div><div id="cc-skills-agents"></div></div>
+        </div>
+        <div id="cc-view-sessions" hidden>
+          <div class="cc-eff-win" id="cc-sessions-win">
+            <button class="cc-win" data-window="today">오늘</button>
+            <button class="cc-win active" data-window="7d">7일</button>
+            <button class="cc-win" data-window="all">전체</button>
+            <button class="cc-win" id="cc-sessions-star-filter">⭐만</button>
+          </div>
+          <div id="cc-sessions-list"></div>
+          <div id="cc-session-detail" class="cc-section" hidden></div>
         </div>
         <div id="cc-footer"></div>
       </div>

@@ -142,6 +142,21 @@ async fn control_alerts() -> Result<Value, String> {
 }
 
 #[tauri::command]
+async fn control_sessions(window: Option<String>) -> Result<Value, String> {
+    rpc("control.sessions", json!({ "window": window })).await
+}
+
+#[tauri::command]
+async fn control_session_detail(session_id: String) -> Result<Value, String> {
+    rpc("control.session_detail", json!({ "session_id": session_id })).await
+}
+
+#[tauri::command]
+async fn control_session_star(session_id: String, starred: bool) -> Result<Value, String> {
+    rpc("control.session_star", json!({ "session_id": session_id, "starred": starred })).await
+}
+
+#[tauri::command]
 async fn create_surface(
     cwd: Option<String>,
     title: Option<String>,
@@ -514,6 +529,9 @@ fn main() {
             control_analytics,
             control_skills,
             control_alerts,
+            control_sessions,
+            control_session_detail,
+            control_session_star,
             control_dashboard,
             create_surface,
             send_input,

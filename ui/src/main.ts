@@ -109,9 +109,12 @@ let ccTimer: number | null = null;
 let ccClockTimer: number | null = null;
 let ccUptimeBase = 0;
 let ccUptimeFetchedAt = 0;
-let ccTab: "live" | "eff" | "skills" = "live";
+let ccTab: "live" | "eff" | "skills" | "sessions" = "live";
 let ccEffWindow = "today";
 let ccSkillsWindow = "today";
+let ccSessionsWindow = "7d";
+let ccSessionsStarOnly = false;
+let ccSessionSelected: string | null = null;
 
 const CC_ROLE_COLOR: Record<string, string> = {
   master: "#3b82f6", cso: "#8b5cf6", worker: "#00e676",
@@ -231,16 +234,26 @@ async function refreshSkills() {
   }
 }
 
-function setCcTab(view: "live" | "eff" | "skills") {
+async function refreshSessions() {
+  try {
+    renderSessions((await invoke("control_sessions", { window: ccSessionsWindow })) as any);
+  } catch {
+    /* graceful */
+  }
+}
+
+function setCcTab(view: "live" | "eff" | "skills" | "sessions") {
   ccTab = view;
   document.getElementById("cc-view-live")!.hidden = view !== "live";
   document.getElementById("cc-view-eff")!.hidden = view !== "eff";
   document.getElementById("cc-view-skills")!.hidden = view !== "skills";
+  document.getElementById("cc-view-sessions")!.hidden = view !== "sessions";
   document.querySelectorAll("#cc-tabs .cc-tab").forEach((b) =>
     b.classList.toggle("active", (b as HTMLElement).dataset.view === view),
   );
   if (view === "eff") refreshEfficiency();
   if (view === "skills") refreshSkills();
+  if (view === "sessions") refreshSessions();
 }
 
 function renderEfficiency(a: any) {
@@ -381,6 +394,107 @@ function renderSkills(a: any) {
             return `<div class="cc-mix-row"><span class="cc-mix-name" title="${ccEsc(x.name ?? "")}">${ccEsc(x.name ?? "?")}</span><span class="cc-tbar-track"><span class="cc-tbar-fill cc-mix-fill" style="width:${pct}%"></span></span><span class="cc-call-n">${x.calls ?? 0}</span><span class="cc-agent-roles">${roles}</span></div>`;
           })
           .join("");
+}
+
+// E4 세션 — 시각 helper (epoch초 → "MM/DD HH:MM") + 지속시간(초 → "Xm"/"Xh Ym")
+function ccShortTime(epoch: number): string {
+  const d = new Date(epoch * 1000);
+  const p = (x: number) => String(x).padStart(2, "0");
+  return `${p(d.getMonth() + 1)}/${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+function ccDur(secs: number): string {
+  const s = Math.round(secs);
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m`;
+  return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
+}
+// 활동 리본 — 8px 색상 strip(강도별 불투명도). 빈 칸은 흐리게.
+function ccRibbon(buckets: number[]): string {
+  const max = Math.max(1, ...buckets);
+  return (
+    `<span class="cc-ribbon">` +
+    buckets
+      .map((v) => `<span class="cc-ribbon-cell" style="opacity:${v === 0 ? 0.12 : 0.35 + 0.65 * (v / max)}"></span>`)
+      .join("") +
+    `</span>`
+  );
+}
+
+function renderSessions(a: any) {
+  let list: any[] = a?.sessions ?? [];
+  if (ccSessionsStarOnly) list = list.filter((s) => s.starred);
+  const listEl = document.getElementById("cc-sessions-list")!;
+  if (list.length === 0) {
+    listEl.innerHTML = `<div class="cc-empty">${ccSessionsStarOnly ? "⭐ 세션 없음" : "세션 없음"}</div>`;
+  } else {
+    listEl.innerHTML = list
+      .map((s) => {
+        const role = s.role || "?";
+        const color = CC_ROLE_COLOR[role] ?? "#64748b";
+        const fail = (s.fail_calls ?? 0) > 0 ? `<span class="cc-fail-badge crit">✗${s.fail_calls}</span>` : "";
+        const star = s.starred ? "★" : "☆";
+        const skill = s.top_skill ? `· ${ccEsc(s.top_skill)}` : "";
+        const sel = s.session_id === ccSessionSelected ? " sel" : "";
+        return (
+          `<div class="cc-sess-row${sel}" data-sid="${ccEsc(s.session_id)}" style="--rc:${color}">` +
+          `<button class="cc-star" data-sid="${ccEsc(s.session_id)}" data-on="${s.starred ? 1 : 0}" title="즐겨찾기">${star}</button>` +
+          `<span class="cc-sess-when">${ccShortTime(s.ended_at ?? 0)}</span>` +
+          `<span class="cc-sess-role">${ccEsc(role)}·${ccEsc(s.agent || "?")}</span>` +
+          ccRibbon(s.ribbon ?? []) +
+          `<span class="cc-sess-meta">${ccDur(s.duration_secs ?? 0)} · ${s.msgs ?? 0}턴 · ${ccFmtTokens(s.tokens ?? 0)} · ${ccMoney(s.cost_usd ?? 0)} ${skill}</span>` +
+          fail +
+          `</div>`
+        );
+      })
+      .join("");
+    // 행 클릭 → 상세, 별 클릭 → 토글
+    listEl.querySelectorAll(".cc-sess-row").forEach((row) =>
+      row.addEventListener("click", (e) => {
+        if ((e.target as HTMLElement).classList.contains("cc-star")) return;
+        openSessionDetail((row as HTMLElement).dataset.sid!);
+      }),
+    );
+    listEl.querySelectorAll(".cc-star").forEach((btn) =>
+      btn.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        const el = btn as HTMLElement;
+        const on = el.dataset.on === "1";
+        await invoke("control_session_star", { sessionId: el.dataset.sid, starred: !on }).catch(() => {});
+        refreshSessions();
+      }),
+    );
+  }
+}
+
+async function openSessionDetail(sid: string) {
+  ccSessionSelected = sid;
+  const el = document.getElementById("cc-session-detail")!;
+  el.hidden = false;
+  let d: any;
+  try {
+    d = await invoke("control_session_detail", { sessionId: sid });
+  } catch {
+    el.innerHTML = `<div class="cc-empty">상세 로드 실패</div>`;
+    return;
+  }
+  const t = d?.summary?.totals ?? {};
+  const tl: any[] = d?.timeline ?? [];
+  const head =
+    `<div class="cc-h">세션 상세 · ${ccEsc(sid.split("/").pop() || sid)}</div>` +
+    `<div class="cc-sess-detail-kpi">${ccFmtTokens(t.tokens ?? 0)} 토큰 · ${ccMoney(t.cost_usd ?? 0)} · ${t.msgs ?? 0}턴 · 이벤트 ${tl.length}</div>` +
+    `<div class="cc-sess-note">전사 원문은 미수집(이벤트 타임라인으로 대체)</div>`;
+  const rows =
+    tl.length === 0
+      ? `<div class="cc-empty">이벤트 없음</div>`
+      : tl
+          .map((e) => {
+            const name = e.is_skill ? `Skill:${e.skill_name ?? "?"}` : e.is_agent ? `Task:${e.agent_type ?? "?"}` : e.tool_name ?? "?";
+            const fail = e.exit_code != null && e.exit_code !== 0;
+            const tag = e.event_type === "POST_TOOL" ? (fail ? "✗" : "✓") : "▸";
+            return `<div class="cc-tl-row ${fail ? "crit" : ""}"><span class="cc-tl-tag">${tag}</span><span class="cc-tl-name">${ccEsc(name)}</span><span class="cc-tl-role">${ccEsc(e.role ?? "")}</span></div>`;
+          })
+          .join("");
+  el.innerHTML = head + `<div class="cc-timeline">${rows}</div>`;
 }
 
 function renderControlCenter(d: any) {
@@ -1676,6 +1790,18 @@ document.querySelectorAll("#cc-skills-win .cc-win").forEach((b) =>
     refreshSkills();
   }),
 );
+document.querySelectorAll("#cc-sessions-win .cc-win[data-window]").forEach((b) =>
+  b.addEventListener("click", () => {
+    ccSessionsWindow = (b as HTMLElement).dataset.window!;
+    document.querySelectorAll("#cc-sessions-win .cc-win[data-window]").forEach((x) => x.classList.toggle("active", x === b));
+    refreshSessions();
+  }),
+);
+document.getElementById("cc-sessions-star-filter")!.addEventListener("click", (e) => {
+  ccSessionsStarOnly = !ccSessionsStarOnly;
+  (e.currentTarget as HTMLElement).classList.toggle("active", ccSessionsStarOnly);
+  refreshSessions();
+});
 document.getElementById("btn-update")!.addEventListener("click", () => promptInstall());
 document.getElementById("btn-ws-new")!.addEventListener("click", () => addWorkspace());
 
