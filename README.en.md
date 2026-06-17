@@ -65,14 +65,14 @@ cys attach surface:1                         # output mirror (read-only)
 
 Request `{"id":1,"method":"surface.send_text","params":{...}}` → Response `{"id":1,"ok":true,"result":{...}}` / `{"id":1,"ok":false,"error":{"code","message"}}`
 
-Methods: `system.ping` `system.identify` `surface.create/list/send_text/send_key/read_text/resize/close/attach` `events.stream` `ledger.register/deregister/list/kill` `health.add_rule/list_rules`
+Methods: `system.ping` `system.identify` `surface.create/list/send_text/send_key/read_text/resize/close/attach` `events.stream` `ledger.register/deregister/list/kill` `health.add_rule/list_rules` `control.dashboard/analytics/skills/weekly/alerts/sessions/session_detail/session_star`
 
 Events: `surface.created/closed/exited/input_injected (sender tagged)` `health.alert` `watchdog.load_high/proc_count_high/duplicate_procs/duplicates_killed` `pane.idle` `ledger.registered/killed` `daemon.started`
 
 ## Environment Variables
 
 `CYS_SOCKET` socket path (default `~/.local/state/cys/cys.sock`, Windows `\\.\pipe\cys`) · `CYS_SHELL` ·
-`CYS_LOAD_THRESHOLD` (default cores×2) · `CYS_PROC_THRESHOLD` (50) · `CYS_DUP_THRESHOLD` (3) · `CYS_AUTOKILL_DUP` (0/1) · `CYS_IDLE_SECONDS` (300)
+`CYS_LOAD_THRESHOLD` (default cores×2) · `CYS_PROC_THRESHOLD` (50) · `CYS_DUP_THRESHOLD` (3) · `CYS_AUTOKILL_DUP` (0/1) · `CYS_IDLE_SECONDS` (300) · `CYS_CONTROL_REDACT` (0/1, redact session PII in Control Center)
 
 ## UI (Tauri 2 + xterm.js)
 
@@ -86,6 +86,28 @@ bun x @tauri-apps/cli build   # release: target/release/bundle/macos/cys.app
 - **Core/UI separation**: the UI is just a socket client. Sessions (PTYs) are owned by the daemon — they survive UI restarts and app reinstalls (re-attach).
 - Workspace tabs (add / rename / close) · split panes (⌘T, ⌘D, ⌘⇧D, ⌘W) · draggable divider resize.
 - health/watchdog/feed push events → toasts. Note: rebuild the app after editing ui/ (frontend is embedded in the binary).
+- **Control Center full panel**: real-time ops + persistent analytics, 5 tabs + alert badge (separate section below).
+
+## Control Center (real-time ops + persistent analytics)
+
+A dedicated full panel in the cys-app UI — cysd serves fleet/usage/system in a single RPC
+(no external dashboard), and persistent analytics accumulate in cysd's embedded SQLite
+(`analytics.db`, separate from recall's transcripts.db · graceful degrade if it fails to open).
+Philosophy: **local-first** (data never leaves the machine) · zero extra infrastructure · 0ms agent latency (hooks are fire-and-forget).
+
+| Tab | RPC | Contents |
+|---|---|---|
+| **Live** | `control.dashboard` | node fleet (role·agent·state·idle·observed usage) · system CPU/MEM · today tokens/cost$/model mix · last 1h · usage sparkline · uptime |
+| **Cost/Efficiency** | `control.analytics {window}` | persistent aggregates — 4-way token split · per-model cost ($) · efficiency metrics |
+| **Skills/Agents** | `control.skills {window}` | skill/agent call counts · 🔥failure rate (exit_code≠0) · duration |
+| **Sessions** | `control.sessions {window}` · `control.session_detail` · `control.session_star` | session timeline · activity ribbon · transcript viewer · ⭐starred sessions |
+| **Trends/Weekly** | `control.weekly` | weekly WoW% deltas · efficiency leaders · skill assets (new/dormant) |
+| Alert badge | `control.alerts` | token/cost thresholds · anomaly detection · repeated failures — same evaluator as watchdog, + UI badge |
+
+- **Event capture**: SessionStart/PreToolUse/PostToolUse/Stop/SubagentStop hooks record tool/skill/agent calls, exit_code and duration into the `events` table — fire-and-forget (0 agent latency).
+- **RBAC PII redaction**: `CYS_CONTROL_REDACT=1` (or the `redact` param on the sessions RPC) masks the path PII in session_id while preserving aggregates. UI sessions tab has a 🔒 toggle.
+- **Refresh**: UI polls every 5s. Tauri commands `control_*` expose the same RPCs. Alert thresholds in `~/.cys/pack/alerts-config.json`.
+- Detailed design: docs/CONTROL_CENTER_DESIGN.md
 
 ## Approval Feed (centralized worker approval requests)
 

@@ -81,6 +81,7 @@ cys attach surface:1                          # 출력 미러 (read-only)
 `surface.create/list/send_text/send_key/read_text(+since_line 델타)/resize/rename/close/attach/set_meta/wait_for`
 `events.stream` `ledger.register/deregister/list/kill` `health.add_rule/list_rules` `feed.push/reply/list`
 `recall.search` `schedule.status/run_now` `status.set` `org.status` `queue.list/clear` `attest.pin/verify`
+`control.dashboard/analytics/skills/weekly/alerts/sessions/session_detail/session_star`
 
 이벤트: `surface.created/closed/exited/input_injected(from 발신자 커널 검증 태깅)` `health.alert/action`
 `watchdog.load_high/proc_count_high/duplicate_procs/duplicates_killed` `pane.idle` `ledger.registered/killed`
@@ -95,7 +96,8 @@ cys attach surface:1                          # 출력 미러 (read-only)
 `CYS_DUP_THRESHOLD`(3) · `CYS_AUTOKILL_DUP`(0/1) · `CYS_IDLE_SECONDS`(300) ·
 `CYS_TYPING_GUARD_SECS`(3, 0=off) · `CYS_FEED_REMIND_SECS`(300, 0=off) ·
 `CYS_MASTER_DEADMAN_SECS`(900, 0=off) · `CYS_AGENT_AUTORESTART`(0/1) ·
-`CYS_RECALL_RETAIN_DAYS`(30, 0=무제한) · `CYS_TODO_DIRS`(콜론 구분 추가 감시 루트)
+`CYS_RECALL_RETAIN_DAYS`(30, 0=무제한) · `CYS_TODO_DIRS`(콜론 구분 추가 감시 루트) ·
+`CYS_CONTROL_REDACT`(0/1, Control Center 세션 탭 PII 가림 — 집계는 보존)
 
 ## 자비스 네이티브 기능 (2026-06-12 전면 구현 — 19건)
 
@@ -125,6 +127,26 @@ cys attach surface:1                          # 출력 미러 (read-only)
 | T4-18 | **트랜스크립트 해시체인 attest**: 저장 트랜스크립트의 변조 증거성 — 평가자가 pin을 외부 보관, 사후 대조 (producer≠evaluator 기계화). 검증 지평=retention 창(prune prefix는 anchor 봉인) | `cys attest pin` → `count:hash` · `cys attest verify <pin>`(exit 2=변조) |
 | T4-19 | **recall 보존 정책**: 트랜스크립트 무한 성장 차단 (기본 30일, 6시간 주기 prune) | `CYS_RECALL_RETAIN_DAYS` |
 
+## Control Center (실시간 관제 + 영속 분석)
+
+cys-app UI의 전용 풀 패널 — cysd가 단일 RPC로 플릿·사용량·시스템을 제공하고(외부 대시보드 무의존),
+영속 분석은 cysd 내장 SQLite(`analytics.db`, recall의 transcripts.db와 별개 · open 실패 시 graceful degrade)에 쌓인다.
+철학: **로컬 우선**(데이터가 머신 밖으로 나가지 않음) · 추가 인프라 0 · 에이전트 0ms 지연(hook은 fire-and-forget).
+
+| 탭 | RPC | 내용 |
+|---|---|---|
+| **Live** | `control.dashboard` | 노드 플릿(role·agent·state·idle·관측 사용량) · 시스템 CPU/MEM · 오늘 토큰/비용$/모델믹스 · 최근 1h · 사용량 스파크라인 · 가동시간 |
+| **비용·효율** | `control.analytics {window}` | 영속 집계 — 토큰 4분해 · 모델별 비용($) 환산 · 효율 지표 |
+| **스킬·에이전트** | `control.skills {window}` | 스킬/에이전트 호출 집계 · 🔥실패율(exit_code≠0) · duration |
+| **세션** | `control.sessions {window}` · `control.session_detail` · `control.session_star` | 세션 타임라인 · 활동 리본 · 전사 뷰어 · ⭐성공 세션 즐겨찾기 |
+| **추세·주간** | `control.weekly` | 주간 WoW% 델타 · 효율 리더 · 스킬 자산(신규/휴면) |
+| 경보 배지 | `control.alerts` | 토큰/비용 임계 · 이상감지 · 반복실패 — watchdog와 동일 평가기로 발화 + UI 배지 |
+
+- **이벤트 캡처**: SessionStart/PreToolUse/PostToolUse/Stop/SubagentStop hook이 툴·스킬·에이전트 호출·exit_code·duration을 `events` 테이블에 적재 — fire-and-forget(에이전트 지연 0).
+- **RBAC PII 가림**: `CYS_CONTROL_REDACT=1`(또는 세션 RPC `redact` 파라미터) → session_id의 경로 PII를 가리고 집계는 보존. UI 세션 탭에 🔒 토글(켜면 집계만 · 드릴다운 비활성).
+- **갱신**: UI가 5초 폴링. Tauri 커맨드 `control_dashboard/analytics/skills/alerts/weekly/sessions/session_detail/session_star` 동형 노출. 경보 임계값은 `~/.cys/pack/alerts-config.json`.
+- 상세 설계: docs/CONTROL_CENTER_DESIGN.md
+
 ## E2E 검증 결과 (2026-06-11, macOS)
 
 - A pane → B pane stdin push → B 셸 실행 → read-screen 확인 ✅
@@ -146,6 +168,7 @@ bun x @tauri-apps/cli build   # 배포: target/release/bundle/macos/cys.app
 - **코어/UI 분리**: UI는 소켓 클라이언트일 뿐. 세션(PTY)은 데몬 소유 → UI 재시작·앱 재설치에도 세션 유지(재attach).
 - 워크스페이스 탭(＋ 추가·더블클릭 이름변경·× 닫기) · 분할 pane(⌘T·⌘D·⌘⇧D·⌘W) · divider 드래그 리사이즈.
 - health/watchdog/feed push 이벤트 → 토스트. 주의: ui/ 수정 후 앱 재빌드 필요(프런트엔드가 바이너리에 임베드됨).
+- **Control Center 풀 패널**: 실시간 관제 + 영속 분석 5탭 + 경보 배지 (아래 별도 섹션).
 
 ## 승인 Feed (워커 승인 요청 집중 처리)
 
@@ -166,8 +189,7 @@ cys feed reply <request_id> allow                            # master 또는 UI 
 - macOS에서 sysinfo가 cmdline 전체를 못 읽으면 프로세스명으로 중복 그룹핑(과탐 가능).
 - `cys run` 중 Ctrl-C로 CLI가 죽으면 그룹 정리가 watchdog 주기(5초)로 넘어감.
 - 스킬 자동수확은 현재 디렉티브 규약(작업 후 수확 의무) — Hermes Curator식 자동 트리거는 후속 연구.
-- 적대 벤치마킹(docs/COMPETITIVE_ANALYSIS.md) 흡수 잔여: 메신저 채널 어댑터(P2)·모바일 Node(P4)·
-  클라우드 실행 백엔드(P6).
+- 외부 벤치마킹 흡수 잔여: 메신저 채널 어댑터(P2)·모바일 Node(P4)·클라우드 실행 백엔드(P6).
 
 ## 인플라이트 큐 (steer / followup)
 
