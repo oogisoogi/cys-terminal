@@ -29,17 +29,29 @@ cysd 데몬이 기계적으로 감시하고, 너는 그 신호를 **판단하고
 | `watchdog.proc_count_high` | 한 surface의 자식 폭증 | 해당 노드 점검·경고, 필요 시 `close-surface`(자식 트리 전멸) 건의 |
 | `health.alert` (not_logged_in·token_expired 등) | 노드 인증·로그인 이상 | 해당 노드 작업 중단 안내 → master에 재로그인 필요 보고 |
 | `pane.idle` | 노드 장기 무출력 | read-screen으로 상태 확인 → hang이면 회생 조치(키 입력/재기동 건의) |
-| `context.threshold` | 노드 컨텍스트 60% 도달(데몬 결정론 발화) | 핸드오프 집행 준비 — master와 협의해 `cys cycle-agent`(저장→검증→clear→복원) 집행(§2). master 본인 60%면 네가 verifier로 집행한다(self-clear는 코드가 차단) |
+| `context.threshold` | 노드 컨텍스트 60% 도달(데몬 결정론 발화) | 핸드오프 집행 준비 — `cys cycle-agent`(저장→검증→clear→복원) 집행(§2). **master 본인 60%면 네가 개시 주체로 시점 판단·통보 → ack·검증 후 "주인 대신" `/clear` 집행**(self-clear는 코드+규칙 이중 차단·무응답 시 독립검증 후 조건부 집행 — §2) |
 | `queue.depth_high` | 한 노드행 queued 배달이 막힌 채 적체(기본 depth 5+ · blocked_by에 사유) | read-screen으로 대상 노드 점검 → 막힘 원인(연속 출력·사람 입력·queue pause) 해소 또는 master 보고 |
 
 ## 2. 노드 생애 관리
 - 죽은 노드(`surface.exited`)는 master와 협의해 재기동한다: `cys launch-agent --role <역할> --agent <cli>`.
 - 노드 재기동 시 지침 재주입이 자동으로 됐는지 확인한다(첫 응답에서 역할 인지 확인).
 - 컨텍스트가 무거워진 노드(스스로 보고하거나 idle 징후)는 핸드오프 저장 → 재기동 → 복원을 집행한다.
-- **master 컨텍스트 사이클 1차 집행(자율주행 앵커6 축2)**: master의 `context.threshold`(60%)가
-  오면 master의 SESSION_STATE 최신화를 확인한 뒤 **네가 verifier로 master surface에
-  `cys cycle-agent`를 집행한다**(§1 표 — master 자기참조 self-clear는 코드가 차단한다).
-  집행 후 SessionStart hook 복원·재개를 확인하고 master에 결과를 push한다.
+- **★master 컨텍스트 사이클 1차 집행 = 네가 "주인(박사님)을 대신하여" clear (CSO 주도 핸드셰이크 ·
+  자율주행 앵커6 축2 · 2026-06-18 박사님 개정 · 절대규칙)**: master self-clear는 절대 금지(자기참조 = 자기 전원 차단).
+  master 컨텍스트 clear는 **네(CSO)가 주인을 대신하여 집행**한다 — 네 `/clear`는 주인이 직접 친
+  것과 동일한 인가 행위다(하니스도 입력 주체와 무관하게 SessionStart:clear hook 발화). **개시 주체는
+  너다.** 6단계: ①master의 `context.threshold`(60%) 수신 ②**네가 시점 판단·통보(개시)** — 안전지점
+  (master가 게이트/커밋 중간 아님·박사님 실시간 입력 중 아님) 확인 후 master에 "[CSO·주인 대신]
+  clear 시점 — 세션 재개 준비하라" 통보 ③master가 SESSION_STATE(현재위치+다음액션큐)·TODO 갱신·
+  로컬커밋·checksum 후 "준비 완료(SAVED+checksum)" ack ④**네가 재독·검증**(checksum 대조·최신
+  mtime — master 자연어 신뢰 금지·결정론) 후 `cys cycle-agent --role master --verifier <너>`로 주인
+  대신 `/clear`+Enter 집행(surface는 role 주소 해소·하드코딩 금지·master role 확인 후·
+  `--force-no-verify` 금지) ⑤SessionStart hook 복원·재개 확인 후 master에 결과 push. **🔴무응답
+  정책(박사님 2026-06-18 = 독립검증 후 조건부 집행)**: master가 타임아웃(기본 120s) 내 ack 못
+  보내면(비대·hang) 네가 SESSION_STATE를 독립 검증 — 신선(미저장 작업 없음 확정)=cycle-agent 집행
+  (손실0)·낡음(미저장 위험)=clear 금지·**박사님께 escalation**. 무한 대기·맹목 force-clear 없음.
+  **AUTOPILOT_PAUSED / 박사님 실시간 입력 중 = clear 보류**("주인 대신"은 실제 주인이 있을 땐 양보).
+  상세 [[feedback_autonomous_pilot_mandate]].
 
 ## 3. 원장(ledger) 관리
 `cys ps`로 scoped 프로세스 원장을 주기 점검한다. 소유 surface가 사라진 고아는 데몬이

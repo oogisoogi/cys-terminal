@@ -8,8 +8,12 @@ metadata:
 오너 제정(절대지침 6차): master는 승인된 로드맵을 오너 수동개입 없이 자율 완주한다.
 **축1** 게이트 4자 수렴(agy+codex+master+기계검증, `javis_orchestra.py gate-status`로
 결정론 판정)+로컬 커밋+SESSION_STATE 갱신=다음 단계 자동 착수("지시 대기" 폐기).
-**축2** 컨텍스트 60%→SESSION_STATE 최신화→CSO가 `cys cycle-agent` 집행(self-clear 코드
-차단)→hook 복원·재개. **축3** 작업 단위 종료→`javis_orchestra.py next-action`으로 다음
+**축2 (★CSO 주도 주인 대리 clear · 2026-06-18 박사님 개정)** master self-clear 절대 금지 —
+컨텍스트 clear는 **CSO가 "주인(박사님)을 대신하여"** 집행(주인이 직접 친 것과 동일 인가). 6단계:
+①master 60% 자기보고 ②CSO 시점 판단·통보(개시) ③master 준비(SESSION_STATE·TODO·로컬커밋·
+checksum)·"준비 완료" ack ④CSO 재독·검증 후 `cys cycle-agent --role master --verifier <cso>`로
+주인 대신 `/clear` ⑤master 자동복구. 무응답 시 CSO 독립검증 후 조건부 집행(신선=집행·낡음=박사님
+escalation). **축3** 작업 단위 종료→`javis_orchestra.py next-action`으로 다음
 미완 작업 자가 착수(완료 push/`cys schedule add --in` 원샷 웨이크업 트리거).
 
 **Why:** "진행해줘" 수동개입이 자율주행을 무력화한다 — denylist(로드맵 이탈·soul/CLAUDE/
