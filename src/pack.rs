@@ -101,6 +101,10 @@ pub const PACK: &[(&str, &str)] = &[
         include_str!("../cysjavis-pack/bin/javis_boot_node.py"),
     ),
     (
+        "bin/javis_rsi.py",
+        include_str!("../cysjavis-pack/bin/javis_rsi.py"),
+    ),
+    (
         "bin/javis_adr.py",
         include_str!("../cysjavis-pack/bin/javis_adr.py"),
     ),

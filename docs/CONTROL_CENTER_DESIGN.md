@@ -161,7 +161,16 @@ stale 마커(정의 변경 시 재계산). 보존 정책(기본 60일·`retentio
 > - **정직 분리**: "주간 다이제스트 master push"는 governance 교리(자동응답 금지=PTY 주입 금지)상 이벤트/feed로만
 >   가능 → 조회형 탭+RPC 우선 완성, 스케줄러 자동 이벤트 push는 후속(E6 alert 패턴 재사용 가능).
 > - 검증: cargo 216/216(신규 `summarize_weekly`) · E2E 11/11(`docs/weekly_e2e.py`) · UI 번들 OK.
-> - **잔여: E7(RSI/autopilot 외트랙)·E8(엔지니어링 횡단·상당수 기존충족)·E9(팀=박사님 큰결정·선택)** — 정직 평가 후 처리.
+>
+> **E7 RSI 무결성 도구 완료**(`javis_rsi.py` — Control Center 외 트랙·로컬 커밋):
+> - 결정론 도구(eval-driven 원칙 박제·producer≠evaluator=점수 주입만): `checkpoint`(HEAD SHA+기준score+복구 ref
+>   `refs/rsi/ckpt/<id>`)·`progress`(delta·verdict improved/regressed/flat)·`markers`(커밋 trailer `iter-id` 파싱)·
+>   `rollback`·`status`. _round/rsi/{state.json,ledger.jsonl} 영속.
+> - ★rollback 안전모델: **기본 dry-run(무실행·계획만)**, `--execute`만 실행하되 **현재 HEAD를 `rsi-abandoned-<id>-<ts>`
+>   브랜치에 먼저 박제(retention=비가역 삭제 차단)** 후 reset · 더티(추적변경)·비조상은 `--force` 없이 거부 · 자동
+>   `git reset --hard` 없음. autopilot kill-switch/self-clear 하만 **불간섭**(독립 도구).
+> - 검증: E2E 17/17(`docs/rsi_e2e.py` — 순수로직·checkpoint·progress·markers·dry-run 무실행·execute 백업보존·더티거부).
+> - **E8=기존 인프라 충족(감사 완료·신규 불요)·E9=박사님 큰결정(선택)** — Control Center(E1-E6)+E7 완결.
 
 ### E1 — 영속 분석 기반 (척추) 【선행·필수】
 - **백엔드**: `analytics.db` 스키마 생성(state.rs init) · `ingest.rs`(hook 이벤트→events/messages 적재) ·
