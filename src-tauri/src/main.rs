@@ -142,6 +142,11 @@ async fn control_alerts() -> Result<Value, String> {
 }
 
 #[tauri::command]
+async fn control_weekly() -> Result<Value, String> {
+    rpc("control.weekly", json!({})).await
+}
+
+#[tauri::command]
 async fn control_sessions(window: Option<String>) -> Result<Value, String> {
     rpc("control.sessions", json!({ "window": window })).await
 }
@@ -529,6 +534,7 @@ fn main() {
             control_analytics,
             control_skills,
             control_alerts,
+            control_weekly,
             control_sessions,
             control_session_detail,
             control_session_star,

@@ -738,6 +738,198 @@ fn load_summary_rows_for_session(conn: &Connection, session_id: &str) -> Vec<Sum
     }
 }
 
+// ───────────────────────── E5 추세·주간 다이제스트 (control.weekly) ─────────────────────────
+
+const WEEK_SECS: f64 = 7.0 * 86_400.0;
+
+/// 주간 집계용 — (session, tokens, cost, ts)
+type WeeklyUsageRow = (String, u64, f64, f64);
+/// 주간 집계용 — (session, role, is_skill, skill, is_agent, event_type, ts)
+type WeeklyEventRow = (String, String, bool, String, bool, String, f64);
+
+fn load_weekly_usage(conn: &Connection, since: f64) -> Vec<WeeklyUsageRow> {
+    let mut stmt = match conn.prepare(
+        "SELECT session_id, input_tokens, output_tokens, cache_creation, cache_read, cost_usd, ts
+         FROM usage_records WHERE ts >= ?1",
+    ) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let rows = stmt.query_map(rusqlite::params![since], |r| {
+        Ok((
+            r.get::<_, String>(0).unwrap_or_default(),
+            (r.get::<_, i64>(1)? + r.get::<_, i64>(2)? + r.get::<_, i64>(3)? + r.get::<_, i64>(4)?) as u64,
+            r.get::<_, f64>(5)?,
+            r.get::<_, f64>(6)?,
+        ))
+    });
+    match rows {
+        Ok(it) => it.filter_map(|x| x.ok()).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn load_weekly_events(conn: &Connection, since: f64) -> Vec<WeeklyEventRow> {
+    let mut stmt = match conn.prepare(
+        "SELECT session_id, role, is_skill, skill_name, is_agent, event_type, ts
+         FROM events WHERE ts >= ?1 AND event_type IN ('PRE_TOOL','POST_TOOL')",
+    ) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let rows = stmt.query_map(rusqlite::params![since], |r| {
+        Ok((
+            r.get::<_, String>(0).unwrap_or_default(),
+            r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+            r.get::<_, Option<i64>>(2)?.unwrap_or(0) != 0,
+            r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+            r.get::<_, Option<i64>>(4)?.unwrap_or(0) != 0,
+            r.get::<_, String>(5).unwrap_or_default(),
+            r.get::<_, f64>(6)?,
+        ))
+    });
+    match rows {
+        Ok(it) => it.filter_map(|x| x.ok()).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// 이번주(now-7d..now) vs 지난주(now-14d..now-7d)를 WoW·일별오버레이·효율리더·스킬자산으로 롤업(순수).
+/// 토큰/비용은 session→role 귀속(events의 역할)으로 노드별 리더 산출. delta_pct: 지난주 0이면 null.
+pub fn summarize_weekly(now: f64, usage: &[WeeklyUsageRow], events: &[WeeklyEventRow]) -> serde_json::Value {
+    use serde_json::{json, Value};
+    use std::collections::{HashMap, HashSet};
+    let this_start = now - WEEK_SECS;
+    let last_start = now - 2.0 * WEEK_SECS;
+    let in_this = |ts: f64| ts >= this_start;
+    let in_last = |ts: f64| (last_start..this_start).contains(&ts);
+
+    // session → role (events에서 첫 비어있지 않은 역할)
+    let mut sess_role: HashMap<String, String> = HashMap::new();
+    for (sid, role, _, _, _, _, _) in events {
+        if !role.is_empty() {
+            sess_role.entry(sid.clone()).or_insert_with(|| role.clone());
+        }
+    }
+    let role_of = |sid: &str| sess_role.get(sid).cloned().unwrap_or_else(|| "?".to_string());
+
+    // WoW 글로벌 + 일별 오버레이(각 주 7칸) + 세션 집합
+    let (mut t_tok, mut t_cost, mut t_msgs) = (0u64, 0.0f64, 0u64);
+    let (mut l_tok, mut l_cost, mut l_msgs) = (0u64, 0.0f64, 0u64);
+    let mut t_sess: HashSet<&str> = HashSet::new();
+    let mut l_sess: HashSet<&str> = HashSet::new();
+    let mut this_daily = vec![0u64; 7];
+    let mut last_daily = vec![0u64; 7];
+    // 역할별 토큰/비용/세션(이번주)
+    let mut role_tok: HashMap<String, u64> = HashMap::new();
+    let mut role_cost: HashMap<String, f64> = HashMap::new();
+    let mut role_sess: HashMap<String, HashSet<String>> = HashMap::new();
+    for (sid, tokens, cost, ts) in usage {
+        if in_this(*ts) {
+            t_tok += tokens;
+            t_cost += cost;
+            t_msgs += 1;
+            t_sess.insert(sid);
+            let d = (((*ts - this_start) / 86_400.0) as usize).min(6);
+            this_daily[d] += tokens;
+            let r = role_of(sid);
+            *role_tok.entry(r.clone()).or_insert(0) += tokens;
+            *role_cost.entry(r.clone()).or_insert(0.0) += cost;
+            role_sess.entry(r).or_default().insert(sid.clone());
+        } else if in_last(*ts) {
+            l_tok += tokens;
+            l_cost += cost;
+            l_msgs += 1;
+            l_sess.insert(sid);
+            let d = (((*ts - last_start) / 86_400.0) as usize).min(6);
+            last_daily[d] += tokens;
+        }
+    }
+
+    // 역할별 활동(이번주) + 스킬 집합(이번주/지난주). 실패율은 E3(control.skills)·E6 담당이라 주간 리더엔 미포함.
+    let mut role_skilldiv: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut role_tool_calls: HashMap<String, u64> = HashMap::new();
+    let mut this_skills: HashMap<String, u64> = HashMap::new();
+    let mut last_skills: HashSet<String> = HashSet::new();
+    for (sid, role, is_skill, skill, _is_agent, etype, ts) in events {
+        let r = if role.is_empty() { role_of(sid) } else { role.clone() };
+        if in_this(*ts) {
+            if etype == "PRE_TOOL" {
+                *role_tool_calls.entry(r.clone()).or_insert(0) += 1;
+                if *is_skill && !skill.is_empty() {
+                    role_skilldiv.entry(r.clone()).or_default().insert(skill.clone());
+                    *this_skills.entry(skill.clone()).or_insert(0) += 1;
+                }
+            }
+        } else if in_last(*ts) && *is_skill && !skill.is_empty() && etype == "PRE_TOOL" {
+            last_skills.insert(skill.clone());
+        }
+    }
+
+    let delta = |t: f64, l: f64| -> Value {
+        if l > 0.0 {
+            json!(((t - l) / l * 100.0 * 10.0).round() / 10.0)
+        } else {
+            Value::Null
+        }
+    };
+    let wow = json!({
+        "tokens": {"this": t_tok, "last": l_tok, "delta_pct": delta(t_tok as f64, l_tok as f64)},
+        "cost":   {"this": t_cost, "last": l_cost, "delta_pct": delta(t_cost, l_cost)},
+        "sessions": {"this": t_sess.len(), "last": l_sess.len(), "delta_pct": delta(t_sess.len() as f64, l_sess.len() as f64)},
+        "msgs":   {"this": t_msgs, "last": l_msgs, "delta_pct": delta(t_msgs as f64, l_msgs as f64)},
+    });
+
+    // 효율 리더: 역할별 토큰·세션·스킬다양성·간결도(토큰/턴)·실패. 토큰 desc 정렬.
+    let mut roles: HashSet<String> = HashSet::new();
+    roles.extend(role_tok.keys().cloned());
+    roles.extend(role_tool_calls.keys().cloned());
+    let mut leaders: Vec<Value> = roles
+        .into_iter()
+        .map(|r| {
+            let tok = *role_tok.get(&r).unwrap_or(&0);
+            let cost = *role_cost.get(&r).unwrap_or(&0.0);
+            let calls = *role_tool_calls.get(&r).unwrap_or(&0);
+            let sess = role_sess.get(&r).map(|s| s.len()).unwrap_or(0);
+            let div = role_skilldiv.get(&r).map(|s| s.len()).unwrap_or(0);
+            json!({
+                "role": r, "tokens": tok, "cost_usd": cost, "sessions": sess, "tool_calls": calls,
+                "skill_diversity": div,
+                "tokens_per_session": if sess > 0 { tok / sess as u64 } else { 0 },
+            })
+        })
+        .collect();
+    leaders.sort_by(|a, b| {
+        b["tokens"].as_u64().unwrap_or(0).cmp(&a["tokens"].as_u64().unwrap_or(0))
+            .then_with(|| a["role"].as_str().unwrap_or("").cmp(b["role"].as_str().unwrap_or("")))
+    });
+
+    // 스킬 자산: 신규(이번주만)·휴면(지난주만)·최다(이번주 호출 TOP)
+    let this_set: HashSet<&String> = this_skills.keys().collect();
+    let mut new_skills: Vec<String> = this_set.iter().filter(|s| !last_skills.contains(**s)).map(|s| (*s).clone()).collect();
+    new_skills.sort();
+    let mut dormant: Vec<String> = last_skills.iter().filter(|s| !this_set.contains(s)).cloned().collect();
+    dormant.sort();
+    let mut top: Vec<Value> = this_skills.iter().map(|(k, v)| json!({"name": k, "calls": v})).collect();
+    top.sort_by(|a, b| {
+        b["calls"].as_u64().unwrap_or(0).cmp(&a["calls"].as_u64().unwrap_or(0))
+            .then_with(|| a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or("")))
+    });
+
+    json!({
+        "wow": wow,
+        "daily": {"this": this_daily, "last": last_daily},
+        "leaders": leaders,
+        "skill_asset": {"new": new_skills, "dormant": dormant, "top": top},
+    })
+}
+
+/// control.weekly 본체 — 최근 14일 usage_records/events로 주간 다이제스트 집계.
+pub fn weekly_summary(conn: &Connection, now: f64) -> serde_json::Value {
+    let since = now - 2.0 * WEEK_SECS;
+    summarize_weekly(now, &load_weekly_usage(conn, since), &load_weekly_events(conn, since))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -923,5 +1115,43 @@ mod tests {
         assert_eq!(s[1]["session_id"], "/s/b");
         assert_eq!(s[1]["agent_calls"], 1);
         assert_eq!(s[1]["starred"], false);
+    }
+
+    #[test]
+    fn summarize_weekly_wow_and_assets() {
+        let now = 2_000_000.0;
+        let day = 86_400.0;
+        // 이번주(now-1d): /s/a worker 2000토큰. 지난주(now-8d): /s/x worker 1000토큰.
+        let usage: Vec<WeeklyUsageRow> = vec![
+            ("/s/a".into(), 2000, 0.10, now - day),
+            ("/s/x".into(), 1000, 0.04, now - 8.0 * day),
+        ];
+        // 이번주 스킬 commit·deep-research(신규), 지난주 commit·old-skill(→ old-skill 휴면)
+        let events: Vec<WeeklyEventRow> = vec![
+            ("/s/a".into(), "worker".into(), true, "commit".into(), false, "PRE_TOOL".into(), now - day),
+            ("/s/a".into(), "worker".into(), true, "deep-research".into(), false, "PRE_TOOL".into(), now - day),
+            ("/s/x".into(), "worker".into(), true, "commit".into(), false, "PRE_TOOL".into(), now - 8.0 * day),
+            ("/s/x".into(), "worker".into(), true, "old-skill".into(), false, "PRE_TOOL".into(), now - 8.0 * day),
+        ];
+        let w = summarize_weekly(now, &usage, &events);
+        // WoW: 토큰 2000 vs 1000 → +100%
+        assert_eq!(w["wow"]["tokens"]["this"], 2000u64);
+        assert_eq!(w["wow"]["tokens"]["last"], 1000u64);
+        assert!((w["wow"]["tokens"]["delta_pct"].as_f64().unwrap() - 100.0).abs() < 1e-6);
+        // 일별 오버레이 7칸
+        assert_eq!(w["daily"]["this"].as_array().unwrap().len(), 7);
+        assert_eq!(w["daily"]["last"].as_array().unwrap().len(), 7);
+        // 리더: worker, 이번주 토큰 2000·스킬다양성 2
+        assert_eq!(w["leaders"][0]["role"], "worker");
+        assert_eq!(w["leaders"][0]["tokens"], 2000u64);
+        assert_eq!(w["leaders"][0]["skill_diversity"], 2);
+        // 스킬 자산: 신규=deep-research, 휴면=old-skill, 최다 포함 commit
+        let new: Vec<&str> = w["skill_asset"]["new"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(new.contains(&"deep-research") && !new.contains(&"commit"), "{:?}", new);
+        let dorm: Vec<&str> = w["skill_asset"]["dormant"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+        assert_eq!(dorm, vec!["old-skill"]);
+        // 지난주 0 분모 가드: 빈 입력 delta null
+        let empty = summarize_weekly(now, &[], &[]);
+        assert!(empty["wow"]["tokens"]["delta_pct"].is_null());
     }
 }

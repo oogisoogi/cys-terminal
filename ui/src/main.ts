@@ -109,7 +109,7 @@ let ccTimer: number | null = null;
 let ccClockTimer: number | null = null;
 let ccUptimeBase = 0;
 let ccUptimeFetchedAt = 0;
-let ccTab: "live" | "eff" | "skills" | "sessions" = "live";
+let ccTab: "live" | "eff" | "skills" | "sessions" | "weekly" = "live";
 let ccEffWindow = "today";
 let ccSkillsWindow = "today";
 let ccSessionsWindow = "7d";
@@ -242,18 +242,28 @@ async function refreshSessions() {
   }
 }
 
-function setCcTab(view: "live" | "eff" | "skills" | "sessions") {
+async function refreshWeekly() {
+  try {
+    renderWeekly((await invoke("control_weekly")) as any);
+  } catch {
+    /* graceful */
+  }
+}
+
+function setCcTab(view: "live" | "eff" | "skills" | "sessions" | "weekly") {
   ccTab = view;
   document.getElementById("cc-view-live")!.hidden = view !== "live";
   document.getElementById("cc-view-eff")!.hidden = view !== "eff";
   document.getElementById("cc-view-skills")!.hidden = view !== "skills";
   document.getElementById("cc-view-sessions")!.hidden = view !== "sessions";
+  document.getElementById("cc-view-weekly")!.hidden = view !== "weekly";
   document.querySelectorAll("#cc-tabs .cc-tab").forEach((b) =>
     b.classList.toggle("active", (b as HTMLElement).dataset.view === view),
   );
   if (view === "eff") refreshEfficiency();
   if (view === "skills") refreshSkills();
   if (view === "sessions") refreshSessions();
+  if (view === "weekly") refreshWeekly();
 }
 
 function renderEfficiency(a: any) {
@@ -495,6 +505,70 @@ async function openSessionDetail(sid: string) {
           })
           .join("");
   el.innerHTML = head + `<div class="cc-timeline">${rows}</div>`;
+}
+
+// E5 추세·주간 — WoW 델타 KPI·일별 오버레이·효율 리더·스킬 자산
+function ccDelta(d: number | null): string {
+  if (d == null) return `<span class="cc-delta">신규</span>`;
+  const up = d >= 0;
+  const cls = up ? "up" : "down";
+  return `<span class="cc-delta ${cls}">${up ? "▲" : "▼"} ${Math.abs(d).toFixed(0)}%</span>`;
+}
+function renderWeekly(a: any) {
+  const s = a?.summary ?? {};
+  const wow = s.wow ?? {};
+  const fmt: Record<string, (v: number) => string> = {
+    tokens: (v) => ccFmtTokens(v),
+    cost: (v) => ccMoney(v),
+    sessions: (v) => String(v),
+    msgs: (v) => String(v),
+  };
+  const label: Record<string, string> = { tokens: "토큰", cost: "비용", sessions: "세션", msgs: "메시지" };
+  document.getElementById("cc-weekly-wow")!.innerHTML = ["tokens", "cost", "sessions", "msgs"]
+    .map((k) => {
+      const w = wow[k] ?? {};
+      return `<div class="cc-card"><div class="cc-card-val">${fmt[k](w.this ?? 0)}</div><div class="cc-card-reset">${ccDelta(w.delta_pct ?? null)} vs 지난주</div><div class="cc-card-name">${label[k]}</div></div>`;
+    })
+    .join("");
+
+  // 일별 오버레이 — this(채움)·last(테두리) 7일 막대
+  const daily = s.daily ?? {};
+  const tw: number[] = daily.this ?? [];
+  const lw: number[] = daily.last ?? [];
+  const dmax = Math.max(1, ...tw, ...lw);
+  document.getElementById("cc-weekly-daily")!.innerHTML =
+    `<div class="cc-wk-overlay">` +
+    tw.map((v, i) => {
+      const lh = Math.round(((lw[i] ?? 0) / dmax) * 100);
+      const th = Math.round((v / dmax) * 100);
+      return `<span class="cc-wk-day" title="D${i + 1} · 이번주 ${ccFmtTokens(v)} / 지난주 ${ccFmtTokens(lw[i] ?? 0)}"><span class="cc-wk-last" style="height:${lh}%"></span><span class="cc-wk-this" style="height:${th}%"></span></span>`;
+    }).join("") +
+    `</div><div class="cc-wk-legend"><span class="cc-leg"><span class="cc-leg-dot" style="background:#00d4ff"></span>이번주</span><span class="cc-leg"><span class="cc-leg-dot" style="background:#475569"></span>지난주</span></div>`;
+
+  // 효율 리더 — 토큰 점유율 바 + 세션/스킬다양성
+  const leaders: any[] = s.leaders ?? [];
+  const lmax = Math.max(1, ...leaders.map((x) => x.tokens ?? 0));
+  document.getElementById("cc-weekly-leaders")!.innerHTML =
+    leaders.length === 0
+      ? `<div class="cc-empty">데이터 없음</div>`
+      : leaders
+          .map((x) => {
+            const role = x.role || "?";
+            const color = CC_ROLE_COLOR[role] ?? "#64748b";
+            const pct = ((x.tokens ?? 0) / lmax) * 100;
+            return `<div class="cc-mix-row" style="--rc:${color}"><span class="cc-mix-name">${ccEsc(role)}</span><span class="cc-tbar-track"><span class="cc-tbar-fill cc-mix-fill" style="width:${pct}%"></span></span><span class="cc-call-n">${ccFmtTokens(x.tokens ?? 0)}</span><span class="cc-agent-roles">${x.sessions ?? 0}세션 · 스킬 ${x.skill_diversity ?? 0}종</span></div>`;
+          })
+          .join("");
+
+  // 스킬 자산 — 신규/휴면/최다
+  const asset = s.skill_asset ?? {};
+  const chips = (arr: string[], cls: string) =>
+    (arr ?? []).length === 0 ? `<span class="cc-empty-inline">없음</span>` : (arr ?? []).map((n: string) => `<span class="cc-chip ${cls}">${ccEsc(n)}</span>`).join("");
+  const top: any[] = asset.top ?? [];
+  document.getElementById("cc-weekly-skills")!.innerHTML =
+    `<div class="cc-asset-row"><span class="cc-asset-lab">🆕 신규</span><span class="cc-asset-v">${chips(asset.new, "new")}</span></div>` +
+    `<div class="cc-asset-row"><span class="cc-asset-lab">💤 휴면</span><span class="cc-asset-v">${chips(asset.dormant, "dormant")}</span></div>` +
+    `<div class="cc-asset-row"><span class="cc-asset-lab">🔝 최다</span><span class="cc-asset-v">${top.length === 0 ? `<span class="cc-empty-inline">없음</span>` : top.slice(0, 8).map((t) => `<span class="cc-chip top">${ccEsc(t.name)} ${t.calls}</span>`).join("")}</span></div>`;
 }
 
 function renderControlCenter(d: any) {

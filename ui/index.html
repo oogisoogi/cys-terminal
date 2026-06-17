@@ -49,6 +49,7 @@
         <button class="cc-tab" data-view="eff">비용·효율</button>
         <button class="cc-tab" data-view="skills">스킬·에이전트</button>
         <button class="cc-tab" data-view="sessions">세션</button>
+        <button class="cc-tab" data-view="weekly">추세·주간</button>
       </div>
       <div id="cc-body">
         <div id="cc-view-live">
@@ -107,6 +108,12 @@
           </div>
           <div id="cc-sessions-list"></div>
           <div id="cc-session-detail" class="cc-section" hidden></div>
+        </div>
+        <div id="cc-view-weekly" hidden>
+          <div class="cc-kpi" id="cc-weekly-wow"></div>
+          <div class="cc-section"><div class="cc-h">이번주 vs 지난주 (일별 토큰)</div><div id="cc-weekly-daily"></div></div>
+          <div class="cc-section"><div class="cc-h">🔥 효율 리더 (노드/역할별)</div><div id="cc-weekly-leaders"></div></div>
+          <div class="cc-section"><div class="cc-h">스킬 자산</div><div id="cc-weekly-skills"></div></div>
         </div>
         <div id="cc-footer"></div>
       </div>

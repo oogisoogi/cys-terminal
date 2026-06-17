@@ -147,7 +147,21 @@ stale 마커(정의 변경 시 재계산). 보존 정책(기본 60일·`retentio
 > - **정직 범위**: 전사 원문(HUMAN/ASSISTANT/TOOL 콘텐츠)·LLM title/summary는 데이터 미수집(messages 테이블
 >   미적재·recall은 surface_id 기준 스크롤백) → **이벤트 타임라인으로 대체**, title은 UI에서 메타로 합성. 후속.
 > - 검증: cargo 215/215(신규 `summarize_sessions`·`ribbon`) · E2E 16/16(`docs/sessions_e2e.py`) · UI 번들 OK.
-> - **다음 = E5**(주간 다이제스트) 또는 일괄 배포.
+>
+> **★8커밋 일괄 배포 완료**(2026-06-17 21:4x): /opt/homebrew/bin+/Applications/cys.app 신본 os.replace(.bak-t7)·
+> 데몬 단일 재기동(pid 88170 v0.2.2)·pack 동기·preflight C32 PASS+C33 FIXED·앱 ad-hoc 재서명 valid.
+> 5 RPC 라이브 실측. ★교훈: release는 strings|grep 부정확(기능검사 권위)·cys.app가 target/release/cysd 재spawn.
+>
+> **E5 추세·주간 다이제스트 탭 완료**(로컬 커밋·미배포):
+> - 백엔드: `analytics.rs` `summarize_weekly`(순수·이번주 vs 지난주)·`weekly_summary` + `control.weekly` RPC.
+>   WoW 델타(토큰·비용·세션·메시지, 지난주 0이면 null)·일별 오버레이(각 주 7칸)·효율 리더(역할별 토큰/비용/세션/
+>   스킬다양성, session→role 귀속)·스킬자산(신규/휴면/최다). 14일 윈도우 1회 로드.
+> - 프런트: Control Center **추세·주간 탭** + WoW KPI(▲▼ 델타)·일별 this/last 오버레이 막대·효율 리더 바·
+>   스킬 자산 칩(🆕신규/💤휴면/🔝최다). Tauri `control_weekly`.
+> - **정직 분리**: "주간 다이제스트 master push"는 governance 교리(자동응답 금지=PTY 주입 금지)상 이벤트/feed로만
+>   가능 → 조회형 탭+RPC 우선 완성, 스케줄러 자동 이벤트 push는 후속(E6 alert 패턴 재사용 가능).
+> - 검증: cargo 216/216(신규 `summarize_weekly`) · E2E 11/11(`docs/weekly_e2e.py`) · UI 번들 OK.
+> - **잔여: E7(RSI/autopilot 외트랙)·E8(엔지니어링 횡단·상당수 기존충족)·E9(팀=박사님 큰결정·선택)** — 정직 평가 후 처리.
 
 ### E1 — 영속 분석 기반 (척추) 【선행·필수】
 - **백엔드**: `analytics.db` 스키마 생성(state.rs init) · `ingest.rs`(hook 이벤트→events/messages 적재) ·

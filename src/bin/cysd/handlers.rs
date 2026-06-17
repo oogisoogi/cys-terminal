@@ -2035,6 +2035,19 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             ))
         }
 
+        // ─── T7 E5: 주간 다이제스트 (Control Center 추세·주간 탭) ───
+        "control.weekly" => {
+            let now = crate::state::now_epoch();
+            let summary = {
+                let guard = daemon.analytics.lock().unwrap();
+                match guard.as_ref() {
+                    Some(conn) => crate::analytics::weekly_summary(conn, now),
+                    None => crate::analytics::summarize_weekly(now, &[], &[]),
+                }
+            };
+            Reply::Single(ok_response(&id, json!({ "now": now, "summary": summary })))
+        }
+
         // ─── T7 E6: 현재 활성 경보 (Control Center 경보 배지 — watchdog 발화와 동일 평가기) ───
         "control.alerts" => {
             let now = crate::state::now_epoch();
