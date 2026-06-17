@@ -141,29 +141,6 @@ html, body {
 .pane .pane-usage .crit { color: #f85149; font-weight: 600; }
 .pane .pane-usage.stale { opacity: .45; }
 
-/* T5 Phase 2-C: 통합 사용량 대시보드 (사이드바 하단) */
-#usage-dash { flex: 0 0 auto; border-top: 1px solid var(--hairline); padding: 4px 0 8px; }
-#usage-dash.empty { display: none; }
-#usage-dash-head {
-  padding: 8px 12px 4px; font-size: 11px; font-weight: 700; letter-spacing: .04em;
-  color: #6e7681; text-transform: uppercase;
-}
-.usage-dash-row {
-  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
-  padding: 3px 12px; font-size: 11px; color: #8b949e; font-variant-numeric: tabular-nums;
-}
-.uda-agent { flex: 0 0 40px; color: var(--text); font-weight: 600; }
-.uda-win { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
-.uda-win.warn { color: var(--warn); }
-.uda-win.crit { color: var(--error); font-weight: 600; }
-.uda-bar {
-  display: inline-block; width: 28px; height: 5px; border-radius: 3px;
-  background: var(--border); overflow: hidden;
-}
-.uda-fill { display: block; height: 100%; background: var(--ok); }
-.uda-win.warn .uda-fill { background: var(--warn); }
-.uda-win.crit .uda-fill { background: var(--error); }
-
 /* ───────── T6 Control Center (전용 풀 패널 — 외장 Streamlit 대시보드의 네이티브 이식) ───────── */
 #cc-panel {
   position: fixed; inset: 39px 0 0 0; z-index: 1500;

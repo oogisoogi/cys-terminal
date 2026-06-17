@@ -103,73 +103,6 @@ function renderUsage(el: HTMLElement, u: ObservedUsage | null | undefined) {
   el.classList.toggle("stale", age > 120);
 }
 
-// ---------- T5 Phase 2-C: 통합 사용량 대시보드 (사이드바 하단) ----------
-// pane별 배지(Phase 1)는 "지금 이 작업"용. 대시보드는 전 계정 rate limit 잔량을 한눈에 —
-// "어느 계정이 곧 소진되나"를 작업 전환 없이 파악. 에이전트(claude/codex/agy)별로 rate
-// 윈도우를 묶어 최대 used_pct(=계정 binding 제약)와 가장 임박한 reset을 보여준다.
-// v1=에이전트별 집계(멀티프로필 분해는 추후 — 프로필↔계정 매핑 미해결).
-function relTime(epoch: number): string {
-  const sec = Math.round(epoch - Date.now() / 1000);
-  if (sec <= 0) return "곧";
-  const h = Math.floor(sec / 3600);
-  const m = Math.floor((sec % 3600) / 60);
-  return h > 0 ? `${h}h${m}m` : `${m}m`;
-}
-
-function renderUsageDashboard(surfaces: { exited: boolean; usage?: ObservedUsage | null }[]) {
-  const dash = document.getElementById("usage-dash");
-  const body = document.getElementById("usage-dash-body");
-  if (!dash || !body) return;
-  // agent → label → {used_pct(max = binding 제약), resets_at(nearest)}
-  const agg = new Map<string, Map<string, { used: number; reset: number | null }>>();
-  for (const s of surfaces) {
-    if (s.exited || !s.usage) continue;
-    for (const w of s.usage.rate ?? []) {
-      let m = agg.get(s.usage.agent);
-      if (!m) agg.set(s.usage.agent, (m = new Map()));
-      const cur = m.get(w.label) ?? { used: 0, reset: null as number | null };
-      if (w.used_pct > cur.used) cur.used = w.used_pct;
-      if (w.resets_at != null && (cur.reset == null || w.resets_at < cur.reset)) cur.reset = w.resets_at;
-      m.set(w.label, cur);
-    }
-  }
-  body.replaceChildren();
-  dash.classList.toggle("empty", agg.size === 0);
-  if (agg.size === 0) return;
-  const order = ["claude", "codex", "gemini"];
-  const agents = [...agg.keys()].sort((a, b) => order.indexOf(a) - order.indexOf(b));
-  for (const agent of agents) {
-    const windows = agg.get(agent)!;
-    const row = document.createElement("div");
-    row.className = "usage-dash-row";
-    const name = document.createElement("span");
-    name.className = "uda-agent";
-    name.textContent = agent === "gemini" ? "agy" : agent;
-    row.appendChild(name);
-    for (const label of [...windows.keys()].sort((a) => (a === "5h" ? -1 : 1))) {
-      const { used, reset } = windows.get(label)!;
-      const cell = document.createElement("span");
-      cell.className = "uda-win " + sevClass(used, 70, 90);
-      const lab = document.createElement("span");
-      lab.textContent = label;
-      const bar = document.createElement("span");
-      bar.className = "uda-bar";
-      const fill = document.createElement("span");
-      fill.className = "uda-fill";
-      fill.style.width = `${Math.min(100, Math.round(used))}%`;
-      bar.appendChild(fill);
-      const val = document.createElement("span");
-      val.textContent = `${Math.round(used)}%`;
-      cell.append(lab, bar, val);
-      cell.title = reset
-        ? `${agent} ${label} reset: ${new Date(reset * 1000).toLocaleString()} (↻${relTime(reset)})`
-        : `${agent} ${label}: ${Math.round(used)}%`;
-      row.appendChild(cell);
-    }
-    body.appendChild(row);
-  }
-}
-
 // ---------- T6 Control Center (전용 풀 패널 — 네이티브 실시간 모니터링) ----------
 let ccOpen = false;
 let ccTimer: number | null = null;
@@ -424,7 +357,6 @@ async function refreshPaneTitles() {
       if (rt.titleEl.isContentEditable) continue; // 이름 편집 중에는 덮어쓰지 않음
       rt.titleEl.textContent = paneTitle(s.title, s.live_cwd) + (s.exited ? " [exited]" : "");
     }
-    renderUsageDashboard(r.surfaces); // 전 계정 rate 집계 — 같은 폴링 데이터 재사용 (새 RPC 불필요)
     // 자동 입양: role이 등록된 살아있는 surface 중 UI에 없는 것 → 현재 ws에 pane으로 표출.
     // role 조건이 UI 자체 생성 pane(역할 없음)과의 생성 경합을 차단한다.
     let adopted = false;
