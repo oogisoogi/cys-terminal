@@ -1,6 +1,7 @@
 //! cysd — CYSJavis 터미널 헤드리스 코어 데몬.
 //! UI와 완전 분리: UI가 hang이어도 이 데몬과 소켓 제어 채널은 항상 살아있다 (OOB 회생).
 
+mod cost;
 mod events;
 mod governance;
 mod handlers;

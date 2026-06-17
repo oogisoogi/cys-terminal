@@ -317,24 +317,42 @@ pub struct Consumption {
     pub today_tokens: u64,
     pub today_input: u64,
     pub today_msgs: u64,
+    pub today_cost_usd: f64,
+    pub model_tokens: std::collections::HashMap<String, u64>,
     pub sessions: std::collections::HashSet<String>,
     pub buckets: std::collections::VecDeque<(f64, u64)>,
 }
 
 impl Consumption {
     /// 새 어시스턴트 메시지 1건 적재 — 날짜가 바뀌면 오늘 카운터를 리셋한다.
-    pub fn record_message(&mut self, session: &str, input: u64, output: u64, now: f64, today: &str) {
+    /// `cost`=cost.rs 4-팩터 환산 USD, `model`=모델믹스 집계 키.
+    pub fn record_message(
+        &mut self,
+        session: &str,
+        input: u64,
+        output: u64,
+        cost: f64,
+        model: &str,
+        now: f64,
+        today: &str,
+    ) {
         if self.today_date != today {
             self.today_date = today.to_string();
             self.today_tokens = 0;
             self.today_input = 0;
             self.today_msgs = 0;
+            self.today_cost_usd = 0.0;
+            self.model_tokens.clear();
             self.sessions.clear();
         }
         let total = input + output;
         self.today_tokens += total;
         self.today_input += input;
         self.today_msgs += 1;
+        self.today_cost_usd += cost;
+        if !model.is_empty() {
+            *self.model_tokens.entry(model.to_string()).or_insert(0) += total;
+        }
         if !session.is_empty() {
             self.sessions.insert(session.to_string());
         }

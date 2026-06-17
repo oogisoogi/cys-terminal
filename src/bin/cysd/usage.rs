@@ -278,16 +278,22 @@ fn collect_for(
     // T6 Control Center 소비 누적 — claude 새 메시지의 (input, output)을 데몬 트래커에 적재.
     // tail은 새 라인을 1회만 읽으므로 이중계수 없음(첫 attach 창만 경미한 초기 중복 가능).
     if agent == "claude" {
-        let ios: Vec<(u64, u64)> = lines
+        let msgs: Vec<MsgCost> = lines
             .iter()
-            .filter_map(|l| parse_claude_message_io(l))
+            .filter_map(|l| parse_claude_message_cost(l))
             .collect();
-        if !ios.is_empty() {
+        if !msgs.is_empty() {
             let today = chrono::Local::now().format("%Y-%m-%d").to_string();
             let sess = path.to_string_lossy().into_owned();
             let mut c = daemon.consumption.lock().unwrap();
-            for (i, o) in ios {
-                c.record_message(&sess, i, o, now, &today);
+            for m in msgs {
+                let cost = crate::cost::calculate_cost(
+                    m.input_tokens, m.output, m.cache_creation, m.cache_read, &m.model,
+                );
+                // 소비 토큰 = input + cache_creation(+output) — cache_read(재사용)는 제외.
+                c.record_message(
+                    &sess, m.input_tokens + m.cache_creation, m.output, cost, &m.model, now, &today,
+                );
             }
         }
     }
@@ -572,10 +578,17 @@ pub fn parse_claude_line(line: &str) -> Option<(u64, String)> {
     Some((ctx, model))
 }
 
-/// T6 Control Center 소비 누적용 — 어시스턴트 메시지 1건의 (input, output) 토큰.
-/// output은 메시지당 가산이라 누적 합이 "오늘 소비"로 모호성 없이 정의된다(ctx와 별개 층위).
-/// cache_read는 컨텍스트 재사용이라 소비로 치지 않는다(생성·입력만). 비대상 라인은 None.
-pub fn parse_claude_message_io(line: &str) -> Option<(u64, u64)> {
+/// T7 비용 환산용 — 메시지의 토큰 4종 + 모델. output은 메시지당 가산이라 "오늘 소비"로
+/// cost.rs로 USD 환산하고 Consumption 모델믹스에 집계한다.
+pub struct MsgCost {
+    pub input_tokens: u64,
+    pub output: u64,
+    pub cache_creation: u64,
+    pub cache_read: u64,
+    pub model: String,
+}
+
+pub fn parse_claude_message_cost(line: &str) -> Option<MsgCost> {
     if !line.contains("\"assistant\"") || !line.contains("\"usage\"") {
         return None;
     }
@@ -588,12 +601,17 @@ pub fn parse_claude_message_io(line: &str) -> Option<(u64, u64)> {
         return None;
     }
     let g = |k: &str| u[k].as_u64().unwrap_or(0);
-    let input = g("input_tokens") + g("cache_creation_input_tokens");
-    let output = g("output_tokens");
-    if input == 0 && output == 0 {
+    let m = MsgCost {
+        input_tokens: g("input_tokens"),
+        output: g("output_tokens"),
+        cache_creation: g("cache_creation_input_tokens"),
+        cache_read: g("cache_read_input_tokens"),
+        model: v["message"]["model"].as_str().unwrap_or("").to_string(),
+    };
+    if m.input_tokens == 0 && m.output == 0 && m.cache_creation == 0 && m.cache_read == 0 {
         return None;
     }
-    Some((input, output))
+    Some(m)
 }
 
 /// claude 컨텍스트 윈도우 추정: 기본 200k, 1M 모델([1m])은 1M. CYS_CLAUDE_CTX_WINDOW로
@@ -1142,17 +1160,18 @@ mod tests {
         assert!(parse_agy_quota(&only3p).is_empty());
     }
 
-    /// T6: 메시지별 (input, output) — cache_read는 소비 아님(제외), sidechain·0/0은 None.
+    /// T7: 메시지별 토큰 4종 + 모델 파싱(cost 환산 입력) — cache_read·model 포함, sidechain·전부0은 None.
     #[test]
-    fn claude_message_io_input_output() {
-        let line = r#"{"type":"assistant","isSidechain":false,"message":{"model":"x","usage":{"input_tokens":1000,"cache_creation_input_tokens":2000,"cache_read_input_tokens":50000,"output_tokens":300}}}"#;
-        assert_eq!(parse_claude_message_io(line), Some((3000, 300)), "input+cache_creation=3000(cache_read 제외), output=300");
+    fn claude_message_cost_parse() {
+        let line = r#"{"type":"assistant","isSidechain":false,"message":{"model":"claude-opus-4-8","usage":{"input_tokens":1000,"cache_creation_input_tokens":2000,"cache_read_input_tokens":50000,"output_tokens":300}}}"#;
+        let m = parse_claude_message_cost(line).unwrap();
+        assert_eq!((m.input_tokens, m.cache_creation, m.cache_read, m.output), (1000, 2000, 50000, 300));
+        assert_eq!(m.model, "claude-opus-4-8");
         let sc = line.replace("\"isSidechain\":false", "\"isSidechain\":true");
-        assert_eq!(parse_claude_message_io(&sc), None, "sidechain 제외");
-        assert_eq!(
-            parse_claude_message_io(r#"{"type":"assistant","message":{"usage":{"input_tokens":0,"output_tokens":0}}}"#),
-            None,
-            "0/0은 None"
+        assert!(parse_claude_message_cost(&sc).is_none(), "sidechain 제외");
+        assert!(
+            parse_claude_message_cost(r#"{"type":"assistant","message":{"usage":{"input_tokens":0,"output_tokens":0}}}"#).is_none(),
+            "전부 0은 None"
         );
     }
 
@@ -1162,17 +1181,22 @@ mod tests {
         use crate::state::Consumption;
         let mut c = Consumption::default();
         let now = 1_000_000.0;
-        c.record_message("/s/a.jsonl", 100, 50, now - 7200.0, "2026-06-17");
-        c.record_message("/s/a.jsonl", 200, 100, now - 1800.0, "2026-06-17");
-        c.record_message("/s/b.jsonl", 10, 5, now, "2026-06-17");
+        c.record_message("/s/a.jsonl", 100, 50, 0.5, "claude-opus-4-8", now - 7200.0, "2026-06-17");
+        c.record_message("/s/a.jsonl", 200, 100, 1.0, "claude-opus-4-8", now - 1800.0, "2026-06-17");
+        c.record_message("/s/b.jsonl", 10, 5, 0.1, "claude-haiku-4-5", now, "2026-06-17");
         assert_eq!(c.today_msgs, 3);
         assert_eq!(c.today_tokens, 100 + 50 + 200 + 100 + 10 + 5);
         assert_eq!(c.today_input, 100 + 200 + 10);
+        assert!((c.today_cost_usd - 1.6).abs() < 1e-9, "비용 합산 0.5+1.0+0.1");
+        assert_eq!(c.model_tokens.get("claude-opus-4-8").copied(), Some(450), "opus 토큰 150+300");
+        assert_eq!(c.model_tokens.get("claude-haiku-4-5").copied(), Some(15));
         assert_eq!(c.sessions.len(), 2, "세션 a,b 2개");
         assert_eq!(c.recent_tokens(now, 3600.0), 300 + 15, "최근 1h = 30m전(300)+now(15)");
         assert_eq!(c.sparkline(now, 12, 43200.0).iter().sum::<u64>(), 150 + 300 + 15, "12h 전부 포함");
-        c.record_message("/s/c.jsonl", 1, 1, now + 100.0, "2026-06-18");
+        c.record_message("/s/c.jsonl", 1, 1, 0.2, "claude-opus-4-8", now + 100.0, "2026-06-18");
         assert_eq!(c.today_msgs, 1, "날짜 변경 시 오늘 카운터 리셋");
         assert_eq!(c.sessions.len(), 1, "세션도 리셋");
+        assert!((c.today_cost_usd - 0.2).abs() < 1e-9, "비용도 리셋");
+        assert_eq!(c.model_tokens.len(), 1, "모델믹스도 리셋");
     }
 }

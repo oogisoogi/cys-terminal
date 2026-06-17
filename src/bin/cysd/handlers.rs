@@ -1907,7 +1907,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 .collect();
             drop(surfaces);
             fleet.sort_by_key(|v| v["surface_id"].as_u64().unwrap_or(0));
-            let (today_tokens, today_input, today_msgs, session_count, last_1h, spark) = {
+            let (today_tokens, today_input, today_msgs, session_count, last_1h, spark, today_cost, model_mix) = {
                 let c = daemon.consumption.lock().unwrap();
                 (
                     c.today_tokens,
@@ -1916,6 +1916,8 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     c.sessions.len() as u64,
                     c.recent_tokens(now, 3600.0),
                     c.sparkline(now, 24, 43_200.0),
+                    c.today_cost_usd,
+                    c.model_tokens.clone(),
                 )
             };
             Reply::Single(ok_response(
@@ -1929,7 +1931,8 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     "consumption": {
                         "today_tokens": today_tokens, "today_input": today_input,
                         "today_msgs": today_msgs, "session_count": session_count,
-                        "last_1h_tokens": last_1h,
+                        "last_1h_tokens": last_1h, "today_cost_usd": today_cost,
+                        "model_mix": model_mix,
                     },
                     "sparkline": spark,
                 }),
