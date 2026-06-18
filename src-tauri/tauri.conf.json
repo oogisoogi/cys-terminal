@@ -43,7 +43,7 @@
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDM5RTYwQTcwMjk0OUQ2QzMKUldURDFra3BjQXJtT1dvZVBUdHk5VnlvKzBJeVNneE11UzdpWFQzVHFoMDFtUG4wZWpkdGlHZ0wK",
       "endpoints": [
-        "https://github.com/idoforgod/cys-terminal/releases/latest/download/latest.json"
+        "https://github.com/idoforgod/cys-terminal-releases/releases/latest/download/latest.json"
       ]
     }
   }

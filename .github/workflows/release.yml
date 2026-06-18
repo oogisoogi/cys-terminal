@@ -1,0 +1,114 @@
+name: release
+
+# 옵션 A — 소스는 비공개 repo에서 빌드·서명하고, 산출물만 공개 repo로 내보낸다.
+#   build    : tag(vX.Y.Z) push → macOS 앱 빌드 → minisign 서명 → 이 비공개 repo에 릴리스 생성
+#   relocate : 산출물(.dmg/.app.tar.gz/.sig/latest.json)을 공개 repo(cys-terminal-releases)로 복사,
+#              latest.json의 다운로드 URL을 공개 repo로 치환 → 공개 repo에 draft 릴리스 생성
+# 사용: 버전 5곳 범프 후  git tag v0.2.3 && git push origin v0.2.3
+#       (수동 실행도 가능 — Actions 탭 Run workflow)
+# 활성 조건(시크릿):  TAURI_SIGNING_PRIVATE_KEY · RELEASES_REPO_TOKEN  (키 암호는 무암호 → 아래 빈 문자열로 처리)
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write          # 비공개 repo에 릴리스 생성·자산 업로드(+ relocate 단계 다운로드)에 필요
+
+env:
+  SRC_REPO: idoforgod/cys-terminal              # 비공개 소스 repo (빌드·1차 릴리스)
+  DST_REPO: idoforgod/cys-terminal-releases     # 공개 배포 repo (사용자 다운로드·updater 대상)
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false     # 한 타깃이 실패해도 나머지는 계속
+      matrix:
+        include:
+          - platform: macos-latest
+            target: aarch64-apple-darwin    # Apple Silicon
+          - platform: macos-latest
+            target: x86_64-apple-darwin     # Intel — arm64 러너에서 크로스 빌드(bundle-prep이 CYS_TARGET 사용)
+          # Windows 레그는 보류(GUI 빌드[WebView2/MSVC]·latest.json windows 키·Authenticode 3종 미비).
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 프런트엔드 번들러(ui/build.sh가 bun 사용). beforeBuildCommand가 bun을 호출하므로 PATH 필수.
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+          key: ${{ matrix.target }}
+
+      # tauri build → beforeBuildCommand(bundle-prep.sh)가 UI 번들 + cys/cysd 릴리스 빌드 + externalBin
+      # 배치 → 번들(dmg/app) → createUpdaterArtifacts(.app.tar.gz + .sig + latest.json) → 비공개 repo 릴리스 업로드.
+      - name: Build, sign, and release (private)
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CYS_TARGET: ${{ matrix.target }}    # bundle-prep.sh가 매트릭스 타깃으로 사이드카(cys-<target>)를 크로스 빌드
+          # ── 업데이트 무결성 서명 (필수 — 없으면 .sig·latest.json 미생성) ──
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''    # 이 키는 무암호로 생성됨(실측 확인) → 빈 문자열. 별도 시크릿 불필요.
+          # ── macOS 코드사이닝 + 공증 (Developer ID, 선택 — 없으면 미서명 빌드 = Gatekeeper 경고) ──
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: 'cys ${{ github.ref_name }} (internal)'
+          releaseBody: '비공개 빌드 산출물 — 공개 배포는 cys-terminal-releases 참조.'
+          releaseDraft: false     # 실태그 발행(비공개 repo) → relocate에서 gh release download 안정 동작
+          prerelease: false
+          args: --target ${{ matrix.target }}
+
+  relocate:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      # 1) 비공개 repo 릴리스에서 산출물 회수 (자기 repo이므로 기본 GITHUB_TOKEN으로 충분)
+      - name: Download artifacts from private release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          gh release download "${{ github.ref_name }}" -R "$SRC_REPO" -D dist
+          echo "── 회수한 산출물 ──"; ls -la dist
+
+      # 2) latest.json의 다운로드 URL을 공개 repo로 치환 (소스 repo URL → 배포 repo URL)
+      - name: Rewrite latest.json URLs to public repo
+        run: |
+          set -euo pipefail
+          test -f dist/latest.json || { echo "::error::latest.json 없음 — 서명 시크릿이 설정됐는지 확인"; exit 1; }
+          sed -i "s#${SRC_REPO}/releases/download#${DST_REPO}/releases/download#g" dist/latest.json
+          echo "── 치환 후 latest.json ──"; cat dist/latest.json
+
+      # 3) 공개 repo에 draft 릴리스 생성 + 자산 업로드 (검토 후 수동 Publish → updater가 latest로 인식)
+      - name: Publish to public releases repo (draft)
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          # 재실행 안전: 기존 동일 태그 릴리스가 있으면 정리
+          gh release delete "${{ github.ref_name }}" -R "$DST_REPO" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "${{ github.ref_name }}" -R "$DST_REPO" dist/* \
+            --title "cys ${{ github.ref_name }}" \
+            --notes "cys 터미널 ${{ github.ref_name }}. 아래 .dmg를 내려받아 설치하세요. 기존 사용자는 앱 내 Update 버튼으로 자동 갱신됩니다." \
+            --draft
+          echo "✅ 공개 repo draft 릴리스 생성됨 — 검토 후 Publish 하면 배포·자동업데이트가 활성화됩니다."
