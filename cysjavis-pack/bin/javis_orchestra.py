@@ -725,7 +725,32 @@ def cmd_gate_status(args):
         pass
     print("종합: GATE CONVERGED — 4자 수렴. 커밋+SESSION_STATE 갱신 후 다음 로드맵 단계를 "
           "자동 착수하라(앵커6 축1 — denylist 해당 시에만 정지).")
+    # (RSI 자율추천 ii) 종료 게이트 — slow 작업 수렴(종료) 시 '더 나은 방법' 학습 1회 추천
+    # (추천만·사람 승인·directive §4). gate-status는 폴링되므로 (task,round)당 1회 마커로 스팸 차단.
+    _recommend_learn_once("gate", "%s R%d 종료 — 더 나은 방법론" % (args.task, rnd),
+                          "gate-%s-%d" % (re.sub(r"[^A-Za-z0-9]+", "-", args.task), rnd))
     return 0
+
+
+def _recommend_learn_once(reason, topic, marker_key):
+    """RSI 학습 자율추천(best-effort) — marker_key당 1회 feed 추천(추천까지만 자율·착수 사람 승인·
+    directive §4). cys 부재·데몬 미가동·오류·중복 마커는 무시(추천은 비핵심·핵심 판정 불간섭)."""
+    import shutil
+    learn_dir = os.path.join(pack_dir(), "round", "learn")
+    marker = os.path.join(learn_dir, ".rec_" + marker_key)
+    if os.path.exists(marker) or not shutil.which("cys"):
+        return
+    body = ('{"reason":"%s","topic":"%s","status":"awaiting_approval"} — '
+            "feed 패널 또는 'cys feed reply <id> allow'로 승인 시에만 학습 착수. directive §4: 추천까지만 자율." % (reason, topic))
+    try:
+        os.makedirs(learn_dir, exist_ok=True)
+        r = subprocess.run(["cys", "feed", "push", "--kind", "learn_proposal",
+                            "--title", "[RSI 학습 추천] " + reason, "--body", body],
+                           capture_output=True, timeout=5)
+        if r.returncode == 0:
+            open(marker, "w").close()
+    except Exception:
+        pass
 
 
 def extract_next_action(text):

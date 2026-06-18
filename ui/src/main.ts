@@ -109,7 +109,7 @@ let ccTimer: number | null = null;
 let ccClockTimer: number | null = null;
 let ccUptimeBase = 0;
 let ccUptimeFetchedAt = 0;
-let ccTab: "live" | "eff" | "skills" | "sessions" | "weekly" = "live";
+let ccTab: "live" | "eff" | "skills" | "sessions" | "weekly" | "learn" = "live";
 let ccEffWindow = "today";
 let ccSkillsWindow = "today";
 let ccSessionsWindow = "7d";
@@ -201,6 +201,7 @@ async function refreshControlCenter() {
   }
   if (ccTab === "eff") refreshEfficiency();
   if (ccTab === "skills") refreshSkills();
+  if (ccTab === "learn") refreshLearn();
 }
 
 // E6 경보 — 헤더 배지(개수) + Live 뷰 상단 스트립. severity: warn(주황)/crit(빨강).
@@ -251,13 +252,14 @@ async function refreshWeekly() {
   }
 }
 
-function setCcTab(view: "live" | "eff" | "skills" | "sessions" | "weekly") {
+function setCcTab(view: "live" | "eff" | "skills" | "sessions" | "weekly" | "learn") {
   ccTab = view;
   document.getElementById("cc-view-live")!.hidden = view !== "live";
   document.getElementById("cc-view-eff")!.hidden = view !== "eff";
   document.getElementById("cc-view-skills")!.hidden = view !== "skills";
   document.getElementById("cc-view-sessions")!.hidden = view !== "sessions";
   document.getElementById("cc-view-weekly")!.hidden = view !== "weekly";
+  document.getElementById("cc-view-learn")!.hidden = view !== "learn";
   document.querySelectorAll("#cc-tabs .cc-tab").forEach((b) =>
     b.classList.toggle("active", (b as HTMLElement).dataset.view === view),
   );
@@ -265,6 +267,78 @@ function setCcTab(view: "live" | "eff" | "skills" | "sessions" | "weekly") {
   if (view === "skills") refreshSkills();
   if (view === "sessions") refreshSessions();
   if (view === "weekly") refreshWeekly();
+  if (view === "learn") refreshLearn();
+}
+
+// RSI 학습 탭 — learn.status(canonical state) 폴링 렌더 + 대기추천은 기존 feed 패널 재사용.
+async function refreshLearn() {
+  let state: any = {};
+  try {
+    state = (await invoke("learn_status")) as any;
+  } catch {
+    /* 데몬 일시 부재 — 다음 틱 재시도 */
+  }
+  const rounds = state?.rounds ?? {};
+  const keys = Object.keys(rounds);
+  const disc = state?.discovery ?? {};
+  // gemini REVISE: discovery 값을 ccEsc/Number 없이 innerHTML 보간하면 XSS(오염 state.json) — 안전한
+  // 0 이상 정수로 강제(KPI 합산·discovery 행 동일 helper). key/verdict/title은 이미 ccEsc.
+  const discNum = (x: any): number => {
+    const n = Number(x);
+    return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 0;
+  };
+  const dCap = discNum(disc.capability), dPer = discNum(disc.perspective), dKno = discNum(disc.knowledge);
+  const totalStored = keys.reduce((n, k) => n + (rounds[k]?.stored?.length ?? 0), 0);
+  const discTotal = dCap + dPer + dKno;
+
+  document.getElementById("cc-learn-kpi")!.innerHTML = (
+    [
+      ["라운드", String(keys.length), "학습 사이클"],
+      ["저장(memory)", String(totalStored), "confirmed/provisional"],
+      ["발견", String(discTotal), "기능·관점·지식"],
+    ] as [string, string, string][]
+  )
+    .map(([n, v, sub]) => `<div class="cc-card"><div class="cc-card-val">${v}</div><div class="cc-card-reset">${ccEsc(sub)}</div><div class="cc-card-name">${ccEsc(n)}</div></div>`)
+    .join("");
+
+  const vColor: Record<string, string> = { improved: "#3ad07a", regressed: "#e0606a", flat: "#9a9a9a" };
+  document.getElementById("cc-learn-timeline")!.innerHTML = keys.length
+    ? keys
+        .map((k) => {
+          const r = rounds[k];
+          const v = String(r?.verdict ?? "-");
+          return `<div class="cc-learn-row"><span class="cc-learn-round">${ccEsc(k)}</span><span class="cc-learn-verdict" style="color:${vColor[v] ?? "inherit"}">${ccEsc(v)}</span><span class="cc-learn-meta">저장 ${r?.stored?.length ?? 0} · harness ${r?.harness?.length ?? 0}</span></div>`;
+        })
+        .join("")
+    : `<div class="cc-empty">학습 라운드 없음</div>`;
+
+  const ribbons: string[] = [];
+  for (const k of keys) for (const h of rounds[k]?.harness ?? []) ribbons.push(`${k}: ${h.retention ?? "?"}`);
+  document.getElementById("cc-learn-retention")!.innerHTML = ribbons.length
+    ? ribbons.map((t) => `<span class="cc-learn-ribbon ${t.includes("keep") ? "keep" : "rollback"}">${ccEsc(t)}</span>`).join("")
+    : `<div class="cc-empty">채택/롤백 기록 없음</div>`;
+
+  document.getElementById("cc-learn-discovery")!.innerHTML = (
+    [
+      ["기능 (도구·스킬·기법)", dCap],
+      ["관점 (다각·교차도메인)", dPer],
+      ["지식 (새 출처·경로)", dKno],
+    ] as [string, number][]
+  )
+    .map(([l, v]) => `<div class="cc-mix-row"><span class="cc-mix-name">${ccEsc(l)}</span><span class="cc-call-n">${v}</span></div>`)
+    .join("");
+
+  // 대기 배지 — 기존 feed에서 learn_proposal pending 필터(승인/거부는 Feed 패널 재사용·중복 UI 0).
+  try {
+    const f = (await invoke("feed_list", { status: null })) as any;
+    const items: any[] = f?.items ?? [];
+    const lp = items.filter((i) => i?.status === "pending" && i?.kind === "learn_proposal");
+    document.getElementById("cc-learn-pending")!.innerHTML = lp.length
+      ? lp.map((i) => `<div class="cc-learn-pending-item">⏳ ${ccEsc(String(i.title ?? "학습 추천"))} <span class="cc-dim">— Feed 패널에서 승인/거부</span></div>`).join("")
+      : `<div class="cc-empty">대기 중 자율추천 없음</div>`;
+  } catch {
+    document.getElementById("cc-learn-pending")!.innerHTML = `<div class="cc-empty">—</div>`;
+  }
 }
 
 function renderEfficiency(a: any) {
@@ -1867,7 +1941,7 @@ document.getElementById("btn-ft-close")!.addEventListener("click", () => setFtOp
 document.getElementById("btn-cc")!.addEventListener("click", () => setCcOpen(!ccOpen));
 document.getElementById("btn-cc-close")!.addEventListener("click", () => setCcOpen(false));
 document.querySelectorAll("#cc-tabs .cc-tab").forEach((b) =>
-  b.addEventListener("click", () => setCcTab((b as HTMLElement).dataset.view as "live" | "eff")),
+  b.addEventListener("click", () => setCcTab((b as HTMLElement).dataset.view as typeof ccTab)),
 );
 document.querySelectorAll("#cc-eff-win .cc-win").forEach((b) =>
   b.addEventListener("click", () => {

@@ -25,6 +25,7 @@ pub fn spawn_watchdog(daemon: Arc<Daemon>) {
         let mut queue_depth_alerted: HashMap<u64, f64> = HashMap::new();
         let mut deadman_last_alert: f64 = 0.0;
         let mut alert_fired: HashMap<String, f64> = HashMap::new();
+        let mut learn_stuck_debounce: HashMap<u64, f64> = HashMap::new();
         let mut tick_no: u64 = 0;
         loop {
             tokio::time::sleep(Duration::from_secs(WATCHDOG_INTERVAL_SECS)).await;
@@ -50,6 +51,8 @@ pub fn spawn_watchdog(daemon: Arc<Daemon>) {
                 // T7 E6 경보(30초): rate·주간예산·반복실패 — analytics SQL 동반이라 저빈도
                 if tick_no.is_multiple_of(6) {
                     check_alerts(&daemon, &mut alert_fired);
+                    // (RSI 학습 자율추천 i) 막힘 — 읽기전용으로 재시작 카운터를 보고 학습 추천만.
+                    check_learn_stuck(&daemon, &restart_counts, &mut learn_stuck_debounce);
                 }
                 // 24/365 데몬 누수 차단: 위 검사들이 surface_id·cmdline 키로 insert만 하는
                 // 태스크-로컬 디바운스/카운터 맵을 살아있는 surface 집합·나이로 솎아낸다.
@@ -64,6 +67,7 @@ pub fn spawn_watchdog(daemon: Arc<Daemon>) {
                     now_epoch(),
                 );
                 queue_depth_alerted.retain(|sid, _| live_surface_ids.contains(sid));
+                learn_stuck_debounce.retain(|sid, _| live_surface_ids.contains(sid));
             });
             if std::panic::catch_unwind(tick).is_err() {
                 daemon.bus.publish(
@@ -183,6 +187,76 @@ fn check_agent_death(
             .await;
             let _ = attempts;
         });
+    }
+}
+
+/// (RSI 학습 자율추천 i · 순수 판정) 재시작 카운트가 임계 이상이고 디바운스 쿨다운이 지난
+/// surface id — '동일 노드 N회 실패 = 막힘' 신호를 결정론으로 추출한다(테스트 핀).
+fn learn_stuck_candidates(
+    restart_counts: &HashMap<u64, u32>,
+    debounce: &HashMap<u64, f64>,
+    threshold: u32,
+    cooldown: f64,
+    now: f64,
+) -> Vec<u64> {
+    if threshold == 0 {
+        return Vec::new();
+    }
+    let mut out: Vec<u64> = restart_counts
+        .iter()
+        .filter(|(_, c)| **c >= threshold)
+        // 디바운스 기록 부재 = 한 번도 추천 안 됨 = 즉시 적격. 기록 있으면 쿨다운 경과 후만.
+        .filter(|(sid, _)| match debounce.get(sid) {
+            None => true,
+            Some(&last) => now - last >= cooldown,
+        })
+        .map(|(sid, _)| *sid)
+        .collect();
+    out.sort_unstable();
+    out
+}
+
+/// (RSI 학습 자율추천 i) 막힘 트리거 — ★읽기 전용: watchdog의 기존 재시작 카운터(동일 노드
+/// N회 실패=막힘 신호)만 읽어 학습 추천 feed 항목을 만든다. autopilot(EFEC/AMI) 자율주행
+/// 로직은 무손상·자동응답 0 — 추천까지만 자율, 착수는 사람 승인(directive §4). 디바운스로 스팸 차단.
+fn check_learn_stuck(
+    daemon: &Arc<Daemon>,
+    restart_counts: &HashMap<u64, u32>,
+    debounce: &mut HashMap<u64, f64>,
+) {
+    let threshold = env_u64("CYS_RSI_STUCK_RESTARTS", 3) as u32;
+    let cooldown = env_u64("CYS_RSI_STUCK_DEBOUNCE_SECS", 3600) as f64;
+    let now = now_epoch();
+    let cands = learn_stuck_candidates(restart_counts, debounce, threshold, cooldown, now);
+    if cands.is_empty() {
+        return;
+    }
+    // role은 읽기 전용으로 조회(surfaces 락을 짧게 잡고 해제) — feed 생성은 락 밖에서.
+    let roles: Vec<(u64, String)> = {
+        let surfaces = daemon.surfaces.lock().unwrap();
+        cands
+            .iter()
+            .map(|sid| {
+                let role = surfaces
+                    .get(sid)
+                    .and_then(|s| s.role.lock().unwrap().clone())
+                    .unwrap_or_else(|| "node".into());
+                (*sid, role)
+            })
+            .collect()
+    };
+    for (sid, role) in roles {
+        debounce.insert(sid, now);
+        let body = format!(
+            "{{\"event\":\"propose\",\"reason\":\"stuck\",\"topic\":\"{role} 막힘 돌파 방법론\",\"status\":\"awaiting_approval\",\"trigger\":\"watchdog restart>={threshold}\"}}\n\
+             동일 노드 {threshold}회+ 재시작(막힘) 감지. 'cys learn \"{role} 막힘 돌파\"'로 학습 착수(사람 승인). directive §4: 추천까지만 자율."
+        );
+        daemon.push_feed_notification(
+            "learn_proposal",
+            &format!("[RSI 학습 추천] 막힘 — {role} 재시작 {threshold}회+"),
+            &body,
+            Some(sid),
+        );
     }
 }
 
@@ -1102,6 +1176,26 @@ fn deliver_queued(daemon: &Arc<Daemon>, depth_alerted: &mut HashMap<u64, f64>) {
 
 #[cfg(test)]
 mod tests {
+    use super::learn_stuck_candidates;
+
+    /// (RSI 학습 자율추천 i) 막힘 판정 순수 함수 — 임계·디바운스·비활성(threshold=0)을 박제한다.
+    #[test]
+    fn learn_stuck_candidates_threshold_and_debounce() {
+        let mut counts: HashMap<u64, u32> = HashMap::new();
+        counts.insert(10, 3); // 임계 도달
+        counts.insert(11, 2); // 임계 미달
+        counts.insert(12, 5); // 임계 초과지만 디바운스 쿨다운 내
+        let mut deb: HashMap<u64, f64> = HashMap::new();
+        deb.insert(12, 1000.0); // 최근 추천 → 쿨다운(3600) 내
+        let now = 2000.0;
+        // threshold=3, cooldown=3600: 10만 후보(11=미달, 12=쿨다운 내)
+        assert_eq!(learn_stuck_candidates(&counts, &deb, 3, 3600.0, now), vec![10]);
+        // 쿨다운 경과 후엔 12도 포함(정렬)
+        assert_eq!(learn_stuck_candidates(&counts, &deb, 3, 3600.0, 5000.0), vec![10, 12]);
+        // threshold=0 = 비활성(보수적 옵트아웃)
+        assert!(learn_stuck_candidates(&counts, &deb, 0, 3600.0, now).is_empty());
+    }
+
     /// ★불변식 박제(2026-06-12 실측 결함): npm 래퍼 에이전트의 모든 실행 형태가 생존으로
     /// 매칭돼야 한다 — 놓치면 agent_alive=false 오판 → orchestra check FAIL → 멀쩡한
     /// 노드를 수선·오살(quit·close-surface)하는 연쇄가 재발한다.

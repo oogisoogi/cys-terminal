@@ -404,3 +404,14 @@ body.pane-dragging .pane .pane-title { cursor: grabbing; }
   background: var(--bg); color: var(--fg); cursor: pointer; font-size: 13px;
 }
 .modal-btns .modal-yes { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+
+/* RSI 학습 탭 (cc-* 패턴 따름) */
+.cc-learn-row { display: flex; align-items: center; gap: 10px; margin-bottom: 5px; font-size: 12px; }
+.cc-learn-round { flex: 0 0 110px; color: #e2e8f0; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cc-learn-verdict { flex: 0 0 84px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.cc-learn-meta { color: #64748b; font-size: 11px; }
+.cc-learn-ribbon { display: inline-block; font-size: 11px; font-weight: 700; padding: 2px 9px; border-radius: 9px; margin: 0 6px 6px 0; }
+.cc-learn-ribbon.keep { background: rgba(34,197,94,0.14); color: #22c55e; }
+.cc-learn-ribbon.rollback { background: rgba(239,68,68,0.14); color: #ef4444; }
+.cc-learn-pending-item { font-size: 12px; color: #e2e8f0; padding: 4px 0; }
+.cc-dim { color: #64748b; font-size: 11px; }

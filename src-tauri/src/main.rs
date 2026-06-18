@@ -162,6 +162,11 @@ async fn control_session_star(session_id: String, starred: bool) -> Result<Value
 }
 
 #[tauri::command]
+async fn learn_status() -> Result<Value, String> {
+    rpc("learn.status", json!({})).await
+}
+
+#[tauri::command]
 async fn create_surface(
     cwd: Option<String>,
     title: Option<String>,
@@ -539,6 +544,7 @@ fn main() {
             control_session_detail,
             control_session_star,
             control_dashboard,
+            learn_status,
             create_surface,
             send_input,
             log_ime,

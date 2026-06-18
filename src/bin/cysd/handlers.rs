@@ -296,6 +296,22 @@ fn typing_guard_secs() -> u64 {
         .unwrap_or(3)
 }
 
+/// authoritative(타이핑 가드 면제) 권한 가드 — defense-in-depth (agy R1 지적1 · codex R2 강화).
+/// 권위 주입(launch-agent/reinject)만 면제를 받게 한다: 발신 surface role이 master/cso일 때만
+/// 허용하고, 미해소 외부 caller(None — raw RPC)와 worker·reviewer는 거부한다. launch-agent는
+/// 조상 추적으로 master surface(Some)로 해소되므로 정상 허용된다. 비권위 노드가 `authoritative`로
+/// 사람-입력 보호(typing_guard)를 무력화하는 것을 막는다(1차 방어는 cys CLI가 authoritative 미노출).
+fn authoritative_caller_ok(daemon: &Daemon, from_sid: Option<u64>) -> bool {
+    // 미해소 caller(None — 어떤 surface의 자손도 아닌 외부 raw RPC)는 면제하지 않는다
+    // (codex R2: None=>true는 외부 raw RPC가 우회 가능한 신원 모델 구멍). launch-agent/reinject는
+    // master가 실행하므로 resolve_caller_surface의 조상 추적(cys→shell→claude=master surface)으로
+    // Some(master)로 해소되어 정상 허용된다 — None 분기에 기대지 않는다.
+    from_sid
+        .and_then(|sid| daemon.get_surface(sid))
+        .and_then(|s| s.role.lock().unwrap().clone())
+        .map_or(false, |r| r == "master" || r == "cso")
+}
+
 /// 컨텍스트 임계(%) — 절대지침의 60% 사이클을 결정론으로 발화하는 기준.
 /// CYS_CONTEXT_THRESHOLD_PCT로 조정 가능. 1~100 범위 밖·파싱 불가는 기본 60으로 폴백.
 /// (usage.rs 관측 수집기도 같은 임계로 발화 — 자기보고/관측이 다른 임계를 쓰면 안 된다.)
@@ -391,6 +407,16 @@ fn derive_node_state(scrollback: &std::collections::VecDeque<String>, idle_secs:
     } else {
         "working"
     }
+}
+
+/// RSI 학습 상태 디렉터리 — ★엔진(javis_learn)의 CYS_ROUND_DIR/learn 규약과 일치시켜
+/// 격리/테스트 정합을 보장한다(codex REVISE). 미설정 시 canonical = pack_dir()/round/learn
+/// (pack_dir은 CYS_PACK_DIR 환경변수 우선). 데몬↔엔진이 동일 경로를 보게 한다.
+fn learn_state_dir() -> std::path::PathBuf {
+    if let Some(r) = cys::env_compat("CYS_ROUND_DIR") {
+        return std::path::PathBuf::from(r).join("learn");
+    }
+    cys::pack::pack_dir().join("round").join("learn")
 }
 
 pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> Reply {
@@ -564,6 +590,15 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 .get("human")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
+            // 권위 주입(launch-agent/reinject의 디렉티브 주입 등 시스템 동작)은 타이핑 가드를
+            // 면제한다. 근거: ①주입 대상은 막 기동한 에이전트 pane이라 '사람 미완성 입력'이
+            // 없고 ②GUI 활성 pane에 남은 사람-입력 잔향(last_human_input)이 디렉티브 주입을
+            // 영구 차단(human is typing 무한)하는 경로를 끊는다. ACL은 그대로 집행되므로
+            // 발신자 신원 검증은 우회하지 않는다 (타이핑 가드만 면제).
+            let authoritative = params
+                .get("authoritative")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             // T1-3 송신 ACL + from 신원 검증 — 항상 커널 peer pid로 평가한다.
             // `human`은 클라이언트 자기신고라 신뢰할 수 없으므로(어떤 pane이든 위조
             // 가능) ACL 우회 신호로 쓰지 않는다. 타이핑 가드 시각 기록은 ACL 통과 후로
@@ -637,7 +672,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             // T3-13 타이핑 가드: 사람이 방금(기본 3초) 입력 중인 pane에 원격 직접 주입 금지.
             // 무음 큐잉 대신 명시 에러 — 후속 send-key Return이 사람의 미완성 입력을
             // 실행해버리는 최악 경로를 차단한다 (--queued는 quiet 대기 배달이라 허용).
-            if !human {
+            if !human && !(authoritative && authoritative_caller_ok(daemon, verified_from)) {
                 let guard = typing_guard_secs();
                 if guard > 0 {
                     let typing = surface
@@ -724,9 +759,10 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 ));
             }
             // T1-3 ACL + T3-13 타이핑 가드 — send_key는 전부 프로그램 경로 (UI는 send_text human)
-            if let Err(e) = check_send_acl(daemon, caller_pid, &surface) {
-                return Reply::Single(err_response(&id, "acl_denied", &e));
-            }
+            let verified_from = match check_send_acl(daemon, caller_pid, &surface) {
+                Ok(v) => v,
+                Err(e) => return Reply::Single(err_response(&id, "acl_denied", &e)),
+            };
             // queued Return: 대상이 조용해질 때 배달자가 CR을 주입한다(빈 텍스트 Inject =
             // bracketed-paste 빈 본문 + CR). 타이핑 가드 에러가 "use --queued"를 안내하는데
             // send-key만 그 경로가 없던 CLI 비대칭이 노드 보고 채널을 막았다(2026-06-12 실측
@@ -768,7 +804,13 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     json!({"surface_id": sid, "key": key, "queued": true, "depth": depth}),
                 ));
             }
-            {
+            // 권위 주입(send_text와 동일 근거)은 타이핑 가드를 면제 — launch-agent/reinject가
+            // 디렉티브 주입 후 보내는 제출 Return이 사람-입력 잔향에 막히지 않게 한다.
+            let authoritative = params
+                .get("authoritative")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if !(authoritative && authoritative_caller_ok(daemon, verified_from)) {
                 let guard = typing_guard_secs();
                 if guard > 0 {
                     let typing = surface
@@ -1505,6 +1547,111 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 Ok(result) => Reply::Single(ok_response(&id, result)),
                 Err(e) => Reply::Single(err_response(&id, "search_failed", &e)),
             }
+        }
+
+        // ─── RSI 학습 루프(Phase 4) — 데몬 python-free: 상태/이력은 canonical state 파일
+        //     (pack/round/learn)을 직접 읽고, 제안은 Rust로 생성한다. 무거운 학습 실행(①~⑤)은
+        //     엔진(javis_learn.py)이 CLI/트리거 경로에서만 수행(directive §4: 추천까지만 자율).
+        "learn.propose" => {
+            let topic = match param_str(&params, "topic") {
+                Some(t) if !t.trim().is_empty() => t,
+                _ => return Reply::Single(err_response(&id, "invalid_params", "missing topic")),
+            };
+            let reason = param_str(&params, "reason").unwrap_or_else(|| "manual".into());
+            // codex 하드닝: 자율추천 reason 화이트리스트(stuck|gate|ceiling)만 — 임의 reason 양산 차단.
+            const AUTONOMOUS: [&str; 3] = ["stuck", "gate", "ceiling"];
+            let manual = reason == "manual";
+            if !manual && !AUTONOMOUS.contains(&reason.as_str()) {
+                return Reply::Single(err_response(
+                    &id,
+                    "invalid_params",
+                    "reason must be manual|stuck|gate|ceiling",
+                ));
+            }
+            // ★자율추천만 feed 승인 게이트(codex REVISE + master 판단): reason!=manual일 때만 pending
+            // feed 항목 등록(push_feed_notification·영속·이벤트 publish) → 사람이 feed 패널/cys feed
+            // reply로 승인 시에만 착수. manual=사람 직접 명령이라 즉시(게이트 없음·directive §4 정합).
+            if !manual {
+                let title = format!("[RSI 학습 추천] {reason} — {topic}");
+                // codex 하드닝: feed body의 JSON 부분은 serde 직렬화로 — topic의 따옴표·개행이 JSON을
+                // 깨는 인젝션 차단(format! 수기 JSON 금지).
+                let payload = json!({"event":"propose","reason":reason,"topic":topic,"status":"awaiting_approval"});
+                let body = format!(
+                    "{payload}\nfeed 패널 또는 'cys feed reply <id> allow'로 승인 시에만 학습 ①~⑤ 착수(④저장·⑤채택은 rsi-gate 봉쇄 통과 필수). directive §4: 추천까지만 자율."
+                );
+                daemon.push_feed_notification("learn_proposal", &title, &body, None);
+            }
+            let (status, feed, note) = if manual {
+                ("ready", "skipped",
+                 "사람 직접 명령 — 즉시 착수 가능(자율추천만 feed 승인 게이트·directive §4).")
+            } else {
+                ("awaiting_approval", "created",
+                 "pending feed approval item 등록 — feed 패널 또는 'cys feed reply <id> allow'로 승인 시에만 ①~⑤ 착수(거부=무실행).")
+            };
+            Reply::Single(ok_response(
+                &id,
+                json!({
+                    "event": "propose",
+                    "topic": topic,
+                    "reason": reason,
+                    "evidence": [],
+                    "status": status,
+                    "feed": feed,
+                    "note": note,
+                    "ts": crate::state::now_epoch(),
+                }),
+            ))
+        }
+
+        "learn.status" => {
+            let p = learn_state_dir().join("state.json");
+            let raw = std::fs::read_to_string(&p)
+                .ok()
+                .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+                .unwrap_or_else(|| json!({}));
+            // ★최소 스키마 정규화(gemini REVISE — 방어를 UI에만 두지 않는다): state.json 오염 시
+            // discovery 값을 0 이상 정수로, rounds를 객체로 fail-safe 강제(XSS/타입오염 차단).
+            let disc = raw.get("discovery");
+            let dnum = |k: &str| -> u64 {
+                disc.and_then(|d| d.get(k)).and_then(|v| v.as_u64()).unwrap_or(0)
+            };
+            let rounds = raw
+                .get("rounds")
+                .filter(|v| v.is_object())
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let state = json!({
+                "rounds": rounds,
+                "discovery": {
+                    "capability": dnum("capability"),
+                    "perspective": dnum("perspective"),
+                    "knowledge": dnum("knowledge"),
+                },
+            });
+            Reply::Single(ok_response(&id, state))
+        }
+
+        "learn.history" => {
+            let round = param_str(&params, "round");
+            let p = learn_state_dir().join("ledger.jsonl");
+            let mut entries: Vec<Value> = Vec::new();
+            if let Ok(text) = std::fs::read_to_string(&p) {
+                for line in text.lines() {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    if let Ok(v) = serde_json::from_str::<Value>(line) {
+                        if let Some(r) = &round {
+                            if v.get("round").and_then(|x| x.as_str()) != Some(r.as_str()) {
+                                continue;
+                            }
+                        }
+                        entries.push(v);
+                    }
+                }
+            }
+            Reply::Single(ok_response(&id, json!({"entries": entries})))
         }
 
         // ─── Heartbeat 스케줄 ───
@@ -2807,6 +2954,124 @@ mod tests {
         assert!(
             worker.last_human_input.lock().unwrap().is_none(),
             "ACL 거부된 human:true 발신이 worker의 last_human_input을 갱신했다 (타이핑 가드 오염)"
+        );
+
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 회귀 박제: authoritative:true 주입은 타이핑 가드를 면제한다. 근거 —
+    /// launch-agent/reinject의 디렉티브 주입이 GUI 활성 pane의 사람-입력 잔향
+    /// (last_human_input)에 'human is typing'으로 영구 차단되던 회귀를 끊는다. 같은 조건에서
+    /// authoritative 없는 send는 가드로 차단되어야 대조가 성립한다 (ACL은 둘 다 그대로 집행).
+    #[test]
+    fn authoritative_send_bypasses_typing_guard() {
+        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let acl = r#"{ "default": "allow", "rules": [] }"#;
+        let (daemon, dir) = daemon_with_acl("auth-guard", acl);
+
+        let worker = daemon
+            .create_surface(None, Some("sleep 30".into()), None, Some("worker-1".into()), 24, 80)
+            .expect("create worker surface");
+        daemon
+            .surfaces
+            .lock()
+            .unwrap()
+            .insert(worker.id, worker.clone());
+        // 사람이 방금 타이핑한 상태 → 타이핑 가드 활성
+        *worker.last_human_input.lock().unwrap() = Some(std::time::Instant::now());
+
+        // 허용된 발신자 (default allow)
+        let sender = daemon
+            .create_surface(None, Some("sleep 30".into()), None, Some("master".into()), 24, 80)
+            .expect("create sender surface");
+        daemon
+            .surfaces
+            .lock()
+            .unwrap()
+            .insert(sender.id, sender.clone());
+        let sender_pid = 999_100_u32;
+        daemon
+            .caller_cache
+            .lock()
+            .unwrap()
+            .insert(sender_pid, (Some(sender.id), crate::state::now_epoch(), None));
+
+        // 대조: authoritative 없는 send는 타이핑 가드로 차단되어야 한다
+        let req_blocked = Request {
+            id: json!(1),
+            method: "surface.send_text".into(),
+            params: json!({ "surface_id": worker.id, "text": "x", "quiet": true }),
+        };
+        let Reply::Single(resp) = dispatch(&daemon, req_blocked, Some(sender_pid)) else {
+            panic!("expected single reply");
+        };
+        assert_eq!(
+            resp.pointer("/error/code"),
+            Some(&json!("typing_guard")),
+            "대조 전제: authoritative 없으면 타이핑 가드가 차단해야 한다 (응답: {resp})"
+        );
+
+        // 핵심 불변식: authoritative:true는 타이핑 가드를 면제한다 (typing_guard 에러 아님)
+        let req_auth = Request {
+            id: json!(2),
+            method: "surface.send_text".into(),
+            params: json!({ "surface_id": worker.id, "text": "x", "quiet": true, "authoritative": true }),
+        };
+        let Reply::Single(resp2) = dispatch(&daemon, req_auth, Some(sender_pid)) else {
+            panic!("expected single reply");
+        };
+        assert_ne!(
+            resp2.pointer("/error/code"),
+            Some(&json!("typing_guard")),
+            "authoritative 주입이 타이핑 가드에 막혔다 (응답: {resp2})"
+        );
+
+        // defense-in-depth (agy R1 지적1): 비권위 노드(worker)의 authoritative는 무시되어
+        // 가드가 그대로 적용된다 — 사람-입력 보호를 무력화하는 백도어를 차단한다.
+        *worker.last_human_input.lock().unwrap() = Some(std::time::Instant::now());
+        let wsender = daemon
+            .create_surface(None, Some("sleep 30".into()), None, Some("worker-9".into()), 24, 80)
+            .expect("create worker sender");
+        daemon
+            .surfaces
+            .lock()
+            .unwrap()
+            .insert(wsender.id, wsender.clone());
+        let wsender_pid = 999_200_u32;
+        daemon
+            .caller_cache
+            .lock()
+            .unwrap()
+            .insert(wsender_pid, (Some(wsender.id), crate::state::now_epoch(), None));
+        let req_w = Request {
+            id: json!(3),
+            method: "surface.send_text".into(),
+            params: json!({ "surface_id": worker.id, "text": "x", "quiet": true, "authoritative": true }),
+        };
+        let Reply::Single(respw) = dispatch(&daemon, req_w, Some(wsender_pid)) else {
+            panic!("expected single reply");
+        };
+        assert_eq!(
+            respw.pointer("/error/code"),
+            Some(&json!("typing_guard")),
+            "비권위 worker의 authoritative가 가드를 우회했다 (보안 회귀): {respw}"
+        );
+
+        // codex R2: 미해소 외부 caller(None — 어떤 surface의 자손도 아닌 raw RPC)도 면제 불가.
+        *worker.last_human_input.lock().unwrap() = Some(std::time::Instant::now());
+        let req_ext = Request {
+            id: json!(4),
+            method: "surface.send_text".into(),
+            params: json!({ "surface_id": worker.id, "text": "x", "quiet": true, "authoritative": true }),
+        };
+        let Reply::Single(respe) = dispatch(&daemon, req_ext, None) else {
+            panic!("expected single reply");
+        };
+        assert_eq!(
+            respe.pointer("/error/code"),
+            Some(&json!("typing_guard")),
+            "미해소 외부 caller(None)의 authoritative가 가드를 우회했다 (codex R2 신원 구멍): {respe}"
         );
 
         std::env::remove_var(cys::pack::ENV_PACK_DIR);

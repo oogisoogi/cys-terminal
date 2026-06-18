@@ -278,6 +278,14 @@ enum Command {
         #[command(subcommand)]
         action: FeedAction,
     },
+    /// RSI 학습 루프 — 사람 직접 명령(제안 생성) 또는 현재 학습 라운드 상태 조회
+    Learn {
+        /// 학습 주제 (생략하고 --status면 상태 조회)
+        topic: Option<String>,
+        /// 현재 학습 라운드 상태(라운드·verdict·채택/rollback·발견)를 조회
+        #[arg(long)]
+        status: bool,
+    },
     /// Install the CYSJavis Pack (multi-agent operating system templates) to ~/.cys/pack
     #[command(name = "init-pack", alias = "init-jarvis")]
     InitPack {
@@ -312,6 +320,11 @@ enum Command {
     Skill {
         #[command(subcommand)]
         action: SkillAction,
+    },
+    /// 노드 페르소나·운영 노브 커스터마이즈 (안전핵은 잠김). `cys persona list-params`로 노브 확인
+    Persona {
+        #[command(subcommand)]
+        action: PersonaAction,
     },
     /// Heartbeat scheduler — 정해진 시각에 반복 업무를 자동 발화 (24/365 상주 데몬)
     Schedule {
@@ -404,6 +417,31 @@ enum SkillAction {
     List,
     /// Print a skill's full SKILL.md
     Show { name: String },
+}
+
+#[derive(Subcommand)]
+enum PersonaAction {
+    /// 현 오버라이드 + 조립 미리보기 출력
+    Show {
+        #[arg(long, default_value = "master")]
+        role: String,
+    },
+    /// 노브(--param key=val) 또는 페르소나(--persona "...") 저장 (둘 다 가능)
+    Set {
+        #[arg(long, default_value = "master")]
+        role: String,
+        #[arg(long)]
+        param: Option<String>,
+        #[arg(long)]
+        persona: Option<String>,
+    },
+    /// 오버라이드 파일 삭제 → 정식 기본 복귀
+    Reset {
+        #[arg(long, default_value = "master")]
+        role: String,
+    },
+    /// 튜닝 가능 노브·범위·기본값 표
+    ListParams,
 }
 
 #[derive(Subcommand)]
@@ -598,17 +636,46 @@ fn surface_entry(sid: u64) -> Result<Value, String> {
         .ok_or_else(|| format!("surface {sid} not found"))
 }
 
+/// cmd 문자열의 env-prefix(KEY=VAL 토큰) 판별 — boot의 바이너리 존재 검사가 env 대입을
+/// 바이너리명으로 오판하지 않게 한다. 값에 공백이 없는 단순 대입만 가린다(현 어댑터 cmd 한정).
+fn is_env_assignment(tok: &str) -> bool {
+    match tok.split_once('=') {
+        Some((name, _)) => {
+            !name.is_empty()
+                && name
+                    .chars()
+                    .next()
+                    .map_or(false, |c| c.is_ascii_alphabetic() || c == '_')
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }
+        None => false,
+    }
+}
+
+/// cmd에서 env-prefix(KEY=VAL)를 건너뛴 실제 바이너리 토큰을 고른다 — boot 설치판정과
+/// agent_bin 메타등록이 공유하는 단일 진실(한 곳만 고쳐 다른 곳이 누락되던 codex R1 회귀 차단).
+/// 한계(agy R1 지적2): split_whitespace 기반이라 값에 공백이 든 따옴표 대입(KEY="a b")은
+/// 미지원 — 현 어댑터 cmd 3종은 공백 없는 env 값이라 영향 없다(범위 한정).
+fn extract_bin<'a>(cmd: &'a str, fallback: &'a str) -> &'a str {
+    cmd.split_whitespace()
+        .find(|t| !is_env_assignment(t))
+        .unwrap_or(fallback)
+}
+
 /// 지침·과업 텍스트의 표준 주입: bracketed paste → 0.8s → Return
 fn inject_text(sid: u64, text: &str) -> Result<(), String> {
     let wrapped = format!("\x1b[200~{text}\x1b[201~");
+    // authoritative: 디렉티브·과업 주입은 타이핑 가드를 면제한다 — 막 기동한 에이전트
+    // pane에 사람 미완성 입력이 없고, GUI 활성 pane의 사람-입력 잔향이 주입을 영구
+    // 차단하던 경로(human is typing 무한)를 끊는다. ACL은 데몬에서 그대로 집행된다.
     request(
         "surface.send_text",
-        json!({"surface_id": sid, "text": wrapped, "quiet": true}),
+        json!({"surface_id": sid, "text": wrapped, "quiet": true, "authoritative": true}),
     )?;
     std::thread::sleep(std::time::Duration::from_millis(800));
     request(
         "surface.send_key",
-        json!({"surface_id": sid, "key": "Return"}),
+        json!({"surface_id": sid, "key": "Return", "authoritative": true}),
     )?;
     Ok(())
 }
@@ -1187,6 +1254,18 @@ fn run(command: Command) -> i32 {
 
         Command::Feed { action } => return run_feed(action),
 
+        Command::Learn { topic, status } => {
+            if status {
+                request("learn.status", json!({}))
+                    .map(|r| println!("{}", serde_json::to_string_pretty(&r).unwrap()))
+            } else if let Some(t) = topic {
+                request("learn.propose", json!({"reason": "manual", "topic": t}))
+                    .map(|r| println!("{}", serde_json::to_string_pretty(&r).unwrap()))
+            } else {
+                Err("usage: cys learn <topic> | cys learn --status".to_string())
+            }
+        }
+
         Command::Schedule { action } => return run_schedule(action),
 
         Command::Recall { query, role, surface, days, limit } => {
@@ -1216,6 +1295,7 @@ fn run(command: Command) -> i32 {
         }
 
         Command::Skill { action } => return run_skill(action),
+        Command::Persona { action } => return run_persona(action),
     };
 
     match result {
@@ -1448,6 +1528,104 @@ fn run_skill(action: SkillAction) -> i32 {
             let content = std::fs::read_to_string(&path)
                 .map_err(|_| format!("no skill '{name}' ({})", path.display()))?;
             println!("{content}");
+            Ok(())
+        })(),
+    };
+    match result {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("error: {e}");
+            1
+        }
+    }
+}
+
+fn run_persona(action: PersonaAction) -> i32 {
+    let expert = std::env::var("CYS_OVERRIDE_EXPERT").map(|v| v == "1").unwrap_or(false);
+    let result: Result<(), String> = match action {
+        PersonaAction::ListParams => {
+            println!("튜닝 가능 노브 (안전핵 denylist·recovery·kill-switch는 잠김 — 미표시):");
+            for k in cys::overrides::KNOBS {
+                println!("  {:<20} {}-{} (기본 {}) — {}", k.key, k.min, k.max, k.default, k.label);
+            }
+            println!(
+                "\n페르소나: cys persona set --persona \"말투·호칭·언어 자유 텍스트\" (최대 {}자)",
+                cys::overrides::PERSONA_MAX_LEN
+            );
+            Ok(())
+        }
+        PersonaAction::Show { role } => {
+            let ov = cys::overrides::load_overrides(&role, expert);
+            let path = cys::overrides::override_path(&role);
+            println!("# role={role}  file={}", path.display());
+            if ov.params.is_empty() && ov.persona.is_empty() {
+                println!("(오버라이드 없음 — 정식 기본값 사용)");
+            } else {
+                for (k, v) in &ov.params {
+                    println!("  {k} = {v}");
+                }
+                if !ov.persona.is_empty() {
+                    println!("  persona = {:?}", ov.persona);
+                }
+            }
+            for w in &ov.warnings {
+                eprintln!("  ⚠ {w}");
+            }
+            println!("\n--- 조립 미리보기(오버라이드 블록) ---");
+            print!("{}", cys::overrides::render_block(&ov));
+            Ok(())
+        }
+        PersonaAction::Reset { role } => {
+            let path = cys::overrides::override_path(&role);
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    println!("삭제 — 정식 기본 복귀: {}", path.display());
+                    Ok(())
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    println!("이미 오버라이드 없음: {}", path.display());
+                    Ok(())
+                }
+                Err(e) => Err(format!("삭제 실패 {}: {e}", path.display())),
+            }
+        }
+        PersonaAction::Set { role, param, persona } => (|| {
+            if param.is_none() && persona.is_none() {
+                return Err("--param key=val 또는 --persona \"...\" 중 최소 하나 필요".into());
+            }
+            let path = cys::overrides::override_path(&role);
+            // 기존 파일 머지 — 검증 통과분만 갱신, 나머지 보존.
+            let mut doc = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .unwrap_or_else(|| serde_json::json!({"schema_version": 1}));
+            if !doc.is_object() {
+                doc = serde_json::json!({"schema_version": 1});
+            }
+            if let Some(p) = &param {
+                let (key, val) = p.split_once('=').ok_or("--param 형식: key=value")?;
+                let n: u64 = val.trim().parse().map_err(|_| format!("값이 정수 아님: {val}"))?;
+                cys::overrides::validate_knob(key.trim(), n, expert)?; // hard-reject
+                // params가 객체가 아니면(부재·수동편집으로 잘못된 타입) 객체로 정규화 —
+                // serde_json IndexMut는 비-Object/Null에 인덱싱 시 패닉하므로 fail-closed 정규화.
+                if !doc["params"].is_object() {
+                    doc["params"] = serde_json::json!({});
+                }
+                doc["params"][key.trim()] = serde_json::json!(n);
+            }
+            if let Some(text) = &persona {
+                let (clean, warns) = cys::overrides::sanitize_persona(text);
+                for w in &warns {
+                    eprintln!("  ⚠ {w}");
+                }
+                doc["persona"] = serde_json::json!(clean);
+            }
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            let pretty = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
+            std::fs::write(&path, pretty).map_err(|e| format!("쓰기 실패 {}: {e}", path.display()))?;
+            println!("저장: {}", path.display());
             Ok(())
         })(),
     };
@@ -1854,9 +2032,11 @@ fn run_boot(cwd: Option<String>) -> i32 {
         let bin = agents
             .get(*agent)
             .and_then(|a| a["cmd"].as_str())
-            .and_then(|c| c.split_whitespace().next())
-            .unwrap_or(agent)
-            .to_string();
+            // env-prefix를 건너뛰고 실제 바이너리 토큰을 찾는다 (extract_bin 단일 진실) — claude
+            // cmd가 `CLAUDE_CONFIG_DIR="..." claude ...`처럼 env 대입으로 시작해 첫 토큰을 바이너리로
+            // 오판('미설치')하던 회귀를 차단한다 (gemini/codex는 바이너리로 시작해 영향 없음).
+            .map(|c| extract_bin(c, agent).to_string())
+            .unwrap_or_else(|| agent.to_string());
         // 경로형 cmd('~/'·'/' 포함 — 예: agy 절대경로)는 which/where가 틸드를 확장하지
         // 않아 '미설치'로 오판한다 → 파일 존재로 판정 (실행은 셸 -lc 경유라 틸드 확장됨)
         let found = if bin.starts_with('~') || bin.contains('/') {
@@ -1930,6 +2110,17 @@ fn compose_directive(role: &str) -> Result<String, String> {
     });
     let mut directive = std::fs::read_to_string(&directive_path)
         .map_err(|e| format!("cannot read {}: {e}", directive_path.display()))?;
+    // RSI 학습 directive(5번째)는 master·worker 양쪽에 추가 주입한다(cso·reviewer 제외 — RSI
+    // 학습 루프 주체는 master·worker). 기존 역할 directive 흐름은 보존하고 뒤에 이어붙인다.
+    if role == "master" || role.starts_with("worker") {
+        let rsi_path = dir.join("directives/RSI_LEARNING_DIRECTIVE.md");
+        // ★fail-closed(codex REVISE): 5번째 절대지침 누락을 침묵 통과시키지 않는다 — 다른 directive
+        // 읽기와 동일하게 실패 시 Err. 침묵 스킵은 학습 봉쇄 지침 없는 master·worker 각성을 부른다.
+        let rsi = std::fs::read_to_string(&rsi_path)
+            .map_err(|e| format!("cannot read {}: {e}", rsi_path.display()))?;
+        directive.push_str("\n\n■ RSI_LEARNING_DIRECTIVE.md (5번째 절대지침 — 학습 루프)\n");
+        directive.push_str(&rsi);
+    }
     let soul_path = dir.join("soul.md");
     if let Ok(soul) = std::fs::read_to_string(&soul_path) {
         directive.push_str("\n\n■ soul.md (운영 헌장)\n");
@@ -1968,6 +2159,12 @@ fn compose_directive(role: &str) -> Result<String, String> {
         directive.push_str("\n\n■ 보유 스킬 색인 (본문: `cys skill show <name>`)\n");
         directive.push_str(&index);
     }
+    // 사용자 오버라이드(취향·운영 노브) — 스킬 색인 뒤. PACK 밖 파일이라 install 불가침·
+    // 정식 directive 무동결. render_block이 SAFETY_CORE_REASSERT를 항상 최후에 둬(last-word)
+    // 사용자 텍스트가 안전핵을 못 뒤집는다. 파일 부재 시 빈 문자열(회귀 0).
+    let expert = std::env::var("CYS_OVERRIDE_EXPERT").map(|v| v == "1").unwrap_or(false);
+    let ov = cys::overrides::load_overrides(role, expert);
+    directive.push_str(&cys::overrides::render_block(&ov));
     Ok(directive)
 }
 
@@ -2019,14 +2216,14 @@ fn boot_agent_on_surface(
     let delay = spec["inject_delay_secs"].as_u64().unwrap_or(12);
     let directive = compose_directive(role)?;
 
-    // 1) 에이전트 기동
+    // 1) 에이전트 기동 (authoritative: launch-agent의 모든 시스템 주입은 타이핑 가드 면제)
     request(
         "surface.send_text",
-        json!({"surface_id": sid, "text": cmd, "quiet": true}),
+        json!({"surface_id": sid, "text": cmd, "quiet": true, "authoritative": true}),
     )?;
     request(
         "surface.send_key",
-        json!({"surface_id": sid, "key": "Return"}),
+        json!({"surface_id": sid, "key": "Return", "authoritative": true}),
     )?;
     eprintln!(
         "[launch-agent] {agent} starting… (polling readiness, max {}s)",
@@ -2055,7 +2252,7 @@ fn boot_agent_on_surface(
             eprintln!("[launch-agent] folder-trust prompt detected → confirming");
             request(
                 "surface.send_key",
-                json!({"surface_id": sid, "key": "Return"}),
+                json!({"surface_id": sid, "key": "Return", "authoritative": true}),
             )?;
             std::thread::sleep(std::time::Duration::from_secs(2));
             continue;
@@ -2130,7 +2327,10 @@ fn boot_agent_on_surface(
     }
 
     // 5) T2-5 에이전트 메타 등록 — 사망 감지·status 보드·approval 스캔의 기반
-    let bin = cmd.split_whitespace().next().unwrap_or(agent).to_string();
+    // boot 설치판정과 동일한 extract_bin으로 env-prefix(KEY=VAL)를 건너뛴다 — 그러지 않으면
+    // claude cmd의 `CLAUDE_CONFIG_DIR=...`가 agent_bin으로 저장돼 governance.rs 사망 감지의
+    // cmdline 매칭이 깨진다 (codex R1 REVISE).
+    let bin = extract_bin(&cmd, agent).to_string();
     request(
         "surface.set_meta",
         json!({"surface_id": sid, "agent": agent, "agent_bin": bin}),
@@ -2235,11 +2435,20 @@ fn run_launch_agent_opts(role: &str, agent: &str, cwd: Option<String>, resume: b
         Err(e) => {
             eprintln!("error: {e}");
             if let Some(sid) = created {
-                let _ = request("surface.close", json!({"surface_id": sid}));
-                eprintln!(
-                    "[launch-agent] failed surface {} closed (role 점유 해제)",
-                    surface_ref(sid)
-                );
+                // close 결과를 정직히 보고한다 — 실패를 'closed'로 거짓 보고하면 role이
+                // 좀비 surface에 점유된 채 남아 재기동이 claim_denied로 막힌다(이번 회귀의 근원).
+                match request("surface.close", json!({"surface_id": sid})) {
+                    Ok(_) => eprintln!(
+                        "[launch-agent] failed surface {} closed (role 점유 해제)",
+                        surface_ref(sid)
+                    ),
+                    Err(e) => eprintln!(
+                        "[launch-agent] failed surface {} close 실패: {e} — \
+                         `cys close-surface {}`로 수동 정리 필요(role 점유 잔존 가능)",
+                        surface_ref(sid),
+                        surface_ref(sid)
+                    ),
+                }
             }
             1
         }
@@ -3222,17 +3431,57 @@ mod tests {
         assert_eq!(expand_tilde("~root/x"), std::path::PathBuf::from("~root/x"));
     }
 
+    /// 회귀 박제: boot의 바이너리 존재 검사가 cmd의 env-prefix(KEY=VAL)를 바이너리명으로
+    /// 오판하면 안 된다 — claude cmd `CLAUDE_CONFIG_DIR="..." claude ...`가 첫 토큰을
+    /// 바이너리로 보고 '미설치'로 건너뛰어 CSO·worker가 조용히 누락되던 회귀를 차단한다.
+    #[test]
+    fn boot_bin_skips_env_prefix_tokens() {
+        assert!(is_env_assignment("CLAUDE_CONFIG_DIR=\"$HOME/.cys/claude\""));
+        assert!(is_env_assignment("FOO=bar"));
+        assert!(!is_env_assignment("claude"));
+        assert!(!is_env_assignment("~/.local/bin/agy"));
+        assert!(!is_env_assignment("/usr/bin/codex"));
+        // extract_bin은 boot 설치판정과 agent_bin 메타등록이 공유하는 단일 진실(codex R1 회귀).
+        assert_eq!(
+            extract_bin(
+                "CLAUDE_CONFIG_DIR=\"$HOME/.cys/claude\" claude --dangerously-skip-permissions",
+                "claude"
+            ),
+            "claude"
+        );
+        assert_eq!(
+            extract_bin("~/.local/bin/agy --dangerously-skip-permissions", "gemini"),
+            "~/.local/bin/agy"
+        );
+        assert_eq!(
+            extract_bin("codex --dangerously-bypass-approvals-and-sandbox", "codex"),
+            "codex"
+        );
+        // 토큰이 전부 env-assignment뿐이면 fallback(agent 이름)을 반환한다.
+        assert_eq!(extract_bin("FOO=bar", "claude"), "claude");
+        // 문서화된 한계 박제 (agy R1 지적2 — 비차단): 값에 공백 있는 따옴표 대입은 미지원.
+        // split_whitespace가 쪼개 잘린 토큰(b")이 바이너리로 잡힌다 — 현 어댑터 cmd 3종은
+        // 공백 없는 env 값이라 미발생. 이 박제는 향후 공백 cmd 도입 시 회귀를 즉시 드러낸다.
+        assert_eq!(extract_bin("KEY=\"a b\" claude", "fallback"), "b\"");
+    }
+
+    /// compose_directive 테스트들은 전역 ENV_PACK_DIR를 변경하므로 직렬화한다(병렬 레이스 방지).
+    static COMPOSE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// ★불변식 박제: compose_directive는 디렉티브 → soul.md → 장기메모리 색인 → 스킬 색인
     /// 순서로 조립한다. 메모리 색인 누락은 "리뷰어·워커 장기기억 0" 결함의 재발이므로
     /// 섹션 존재와 순서를 기계 검증한다 (launch/reinject/cycle 공용 경로).
     #[test]
     fn compose_directive_includes_memory_index_after_soul() {
+        let _env = COMPOSE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let td = std::env::temp_dir().join(format!("cys-compose-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&td);
         for sub in ["directives", "memory", "skills/demo"] {
             std::fs::create_dir_all(td.join(sub)).unwrap();
         }
         std::fs::write(td.join("directives/WORKER_DIRECTIVE.md"), "# WORKER 절대지침\n").unwrap();
+        // worker compose는 이제 RSI 5번째 directive를 fail-closed로 요구 → fixture 동반.
+        std::fs::write(td.join("directives/RSI_LEARNING_DIRECTIVE.md"), "# RSI 학습 절대지침\n").unwrap();
         std::fs::write(td.join("soul.md"), "soul-marker\n").unwrap();
         std::fs::write(td.join("memory/MEMORY.md"), "memory-index-marker\n").unwrap();
         std::fs::write(
@@ -3261,6 +3510,50 @@ mod tests {
             "메모리 절대경로 미표기 — 노드가 위치를 추론하게 된다"
         );
         assert!(d < s && s < m && m < k, "조립 순서 위반: 디렉티브<soul<메모리<스킬");
+    }
+
+    /// ★불변식 박제(Phase 2 배선): RSI_LEARNING_DIRECTIVE는 master·worker 주입물에만 포함되고
+    /// cso·reviewer에는 포함되지 않는다. 단일-directive-per-role을 깨지 않고 RSI만 추가 주입함을
+    /// 실측한다(추측 금지 — compose_directive 실출력에서 §1~§6 마커 존재/부재 검증).
+    #[test]
+    fn compose_directive_injects_rsi_only_for_master_worker() {
+        let _env = COMPOSE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let td = std::env::temp_dir().join(format!("cys-rsi-inject-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        std::fs::create_dir_all(td.join("directives")).unwrap();
+        for (f, body) in [
+            ("MASTER_DIRECTIVE.md", "# MASTER 절대지침\n"),
+            ("WORKER_DIRECTIVE.md", "# WORKER 절대지침\n"),
+            ("CSO_DIRECTIVE.md", "# CSO 절대지침\n"),
+            ("REVIEWER_DIRECTIVE.md", "# REVIEWER 절대지침\n"),
+        ] {
+            std::fs::write(td.join("directives").join(f), body).unwrap();
+        }
+        // RSI directive — §1~§6 마커를 가진 본문(실주입 여부를 본문으로 판정)
+        std::fs::write(
+            td.join("directives/RSI_LEARNING_DIRECTIVE.md"),
+            "# RSI 학습 루프 — 절대지침 (5번째 directive)\n\n## 1. '학습'의 조작적 정의\n## 6. 할루시네이션 원천 봉쇄장치\nRSI-BODY-MARKER\n",
+        )
+        .unwrap();
+
+        let saved = std::env::var(cys::pack::ENV_PACK_DIR).ok();
+        std::env::set_var(cys::pack::ENV_PACK_DIR, &td);
+        let master = compose_directive("master").expect("master compose");
+        let worker = compose_directive("worker").expect("worker compose");
+        let worker2 = compose_directive("worker-2").expect("worker-2 compose");
+        let cso = compose_directive("cso").expect("cso compose");
+        let reviewer = compose_directive("reviewer-gemini").expect("reviewer compose");
+        match saved {
+            Some(v) => std::env::set_var(cys::pack::ENV_PACK_DIR, v),
+            None => std::env::remove_var(cys::pack::ENV_PACK_DIR),
+        }
+        let _ = std::fs::remove_dir_all(&td);
+
+        assert!(master.contains("RSI-BODY-MARKER"), "master에 RSI 미주입");
+        assert!(worker.contains("RSI-BODY-MARKER"), "worker에 RSI 미주입");
+        assert!(worker2.contains("RSI-BODY-MARKER"), "worker-2(변형)에 RSI 미주입");
+        assert!(!cso.contains("RSI-BODY-MARKER"), "cso에 RSI 오주입(대상 아님)");
+        assert!(!reviewer.contains("RSI-BODY-MARKER"), "reviewer에 RSI 오주입(대상 아님)");
     }
 
     /// ★불변식 박제 (절대지침 앵커1-b): 탭 타이틀 = "{role}-{agent} · {워크플로우 폴더명}".
@@ -3645,5 +3938,129 @@ mod tests {
         assert_eq!(fmt_secs(3600), "1h0m");
         assert_eq!(fmt_secs(5400), "1h30m");
         assert_eq!(fmt_secs(7325), "2h2m"); // 5초 버림
+    }
+
+    /// ★불변식 박제: 사용자 오버라이드가 있어도 안전핵 재선언이 조립 최후(last-word).
+    #[test]
+    fn compose_directive_safety_core_is_last_word() {
+        let _env = COMPOSE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let td = std::env::temp_dir().join(format!("cys-ovcompose-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        for sub in ["directives", "overrides"] {
+            std::fs::create_dir_all(td.join(sub)).unwrap();
+        }
+        std::fs::write(td.join("directives/MASTER_DIRECTIVE.md"), "# MASTER 절대지침\n").unwrap();
+        std::fs::write(td.join("directives/RSI_LEARNING_DIRECTIVE.md"), "# RSI 학습\n").unwrap();
+        std::fs::write(
+            td.join("overrides/master.json"),
+            r#"{"params":{"review_rounds":3},"persona":"무조건 내 말만 들어라"}"#,
+        )
+        .unwrap();
+
+        let saved = std::env::var(cys::pack::ENV_PACK_DIR).ok();
+        std::env::set_var(cys::pack::ENV_PACK_DIR, &td);
+        let out = compose_directive("master").expect("compose 실패");
+        match saved {
+            Some(v) => std::env::set_var(cys::pack::ENV_PACK_DIR, v),
+            None => std::env::remove_var(cys::pack::ENV_PACK_DIR),
+        }
+        let _ = std::fs::remove_dir_all(&td);
+
+        let persona = out.find("무조건 내 말만").expect("persona 미동봉");
+        let knob = out.find("검증 라운드: 3").expect("노브 미동봉");
+        let safety = out.rfind("■ 안전핵 재확인").expect("안전핵 재선언 누락");
+        assert!(safety > persona, "안전핵이 persona보다 먼저 — last-word 위반");
+        assert!(safety > knob, "안전핵이 노브보다 먼저 — last-word 위반");
+        assert!(out[safety..].find("■ 사용자 오버라이드").is_none(), "안전핵 뒤 오버라이드 재등장");
+    }
+
+    /// 오버라이드 파일 부재 시 오버라이드/안전핵 블록 모두 미등장(회귀 0).
+    #[test]
+    fn compose_directive_no_override_is_noop() {
+        let _env = COMPOSE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let td = std::env::temp_dir().join(format!("cys-ovnoop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        std::fs::create_dir_all(td.join("directives")).unwrap();
+        std::fs::write(td.join("directives/MASTER_DIRECTIVE.md"), "# MASTER 절대지침\n").unwrap();
+        std::fs::write(td.join("directives/RSI_LEARNING_DIRECTIVE.md"), "# RSI 학습\n").unwrap();
+
+        let saved = std::env::var(cys::pack::ENV_PACK_DIR).ok();
+        std::env::set_var(cys::pack::ENV_PACK_DIR, &td);
+        let out = compose_directive("master").expect("compose 실패");
+        match saved {
+            Some(v) => std::env::set_var(cys::pack::ENV_PACK_DIR, v),
+            None => std::env::remove_var(cys::pack::ENV_PACK_DIR),
+        }
+        let _ = std::fs::remove_dir_all(&td);
+        assert!(out.find("■ 사용자 오버라이드").is_none(), "오버라이드 없는데 블록 등장");
+        assert!(out.find("■ 안전핵 재확인").is_none(), "오버라이드 없으면 안전핵 재선언도 생략");
+    }
+
+    #[test]
+    fn persona_set_writes_and_reset_deletes() {
+        let _env = COMPOSE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let td = std::env::temp_dir().join(format!("cys-persona-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        std::fs::create_dir_all(&td).unwrap();
+        let saved = std::env::var(cys::pack::ENV_PACK_DIR).ok();
+        std::env::set_var(cys::pack::ENV_PACK_DIR, &td);
+
+        let rc = run_persona(PersonaAction::Set {
+            role: "master".into(),
+            param: Some("review_rounds=3".into()),
+            persona: None,
+        });
+        assert_eq!(rc, 0, "유효 set이 실패");
+        let path = cys::overrides::override_path("master");
+        let body = std::fs::read_to_string(&path).expect("파일 미생성");
+        assert!(body.contains("review_rounds"), "노브 미기록");
+
+        let rc_bad = run_persona(PersonaAction::Set {
+            role: "master".into(),
+            param: Some("review_rounds=99".into()),
+            persona: None,
+        });
+        assert_ne!(rc_bad, 0, "범위 밖 set이 통과");
+
+        let rc_reset = run_persona(PersonaAction::Reset { role: "master".into() });
+        assert_eq!(rc_reset, 0);
+        assert!(!path.exists(), "reset 후 파일 잔존");
+
+        match saved {
+            Some(v) => std::env::set_var(cys::pack::ENV_PACK_DIR, v),
+            None => std::env::remove_var(cys::pack::ENV_PACK_DIR),
+        }
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// ★회귀 핀: params가 객체 아닌 타입(수동편집 손상)일 때 set이 패닉하지 않고 정규화한다.
+    /// serde_json IndexMut의 비-Object 인덱싱 패닉을 fail-closed로 차단(load_overrides 원칙과 정합).
+    #[test]
+    fn persona_set_normalizes_non_object_params() {
+        let _env = COMPOSE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let td = std::env::temp_dir().join(format!("cys-persona-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        std::fs::create_dir_all(td.join("overrides")).unwrap();
+        // params가 정수(손상)인 override 파일을 미리 심는다.
+        std::fs::write(td.join("overrides/master.json"), r#"{"params":42}"#).unwrap();
+        let saved = std::env::var(cys::pack::ENV_PACK_DIR).ok();
+        std::env::set_var(cys::pack::ENV_PACK_DIR, &td);
+
+        // 패닉 없이 정상 저장돼야 한다(손상 params는 객체로 정규화).
+        let rc = run_persona(PersonaAction::Set {
+            role: "master".into(),
+            param: Some("review_rounds=4".into()),
+            persona: None,
+        });
+        assert_eq!(rc, 0, "손상 params에서 set이 실패/패닉");
+        let body = std::fs::read_to_string(cys::overrides::override_path("master")).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(doc["params"]["review_rounds"], 4, "정규화 후 노브 미기록");
+
+        match saved {
+            Some(v) => std::env::set_var(cys::pack::ENV_PACK_DIR, v),
+            None => std::env::remove_var(cys::pack::ENV_PACK_DIR),
+        }
+        let _ = std::fs::remove_dir_all(&td);
     }
 }

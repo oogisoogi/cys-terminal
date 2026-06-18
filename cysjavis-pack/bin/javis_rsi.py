@@ -131,6 +131,22 @@ def _append_ledger(entry):
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
+def _recommend_learn(reason, topic):
+    """RSI 학습 자율추천(best-effort) — feed 추천 항목만 생성한다(추천까지만 자율·착수는 사람
+    승인·directive §4). cys 부재·데몬 미가동·오류는 무시(추천은 비핵심 부가 신호 — 핵심 판정 불간섭)."""
+    import shutil
+    if not shutil.which("cys"):
+        return
+    body = ('{"reason":"%s","topic":"%s","status":"awaiting_approval"} — '
+            "feed 패널 또는 'cys feed reply <id> allow'로 승인 시에만 학습 착수. directive §4: 추천까지만 자율." % (reason, topic))
+    try:
+        subprocess.run(["cys", "feed", "push", "--kind", "learn_proposal",
+                        "--title", "[RSI 학습 추천] " + reason, "--body", body],
+                       capture_output=True, timeout=5)
+    except Exception:
+        pass
+
+
 # ───────────────────────── 명령 ─────────────────────────
 
 def cmd_checkpoint(a):
@@ -171,10 +187,14 @@ def cmd_progress(a):
     rec = {"score": a.score, "prev": prev, "delta": round(delta, 6), "verdict": v,
            "ts": ts, "note": a.note or ""}
     r["progress"].append(rec)
+    # (RSI 자율추천 iii) ceiling — flat N연속 = 점수 정체 → 학습 추천(추천만·사람 승인).
+    r["flat_streak"] = (r.get("flat_streak", 0) + 1) if v == "flat" else 0
     _save_state(state)
     entry = {"event": "progress", "round": a.round, **rec}
     _append_ledger(entry)
     print(json.dumps(entry, ensure_ascii=False))
+    if r["flat_streak"] >= int(os.environ.get("CYS_RSI_CEILING_FLATS", "3")):
+        _recommend_learn("ceiling", "%s 정체(ceiling) 돌파 방법론" % a.round)
     return 0
 
 

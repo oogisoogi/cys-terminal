@@ -27,6 +27,10 @@ pub const PACK: &[(&str, &str)] = &[
         include_str!("../cysjavis-pack/directives/REVIEWER_DIRECTIVE.md"),
     ),
     (
+        "directives/RSI_LEARNING_DIRECTIVE.md",
+        include_str!("../cysjavis-pack/directives/RSI_LEARNING_DIRECTIVE.md"),
+    ),
+    (
         "CLAUDE.md.template",
         include_str!("../cysjavis-pack/CLAUDE.md.template"),
     ),
@@ -103,6 +107,14 @@ pub const PACK: &[(&str, &str)] = &[
     (
         "bin/javis_rsi.py",
         include_str!("../cysjavis-pack/bin/javis_rsi.py"),
+    ),
+    (
+        "bin/javis_learn.py",
+        include_str!("../cysjavis-pack/bin/javis_learn.py"),
+    ),
+    (
+        "bin/rsi-gate.sh",
+        include_str!("../cysjavis-pack/bin/rsi-gate.sh"),
     ),
     (
         "bin/javis_adr.py",
