@@ -299,6 +299,12 @@ pub fn role_directive_path(role: &str) -> Option<PathBuf> {
     Some(pack_dir().join("directives").join(file))
 }
 
+/// pack_dir()이 읽는 전역 env 키(ENV_PACK_DIR)의 set/remove 윈도를 직렬화하는 테스트 락.
+/// pack.rs·overrides.rs 테스트가 같은 lib 테스트 바이너리에서 ENV_PACK_DIR을 공유하므로
+/// 한 락으로 직렬화해야 프로세스 전역 env 경합(flaky)을 막는다 (R4 패턴의 모듈 간 공유).
+#[cfg(test)]
+pub(crate) static PACK_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,9 +360,8 @@ mod tests {
         );
     }
 
-    // pack_dir()이 읽는 env 키는 고정명이라 set/remove 윈도를 직렬화해야 cargo 병렬
-    // 러너에서 서로 덮어쓰지 않는다 (R4 발견: 프로세스 전역 env 경합 차단 패턴).
-    static PACK_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // PACK_ENV_LOCK은 모듈 스코프(pub(crate))로 이동 — overrides.rs 테스트와 공유해
+    // 같은 lib 바이너리 내 ENV_PACK_DIR 경합을 막는다. `use super::*`로 가시.
 
     /// ★불변식 박제: build.rs 자동 임베드가 오너 채택 스킬 14종(2026-06-12 k-skill 감사)
     /// + 기본 2종 + harness-creator + work management 2종(절대지침 5차 앵커 4규칙 b·c:

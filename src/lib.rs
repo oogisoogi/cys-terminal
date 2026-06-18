@@ -5,6 +5,7 @@ use serde_json::Value;
 use std::path::PathBuf;
 
 pub mod pack;
+pub mod overrides;
 
 pub const ENV_SOCKET: &str = "CYS_SOCKET";
 pub const ENV_SURFACE_ID: &str = "CYS_SURFACE_ID";
