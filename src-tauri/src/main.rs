@@ -345,6 +345,44 @@ async fn attach_surface(
     Ok(())
 }
 
+/// 데몬 소켓이 준비될 때까지 connect를 폴링(수동 spawn 없음). `attempts`×100ms.
+async fn wait_for_connect(attempts: u32) -> bool {
+    for _ in 0..attempts {
+        if connect().await.is_ok() {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    false
+}
+
+/// 앱 첫 실행 시 cysd를 launchd에 자동등록(RunAtLoad·KeepAlive) — 재부팅 후에도 데몬 생존.
+/// 수동 `cys daemon install`의 opt-in을 자동화한다(`cys::launchd`와 plist 포맷 단일화).
+/// 반환값 = **launchd가 cysd 기동을 책임지는가**. true면 setter가 수동 spawn을 건너뛰고
+/// launchd-owned cysd의 socket-ready를 폴링해야 한다(중복 spawn·flock 경합 방지 — codex BLOCKER).
+#[cfg(target_os = "macos")]
+async fn maybe_autoregister_launchd() -> bool {
+    // 번들 동봉 cysd 절대경로(ensure_daemon과 동일 규칙) — 형제 cysd가 없으면 보류.
+    let daemon = match std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("cysd")))
+    {
+        Some(p) if p.exists() => p,
+        _ => return false,
+    };
+    let running = connect().await.is_ok();
+    match cys::launchd::register_if_absent(&daemon, running) {
+        Ok(outcome) => {
+            eprintln!("[cys-app] launchd autoregister: {outcome:?}");
+            cys::launchd::launchd_will_serve(outcome)
+        }
+        Err(e) => {
+            eprintln!("[cys-app] launchd autoregister skipped: {e}");
+            false
+        }
+    }
+}
+
 /// Ensure aitermd is running: try to connect, otherwise spawn the bundled/sibling binary.
 async fn ensure_daemon() -> Result<(), String> {
     if connect().await.is_ok() {
@@ -365,13 +403,11 @@ async fn ensure_daemon() -> Result<(), String> {
         .stderr(std::process::Stdio::null())
         .spawn()
         .map_err(|e| format!("failed to start cysd ({}): {e}", program.display()))?;
-    for _ in 0..40 {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        if connect().await.is_ok() {
-            return Ok(());
-        }
+    if wait_for_connect(40).await {
+        Ok(())
+    } else {
+        Err("cysd did not come up within 4s".into())
     }
-    Err("cysd did not come up within 4s".into())
 }
 
 /// Background: subscribe to the daemon push event stream, forward to the webview.
@@ -563,7 +599,22 @@ fn main() {
         .setup(|app| {
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
-                if let Err(e) = ensure_daemon().await {
+                #[cfg(target_os = "macos")]
+                let launchd_owns = maybe_autoregister_launchd().await;
+                #[cfg(not(target_os = "macos"))]
+                let launchd_owns = false;
+                let result = if launchd_owns {
+                    // launchd가 cysd를 소유·기동한다 — 수동 spawn 금지(중복 spawn·flock 경합 방지,
+                    // codex BLOCKER). launchctl load는 비동기라 socket-ready를 최대 5초 폴링.
+                    if wait_for_connect(50).await {
+                        Ok(())
+                    } else {
+                        Err("launchd-owned cysd did not become ready within 5s".to_string())
+                    }
+                } else {
+                    ensure_daemon().await
+                };
+                if let Err(e) = result {
                     let _ = handle.emit("daemon-error", e);
                     return;
                 }

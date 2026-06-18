@@ -1,0 +1,272 @@
+//! launchd 자동등록 — 앱 첫 실행 시 cysd를 RunAtLoad·KeepAlive로 상시 가동 등록.
+//!
+//! 수동 `cys daemon install`과 **동일 plist 포맷·경로를 단일 소스**로 공유해
+//! 자동/수동 등록의 포맷 드리프트를 막는다. 전체가 macOS 한정.
+#![cfg(target_os = "macos")]
+
+use std::path::{Path, PathBuf};
+
+pub const LAUNCHD_LABEL: &str = "com.cysjavis.cysd";
+
+/// ~/Library/LaunchAgents/com.cysjavis.cysd.plist
+pub fn plist_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("Library/LaunchAgents")
+        .join(format!("{LAUNCHD_LABEL}.plist"))
+}
+
+/// 데몬 로그 경로(소켓 디렉터리 옆 cysd.log).
+pub fn log_path() -> PathBuf {
+    crate::socket_path()
+        .parent()
+        .map(|d| d.join("cysd.log"))
+        .unwrap_or_else(|| PathBuf::from("/tmp/cysd.log"))
+}
+
+/// XML `<string>` 콘텐츠 이스케이프 — 경로·사용자명에 `&`·`<`·`>`가 있어도
+/// plist가 조기 종료·손상되지 않게 엔티티로 치환한다.
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// launchd plist 본문 — RunAtLoad(로그인 자동 기동) + KeepAlive(사망 시 재기동).
+pub fn render_plist(daemon: &Path, log: &Path) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>{LAUNCHD_LABEL}</string>
+  <key>ProgramArguments</key><array><string>{daemon}</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>StandardOutPath</key><string>{log}</string>
+  <key>StandardErrorPath</key><string>{log}</string>
+</dict>
+</plist>
+"#,
+        daemon = xml_escape(&daemon.display().to_string()),
+        log = xml_escape(&log.display().to_string()),
+    )
+}
+
+/// launchd가 현재 LAUNCHD_LABEL을 적재 중인가(`launchctl list <label>` 성공 여부).
+pub fn is_loaded() -> bool {
+    std::process::Command::new("launchctl")
+        .args(["list", LAUNCHD_LABEL])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// plist 본문에서 ProgramArguments의 첫 `<string>`(=cysd 경로, XML 이스케이프된 형태)을 추출.
+/// stale drift(plist가 옛 cysd 경로를 가리킴) 감지에 쓴다. 순수 함수(테스트 가능).
+fn extract_program_path(content: &str) -> Option<String> {
+    let after = content.split("ProgramArguments").nth(1)?;
+    let s = after.split("<string>").nth(1)?;
+    let path = s.split("</string>").next()?;
+    Some(path.to_string())
+}
+
+/// 현재 기록된 plist의 cysd 경로가 `daemon`(원하는 경로)과 일치하는가.
+/// plist가 없거나 파싱 실패 시 false(=불일치로 간주 → 재기록 유도).
+fn plist_path_matches(daemon: &Path) -> bool {
+    let Ok(content) = std::fs::read_to_string(plist_path()) else {
+        return false;
+    };
+    extract_program_path(&content).as_deref() == Some(xml_escape(&daemon.display().to_string()).as_str())
+}
+
+/// 이 결과에서 launchd가 cysd 기동을 책임지는가 — 앱 setup이 **수동 spawn을 건너뛰고**
+/// launchd-owned cysd의 socket-ready를 폴링할지 결정한다(split-brain·이중 spawn 방지).
+/// Registered/AlreadyRegistered = launchd가 띄움. DeferredDaemonRunning = 기존 데몬이
+/// 이미 가동(connect로 충분, launchd 미적재).
+pub fn launchd_will_serve(outcome: RegisterOutcome) -> bool {
+    matches!(
+        outcome,
+        RegisterOutcome::Registered | RegisterOutcome::AlreadyRegistered
+    )
+}
+
+/// plist를 ~/Library/LaunchAgents에 기록(부모 디렉터리 생성 포함). 기록한 경로 반환.
+pub fn write_plist(daemon: &Path) -> std::io::Result<PathBuf> {
+    let path = plist_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, render_plist(daemon, &log_path()))?;
+    Ok(path)
+}
+
+/// 자동등록 결과 — 호출자가 로그·UI 분기에 사용.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegisterOutcome {
+    /// plist가 이미 존재 — 이미 launchd 소유(무동작).
+    AlreadyRegistered,
+    /// plist 기록 + launchctl load 완료(launchd가 cysd 소유).
+    Registered,
+    /// 데몬이 이미 가동 중 — plist만 기록(load 보류, 다음 로그인 발효).
+    /// 현 세션의 flock 단일소유를 깨지 않아 가동 세션 소멸을 피한다.
+    DeferredDaemonRunning,
+}
+
+/// 자동등록 결정(순수 함수 — 부작용 없음, 진리표 테스트 가능).
+/// 멱등성은 plist 존재만이 아니라 **'plist 존재 AND launchd 적재'** 교차검사로 판정한다 —
+/// DeferredDaemonRunning(plist만 기록·load 보류) 후 데몬이 소멸하면 plist는 남아도
+/// 적재는 안 된 상태이므로, 재호출 시 `loaded=false`를 보고 load를 시도해 KeepAlive 보호를 복원한다.
+struct Plan {
+    write: bool,
+    load: bool,
+    outcome: RegisterOutcome,
+}
+
+/// `fresh` = plist 존재 **그리고** 그 ProgramArguments 경로가 현재 원하는 cysd 경로와 일치.
+/// stale drift(앱 이동·재설치로 plist가 옛 경로를 가리킴)면 fresh=false → 재기록 + reload 유도.
+fn plan(fresh: bool, loaded: bool, daemon_running: bool) -> Plan {
+    if fresh && loaded {
+        // plist가 올바른 경로로 존재 AND launchd 적재 중 — 무동작.
+        Plan { write: false, load: false, outcome: RegisterOutcome::AlreadyRegistered }
+    } else if daemon_running {
+        // 가동 데몬이 flock을 보유 — 지금 load하면 충돌. plist만 갱신하고 보류
+        // (부재/stale면 재기록, 다음 로그인·데몬 소멸 후 재호출 시 load).
+        Plan { write: !fresh, load: false, outcome: RegisterOutcome::DeferredDaemonRunning }
+    } else {
+        // 미가동 + (미적재 또는 stale) → 재기록 + load(신규 등록·보호 복원·stale 경로 교정).
+        Plan { write: !fresh, load: true, outcome: RegisterOutcome::Registered }
+    }
+}
+
+/// 앱 첫 실행/매 기동 시 자동등록(멱등). 부작용 없는 `plan()`이 결정한 대로 plist 기록·load.
+/// 멱등성은 'plist 존재 AND 경로 일치(fresh) AND launchd 적재' 교차검사로 판정한다.
+/// - 미등록 + 데몬 미가동(첫 실행): plist write + `launchctl load` → launchd가 즉시 cysd 소유
+/// - plist 존재하나 미적재 + 데몬 미가동(deferred 후 데몬 소멸 등): load로 KeepAlive 보호 복원
+/// - plist가 옛 경로(stale drift) + 데몬 미가동: 재기록 + reload로 경로 교정
+/// - 데몬 가동 중: plist만 보장(load 보류) → 현 세션 flock 단일소유 비파괴
+/// - fresh AND 적재 중: 무동작
+pub fn register_if_absent(daemon: &Path, daemon_running: bool) -> std::io::Result<RegisterOutcome> {
+    // fresh = plist 존재 AND 경로 일치(stale drift 아님).
+    let fresh = plist_path().exists() && plist_path_matches(daemon);
+    let p = plan(fresh, is_loaded(), daemon_running);
+    if p.write {
+        write_plist(daemon)?;
+    }
+    if p.load {
+        let path = plist_path();
+        // 재등록 대비 unload(실패 무시) 후 load.
+        let _ = std::process::Command::new("launchctl")
+            .args(["unload", "-w"])
+            .arg(&path)
+            .output();
+        let out = std::process::Command::new("launchctl")
+            .args(["load", "-w"])
+            .arg(&path)
+            .output()?;
+        if !out.status.success() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!(
+                    "launchctl load failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ),
+            ));
+        }
+    }
+    Ok(p.outcome)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn render_plist_has_reboot_survival_keys_and_daemon_path() {
+        let daemon = Path::new("/Applications/cys.app/Contents/MacOS/cysd");
+        let log = Path::new("/tmp/cysd.log");
+        let plist = render_plist(daemon, log);
+        // 재부팅 생존 핵심: RunAtLoad(로그인 자동 기동) + KeepAlive(사망 시 재기동).
+        assert!(plist.contains("<key>RunAtLoad</key><true/>"), "RunAtLoad 누락");
+        assert!(plist.contains("<key>KeepAlive</key><true/>"), "KeepAlive 누락");
+        // launchd가 띄울 대상은 정확한 cysd 절대경로.
+        assert!(
+            plist.contains("<string>/Applications/cys.app/Contents/MacOS/cysd</string>"),
+            "ProgramArguments에 cysd 경로 누락"
+        );
+        assert!(plist.contains(&format!("<string>{LAUNCHD_LABEL}</string>")), "Label 누락");
+        assert!(plist.contains("<string>/tmp/cysd.log</string>"), "로그 경로 누락");
+        // 유효한 plist 골격.
+        assert!(plist.starts_with("<?xml"), "plist 헤더 누락");
+    }
+
+    #[test]
+    fn label_matches_manual_install_contract() {
+        // 수동 `cys daemon install`과 동일 라벨이어야 status/uninstall이 자동등록분을 인식한다.
+        assert_eq!(LAUNCHD_LABEL, "com.cysjavis.cysd");
+    }
+
+    #[test]
+    fn render_plist_escapes_xml_special_chars_in_path() {
+        // 사용자명·경로에 &,<,> 가 있어도 plist가 손상되지 않아야 한다.
+        let daemon = Path::new("/Users/a&b<c>/cys.app/Contents/MacOS/cysd");
+        let plist = render_plist(daemon, Path::new("/tmp/l&g.log"));
+        assert!(plist.contains("/Users/a&amp;b&lt;c&gt;/cys.app/Contents/MacOS/cysd"));
+        assert!(plist.contains("/tmp/l&amp;g.log"));
+        // 원시(미이스케이프) 앰퍼샌드가 <string> 안에 남으면 안 된다.
+        assert!(!plist.contains("a&b<c>"));
+    }
+
+    #[test]
+    fn plan_outcomes_with_fresh_loaded_running() {
+        use RegisterOutcome::*;
+        // (fresh, loaded, daemon_running) → (write, load, outcome). fresh = plist 존재 AND 경로 일치.
+        // fresh + 적재 중 = 무동작.
+        assert_eq!(tup(plan(true, true, false)), (false, false, AlreadyRegistered));
+        assert_eq!(tup(plan(true, true, true)), (false, false, AlreadyRegistered));
+        // 첫 실행(미존재=非fresh·미가동) → write + load.
+        assert_eq!(tup(plan(false, false, false)), (true, true, Registered));
+        // ★멱등성 회귀: fresh plist이나 미적재 + 데몬 소멸(미가동) → load로 보호 복원(write 불요).
+        // fresh=true라 write=false지만 미적재라 load=true.
+        assert_eq!(tup(plan(true, false, false)), (false, true, Registered));
+        // ★stale drift: 非fresh(옛 경로) + 미적재 + 미가동 → 재기록 + reload로 경로 교정.
+        assert_eq!(tup(plan(false, false, false)), (true, true, Registered));
+        // 데몬 가동 중(非fresh) → plist write·load 보류.
+        assert_eq!(tup(plan(false, false, true)), (true, false, DeferredDaemonRunning));
+        // 데몬 가동 중(fresh·미적재) → load 보류(flock 충돌 회피·write 불요).
+        assert_eq!(tup(plan(true, false, true)), (false, false, DeferredDaemonRunning));
+    }
+
+    fn tup(p: Plan) -> (bool, bool, RegisterOutcome) {
+        (p.write, p.load, p.outcome)
+    }
+
+    #[test]
+    fn extract_program_path_roundtrips_with_render_plist() {
+        // render_plist가 쓴 경로를 그대로 추출해야 stale 비교가 정확하다(이스케이프 형태로).
+        let daemon = Path::new("/Applications/cys.app/Contents/MacOS/cysd");
+        let plist = render_plist(daemon, Path::new("/tmp/cysd.log"));
+        assert_eq!(
+            extract_program_path(&plist).as_deref(),
+            Some("/Applications/cys.app/Contents/MacOS/cysd")
+        );
+        // 이스케이프 경로도 그대로(이스케이프된 형태로) 추출 — plist_path_matches는 동일 형태끼리 비교.
+        let weird = Path::new("/Users/a&b/MacOS/cysd");
+        let plist = render_plist(weird, Path::new("/tmp/cysd.log"));
+        assert_eq!(extract_program_path(&plist).as_deref(), Some("/Users/a&amp;b/MacOS/cysd"));
+        // 깨진 입력은 None.
+        assert_eq!(extract_program_path("no program args here"), None);
+    }
+
+    #[test]
+    fn launchd_will_serve_only_for_registered_and_already() {
+        use RegisterOutcome::*;
+        // launchd가 띄울 책임 → 앱 setup이 수동 spawn 건너뛰고 socket-ready 폴링.
+        assert!(launchd_will_serve(Registered));
+        assert!(launchd_will_serve(AlreadyRegistered));
+        // 기존 데몬 가동 중(deferred) → launchd 미적재, connect로 충분 → 수동 경로 허용.
+        assert!(!launchd_will_serve(DeferredDaemonRunning));
+    }
+}

@@ -613,9 +613,16 @@ impl Daemon {
         let shell = default_shell();
         let mut builder = CommandBuilder::new(&shell);
         #[cfg(not(windows))]
-        if let Some(c) = &cmd {
-            builder = CommandBuilder::new(&shell);
-            builder.args(["-lc", c]);
+        {
+            if let Some(c) = &cmd {
+                builder = CommandBuilder::new(&shell);
+                builder.args(["-lc", c]);
+            } else {
+                // 대화형 surface도 로그인 셸(-l)로 기동 — Finder(GUI) 기동 시 빈곤한 PATH를
+                // 셸 로그인 프로파일이 복원(/opt/homebrew/bin·~/.local/bin·path_helper)해
+                // pane 속 노드(claude·agy 등)가 도구를 찾는다. cmd 경로(-lc)와 동일한 가정.
+                builder.args(["-l"]);
+            }
         }
         #[cfg(windows)]
         if let Some(c) = &cmd {

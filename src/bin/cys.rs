@@ -2456,17 +2456,7 @@ fn run_launch_agent_opts(role: &str, agent: &str, cwd: Option<String>, resume: b
 }
 
 // ---------- 온보딩③: 상시 가동 등록 (launchd / Task Scheduler) ----------
-
-#[cfg(target_os = "macos")]
-const LAUNCHD_LABEL: &str = "com.cysjavis.cysd";
-
-#[cfg(target_os = "macos")]
-fn launchd_plist_path() -> std::path::PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("Library/LaunchAgents")
-        .join(format!("{LAUNCHD_LABEL}.plist"))
-}
+// plist 포맷·경로·LABEL은 `cys::launchd`(앱 자동등록과 단일 소스) 위임 — 드리프트 방지.
 
 fn run_daemon_cmd(action: DaemonAction) -> i32 {
     let result: Result<(), String> = (|| {
@@ -2485,40 +2475,53 @@ fn run_daemon_cmd(action: DaemonAction) -> i32 {
                                 .into(),
                         );
                     }
-                    let log = cys::socket_path()
-                        .parent()
-                        .map(|d| d.join("cysd.log"))
-                        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/cysd.log"));
-                    let plist = format!(
-                        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>{LAUNCHD_LABEL}</string>
-  <key>ProgramArguments</key><array><string>{}</string></array>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>ThrottleInterval</key><integer>10</integer>
-  <key>StandardOutPath</key><string>{log}</string>
-  <key>StandardErrorPath</key><string>{log}</string>
-</dict>
-</plist>
-"#,
-                        daemon.display(),
-                        log = log.display(),
-                    );
-                    let path = launchd_plist_path();
+                    let plist = cys::launchd::render_plist(&daemon, &cys::launchd::log_path());
+                    let path = cys::launchd::plist_path();
                     if let Some(parent) = path.parent() {
                         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
                     }
                     std::fs::write(&path, plist).map_err(|e| e.to_string())?;
                     if running && takeover {
-                        // 소유권 이관: 기존 데몬 정상 종료 (SIGTERM — scoped 정리·소켓 제거)
+                        // 소유권 이관: 기존 데몬 정상 종료 (SIGTERM — scoped 정리·소켓 제거).
                         eprintln!("[daemon] 기존 데몬 정지 중 (소유권 이관)…");
-                        let _ = std::process::Command::new("pkill")
-                            .args(["-TERM", "-x", "cysd"])
-                            .output();
-                        std::thread::sleep(std::time::Duration::from_secs(2));
+                        // ★기존 job이 이미 launchd 적재 상태면 KeepAlive가 kill 직후 재기동해
+                        // 폴링이 영영 down을 못 본다 → kill 전에 먼저 unload(KeepAlive 해제).
+                        if cys::launchd::is_loaded() {
+                            let _ = std::process::Command::new("launchctl")
+                                .args(["unload", "-w"])
+                                .arg(&path)
+                                .output();
+                        }
+                        // ⚠ `pkill -x cysd`는 macOS comm이 15자로 잘려(/Applications/cy…)
+                        // 매칭에 실패한다 → 데몬이 보고하는 self-pid로 정확히 종료한다.
+                        let pid = request("system.identify", json!({}))
+                            .ok()
+                            .and_then(|v| v["daemon_pid"].as_u64());
+                        if let Some(pid) = pid {
+                            let _ = std::process::Command::new("kill")
+                                .args(["-TERM", &pid.to_string()])
+                                .output();
+                        } else {
+                            // 폴백: 전체 인자 경로 매칭(comm 절단 무관).
+                            let _ = std::process::Command::new("pkill")
+                                .args(["-TERM", "-f", "MacOS/cysd"])
+                                .output();
+                        }
+                        // 고정 sleep 대신 flock 해제(=소켓 연결 불가)까지 폴링(최대 5초).
+                        let mut down = false;
+                        for _ in 0..50 {
+                            if connect_raw().is_err() {
+                                down = true;
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                        }
+                        if !down {
+                            return Err(
+                                "기존 데몬이 5초 내 종료되지 않음 — launchctl load 보류(수동 확인 필요)"
+                                    .into(),
+                            );
+                        }
                     }
                     let _ = std::process::Command::new("launchctl")
                         .args(["unload", "-w"])
@@ -2553,7 +2556,7 @@ fn run_daemon_cmd(action: DaemonAction) -> i32 {
                     Ok(())
                 }
                 DaemonAction::Uninstall => {
-                    let path = launchd_plist_path();
+                    let path = cys::launchd::plist_path();
                     let _ = std::process::Command::new("launchctl")
                         .args(["unload", "-w"])
                         .arg(&path)
@@ -2565,10 +2568,10 @@ fn run_daemon_cmd(action: DaemonAction) -> i32 {
                     Ok(())
                 }
                 DaemonAction::Status => {
-                    let path = launchd_plist_path();
+                    let path = cys::launchd::plist_path();
                     let registered = path.exists();
                     let loaded = std::process::Command::new("launchctl")
-                        .args(["list", LAUNCHD_LABEL])
+                        .args(["list", cys::launchd::LAUNCHD_LABEL])
                         .output()
                         .map(|o| o.status.success())
                         .unwrap_or(false);

@@ -6,6 +6,8 @@ use std::path::PathBuf;
 
 pub mod pack;
 pub mod overrides;
+#[cfg(target_os = "macos")]
+pub mod launchd;
 
 pub const ENV_SOCKET: &str = "CYS_SOCKET";
 pub const ENV_SURFACE_ID: &str = "CYS_SURFACE_ID";
