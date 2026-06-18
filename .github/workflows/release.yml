@@ -62,13 +62,9 @@ jobs:
           # ── 업데이트 무결성 서명 (필수 — 없으면 .sig·latest.json 미생성) ──
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''    # 이 키는 무암호로 생성됨(실측 확인) → 빈 문자열. 별도 시크릿 불필요.
-          # ── macOS 코드사이닝 + 공증 (Developer ID, 선택 — 없으면 미서명 빌드 = Gatekeeper 경고) ──
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # ── macOS 코드사이닝 + 공증은 Developer ID 인증서 취득 후 추가. ──
+          # ★빈 APPLE_* env 를 넘기면 tauri 번들러가 빈 인증서를 security import 하려다 실패하므로,
+          #   인증서가 없는 동안에는 APPLE_* 를 아예 전달하지 않는다(=미서명 빌드 → Gatekeeper 경고 감수).
         with:
           tagName: ${{ github.ref_name }}
           releaseName: 'cys ${{ github.ref_name }} (internal)'
