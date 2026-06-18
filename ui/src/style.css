@@ -148,6 +148,8 @@ html, body {
   font-family: -apple-system, "Pretendard Variable", system-ui, sans-serif;
 }
 #cc-panel[hidden] { display: none; }
+/* Control Center 본문 zoom (Cmd +/-/0) — host #cc-panel(fixed)·사이드바 제외, #cc-body만 확대 */
+#cc-body { zoom: var(--panel-zoom, 1); }
 #cc-header {
   position: sticky; top: 0; z-index: 2; display: flex; align-items: center; gap: 12px;
   padding: 13px 20px; background: rgba(10,10,10,.85); backdrop-filter: blur(16px);

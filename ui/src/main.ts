@@ -683,6 +683,20 @@ function applyZoom(delta: number | null) {
   }
 }
 
+// Control Center 본문 전용 zoom — 터미널 fontSize와 분리(배율 단위).
+// WebKit `zoom`을 #cc-body에만 적용(host #cc-panel은 fixed라 zoom 시 위치/스크롤 회귀 → 본문만 확대,
+// sticky 헤더·탭은 1.0x 유지). 사이드바(ft/feed)는 터미널 작업공간 폭이라 zoom 비대상(터미널 fit 회귀 방지).
+let panelZoom = Math.min(2, Math.max(0.6, Number(localStorage.getItem("cys-panel-zoom")) || 1)); // NaN·범위밖 방어
+function applyPanelZoomVar() {
+  document.documentElement.style.setProperty("--panel-zoom", String(panelZoom));
+}
+applyPanelZoomVar(); // 마운트 시 저장된 배율 복원
+function applyPanelZoom(delta: number | null) {
+  panelZoom = delta === null ? 1 : Math.min(2, Math.max(0.6, +(panelZoom + delta * 0.1).toFixed(2)));
+  localStorage.setItem("cys-panel-zoom", String(panelZoom));
+  applyPanelZoomVar();
+}
+
 let workspaces: Workspace[] = [];
 let activeWs = 0;
 let wsCounter = 1;
@@ -1908,13 +1922,13 @@ window.addEventListener("keydown", (e) => {
     actionClose();
   } else if (e.key === "=" || e.key === "+") {
     e.preventDefault();
-    applyZoom(+1);
+    ccOpen ? applyPanelZoom(+1) : applyZoom(+1);
   } else if (e.key === "-") {
     e.preventDefault();
-    applyZoom(-1);
+    ccOpen ? applyPanelZoom(-1) : applyZoom(-1);
   } else if (e.key === "0") {
     e.preventDefault();
-    applyZoom(null);
+    ccOpen ? applyPanelZoom(null) : applyZoom(null);
   }
 });
 
