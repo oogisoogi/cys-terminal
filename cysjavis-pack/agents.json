@@ -26,9 +26,9 @@
     ]
   },
   "codex": {
-    "cmd": "codex --dangerously-bypass-approvals-and-sandbox",
+    "cmd": "~/.npm-global/bin/codex --dangerously-bypass-approvals-and-sandbox",
     "inject_delay_secs": 12,
-    "notes": "OpenAI Codex CLI (YOLO 모드 — cys 터미널 소켓 push 무프롬프트). 첫 실행 update 프롬프트는 Skip.",
+    "notes": "OpenAI Codex CLI (YOLO 모드 — cys 터미널 소켓 push 무프롬프트). 첫 실행 update 프롬프트는 Skip. 홈 기반 경로(~)인 이유: brew 본 /opt/homebrew/bin/codex가 dangling symlink(Caskroom 0.76.0 타깃 소멸)라 PATH 순서·로그인셸 차이에 따라 끊긴 본을 잡을 수 있다 → npm 설치본(~/.npm-global/bin/codex)으로 고정해 회피. ~ 는 로그인셸이 전개(gemini agy 어댑터와 동일 방식). 설치 위치가 다르면 이 경로를 수정.",
     "clear_cmd": "/new",
     "capabilities": ["review", "coding"],
     "capability_notes": "앵커4-6: 코딩 협업·코드 리뷰 담당.",
