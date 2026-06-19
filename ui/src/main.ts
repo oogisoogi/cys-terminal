@@ -31,12 +31,18 @@ interface Workspace {
   id: number;
   name: string;
   tree: Node | null;
+  // 멀티마스터 F4: 이 workspace가 붙은 부서 데몬 소켓(undefined=기본 데몬). 한 ws의 모든 pane은 같은 socket.
+  socket?: string;
 }
 
 const LAYOUT_KEY = "cys-layout-v2";
 
+// pane 식별 복합키 — 서로 다른 데몬이 같은 surface_id를 독립 발급하므로 (socket, sid)로 구분한다.
+const paneKey = (sid: number, socket?: string): string => `${socket ?? ""}#${sid}`;
+
 interface PaneRuntime {
   sid: number;
+  socket?: string;
   el: HTMLElement;
   termHost: HTMLElement;
   titleEl: HTMLElement;
@@ -775,7 +781,9 @@ let workspaces: Workspace[] = [];
 let activeWs = 0;
 let wsCounter = 1;
 let focusedSid: number | null = null;
-const panes = new Map<number, PaneRuntime>();
+const panes = new Map<string, PaneRuntime>(); // 키 = paneKey(sid, socket)
+// 부서 데몬 socket_slug(F3 백엔드 단일진실) → socket 경로. launch_dept_daemon 반환·daemon-event로 채운다.
+const socketForSlug = new Map<string, string>();
 const root = document.getElementById("root")!;
 
 const current = (): Workspace => workspaces[activeWs];
@@ -795,12 +803,6 @@ function collectSids(node: Node | null, out: number[] = []): number[] {
     collectSids(node.b, out);
   }
   return out;
-}
-
-function allLayoutSids(): Set<number> {
-  const s = new Set<number>();
-  for (const ws of workspaces) collectSids(ws.tree).forEach((x) => s.add(x));
-  return s;
 }
 
 function replaceNode(node: Node, target: number, make: (old: Node) => Node | null): Node | null {
@@ -836,35 +838,39 @@ async function refreshPaneTitles() {
   if (!started || refreshing) return; // 겹친 호출의 이중 입양 방지
   refreshing = true;
   try {
-    const r = (await invoke("list_surfaces")) as {
-      surfaces: {
-        surface_id: number;
-        title: string;
-        role: string | null;
-        live_cwd: string | null;
-        exited: boolean;
-        usage?: ObservedUsage | null;
-      }[];
-    };
-    for (const s of r.surfaces) {
-      const rt = panes.get(s.surface_id);
-      if (!rt) continue;
-      renderUsage(rt.usageEl, s.exited ? null : s.usage); // 종료 pane은 배지 제거 (혼동 방지)
-      if (rt.titleEl.isContentEditable) continue; // 이름 편집 중에는 덮어쓰지 않음
-      rt.titleEl.textContent = paneTitle(s.title, s.live_cwd) + (s.exited ? " [exited]" : "");
-    }
-    // 자동 입양: role이 등록된 살아있는 surface 중 UI에 없는 것 → 현재 ws에 pane으로 표출.
-    // role 조건이 UI 자체 생성 pane(역할 없음)과의 생성 경합을 차단한다.
+    // 멀티마스터 F4: workspace별 소켓을 순회 — 각 데몬의 surface를 그 소켓 ws에만 귀속시킨다.
+    const sockets = [...new Set(workspaces.map((w) => w.socket))];
     let adopted = false;
-    for (const s of r.surfaces) {
-      if (s.exited || !s.role || panes.has(s.surface_id)) continue;
-      if (allLayoutSids().has(s.surface_id)) continue;
-      await makePane(s.surface_id, s.title);
-      const ws = current();
-      ws.tree = ws.tree
-        ? { type: "split", dir: "row", a: ws.tree, b: { type: "pane", sid: s.surface_id } }
-        : { type: "pane", sid: s.surface_id };
-      adopted = true;
+    for (const sk of sockets) {
+      const r = (await invoke("list_surfaces", { socket: sk })) as {
+        surfaces: {
+          surface_id: number;
+          title: string;
+          role: string | null;
+          live_cwd: string | null;
+          exited: boolean;
+          usage?: ObservedUsage | null;
+        }[];
+      };
+      for (const s of r.surfaces) {
+        const rt = panes.get(paneKey(s.surface_id, sk));
+        if (!rt) continue;
+        renderUsage(rt.usageEl, s.exited ? null : s.usage); // 종료 pane은 배지 제거 (혼동 방지)
+        if (rt.titleEl.isContentEditable) continue; // 이름 편집 중에는 덮어쓰지 않음
+        rt.titleEl.textContent = paneTitle(s.title, s.live_cwd) + (s.exited ? " [exited]" : "");
+      }
+      // 자동 입양: 그 소켓의 role surface 중 UI에 없는 것 → '같은 소켓을 가진 ws'에만 표출.
+      // ★소켓 일치 가드 — 부서A 노드가 부서B 탭에 잘못 입양되는 격리 누수 차단(검증 mustFix).
+      for (const s of r.surfaces) {
+        if (s.exited || !s.role || panes.has(paneKey(s.surface_id, sk))) continue;
+        const ws = workspaces.find((w) => (w.socket ?? undefined) === (sk ?? undefined));
+        if (!ws || collectSids(ws.tree).includes(s.surface_id)) continue;
+        await makePane(s.surface_id, s.title, sk);
+        ws.tree = ws.tree
+          ? { type: "split", dir: "row", a: ws.tree, b: { type: "pane", sid: s.surface_id } }
+          : { type: "pane", sid: s.surface_id };
+        adopted = true;
+      }
     }
     if (adopted) render();
   } catch {
@@ -876,9 +882,9 @@ async function refreshPaneTitles() {
 }
 setInterval(refreshPaneTitles, 3000);
 
-async function makePane(sid: number, title: string): Promise<PaneRuntime> {
-  // 멱등 보장 — 같은 surface에 pane 런타임·리스너가 이중 생성되지 않게
-  const existing = panes.get(sid);
+async function makePane(sid: number, title: string, socket?: string): Promise<PaneRuntime> {
+  // 멱등 보장 — 같은 (소켓,surface)에 pane 런타임·리스너가 이중 생성되지 않게
+  const existing = panes.get(paneKey(sid, socket));
   if (existing) return existing;
   const el = document.createElement("div");
   el.className = "pane";
@@ -912,8 +918,8 @@ async function makePane(sid: number, title: string): Promise<PaneRuntime> {
       }, 2500);
       return;
     }
-    await invoke("close_surface", { surfaceId: sid }).catch(() => {});
-    destroyPaneRuntime(sid);
+    await invoke("close_surface", { socket, surfaceId: sid }).catch(() => {});
+    destroyPaneRuntime(sid, socket);
     const ws = current();
     if (ws.tree) ws.tree = replaceNode(ws.tree, sid, () => null);
     if (focusedSid === sid) focusedSid = collectSids(ws.tree)[0] ?? null;
@@ -940,7 +946,7 @@ async function makePane(sid: number, title: string): Promise<PaneRuntime> {
             titleEl.contentEditable = "false";
             const name = (titleEl.textContent || "").trim();
             // 빈 이름 = 자동 제목(경로)으로 복귀 — 데몬에 ""를 저장하면 isAutoTitle이 잡는다
-            invoke("rename_surface", { surfaceId: sid, title: name })
+            invoke("rename_surface", { socket, surfaceId: sid, title: name })
               .catch(() => {})
               .then(() => refreshPaneTitles());
           };
@@ -976,7 +982,7 @@ async function makePane(sid: number, title: string): Promise<PaneRuntime> {
   let sendChain: Promise<unknown> = Promise.resolve();
   const sendRaw = (data: string) => {
     sendChain = sendChain
-      .then(() => invoke("send_input", { surfaceId: sid, data }))
+      .then(() => invoke("send_input", { socket, surfaceId: sid, data }))
       .catch(() => {});
     return sendChain;
   };
@@ -1060,10 +1066,15 @@ async function makePane(sid: number, title: string): Promise<PaneRuntime> {
   el.addEventListener("mousedown", () => setFocus(sid));
   term.textarea?.addEventListener("focus", () => setFocus(sid));
 
-  const un1 = await listen(`surface-output-${sid}`, (e) => {
+  // attach 먼저 — 백엔드가 (소켓 slug, surface_id) 이벤트명을 만들어 반환한다(단일 진실, UI 재계산 금지).
+  const ev = (await invoke("attach_surface", { socket, surfaceId: sid })) as {
+    output_event: string;
+    exited_event: string;
+  };
+  const un1 = await listen(ev.output_event, (e) => {
     term.write(b64ToBytes(e.payload as string));
   });
-  const un2 = await listen(`surface-exited-${sid}`, () => {
+  const un2 = await listen(ev.exited_event, () => {
     term.write("\r\n\x1b[31m[surface exited]\x1b[0m\r\n");
   });
 
@@ -1074,9 +1085,8 @@ async function makePane(sid: number, title: string): Promise<PaneRuntime> {
   });
   observer.observe(termHost);
 
-  const rt: PaneRuntime = { sid, el, termHost, titleEl, usageEl, term, fit, unlisten: [un1, un2], observer };
-  panes.set(sid, rt);
-  await invoke("attach_surface", { surfaceId: sid });
+  const rt: PaneRuntime = { sid, socket, el, termHost, titleEl, usageEl, term, fit, unlisten: [un1, un2], observer };
+  panes.set(paneKey(sid, socket), rt);
   return rt;
 }
 
@@ -1084,17 +1094,17 @@ async function makePane(sid: number, title: string): Promise<PaneRuntime> {
 function fitPane(rt: PaneRuntime) {
   if (rt.termHost.offsetWidth < 60 || rt.termHost.offsetHeight < 40) return;
   rt.fit.fit();
-  invoke("resize_surface", { surfaceId: rt.sid, rows: rt.term.rows, cols: rt.term.cols }).catch(() => {});
+  invoke("resize_surface", { socket: rt.socket, surfaceId: rt.sid, rows: rt.term.rows, cols: rt.term.cols }).catch(() => {});
 }
 
-function destroyPaneRuntime(sid: number) {
-  const rt = panes.get(sid);
+function destroyPaneRuntime(sid: number, socket?: string) {
+  const rt = panes.get(paneKey(sid, socket));
   if (!rt) return;
   rt.observer.disconnect();
   rt.unlisten.forEach((u) => u());
   rt.term.dispose();
   rt.el.remove();
-  panes.delete(sid);
+  panes.delete(paneKey(sid, socket));
 }
 
 // ---------- pane drag 이동 (탭을 끌어 자유 배치) ----------
@@ -1115,7 +1125,7 @@ function startPaneDrag(e0: MouseEvent, sid: number) {
       dragging = true;
       ghost = document.createElement("div");
       ghost.id = "drag-ghost";
-      ghost.textContent = panes.get(sid)?.titleEl.textContent || `surface ${sid}`;
+      ghost.textContent = panes.get(paneKey(sid, current()?.socket))?.titleEl.textContent || `surface ${sid}`;
       hint = document.createElement("div");
       hint.id = "drop-hint";
       hint.hidden = true;
@@ -1184,8 +1194,9 @@ function movePane(sid: number, targetSid: number, side: DropSide) {
 
 function setFocus(sid: number) {
   focusedSid = sid;
-  for (const [id, rt] of panes) rt.el.classList.toggle("focused", id === sid);
-  panes.get(sid)?.term.focus();
+  const key = paneKey(sid, current()?.socket);
+  for (const [id, rt] of panes) rt.el.classList.toggle("focused", id === key);
+  panes.get(key)?.term.focus();
   updateFtRoot(); // 파일 트리가 열려 있으면 선택한 surface의 폴더로 전환
 }
 
@@ -1199,7 +1210,7 @@ function render() {
   renderWsTabs();
   requestAnimationFrame(() => {
     for (const sid of collectSids(current()?.tree ?? null)) {
-      const rt = panes.get(sid);
+      const rt = panes.get(paneKey(sid, current()?.socket));
       if (rt) fitPane(rt);
     }
   });
@@ -1208,7 +1219,7 @@ function render() {
 
 function renderNode(node: Node): HTMLElement {
   if (node.type === "pane") {
-    const rt = panes.get(node.sid);
+    const rt = panes.get(paneKey(node.sid, current()?.socket));
     if (rt) return rt.el;
     const placeholder = document.createElement("div");
     placeholder.className = "pane";
@@ -1255,7 +1266,7 @@ function attachDividerDrag(
       window.removeEventListener("mouseup", up);
       saveLayout();
       for (const sid of collectSids(node)) {
-        const rt = panes.get(sid);
+        const rt = panes.get(paneKey(sid, current()?.socket));
         if (rt) fitPane(rt);
       }
     };
@@ -1352,7 +1363,7 @@ function renderWsTabs() {
     // 서브라인: pane 수 + 대표 pane 제목 (항목 가독성)
     const sids = collectSids(ws.tree);
     const firstTitle =
-      panes.get(sids[0] ?? -1)?.titleEl.textContent ?? "";
+      panes.get(paneKey(sids[0] ?? -1, ws.socket))?.titleEl.textContent ?? "";
     const sub = document.createElement("span");
     sub.className = "ws-sub";
     sub.textContent = `${sids.length} pane${firstTitle ? ` · ${firstTitle}` : ""}`;
@@ -1406,9 +1417,11 @@ function renderWsTabs() {
         return;
       }
       for (const sid of collectSids(ws.tree)) {
-        await invoke("close_surface", { surfaceId: sid }).catch(() => {});
-        destroyPaneRuntime(sid);
+        await invoke("close_surface", { socket: ws.socket, surfaceId: sid }).catch(() => {});
+        destroyPaneRuntime(sid, ws.socket);
       }
+      // 부서 workspace면 그 부서 데몬을 teardown(cys-dept down 일임)
+      if (ws.socket) await invoke("stop_dept_daemon", { name: ws.name }).catch(() => {});
       workspaces.splice(idx, 1);
       if (workspaces.length === 0) {
         await addWorkspace(); // addWorkspace가 activeWs를 설정
@@ -1475,13 +1488,27 @@ async function addWorkspace(): Promise<Workspace> {
   return ws;
 }
 
+// 멀티마스터 F4: 새 '부서 workspace' 런칭 = 새 부서 데몬 spawn(cys-dept launch 단일 진입점).
+// 첫 부서가 생기면 백엔드(cys-dept)가 기본 데몬을 CEO로 자동 승격한다.
+async function addDeptWorkspace(name: string): Promise<Workspace> {
+  const info = (await invoke("launch_dept_daemon", { name })) as { socket: string; socket_slug?: string };
+  if (info.socket_slug && info.socket) socketForSlug.set(info.socket_slug, info.socket);
+  const sid = await newSurface(null, info.socket);
+  const ws: Workspace = { id: wsCounter++, name, tree: { type: "pane", sid }, socket: info.socket };
+  workspaces.push(ws);
+  activeWs = workspaces.length - 1;
+  render();
+  setFocus(sid);
+  return ws;
+}
+
 // ---------- actions ----------
 
-async function newSurface(cwd: string | null = null): Promise<number> {
-  const r = (await invoke("create_surface", { cwd, title: null, rows: 35, cols: 120 })) as {
+async function newSurface(cwd: string | null = null, socket?: string): Promise<number> {
+  const r = (await invoke("create_surface", { socket, cwd, title: null, rows: 35, cols: 120 })) as {
     surface_id: number;
   };
-  await makePane(r.surface_id, ""); // 자동 제목 — 곧 refreshPaneTitles가 현재 경로로 채움
+  await makePane(r.surface_id, "", socket); // 자동 제목 — 곧 refreshPaneTitles가 현재 경로로 채움
   refreshPaneTitles();
   return r.surface_id;
 }
@@ -1491,7 +1518,7 @@ async function firstPaneCwd(): Promise<string | null> {
   const first = collectSids(current().tree)[0];
   if (first == null) return null;
   try {
-    const r = (await invoke("list_surfaces")) as {
+    const r = (await invoke("list_surfaces", { socket: current()?.socket })) as {
       surfaces: { surface_id: number; live_cwd: string | null }[];
     };
     return r.surfaces.find((s) => s.surface_id === first)?.live_cwd ?? null;
@@ -1501,7 +1528,7 @@ async function firstPaneCwd(): Promise<string | null> {
 }
 
 async function actionNew() {
-  const sid = await newSurface(await firstPaneCwd());
+  const sid = await newSurface(await firstPaneCwd(), current().socket);
   const ws = current();
   ws.tree = ws.tree
     ? { type: "split", dir: "row", a: ws.tree, b: { type: "pane", sid } }
@@ -1518,7 +1545,7 @@ async function actionSplit(dir: "row" | "col") {
     return actionNew();
   }
   const target = focusedSid;
-  const sid = await newSurface(await firstPaneCwd());
+  const sid = await newSurface(await firstPaneCwd(), ws.socket);
   if (!ws.tree || !collectSids(ws.tree).includes(target)) {
     // await 사이에 대상이 닫힌 경우 — 루트에 덧붙여 고아를 만들지 않는다
     ws.tree = ws.tree
@@ -1540,8 +1567,8 @@ async function actionClose() {
   const ws = current();
   if (focusedSid == null || !ws.tree) return;
   const sid = focusedSid;
-  await invoke("close_surface", { surfaceId: sid }).catch(() => {});
-  destroyPaneRuntime(sid);
+  await invoke("close_surface", { socket: ws.socket, surfaceId: sid }).catch(() => {});
+  destroyPaneRuntime(sid, ws.socket);
   ws.tree = replaceNode(ws.tree, sid, () => null);
   focusedSid = collectSids(ws.tree)[0] ?? null;
   render();
@@ -1551,12 +1578,13 @@ async function actionClose() {
 // 데몬에서 사라진(종료·닫힘·reap) surface의 UI pane을 자동 제거 — 멱등(이미 없으면 무동작).
 // 데몬이 close_surface 하지 않은 자력종료라도 즉시 정리해 죽은 pane이 쌓이지 않게 한다.
 // 복구는 보존: 60s grace 내 node-recover로 surface가 되살아나면 refreshPaneTitles 폴링이 재입양한다.
-function removeDeadPane(sid: number) {
-  const inLayout = workspaces.some((w) => w.tree != null && collectSids(w.tree).includes(sid));
-  if (!panes.has(sid) && !inLayout) return; // 이미 정리됨
-  destroyPaneRuntime(sid);
+function removeDeadPane(sid: number, socket?: string) {
+  const sameSock = (w: Workspace) => (w.socket ?? undefined) === (socket ?? undefined);
+  const inLayout = workspaces.some((w) => sameSock(w) && w.tree != null && collectSids(w.tree).includes(sid));
+  if (!panes.has(paneKey(sid, socket)) && !inLayout) return; // 이미 정리됨
+  destroyPaneRuntime(sid, socket);
   for (const ws of workspaces) {
-    if (ws.tree != null && collectSids(ws.tree).includes(sid)) {
+    if (sameSock(ws) && ws.tree != null && collectSids(ws.tree).includes(sid)) {
       ws.tree = replaceNode(ws.tree, sid, () => null);
     }
   }
@@ -1835,7 +1863,9 @@ function onDaemonEvent(event: Record<string, unknown>) {
     refreshFeed();
   } else if (name === "surface.exited" || name === "surface.closed" || name === "surface.reaped") {
     // 종료 즉시 죽은 pane 자동 제거 (A안) — 데몬 reap을 기다리지 않는다. 멱등.
-    removeDeadPane(Number(sid));
+    // 멀티마스터 F4: 출처 데몬을 socket_slug로 특정해 그 부서 pane만 제거(타 부서 같은 sid 보호).
+    const sock = event.socket_slug ? socketForSlug.get(String(event.socket_slug)) : undefined;
+    removeDeadPane(Number(sid), sock);
   }
 }
 
@@ -1868,13 +1898,8 @@ async function start() {
   checkForUpdate(true);
   setInterval(() => checkForUpdate(true), 6 * 3600 * 1000);
 
-  // Session restore: surfaces live in the daemon; reconcile saved workspaces with reality.
-  const listResp = (await invoke("list_surfaces")) as {
-    surfaces: { surface_id: number; title: string; exited: boolean }[];
-  };
-  const live = listResp.surfaces.filter((s) => !s.exited);
-  const liveIds = new Set(live.map((s) => s.surface_id));
-
+  // Session restore (멀티마스터 F4): 저장본 먼저 로드(ws.socket 포함) → 부서 데몬 확보를 list 대조보다
+  // 선행 → 소켓별 대조. 데몬 일시 미가동 ws는 보존(영구 삭제 방지, 검증 mustFix).
   try {
     const saved = JSON.parse(localStorage.getItem(LAYOUT_KEY) ?? "null");
     if (saved && Array.isArray(saved.workspaces)) {
@@ -1885,15 +1910,50 @@ async function start() {
   } catch {
     workspaces = [];
   }
-  // Drop dead panes from every workspace.
-  // 활성 ws는 인덱스가 아닌 id로 추적 — 죽은 ws filter가 인덱스를 어긋나게 해도 유지된다
-  const activeWsId = workspaces[activeWs]?.id;
-  for (const ws of workspaces) {
-    for (const sid of collectSids(ws.tree)) {
-      if (!liveIds.has(sid)) ws.tree = ws.tree ? replaceNode(ws.tree, sid, () => null) : null;
+  for (const ws of workspaces) ws.socket = ws.socket ?? undefined; // 하위호환 마이그레이션(기본 데몬)
+
+  // 부서 데몬 확보를 list 대조보다 선행 — 미가동이면 cys-dept launch. 실패해도 ws는 보존.
+  for (const ws of workspaces.filter((w) => w.socket)) {
+    try {
+      await invoke("daemon_status", { socket: ws.socket });
+    } catch {
+      try {
+        const info = (await invoke("launch_dept_daemon", { name: ws.name })) as { socket: string; socket_slug?: string };
+        if (info.socket_slug && info.socket) socketForSlug.set(info.socket_slug, info.socket);
+      } catch {
+        /* 데몬 확보 실패 — ws는 빈 채 보존(저장본 삭제 금지) */
+      }
     }
   }
-  workspaces = workspaces.filter((ws) => ws.tree !== null);
+
+  // 소켓별 live 집계 — 데몬 미응답(ok=false) 소켓은 판정 보류(죽은 pane 제거 스킵, ws 보존).
+  const sockets = [...new Set(workspaces.map((w) => w.socket))];
+  const liveBySock = new Map<
+    string | undefined,
+    { ids: Set<number>; ok: boolean; list: { surface_id: number; title: string }[] }
+  >();
+  for (const sk of sockets) {
+    try {
+      const r = (await invoke("list_surfaces", { socket: sk })) as {
+        surfaces: { surface_id: number; title: string; exited: boolean }[];
+      };
+      const liveList = r.surfaces.filter((s) => !s.exited);
+      liveBySock.set(sk, { ids: new Set(liveList.map((s) => s.surface_id)), ok: true, list: liveList });
+    } catch {
+      liveBySock.set(sk, { ids: new Set(), ok: false, list: [] });
+    }
+  }
+
+  // 죽은 pane 제거 — 데몬 미응답 소켓의 ws는 건드리지 않는다(일시 미가동=영구삭제 방지).
+  const activeWsId = workspaces[activeWs]?.id;
+  for (const ws of workspaces) {
+    const lb = liveBySock.get(ws.socket);
+    if (!lb || !lb.ok) continue;
+    for (const sid of collectSids(ws.tree)) {
+      if (!lb.ids.has(sid)) ws.tree = ws.tree ? replaceNode(ws.tree, sid, () => null) : null;
+    }
+  }
+  workspaces = workspaces.filter((ws) => ws.tree !== null || liveBySock.get(ws.socket)?.ok === false);
   // 구버전 자동 번호 이름("ws N")은 미정 표시로 이행
   for (const ws of workspaces) {
     if (/^ws \d+$/.test(ws.name)) ws.name = UNTITLED;
@@ -1904,19 +1964,22 @@ async function start() {
   const restoredIdx = workspaces.findIndex((ws) => ws.id === activeWsId);
   activeWs = restoredIdx >= 0 ? restoredIdx : Math.min(activeWs, workspaces.length - 1);
 
-  // Create runtimes for everything still referenced; merge orphans into the active workspace.
-  const inLayout = allLayoutSids();
-  for (const s of live) {
-    await makePane(s.surface_id, s.title);
-    if (!inLayout.has(s.surface_id)) {
-      const ws = current();
-      ws.tree = ws.tree
-        ? { type: "split", dir: "row", a: ws.tree, b: { type: "pane", sid: s.surface_id } }
-        : { type: "pane", sid: s.surface_id };
+  // pane 런타임 생성 + 고아(레이아웃에 없는 살아있는 surface)는 같은 소켓 ws에 병합.
+  for (const sk of sockets) {
+    const lb = liveBySock.get(sk);
+    if (!lb || !lb.ok) continue;
+    const ws = workspaces.find((w) => (w.socket ?? undefined) === (sk ?? undefined));
+    for (const s of lb.list) {
+      await makePane(s.surface_id, s.title, sk);
+      if (ws && !collectSids(ws.tree).includes(s.surface_id)) {
+        ws.tree = ws.tree
+          ? { type: "split", dir: "row", a: ws.tree, b: { type: "pane", sid: s.surface_id } }
+          : { type: "pane", sid: s.surface_id };
+      }
     }
   }
   if (!current().tree) {
-    const sid = await newSurface();
+    const sid = await newSurface(null, current().socket);
     current().tree = { type: "pane", sid };
   }
   render();
@@ -1977,6 +2040,13 @@ document.getElementById("cc-sessions-redact")!.addEventListener("click", (e) => 
 });
 document.getElementById("btn-update")!.addEventListener("click", () => promptInstall());
 document.getElementById("btn-ws-new")!.addEventListener("click", () => addWorkspace());
+// 멀티마스터 F4: 새 부서(독립 데몬) workspace 런칭. 부서명 자동(dept-N) — WKWebView prompt 무동작이라 자동 번호.
+let deptCounter = 1;
+document.getElementById("btn-ws-dept")?.addEventListener("click", () => {
+  const used = new Set(workspaces.map((w) => w.name));
+  while (used.has(`dept-${deptCounter}`)) deptCounter++;
+  addDeptWorkspace(`dept-${deptCounter}`).catch((e) => toast("watchdog", "부서 런칭 실패", String(e)));
+});
 
 window.addEventListener("keydown", (e) => {
   if (e.isComposing || e.keyCode === 229) return; // IME 조합 중 무시
