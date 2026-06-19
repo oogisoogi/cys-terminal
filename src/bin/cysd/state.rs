@@ -653,6 +653,14 @@ impl Daemon {
             }
         }
         builder.env(cys::ENV_SOCKET, self.socket_path.to_string_lossy().as_ref());
+        // 부서 격리: 데몬 자신의 pack_dir(=CYS_PACK_DIR env, 미설정 시 기본 ~/.cys/pack)을 자식 pane에
+        // 전파한다. 이게 없으면 부서 데몬이 띄운 worker pane의 `cys todo-path`/skill/memory가
+        // 글로벌 pack으로 폴백해 부서 격리가 도구 레벨에서 깨진다(멀티마스터 정식화 F1).
+        // 기본 데몬은 기본값을 전파하므로 단일 사용자 동작은 무변경.
+        builder.env(
+            cys::pack::ENV_PACK_DIR,
+            cys::pack::pack_dir().to_string_lossy().as_ref(),
+        );
         builder.env(cys::ENV_SURFACE_ID, id.to_string());
         builder.env(cys::ENV_SURFACE_REF, cys::surface_ref(id));
         if let Some(r) = &role {

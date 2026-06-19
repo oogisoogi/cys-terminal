@@ -238,6 +238,18 @@ pub fn install(force: bool) -> Result<(usize, usize), String> {
     let mut kept = 0;
     for (rel, content) in PACK.iter().chain(PACK_SKILLS.iter()) {
         let path = dir.join(rel);
+        // 디렉티브 영구 보존(멀티마스터 정식화 F1): *_DIRECTIVE.md가 디스크에 임베드와 다른
+        // 내용으로 존재하면(CEO 디렉티브·사용자 헌법 커스텀) force여도 절대 덮지 않는다.
+        // CEO 승격이 pack-ceo/directives/MASTER_DIRECTIVE.md를 CEO 내용으로 둔 것을, 데몬 매
+        // 기동 install(false)·init-pack --force가 임베드 표준본으로 파괴하는 것을 결정론 차단.
+        if path.exists() && rel.ends_with("_DIRECTIVE.md") {
+            if let Ok(existing) = std::fs::read_to_string(&path) {
+                if existing != *content {
+                    kept += 1;
+                    continue;
+                }
+            }
+        }
         if path.exists() && !force {
             match std::fs::read_to_string(&path) {
                 Ok(existing) if existing == *content => {

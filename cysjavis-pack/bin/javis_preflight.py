@@ -275,6 +275,17 @@ def pack_dir():
     return os.path.join(os.path.expanduser("~"), ".cys/pack")
 
 
+def is_dept_pack():
+    """부서/CEO pack 컨텍스트인가 — pack_dir이 기본(~/.cys/pack)이 아니면 부서/CEO 데몬이다.
+    부서장·CEO의 MASTER_DIRECTIVE는 표준 핀이 없는 게 정상이라 C03 표준 핀 검사를 면제한다
+    (멀티마스터 정식화 F1 — 부서 운영 중 C03 영구 FAIL→`--force` 복원이 CEO 디렉티브를 파괴하는 것 차단)."""
+    default = os.path.join(os.path.expanduser("~"), ".cys/pack")
+    try:
+        return os.path.realpath(pack_dir()) != os.path.realpath(default)
+    except OSError:
+        return False
+
+
 def discover_claude_settings():
     """$HOME 직하 .claude*/settings.json 전부 (존재 파일만, 사전순) — cys.rs와 동일 규칙."""
     home = os.path.expanduser("~")
@@ -364,6 +375,11 @@ class Preflight:
 
     # ── C03 내용 핀 (절대지침 조항이 문서에 살아있는가) ──
     def c03_content_pins(self):
+        if is_dept_pack():
+            self.add("C03.pin", WARN,
+                     "부서/CEO pack(%s) — 표준 디렉티브 핀 검사 면제(CEO/부서장 커스텀 디렉티브가 정상)"
+                     % pack_dir())
+            return
         for f, pins in CONTENT_PINS.items():
             cid = "C03.pin.%s" % f.split("_")[0].lower()
             if self.skipped(cid):
