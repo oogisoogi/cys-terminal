@@ -15,30 +15,66 @@ type Stream = Box<dyn AsyncReadWrite>;
 trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncReadWrite for T {}
 
-struct Attachments(Mutex<HashMap<u64, tauri::async_runtime::JoinHandle<()>>>);
+// 멀티마스터 F3: attach 핸들 키를 (소켓 slug, surface_id) 복합키로 — 서로 다른 데몬이 같은
+// surface_id를 독립 발급하므로 단독 키는 부서 간 PTY 스트림이 충돌한다.
+struct Attachments(Mutex<HashMap<(String, u64), tauri::async_runtime::JoinHandle<()>>>);
+
+/// 소켓 경로 → 짧은 결정론 식별자(이벤트명·attach 키용). 백엔드 단일 진실 — UI는 attach 반환값/
+/// daemon-event 페이로드로 이 값을 전달받아 그대로 쓴다(독립 재계산 금지, 검증 mustFix).
+fn sock_slug(socket: &std::path::Path) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    socket.to_string_lossy().hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
+/// 기본 소켓 — env(CYS_SOCKET) 누수 방지를 위해 명시적 기본 경로를 쓴다(멀티마스터 F3:
+/// 앱이 CYS_SOCKET 걸린 셸에서 런칭돼도 단일 데몬 사용자 하위호환이 깨지지 않게).
+fn default_socket() -> std::path::PathBuf {
+    cys::socket_path()
+}
+/// UI workspace의 socket(Option) → 실제 경로. None = 기본 데몬(하위호환의 단일 결정요인).
+fn resolve_socket(opt: &Option<String>) -> std::path::PathBuf {
+    opt.as_ref()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(default_socket)
+}
 
 #[cfg(unix)]
-async fn connect() -> Result<Stream, String> {
-    let path = cys::socket_path();
-    tokio::net::UnixStream::connect(&path)
+async fn connect_to(socket: &std::path::Path) -> Result<Stream, String> {
+    tokio::net::UnixStream::connect(socket)
         .await
         .map(|s| Box::new(s) as Stream)
-        .map_err(|e| format!("cannot connect to aitermd at {}: {e}", path.display()))
+        .map_err(|e| format!("cannot connect to cysd at {}: {e}", socket.display()))
 }
 
 #[cfg(windows)]
-async fn connect() -> Result<Stream, String> {
+async fn connect_to(socket: &std::path::Path) -> Result<Stream, String> {
     use tokio::net::windows::named_pipe::ClientOptions;
-    let path = cys::socket_path();
     ClientOptions::new()
-        .open(path.to_string_lossy().as_ref())
+        .open(socket.to_string_lossy().as_ref())
         .map(|s| Box::new(s) as Stream)
-        .map_err(|e| format!("cannot connect to aitermd pipe: {e}"))
+        .map_err(|e| format!("cannot connect to cysd pipe: {e}"))
 }
 
-/// 영속 RPC 연결: 키 입력마다 새 소켓을 여는 오버헤드 제거 + 단일 연결 직렬화로 순서 보장.
-static RPC_CONN: std::sync::OnceLock<tokio::sync::Mutex<Option<tokio::io::BufReader<Stream>>>> =
+/// 기본 소켓 연결 (하위호환 wrapper).
+async fn connect() -> Result<Stream, String> {
+    connect_to(&default_socket()).await
+}
+
+/// 소켓별 영속 RPC 연결 풀 — 데몬(부서)마다 독립 연결 + 독립 락(데몬 간 직렬화 병목 제거).
+type ConnCell = std::sync::Arc<tokio::sync::Mutex<Option<tokio::io::BufReader<Stream>>>>;
+static RPC_POOL: std::sync::OnceLock<Mutex<HashMap<std::path::PathBuf, ConnCell>>> =
     std::sync::OnceLock::new();
+
+/// 풀에서 소켓의 연결 셀을 얻는다 — 외부 std Mutex는 Arc 클론만 짧게 잡고 즉시 푼다(await 경계 안 넘김).
+fn conn_cell(socket: &std::path::Path) -> ConnCell {
+    let pool = RPC_POOL.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut g = pool.lock().unwrap();
+    g.entry(socket.to_path_buf())
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(None)))
+        .clone()
+}
 
 /// rpc_once 실패 단계: 전송 전(BeforeSend)은 데몬이 요청을 못 봤으므로 재시도 안전,
 /// 전송 후(AfterSend)는 처리됐을 수 있어 비멱등 명령(create·send)의 맹목 재시도 금지.
@@ -48,11 +84,14 @@ enum RpcErr {
 }
 
 async fn rpc_once(
+    socket: &std::path::Path,
     conn: &mut Option<tokio::io::BufReader<Stream>>,
     line: &[u8],
 ) -> Result<String, RpcErr> {
     if conn.is_none() {
-        *conn = Some(BufReader::new(connect().await.map_err(RpcErr::BeforeSend)?));
+        *conn = Some(BufReader::new(
+            connect_to(socket).await.map_err(RpcErr::BeforeSend)?,
+        ));
     }
     let c = conn.as_mut().unwrap();
     c.get_mut()
@@ -74,18 +113,24 @@ async fn rpc_once(
     Ok(resp_line)
 }
 
+/// 기본 소켓 RPC (하위호환 wrapper).
 async fn rpc(method: &str, params: Value) -> Result<Value, String> {
+    rpc_on(&default_socket(), method, params).await
+}
+
+/// 소켓 지정 RPC — 풀의 소켓별 연결을 잠가 직렬화(다른 데몬 RPC를 막지 않음).
+async fn rpc_on(socket: &std::path::Path, method: &str, params: Value) -> Result<Value, String> {
     let req = json!({"id": 1, "method": method, "params": params});
     let mut line = serde_json::to_vec(&req).map_err(|e| e.to_string())?;
     line.push(b'\n');
-    let lock = RPC_CONN.get_or_init(|| tokio::sync::Mutex::new(None));
-    let mut conn = lock.lock().await;
-    let resp_line = match rpc_once(&mut conn, &line).await {
+    let cell = conn_cell(socket);
+    let mut conn = cell.lock().await;
+    let resp_line = match rpc_once(socket, &mut conn, &line).await {
         Ok(r) => r,
         Err(RpcErr::BeforeSend(_)) => {
             // 풀링된 연결이 끊겨 전송 자체가 실패 — 데몬이 요청을 못 봤으니 재시도 안전
             *conn = None;
-            match rpc_once(&mut conn, &line).await {
+            match rpc_once(socket, &mut conn, &line).await {
                 Ok(r) => r,
                 Err(RpcErr::BeforeSend(e)) | Err(RpcErr::AfterSend(e)) => {
                     *conn = None;
@@ -112,13 +157,13 @@ async fn rpc(method: &str, params: Value) -> Result<Value, String> {
 }
 
 #[tauri::command]
-async fn daemon_status() -> Result<Value, String> {
-    rpc("system.identify", json!({"caller": "ui"})).await
+async fn daemon_status(socket: Option<String>) -> Result<Value, String> {
+    rpc_on(&resolve_socket(&socket), "system.identify", json!({"caller": "ui"})).await
 }
 
 #[tauri::command]
-async fn list_surfaces() -> Result<Value, String> {
-    rpc("surface.list", json!({})).await
+async fn list_surfaces(socket: Option<String>) -> Result<Value, String> {
+    rpc_on(&resolve_socket(&socket), "surface.list", json!({})).await
 }
 
 #[tauri::command]
@@ -168,12 +213,14 @@ async fn learn_status() -> Result<Value, String> {
 
 #[tauri::command]
 async fn create_surface(
+    socket: Option<String>,
     cwd: Option<String>,
     title: Option<String>,
     rows: u16,
     cols: u16,
 ) -> Result<Value, String> {
-    rpc(
+    rpc_on(
+        &resolve_socket(&socket),
         "surface.create",
         json!({"cwd": cwd, "title": title, "rows": rows, "cols": cols}),
     )
@@ -200,10 +247,11 @@ fn log_ime(line: String) {
 }
 
 #[tauri::command]
-async fn send_input(surface_id: u64, data: String) -> Result<(), String> {
+async fn send_input(socket: Option<String>, surface_id: u64, data: String) -> Result<(), String> {
     // human=true: T3-13 타이핑 가드의 신호 — UI 키 입력을 '사람'으로 표시해
     // 원격 주입이 사람의 미완성 입력을 오염시키지 못하게 한다
-    rpc(
+    rpc_on(
+        &resolve_socket(&socket),
         "surface.send_text",
         json!({"surface_id": surface_id, "text": data, "quiet": true, "human": true}),
     )
@@ -248,8 +296,9 @@ fn open_path(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn rename_surface(surface_id: u64, title: String) -> Result<(), String> {
-    rpc(
+async fn rename_surface(socket: Option<String>, surface_id: u64, title: String) -> Result<(), String> {
+    rpc_on(
+        &resolve_socket(&socket),
         "surface.rename",
         json!({"surface_id": surface_id, "title": title}),
     )
@@ -258,8 +307,14 @@ async fn rename_surface(surface_id: u64, title: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn resize_surface(surface_id: u64, rows: u16, cols: u16) -> Result<(), String> {
-    rpc(
+async fn resize_surface(
+    socket: Option<String>,
+    surface_id: u64,
+    rows: u16,
+    cols: u16,
+) -> Result<(), String> {
+    rpc_on(
+        &resolve_socket(&socket),
         "surface.resize",
         json!({"surface_id": surface_id, "rows": rows, "cols": cols}),
     )
@@ -268,11 +323,17 @@ async fn resize_surface(surface_id: u64, rows: u16, cols: u16) -> Result<(), Str
 }
 
 #[tauri::command]
-async fn close_surface(state: State<'_, Attachments>, surface_id: u64) -> Result<(), String> {
-    if let Some(handle) = state.0.lock().unwrap().remove(&surface_id) {
+async fn close_surface(
+    state: State<'_, Attachments>,
+    socket: Option<String>,
+    surface_id: u64,
+) -> Result<(), String> {
+    let sock = resolve_socket(&socket);
+    let key = (sock_slug(&sock), surface_id);
+    if let Some(handle) = state.0.lock().unwrap().remove(&key) {
         handle.abort();
     }
-    rpc("surface.close", json!({"surface_id": surface_id}))
+    rpc_on(&sock, "surface.close", json!({"surface_id": surface_id}))
         .await
         .map(|_| ())
 }
@@ -292,18 +353,28 @@ async fn feed_reply(request_id: String, decision: String) -> Result<(), String> 
     .map(|_| ())
 }
 
-/// Attach to a surface: stream raw PTY output to the webview as base64 events.
+/// Attach: 부서 소켓의 surface PTY 출력을 base64 이벤트로 webview에 스트리밍.
+/// 이벤트명은 (소켓 slug, surface_id)로 데몬 간 충돌을 막고, 그 이름을 반환해 UI가 구독한다
+/// (백엔드 단일 진실 — UI 독립 재계산 금지, 검증 mustFix).
 #[tauri::command]
 async fn attach_surface(
     app: AppHandle,
     state: State<'_, Attachments>,
+    socket: Option<String>,
     surface_id: u64,
-) -> Result<(), String> {
-    if let Some(prev) = state.0.lock().unwrap().remove(&surface_id) {
+) -> Result<Value, String> {
+    let sock = resolve_socket(&socket);
+    let slug = sock_slug(&sock);
+    let key = (slug.clone(), surface_id);
+    if let Some(prev) = state.0.lock().unwrap().remove(&key) {
         prev.abort();
     }
+    let event_name = format!("surface-output-{slug}-{surface_id}");
+    let event_exited = format!("surface-exited-{slug}-{surface_id}");
+    let (en, ee) = (event_name.clone(), event_exited.clone());
     let handle = tauri::async_runtime::spawn(async move {
-        let Ok(mut stream) = connect().await else {
+        let Ok(mut stream) = connect_to(&sock).await else {
+            let _ = app.emit(&ee, ());
             return;
         };
         let req =
@@ -311,38 +382,37 @@ async fn attach_surface(
         let mut line = serde_json::to_vec(&req).unwrap_or_default();
         line.push(b'\n');
         if stream.write_all(&line).await.is_err() {
+            let _ = app.emit(&ee, ());
             return;
         }
         let mut reader = BufReader::new(stream);
-        let event_exited = format!("surface-exited-{surface_id}");
         let mut ack = String::new();
         // ack 검증 — not_found 등 에러 ack에서 read 블록·무신호 죽은 pane이 되지 않게
         if reader.read_line(&mut ack).await.unwrap_or(0) == 0 {
-            let _ = app.emit(&event_exited, ());
+            let _ = app.emit(&ee, ());
             return;
         }
         let ack_v: Value = serde_json::from_str(ack.trim()).unwrap_or(Value::Null);
         if ack_v["ok"].as_bool() != Some(true) {
-            let _ = app.emit(&event_exited, ());
+            let _ = app.emit(&ee, ());
             return;
         }
-        let event_name = format!("surface-output-{surface_id}");
         let mut buf = [0u8; 8192];
         loop {
             match reader.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     let b64 = base64::engine::general_purpose::STANDARD.encode(&buf[..n]);
-                    if app.emit(&event_name, b64).is_err() {
+                    if app.emit(&en, b64).is_err() {
                         break;
                     }
                 }
             }
         }
-        let _ = app.emit(&event_exited, ());
+        let _ = app.emit(&ee, ());
     });
-    state.0.lock().unwrap().insert(surface_id, handle);
-    Ok(())
+    state.0.lock().unwrap().insert(key, handle);
+    Ok(json!({"output_event": event_name, "exited_event": event_exited}))
 }
 
 /// 데몬 소켓이 준비될 때까지 connect를 폴링(수동 spawn 없음). `attempts`×100ms.
@@ -410,13 +480,15 @@ async fn ensure_daemon() -> Result<(), String> {
     }
 }
 
-/// Background: subscribe to the daemon push event stream, forward to the webview.
-fn spawn_event_forwarder(app: AppHandle) {
+/// Background: 한 데몬의 push 이벤트 스트림을 구독해 webview로 전달.
+/// 데몬마다 spawn — 페이로드에 출처 socket_slug를 주입해 UI가 부서를 구분한다(멀티마스터 F3).
+fn spawn_event_forwarder(app: AppHandle, socket: std::path::PathBuf) {
+    let slug = sock_slug(&socket);
     tauri::async_runtime::spawn(async move {
         let mut after_seq: Option<u64> = None;
         loop {
             let attempt: Result<(), String> = async {
-                let mut stream = connect().await?;
+                let mut stream = connect_to(&socket).await?;
                 let req = json!({"id": 1, "method": "events.stream",
                                  "params": {"after_seq": after_seq}});
                 let mut line = serde_json::to_vec(&req).unwrap_or_default();
@@ -424,10 +496,13 @@ fn spawn_event_forwarder(app: AppHandle) {
                 stream.write_all(&line).await.map_err(|e| e.to_string())?;
                 let mut lines = BufReader::new(stream).lines();
                 while let Ok(Some(l)) = lines.next_line().await {
-                    if let Ok(v) = serde_json::from_str::<Value>(&l) {
+                    if let Ok(mut v) = serde_json::from_str::<Value>(&l) {
                         if v["type"] == "event" {
                             if let Some(seq) = v["seq"].as_u64() {
                                 after_seq = Some(seq);
+                            }
+                            if let Some(obj) = v.as_object_mut() {
+                                obj.insert("socket_slug".into(), json!(slug));
                             }
                             let _ = app.emit("daemon-event", v);
                         }
@@ -440,6 +515,65 @@ fn spawn_event_forwarder(app: AppHandle) {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
     });
+}
+
+/// 부서 운용 정식 도구 cys-dept 경로(pack_dir/bin/cys-dept).
+fn dept_tool() -> std::path::PathBuf {
+    cys::pack::pack_dir().join("bin").join("cys-dept")
+}
+
+/// 부서 데몬 소켓 경로 — cys-dept 규약과 동일(~/.local/state/cys-dept-<name>/cys.sock).
+fn dept_socket_path(name: &str) -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_default();
+    std::path::PathBuf::from(home)
+        .join(".local/state")
+        .join(format!("cys-dept-{name}"))
+        .join("cys.sock")
+}
+
+/// 새 부서 workspace 런칭 = 부서 데몬 spawn. 단일 진입점 cys-dept launch를 OS 호출해
+/// 레지스트리·ACL 시드·CEO 승격을 일임한다(직접 cysd spawn 금지, 검증 mustFix). 성공 시
+/// 그 데몬용 이벤트 forwarder를 추가 spawn하고 socket·slug·identify를 반환한다.
+#[tauri::command]
+async fn launch_dept_daemon(app: AppHandle, name: String) -> Result<Value, String> {
+    let tool = dept_tool();
+    let n = name.clone();
+    let out = tokio::task::spawn_blocking(move || {
+        std::process::Command::new("bash")
+            .arg(&tool)
+            .arg("launch")
+            .arg(&n)
+            .output()
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).to_string());
+    }
+    let sock = dept_socket_path(&name);
+    spawn_event_forwarder(app.clone(), sock.clone());
+    let mut info = rpc_on(&sock, "system.identify", json!({"caller": "ui"})).await?;
+    if let Some(obj) = info.as_object_mut() {
+        obj.insert("socket".into(), json!(sock.to_string_lossy()));
+        obj.insert("socket_slug".into(), json!(sock_slug(&sock)));
+    }
+    Ok(info)
+}
+
+/// 부서 workspace 닫기 = 부서 데몬 teardown. cys-dept down에 일임(SIGTERM·소켓 정리·레지스트리·CEO 강등).
+#[tauri::command]
+async fn stop_dept_daemon(name: String) -> Result<(), String> {
+    let tool = dept_tool();
+    let _ = tokio::task::spawn_blocking(move || {
+        std::process::Command::new("bash")
+            .arg(&tool)
+            .arg("down")
+            .arg(&name)
+            .output()
+    })
+    .await;
+    Ok(())
 }
 
 /// 업데이트 확인: 새 버전이 있으면 (version, notes)를 반환, 없으면 null.
@@ -595,6 +729,8 @@ fn main() {
             check_update,
             live_session_count,
             install_update,
+            launch_dept_daemon,
+            stop_dept_daemon,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
@@ -619,7 +755,7 @@ fn main() {
                     return;
                 }
                 let _ = handle.emit("daemon-ready", ());
-                spawn_event_forwarder(handle);
+                spawn_event_forwarder(handle, default_socket());
             });
             Ok(())
         })
