@@ -31,6 +31,10 @@ pub const PACK: &[(&str, &str)] = &[
         include_str!("../cysjavis-pack/directives/RSI_LEARNING_DIRECTIVE.md"),
     ),
     (
+        "directives/CEO_TEMPLATE.md",
+        include_str!("../cysjavis-pack/directives/CEO_TEMPLATE.md"),
+    ),
+    (
         "CLAUDE.md.template",
         include_str!("../cysjavis-pack/CLAUDE.md.template"),
     ),
@@ -127,6 +131,10 @@ pub const PACK: &[(&str, &str)] = &[
     (
         "bin/javis_reflect.py",
         include_str!("../cysjavis-pack/bin/javis_reflect.py"),
+    ),
+    (
+        "bin/cys-dept",
+        include_str!("../cysjavis-pack/bin/cys-dept"),
     ),
     (
         "hooks/inject-context.sh",

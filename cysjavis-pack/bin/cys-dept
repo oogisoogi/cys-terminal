@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# cys-dept — 부서(독립 데몬) 운용 정식 도구 (멀티마스터 정식화 F2)
+#
+#   cys-dept launch <name>    부서 데몬 spawn + ACL 시드 + 부서장 자리 + (부서≥1)CEO 승격 + 레지스트리 등재
+#   cys-dept down   <name>    teardown: SIGTERM + 소켓/lock 정리 + 레지스트리 해제 + (마지막)CEO 강등
+#   cys-dept list             부서명 목록
+#   cys-dept sock   <name>    부서 소켓 경로 출력 (broadcast fan-out 루프용)
+#   cys-dept <name> -- <cmd>  부서 컨텍스트(CYS_SOCKET+CYS_PACK_DIR)로 명령 실행
+#
+# 격리 불변식: 부서마다 socket의 *부모 디렉토리*와 pack_dir이 서로 달라야 한다(state_dir·ACL 격리).
+# 단일 진입점: Tauri/UI·CLI 모두 이 도구를 거쳐 부서를 운용한다(직접 cysd spawn 금지 — 레지스트리/ACL 미시드 방지).
+set -euo pipefail
+
+REG="${CYS_DEPTS_JSON:-$HOME/.cys/depts.json}"
+PACK_DEFAULT="$HOME/.cys/pack"
+CYSD="$(command -v cysd || echo /opt/homebrew/bin/cysd)"
+CYS="$(command -v cys || echo /opt/homebrew/bin/cys)"
+
+dept_sock(){ echo "$HOME/.local/state/cys-dept-$1/cys.sock"; }
+dept_pack(){ echo "$HOME/.cys/pack-dept-$1"; }
+
+reg_init(){ [ -f "$REG" ] || { mkdir -p "$(dirname "$REG")"; printf '{"depts":{}}\n' > "$REG"; }; }
+reg_count(){ reg_init; python3 -c "import json;print(len(json.load(open('$REG'))['depts']))"; }
+reg_names(){ reg_init; python3 -c "import json;[print(k) for k in json.load(open('$REG'))['depts']]"; }
+reg_upsert(){ reg_init; python3 - "$REG" "$1" "$2" "$3" <<'PY'
+import json,sys
+p,n,s,k=sys.argv[1:5]
+d=json.load(open(p)); d['depts'][n]={'socket':s,'pack_dir':k,'role':'dept-master'}
+json.dump(d,open(p,'w'),ensure_ascii=False,indent=2)
+PY
+}
+reg_remove(){ reg_init; python3 - "$REG" "$1" <<'PY'
+import json,sys
+p,n=sys.argv[1:3]
+d=json.load(open(p)); d['depts'].pop(n,None)
+json.dump(d,open(p,'w'),ensure_ascii=False,indent=2)
+PY
+}
+
+# 부서 데몬 ACL 시드 — external(CEO·오너셸)→worker 차단. fail-closed: 없으면 격리 붕괴이므로 항상 시드.
+seed_acl(){
+  local pk="$1"; mkdir -p "$pk"
+  cat > "$pk/acl.json" <<'JSON'
+{
+  "_doc": "부서 데몬 ACL — CEO·외부는 워커 직접 조향 불가(부서장 master 경유). cys-dept 시드.",
+  "default": "allow",
+  "rules": [
+    { "from": "external", "to": "worker*", "allow": false },
+    { "from": "reviewer-*", "to": "worker*", "allow": false },
+    { "from": "external", "to": "master", "allow": true }
+  ]
+}
+JSON
+}
+
+# 부서 데몬은 첫 기동 시 pack install(수백 파일)로 listening까지 지연될 수 있어 폴링 간격을 둔다(최대 ~12s).
+ready(){ local s="$1" i; for i in $(seq 1 120); do CYS_SOCKET="$s" "$CYS" ping >/dev/null 2>&1 && return 0; sleep 0.1; done; return 1; }
+
+# CEO 승격: 부서가 1개 이상이면 기본 데몬을 CEO로(디렉티브 교체, 가역 백업). 부서 0이면 표준 master 보존(하위호환).
+ceo_promote(){
+  local md="$PACK_DEFAULT/directives/MASTER_DIRECTIVE.md"
+  local ceo="$PACK_DEFAULT/directives/CEO_TEMPLATE.md"
+  [ -f "$ceo" ] || { echo "[cys-dept] CEO 템플릿 없음 — 승격 생략(cys init-pack 필요)"; return 0; }
+  cmp -s "$md" "$ceo" 2>/dev/null && return 0
+  [ -f "$md.pre-ceo" ] || cp "$md" "$md.pre-ceo"
+  cp "$ceo" "$md"
+  echo "[cys-dept] 기본 데몬 CEO 승격(directives 교체·백업 .pre-ceo)"
+}
+ceo_demote(){
+  local md="$PACK_DEFAULT/directives/MASTER_DIRECTIVE.md"
+  [ -f "$md.pre-ceo" ] || return 0
+  cp "$md.pre-ceo" "$md"; rm -f "$md.pre-ceo"
+  echo "[cys-dept] CEO 강등(표준 master 원복)"
+}
+
+cmd="${1:?usage: cys-dept launch|down|list|sock <name> | <name> -- <cmd>}"
+case "$cmd" in
+  launch)
+    name="${2:?usage: cys-dept launch <name>}"
+    sock="$(dept_sock "$name")"; pack="$(dept_pack "$name")"
+    mkdir -p "$(dirname "$sock")" "$pack/directives"
+    seed_acl "$pack"
+    reg_upsert "$name" "$sock" "$pack"
+    if ready "$sock"; then
+      echo "[cys-dept] $name 이미 가동 중 — 재사용"
+    else
+      CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" nohup "$CYSD" >"$(dirname "$sock")/cysd.log" 2>&1 &
+      disown
+      ready "$sock" || { echo "[cys-dept] ERROR: $name 데몬 기동 실패"; exit 1; }
+    fi
+    CYS_SOCKET="$sock" "$CYS" new-surface --role master --title "$name-master" >/dev/null 2>&1 || true
+    ceo_promote
+    echo "[cys-dept] $name 가동 완료 (sock=$sock pack=$pack). 부서 수=$(reg_count)"
+    ;;
+  down)
+    name="${2:?usage: cys-dept down <name>}"
+    sock="$(dept_sock "$name")"
+    pid=$(CYS_SOCKET="$sock" "$CYS" identify 2>/dev/null | python3 -c "import json,sys;print(json.load(sys.stdin).get('daemon_pid',''))" 2>/dev/null || true)
+    [ -n "${pid:-}" ] && kill "$pid" 2>/dev/null || true
+    rm -f "$sock" "$sock.lock" 2>/dev/null || true
+    reg_remove "$name"
+    [ "$(reg_count)" = "0" ] && ceo_demote || true
+    echo "[cys-dept] $name 종료·정리 완료. 부서 수=$(reg_count)"
+    ;;
+  list) reg_names ;;
+  sock) dept_sock "${2:?usage: cys-dept sock <name>}" ;;
+  *)
+    name="$cmd"; shift; [ "${1:-}" = "--" ] && shift
+    [ "$#" -ge 1 ] || { echo "usage: cys-dept <name> -- <cmd>" >&2; exit 2; }
+    export CYS_SOCKET="$(dept_sock "$name")" CYS_PACK_DIR="$(dept_pack "$name")"
+    exec "$@"
+    ;;
+esac
