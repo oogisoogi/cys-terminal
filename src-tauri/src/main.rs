@@ -481,14 +481,29 @@ async fn ensure_daemon() -> Result<(), String> {
 }
 
 /// Background: 한 데몬의 push 이벤트 스트림을 구독해 webview로 전달.
+/// 데몬별 event forwarder 중복 spawn 방지 — restore가 ws마다 launch_dept_daemon을 재호출해도
+/// socket당 forwarder 1개만 유지(태스크 누수·daemon-event 중복 emit 차단).
+static FORWARDERS: std::sync::OnceLock<Mutex<std::collections::HashSet<std::path::PathBuf>>> =
+    std::sync::OnceLock::new();
+
 /// 데몬마다 spawn — 페이로드에 출처 socket_slug를 주입해 UI가 부서를 구분한다(멀티마스터 F3).
 fn spawn_event_forwarder(app: AppHandle, socket: std::path::PathBuf) {
+    // 멱등 가드: 이 socket의 forwarder가 이미 돌고 있으면 no-op.
+    {
+        let set = FORWARDERS.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+        if !set.lock().unwrap().insert(socket.clone()) {
+            return;
+        }
+    }
     let slug = sock_slug(&socket);
     tauri::async_runtime::spawn(async move {
         let mut after_seq: Option<u64> = None;
+        let mut fails: u32 = 0;
         loop {
+            let mut connected = false;
             let attempt: Result<(), String> = async {
                 let mut stream = connect_to(&socket).await?;
+                connected = true; // 연결 수립 — dead-socket 아님
                 let req = json!({"id": 1, "method": "events.stream",
                                  "params": {"after_seq": after_seq}});
                 let mut line = serde_json::to_vec(&req).unwrap_or_default();
@@ -512,6 +527,19 @@ fn spawn_event_forwarder(app: AppHandle, socket: std::path::PathBuf) {
             }
             .await;
             let _ = attempt;
+            // dead-socket 회수: 연속 연결 실패(스트림 수립 실패)가 ~30s 넘으면 forwarder 종료.
+            // 스트림 수립 후 종료(데몬 재시작 등)는 정상 재연결 대상이라 카운터를 리셋한다.
+            if connected {
+                fails = 0;
+            } else {
+                fails += 1;
+                if fails >= 30 {
+                    if let Some(set) = FORWARDERS.get() {
+                        set.lock().unwrap().remove(&socket);
+                    }
+                    return;
+                }
+            }
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
     });
@@ -570,6 +598,37 @@ async fn stop_dept_daemon(name: String) -> Result<(), String> {
             .arg(&tool)
             .arg("down")
             .arg(&name)
+            .output()
+    })
+    .await;
+    Ok(())
+}
+
+/// 부서 레지스트리(depts.json) 조회 — restore가 등록된 부서(진실원)와 대조해 죽은 socket의 유령 ws를
+/// 무비판 재-launch하지 않게 한다(옛 테스트 잔재·삭제된 부서 차단). 부재 시 빈 depts.
+#[tauri::command]
+fn list_depts() -> Result<Value, String> {
+    let reg = std::env::var("CYS_DEPTS_JSON")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cys/depts.json")
+        });
+    match std::fs::read_to_string(&reg) {
+        Ok(s) => serde_json::from_str::<Value>(&s).map_err(|e| e.to_string()),
+        Err(_) => Ok(json!({ "depts": {} })),
+    }
+}
+
+/// 부서 데몬 teardown(socket 기준) — ws 이름 변경(rename)으로 name→socket 매핑이 끊겨도 정확히 종료.
+/// cys-dept down-sock에 일임(레지스트리 역인덱스로 부서명 해석 후 teardown).
+#[tauri::command]
+async fn stop_dept_daemon_by_socket(socket: String) -> Result<(), String> {
+    let tool = dept_tool();
+    let _ = tokio::task::spawn_blocking(move || {
+        std::process::Command::new("bash")
+            .arg(&tool)
+            .arg("down-sock")
+            .arg(&socket)
             .output()
     })
     .await;
@@ -731,6 +790,8 @@ fn main() {
             install_update,
             launch_dept_daemon,
             stop_dept_daemon,
+            stop_dept_daemon_by_socket,
+            list_depts,
         ])
         .setup(|app| {
             let handle = app.handle().clone();

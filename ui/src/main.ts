@@ -788,10 +788,37 @@ const root = document.getElementById("root")!;
 
 const current = (): Workspace => workspaces[activeWs];
 
+// 부서 workspace는 socket 단위로 유일해야 한다(한 부서 데몬 = 한 탭). 저장·복원 양쪽에서 이 게이트를
+// 통과시켜 중복(같은 socket 2탭)·id 중복이 저장→복원→재저장으로 증식하는 것을 차단한다.
+// socket=undefined(기본 데몬) ws는 여러 개가 정상이므로 수렴 대상에서 제외.
+function normalizeWorkspaces(list: Workspace[]): Workspace[] {
+  const seenId = new Set<number>();
+  const seenSock = new Map<string, Workspace>();
+  const out: Workspace[] = [];
+  for (const w of list) {
+    if (seenId.has(w.id)) continue;
+    if (w.socket) {
+      const prev = seenSock.get(w.socket);
+      if (prev) {
+        // 같은 부서 socket 중복: 비어있지 않은 트리를 우선 보존(사용자 분할 레이아웃 유실 방지)
+        if (collectSids(w.tree).length && !collectSids(prev.tree).length) prev.tree = w.tree;
+        continue;
+      }
+      seenSock.set(w.socket, w);
+    }
+    seenId.add(w.id);
+    out.push(w);
+  }
+  return out;
+}
+
 function saveLayout() {
+  const norm = normalizeWorkspaces(workspaces);
+  const activeId = workspaces[activeWs]?.id;
+  const a = Math.max(0, norm.findIndex((w) => w.id === activeId));
   localStorage.setItem(
     LAYOUT_KEY,
-    JSON.stringify({ workspaces, active: activeWs, counter: wsCounter }),
+    JSON.stringify({ workspaces: norm, active: a, counter: wsCounter, deptCounter }),
   );
 }
 
@@ -1420,14 +1447,17 @@ function renderWsTabs() {
         await invoke("close_surface", { socket: ws.socket, surfaceId: sid }).catch(() => {});
         destroyPaneRuntime(sid, ws.socket);
       }
-      // 부서 workspace면 그 부서 데몬을 teardown(cys-dept down 일임)
-      if (ws.socket) await invoke("stop_dept_daemon", { name: ws.name }).catch(() => {});
-      workspaces.splice(idx, 1);
+      const i = workspaces.indexOf(ws); // 캡처된 idx는 stale일 수 있음 — 실시간 위치로 식별
+      if (i < 0) { render(); return; } // 이미 제거된 ws 재클릭 — no-op
+      workspaces.splice(i, 1);
+      // 부서 데몬 teardown은 '그 socket을 쓰는 마지막 탭'일 때만(중복 탭 잔존 시 다른 탭 보호)
+      const stillUsed = ws.socket && workspaces.some((w) => w.socket === ws.socket);
+      // socket 기준 teardown(order 8) — ws rename으로 name↔socket이 끊겨도 정확히 종료.
+      if (ws.socket && !stillUsed) await invoke("stop_dept_daemon_by_socket", { socket: ws.socket }).catch(() => {});
       if (workspaces.length === 0) {
         await addWorkspace(); // addWorkspace가 activeWs를 설정
-      } else if (idx < activeWs) {
-        activeWs -= 1; // 활성보다 앞 탭을 닫으면 인덱스가 한 칸 당겨진다
       } else {
+        if (i < activeWs) activeWs -= 1; // 활성보다 앞 탭을 닫으면 인덱스가 한 칸 당겨진다
         activeWs = Math.min(activeWs, workspaces.length - 1);
       }
       render();
@@ -1493,6 +1523,16 @@ async function addWorkspace(): Promise<Workspace> {
 async function addDeptWorkspace(name: string): Promise<Workspace> {
   const info = (await invoke("launch_dept_daemon", { name })) as { socket: string; socket_slug?: string };
   if (info.socket_slug && info.socket) socketForSlug.set(info.socket_slug, info.socket);
+  // 멱등 합류 — 같은 부서 socket의 탭이 이미 있으면(연타·재호출이 같은 데몬을 멱등 반환) 새 탭/고아 surface
+  // 생성 대신 기존 탭 활성화. 반드시 newSurface 전에 검사(고아 surface 방지).
+  const existing = workspaces.findIndex((w) => w.socket && w.socket === info.socket);
+  if (existing >= 0) {
+    activeWs = existing;
+    render();
+    const firstSid = collectSids(workspaces[existing].tree)[0];
+    if (firstSid != null) setFocus(firstSid);
+    return workspaces[existing];
+  }
   const sid = await newSurface(null, info.socket);
   const ws: Workspace = { id: wsCounter++, name, tree: { type: "pane", sid }, socket: info.socket };
   workspaces.push(ws);
@@ -1905,26 +1945,66 @@ async function start() {
     if (saved && Array.isArray(saved.workspaces)) {
       workspaces = saved.workspaces;
       activeWs = saved.active ?? 0;
-      wsCounter = saved.counter ?? workspaces.length + 1;
+      wsCounter = saved.counter ?? 1;
+      deptCounter = saved.deptCounter ?? deptCounter;
     }
   } catch {
     workspaces = [];
   }
   for (const ws of workspaces) ws.socket = ws.socket ?? undefined; // 하위호환 마이그레이션(기본 데몬)
+  // socket 1:1 수렴 + id 중복 제거(중복 탭 증식 차단) — 복원 적재 직후 단일 게이트.
+  workspaces = normalizeWorkspaces(workspaces);
+  // 카운터 보정: 신규 id/이름이 항상 기존 최댓값 초과하도록(중복·손상 저장본에도 강건)
+  wsCounter = Math.max(wsCounter, 0, ...workspaces.map((w) => w.id)) + 1;
+  deptCounter = Math.max(
+    deptCounter,
+    0,
+    ...workspaces.map((w) => {
+      const m = /^dept-(\d+)$/.exec(w.name);
+      return m ? +m[1] + 1 : 0;
+    }),
+  );
 
-  // 부서 데몬 확보를 list 대조보다 선행 — 미가동이면 cys-dept launch. 실패해도 ws는 보존.
+  // (order 8) 레지스트리 진실원 대조 — 죽은 socket이면서 레지스트리 미등록인 부서 ws는 유령(옛 테스트
+  // 잔재·삭제된 부서)이므로 재-launch 안 하고 드롭. 조회 실패 시엔 보수적으로 전부 보존(기존 동작).
+  let registered: Set<string> | null = null;
+  try {
+    const reg = (await invoke("list_depts")) as { depts?: Record<string, { socket?: string }> };
+    registered = new Set(
+      Object.values(reg.depts ?? {})
+        .map((v) => v?.socket)
+        .filter((s): s is string => !!s),
+    );
+  } catch {
+    registered = null;
+  }
+
+  // 부서 데몬 확보를 list 대조보다 선행 — 미가동이면 cys-dept launch. 실패해도(등록된) ws는 보존.
+  const ghosts = new Set<number>();
   for (const ws of workspaces.filter((w) => w.socket)) {
+    let alive = false;
     try {
       await invoke("daemon_status", { socket: ws.socket });
+      alive = true;
     } catch {
-      try {
-        const info = (await invoke("launch_dept_daemon", { name: ws.name })) as { socket: string; socket_slug?: string };
-        if (info.socket_slug && info.socket) socketForSlug.set(info.socket_slug, info.socket);
-      } catch {
-        /* 데몬 확보 실패 — ws는 빈 채 보존(저장본 삭제 금지) */
-      }
+      alive = false;
+    }
+    if (alive) continue;
+    // 죽은 socket + 레지스트리 미등록 → 유령 → 드롭(재-launch로 부활시키지 않음)
+    if (registered && ws.socket && !registered.has(ws.socket)) {
+      ghosts.add(ws.id);
+      continue;
+    }
+    // 등록된(또는 레지스트리 미조회) 부서 → 재-launch
+    try {
+      const info = (await invoke("launch_dept_daemon", { name: ws.name })) as { socket: string; socket_slug?: string };
+      if (info.socket_slug && info.socket) socketForSlug.set(info.socket_slug, info.socket);
+      if (info.socket) ws.socket = info.socket; // 재-launch된 실제 socket 반영(이후 집계·prune·병합 정합)
+    } catch {
+      /* 데몬 확보 실패 — 등록된 ws는 빈 채 보존(저장본 삭제 금지) */
     }
   }
+  if (ghosts.size) workspaces = workspaces.filter((w) => !ghosts.has(w.id));
 
   // 소켓별 live 집계 — 데몬 미응답(ok=false) 소켓은 판정 보류(죽은 pane 제거 스킵, ws 보존).
   const sockets = [...new Set(workspaces.map((w) => w.socket))];
@@ -2045,7 +2125,9 @@ let deptCounter = 1;
 document.getElementById("btn-ws-dept")?.addEventListener("click", () => {
   const used = new Set(workspaces.map((w) => w.name));
   while (used.has(`dept-${deptCounter}`)) deptCounter++;
-  addDeptWorkspace(`dept-${deptCounter}`).catch((e) => toast("watchdog", "부서 런칭 실패", String(e)));
+  const name = `dept-${deptCounter}`;
+  deptCounter++; // 동기 예약 — 빠른 연속 클릭이 addDeptWorkspace의 await(push) 전에 같은 이름을 재사용하지 않게
+  addDeptWorkspace(name).catch((e) => toast("watchdog", "부서 런칭 실패", String(e)));
 });
 
 window.addEventListener("keydown", (e) => {

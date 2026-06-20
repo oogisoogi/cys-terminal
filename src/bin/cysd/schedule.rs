@@ -400,13 +400,20 @@ async fn fire_push(daemon: &Arc<Daemon>, job: &Job) -> Result<String, String> {
         return Ok(format!("fresh-launched and pushed (surface:{sid})"));
     }
     let mut sid = daemon.roles.lock().unwrap().get(to).copied();
-    // 대상 surface가 죽어 있으면 부재로 간주
+    // 대상 surface가 죽어 있거나 agent-backed가 아니면(빈 셸) 부재로 간주.
+    // agent_meta=None인 surface(new-surface로 만든 빈 zsh 셸)에 자연어 프롬프트를 push하면
+    // 셸이 명령으로 해석해 깨진다(예: '[heartbeat]…' → zsh no matches). launch-agent로 등록된
+    // 에이전트 pane만 유효 대상 → 빈 셸은 if_absent 규칙으로 처리(owner 보고는 skip).
     if let Some(s) = sid {
-        let alive = daemon
+        let valid = daemon
             .get_surface(s)
-            .map(|surf| !surf.exited.load(std::sync::atomic::Ordering::Relaxed))
+            .map(|surf| {
+                let alive = !surf.exited.load(std::sync::atomic::Ordering::Relaxed);
+                let is_agent = surf.agent_meta.lock().unwrap().is_some();
+                alive && is_agent
+            })
             .unwrap_or(false);
-        if !alive {
+        if !valid {
             sid = None;
         }
     }
