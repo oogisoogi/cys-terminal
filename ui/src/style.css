@@ -77,6 +77,8 @@ html, body {
 }
 .ws-tab.active .ws-name { color: #fff; }
 .ws-tab.active .ws-sub { color: rgba(255, 255, 255, .75); }
+.ws-tab .ws-sub-pending { color: #58a6ff; animation: cc-blink 1.4s infinite; }
+#btn-ws-dept:disabled { opacity: .5; cursor: default; }
 .ws-tab .ws-close {
   flex: none; opacity: 0; cursor: pointer; color: inherit; font-size: 12px;
 }

@@ -33,6 +33,9 @@ interface Workspace {
   tree: Node | null;
   // 멀티마스터 F4: 이 workspace가 붙은 부서 데몬 소켓(undefined=기본 데몬). 한 ws의 모든 pane은 같은 socket.
   socket?: string;
+  // 부서 런칭 중 임시 placeholder 표식 — 무거운 launch await 동안 탭을 즉시 표시(체감 지연 0)하기 위함.
+  // launch 완료 시 false로 내리고, 실패 시 ws 자체를 제거한다. 직렬화 제외(normalizeWorkspaces)로 디스크/복원 누수 차단.
+  pending?: boolean;
 }
 
 const LAYOUT_KEY = "cys-layout-v2";
@@ -796,6 +799,7 @@ function normalizeWorkspaces(list: Workspace[]): Workspace[] {
   const seenSock = new Map<string, Workspace>();
   const out: Workspace[] = [];
   for (const w of list) {
+    if (w.pending) continue; // 런칭 중 임시 placeholder는 저장·복원에서 배제 (미완료 유령 탭 누수 차단)
     if (seenId.has(w.id)) continue;
     if (w.socket) {
       const prev = seenSock.get(w.socket);
@@ -888,9 +892,13 @@ async function refreshPaneTitles() {
       }
       // 자동 입양: 그 소켓의 role surface 중 UI에 없는 것 → '같은 소켓을 가진 ws'에만 표출.
       // ★소켓 일치 가드 — 부서A 노드가 부서B 탭에 잘못 입양되는 격리 누수 차단(검증 mustFix).
-      for (const s of r.surfaces) {
+      // role 우선순위(master>cso>worker>reviewer) 정렬 — 부서 첫 입양 시 master가 첫 pane(좌측·focus)이 되도록.
+      const rolePri = (role: string | null): number =>
+        role === "master" ? 0 : role === "cso" ? 1 : role?.startsWith("worker") ? 2 : role?.startsWith("reviewer") ? 3 : 4;
+      for (const s of [...r.surfaces].sort((a, b) => rolePri(a.role) - rolePri(b.role))) {
         if (s.exited || !s.role || panes.has(paneKey(s.surface_id, sk))) continue;
-        const ws = workspaces.find((w) => (w.socket ?? undefined) === (sk ?? undefined));
+        // !w.pending — 런칭 중 placeholder(socket 미정)에는 입양 금지(타 데몬 surface 오입양 차단).
+        const ws = workspaces.find((w) => !w.pending && (w.socket ?? undefined) === (sk ?? undefined));
         if (!ws || collectSids(ws.tree).includes(s.surface_id)) continue;
         await makePane(s.surface_id, s.title, sk);
         ws.tree = ws.tree
@@ -899,7 +907,13 @@ async function refreshPaneTitles() {
         adopted = true;
       }
     }
-    if (adopted) render();
+    if (adopted) {
+      render();
+      // 자동입양으로 pane이 생긴 활성 ws에 유효 포커스가 없으면 그 첫 pane에 포커스(포커스 회수, 탈취 아님).
+      // 안 A: 부서 master 첫 등장 시 — 빈 셸이 없으므로 master pane으로 직행한다.
+      const aSids = collectSids(current()?.tree ?? null);
+      if (aSids.length && (focusedSid == null || !aSids.includes(focusedSid))) setFocus(aSids[0]);
+    }
   } catch {
     /* 데몬 일시 미응답은 다음 틱에 */
   } finally {
@@ -1396,7 +1410,12 @@ function renderWsTabs() {
       panes.get(paneKey(sids[0] ?? -1, ws.socket))?.titleEl.textContent ?? "";
     const sub = document.createElement("span");
     sub.className = "ws-sub";
-    sub.textContent = `${sids.length} pane${firstTitle ? ` · ${firstTitle}` : ""}`;
+    if (ws.pending) {
+      sub.textContent = "부서 데몬 시작 중…";
+      sub.classList.add("ws-sub-pending");
+    } else {
+      sub.textContent = `${sids.length} pane${firstTitle ? ` · ${firstTitle}` : ""}`;
+    }
     tab.append(titleRow, sub);
     tab.addEventListener("mousedown", (e) => {
       // 우클릭은 전환하지 않음 — render()가 탭 DOM을 재생성하면 컨텍스트 메뉴가 죽은 엘리먼트를 잡는다
@@ -1523,26 +1542,50 @@ async function addWorkspace(): Promise<Workspace> {
 
 // 멀티마스터 F4: 새 '부서 workspace' 런칭 = 새 부서 데몬 spawn(cys-dept launch 단일 진입점).
 // 첫 부서가 생기면 백엔드(cys-dept)가 기본 데몬을 CEO로 자동 승격한다.
+// ① 표시 지연(안 C): 무거운 launch await(최대 ~12s) '전에' placeholder 탭을 즉시 render — 체감 지연 0.
+// ② 고아 방지(안 A): 빈 newSurface를 만들지 않는다. cys-dept가 띄우는 role=master surface가
+//    refreshPaneTitles 자동입양으로 '첫 pane'이 되게 한다(빈 셸 미생성 → 고아 0).
 async function addDeptWorkspace(name: string): Promise<Workspace> {
-  const info = (await invoke("launch_dept_daemon", { name })) as { socket: string; socket_slug?: string };
-  if (info.socket_slug && info.socket) socketForSlug.set(info.socket_slug, info.socket);
-  // 멱등 합류 — 같은 부서 socket의 탭이 이미 있으면(연타·재호출이 같은 데몬을 멱등 반환) 새 탭/고아 surface
-  // 생성 대신 기존 탭 활성화. 반드시 newSurface 전에 검사(고아 surface 방지).
-  const existing = workspaces.findIndex((w) => w.socket && w.socket === info.socket);
-  if (existing >= 0) {
-    activeWs = existing;
-    render();
-    const firstSid = collectSids(workspaces[existing].tree)[0];
-    if (firstSid != null) setFocus(firstSid);
-    return workspaces[existing];
-  }
-  const sid = await newSurface(null, info.socket);
-  const ws: Workspace = { id: wsCounter++, name, tree: { type: "pane", sid }, socket: info.socket };
+  // 클릭 즉시 placeholder 탭(tree:null·socket 미정) push+render — launch await 동안 시각 피드백 제공.
+  const ws: Workspace = { id: wsCounter++, name, tree: null, pending: true };
   workspaces.push(ws);
   activeWs = workspaces.length - 1;
   render();
-  setFocus(sid);
-  return ws;
+  try {
+    const info = (await invoke("launch_dept_daemon", { name })) as { socket: string; socket_slug?: string };
+    if (info.socket_slug && info.socket) socketForSlug.set(info.socket_slug, info.socket);
+    // 멱등 합류 — 같은 부서 socket의 (이 placeholder가 아닌) 탭이 이미 있으면(연타·재호출이 같은 데몬을
+    // 멱등 반환) placeholder를 폐기하고 기존 탭을 활성화한다. w !== ws 가드로 자기 자신과 오매칭 방지.
+    const dup = workspaces.find((w) => w !== ws && w.socket && w.socket === info.socket);
+    // placeholder가 launch await 중 탭 ×로 닫혔으면: 같은 소켓을 쓰는 다른 탭(dup)이 없을 때
+    // 방금 spawn된 부서 데몬을 회수해 무탭 headless 누수를 막는다(close 핸들러는 socket 미정이라 미회수).
+    if (workspaces.indexOf(ws) < 0) {
+      if (!dup && info.socket) await invoke("stop_dept_daemon_by_socket", { socket: info.socket }).catch(() => {});
+      return dup ?? ws;
+    }
+    if (dup) {
+      const pi = workspaces.indexOf(ws);
+      if (pi >= 0) workspaces.splice(pi, 1); // indexOf -1 시 splice(-1,1)이 엉뚱한 ws 제거하는 것 방지
+      activeWs = Math.max(0, workspaces.indexOf(dup));
+      render();
+      const firstSid = collectSids(dup.tree)[0];
+      if (firstSid != null) setFocus(firstSid);
+      return dup;
+    }
+    // socket만 확정하고 빈 surface는 만들지 않는다 — master role surface를 자동입양이 첫 pane으로 채운다.
+    ws.socket = info.socket;
+    ws.pending = false;
+    render();
+    refreshPaneTitles(); // 즉시 1회 입양 시도 — 3초 인터벌을 기다리지 않게(master가 이미 떴으면 바로 입양)
+    return ws;
+  } catch (e) {
+    // 실패 시 placeholder 롤백 — 유령 탭이 남지 않게 제거.
+    const i = workspaces.indexOf(ws);
+    if (i >= 0) workspaces.splice(i, 1);
+    if (activeWs >= workspaces.length) activeWs = Math.max(0, workspaces.length - 1);
+    render();
+    throw e;
+  }
 }
 
 // ---------- actions ----------
@@ -1571,6 +1614,7 @@ async function firstPaneCwd(): Promise<string | null> {
 }
 
 async function actionNew() {
+  if (current()?.pending) return; // 부서 데몬 준비 중(빈 socket placeholder) — surface 생성 금지(기본 데몬 고아 차단)
   const sid = await newSurface(await firstPaneCwd(), current().socket);
   const ws = current();
   ws.tree = ws.tree
@@ -2039,7 +2083,14 @@ async function start() {
       if (!lb.ids.has(sid)) ws.tree = ws.tree ? replaceNode(ws.tree, sid, () => null) : null;
     }
   }
-  workspaces = workspaces.filter((ws) => ws.tree !== null || liveBySock.get(ws.socket)?.ok === false);
+  // 안 A: 부서 ws는 tree:null(빈 셸 미생성)로 저장될 수 있다 — 데몬이 살아있고 입양할 live surface가
+  // 있으면(master 등) 드롭하지 말고 보존한다. 아래 입양 루프(병합)가 그 surface로 tree를 채운다.
+  workspaces = workspaces.filter(
+    (ws) =>
+      ws.tree !== null ||
+      liveBySock.get(ws.socket)?.ok === false ||
+      (ws.socket != null && (liveBySock.get(ws.socket)?.ids.size ?? 0) > 0),
+  );
   // 구버전 자동 번호 이름("ws N")은 미정 표시로 이행
   for (const ws of workspaces) {
     if (/^ws \d+$/.test(ws.name)) ws.name = UNTITLED;
@@ -2128,12 +2179,22 @@ document.getElementById("btn-update")!.addEventListener("click", () => promptIns
 document.getElementById("btn-ws-new")!.addEventListener("click", () => addWorkspace());
 // 멀티마스터 F4: 새 부서(독립 데몬) workspace 런칭. 부서명 자동(dept-N) — WKWebView prompt 무동작이라 자동 번호.
 let deptCounter = 1;
-document.getElementById("btn-ws-dept")?.addEventListener("click", () => {
+const deptBtn = document.getElementById("btn-ws-dept") as HTMLButtonElement | null;
+deptBtn?.addEventListener("click", () => {
+  if (deptBtn.disabled) return; // 연타 차단 — in-flight launch 중 재클릭이 별도 부서 데몬을 spawn하지 않게
   const used = new Set(workspaces.map((w) => w.name));
   while (used.has(`dept-${deptCounter}`)) deptCounter++;
   const name = `dept-${deptCounter}`;
   deptCounter++; // 동기 예약 — 빠른 연속 클릭이 addDeptWorkspace의 await(push) 전에 같은 이름을 재사용하지 않게
-  addDeptWorkspace(name).catch((e) => toast("watchdog", "부서 런칭 실패", String(e)));
+  const prevLabel = deptBtn.textContent;
+  deptBtn.disabled = true;
+  deptBtn.textContent = "…"; // 진행 표시 — launch await 동안(placeholder 탭은 즉시 보임)
+  addDeptWorkspace(name)
+    .catch((e) => toast("watchdog", "부서 런칭 실패", String(e)))
+    .finally(() => {
+      deptBtn.disabled = false;
+      deptBtn.textContent = prevLabel;
+    });
 });
 
 window.addEventListener("keydown", (e) => {
