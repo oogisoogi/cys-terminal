@@ -1350,12 +1350,12 @@ function roleLayout(sids: number[], roleOf: Map<number, string | null>): Node {
 async function actionEqualize() {
   const ws = current();
   if (!ws?.tree) return;
-  const live = collectSids(ws.tree).filter((sid) => panes.has(sid)); // 죽은/placeholder 노드 제외
+  const live = collectSids(ws.tree).filter((sid) => panes.has(paneKey(sid, ws.socket))); // 죽은/placeholder 노드 제외 (F4 복합키)
   if (live.length < 2) return; // 0~1개는 정렬할 대상이 없음
   // 역할은 데몬 surface.list에서 조회 (UI 생성 pane은 role=null → 가운데로)
   const roleOf = new Map<number, string | null>();
   try {
-    const r = (await invoke("list_surfaces")) as { surfaces: { surface_id: number; role: string | null }[] };
+    const r = (await invoke("list_surfaces", { socket: ws.socket })) as { surfaces: { surface_id: number; role: string | null }[] };
     for (const s of r.surfaces) roleOf.set(s.surface_id, s.role);
   } catch {
     /* 데몬 일시 미응답: role 없이 진행 → 전부 가운데 균등 */
@@ -1628,7 +1628,9 @@ function removeDeadPane(sid: number, socket?: string) {
       ws.tree = replaceNode(ws.tree, sid, () => null);
     }
   }
-  if (focusedSid === sid) focusedSid = collectSids(current()?.tree ?? null)[0] ?? null;
+  // 포커스 이동은 죽은 pane이 '활성 ws(동일 socket)' 소속일 때만 — 타부서 동일 sid 종료가 현 포커스를 오해제하지 않게.
+  if (focusedSid === sid && (current()?.socket ?? undefined) === (socket ?? undefined))
+    focusedSid = collectSids(current()?.tree ?? null)[0] ?? null;
   render();
   if (focusedSid != null) setFocus(focusedSid);
 }
@@ -1669,7 +1671,7 @@ function setFtOpen(open: boolean) {
 async function updateFtRoot() {
   if (!ftOpen || focusedSid == null) return;
   try {
-    const r = (await invoke("list_surfaces")) as {
+    const r = (await invoke("list_surfaces", { socket: current()?.socket })) as {
       surfaces: { surface_id: number; live_cwd: string | null }[];
     };
     const cwd = r.surfaces.find((s) => s.surface_id === focusedSid)?.live_cwd ?? null;
@@ -1905,6 +1907,7 @@ function onDaemonEvent(event: Record<string, unknown>) {
     // 종료 즉시 죽은 pane 자동 제거 (A안) — 데몬 reap을 기다리지 않는다. 멱등.
     // 멀티마스터 F4: 출처 데몬을 socket_slug로 특정해 그 부서 pane만 제거(타 부서 같은 sid 보호).
     const sock = event.socket_slug ? socketForSlug.get(String(event.socket_slug)) : undefined;
+    if (event.socket_slug && !sock) return; // slug 명시됐는데 미해결 → 기본 데몬 폴백 금지(타부서 동일 sid 오제거 방지)
     removeDeadPane(Number(sid), sock);
   }
 }
