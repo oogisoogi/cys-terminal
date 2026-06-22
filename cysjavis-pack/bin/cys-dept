@@ -145,6 +145,17 @@ ceo_demote(){
 }
 
 cmd="${1:?usage: cys-dept launch|allocate|create|down|list|sock <name> | <name> -- <cmd>}"
+# ★단일소유 기술 강제(CEO 2026-06-22): 부서 lifecycle mutation은 CSO(CYS_ROLE=cso)·GUI(role 없음·박사님
+# 직접)만 허용한다. roled 비-CSO 노드(부서장 master·워커·리뷰어·CEO)의 cys-dept create/down 직접 호출을
+# 차단해 다중주체 churn(빈 dept-N·중복·레이스)을 기술적으로 방지. (defense-in-depth — 의도적 unset 우회는
+# 거버넌스 영역이나, 정상 다중 노드 churn은 차단). 읽기 전용(list/sock/<name> --)은 무제한.
+case "$cmd" in
+  launch|allocate|create|down|down-sock)
+    if [ -n "${CYS_ROLE:-}" ] && [ "${CYS_ROLE}" != "cso" ]; then
+      echo "[cys-dept] ★단일소유 강제: 부서 lifecycle mutation은 CSO/GUI 전용(CYS_ROLE=$CYS_ROLE 차단·다중 churn 방지). CSO에 요청하라." >&2
+      exit 7
+    fi ;;
+esac
 case "$cmd" in
   launch)
     name="${2:?usage: cys-dept launch <name>}"
