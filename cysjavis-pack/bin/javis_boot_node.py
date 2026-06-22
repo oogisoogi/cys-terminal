@@ -72,6 +72,7 @@ ROLE_AGENT = {
 }
 # role → (각성 지침에서 가리킬 디렉티브 자연어 명칭[확장자 없음 — F4], 기본 set-status state)
 ROLE_DIRECTIVE = {
+    "master":          ("MASTER(부서장) 절대지침", "working"),
     "cso":             ("CSO(최고 시스템 운영자) 절대지침", "working"),
     "worker":          ("WORKER(워커) 절대지침", "waiting"),
     "reviewer-gemini": ("REVIEWER(리뷰어) 절대지침", "waiting"),

@@ -31,7 +31,10 @@ lf=open(p+'.lock','w'); fcntl.flock(lf,fcntl.LOCK_EX)
 try:
     try: d=json.load(open(p))
     except Exception: d={'depts':{}}
-    d.setdefault('depts',{})[n]={'socket':s,'pack_dir':k,'role':'dept-master'}
+    # F2(codex#2): full-replace 대신 merge — 기존 메타(display_name/account/mission_key) 보존.
+    # launch 재진입 시 create가 심은 메타 소실 방지. 신규 엔트리는 3필드만(하위호환).
+    e=d.setdefault('depts',{}).setdefault(n,{})
+    e.update({'socket':s,'pack_dir':k,'role':'dept-master'})
     tmp=p+'.tmp.%d'%os.getpid()
     with open(tmp,'w') as f: json.dump(d,f,ensure_ascii=False,indent=2); f.flush(); os.fsync(f.fileno())
     os.replace(tmp,p)
@@ -46,6 +49,25 @@ try:
     try: d=json.load(open(p))
     except Exception: d={'depts':{}}
     d.setdefault('depts',{}).pop(n,None)
+    tmp=p+'.tmp.%d'%os.getpid()
+    with open(tmp,'w') as f: json.dump(d,f,ensure_ascii=False,indent=2); f.flush(); os.fsync(f.fileno())
+    os.replace(tmp,p)
+finally: fcntl.flock(lf,fcntl.LOCK_UN)
+PY
+}
+# reg_set_meta: 기존 엔트리에 display_name·account·mission_key 를 merge(socket/pack_dir/role 보존).
+# reg_upsert 시그니처 불변(launch 회귀0) — ＋부서 자동화(cys-dept create)용 신설. flock RMW·원자교체.
+reg_set_meta(){ reg_init; python3 - "$REG" "$1" "$2" "$3" <<'PY'
+import json,sys,os,fcntl
+p,n,disp,acct=sys.argv[1:5]
+lf=open(p+'.lock','w'); fcntl.flock(lf,fcntl.LOCK_EX)
+try:
+    try: d=json.load(open(p))
+    except Exception: d={'depts':{}}
+    e=d.setdefault('depts',{}).get(n)
+    if e is None:   # ★fail-closed(CSO GAP①): create가 base 엔트리 선기록 → 부재=버그 → no-op 말고 에러
+        sys.stderr.write("reg_set_meta: 엔트리 부재 %s — fail-closed(예약 base 미기록=버그)\n"%n); sys.exit(1)
+    e['display_name']=disp; e['account']=acct   # mission_key는 예약시 원자기록(중복 set 제거)
     tmp=p+'.tmp.%d'%os.getpid()
     with open(tmp,'w') as f: json.dump(d,f,ensure_ascii=False,indent=2); f.flush(); os.fsync(f.fileno())
     os.replace(tmp,p)
@@ -67,6 +89,30 @@ seed_acl(){
   ]
 }
 JSON
+}
+
+# F1(codex#1·verdict-D): 부서 pack 에 agents.json 을 명시 시드 — claude.cmd 의 CLAUDE_CONFIG_DIR 을
+# 해당 account dir 로 **직접 치환**(하드코딩). 이렇게 하면 cysd 임베드 버전·CYS_ACCOUNT_DIR 전파(patch2)
+# 에 비의존하여 계정격리가 완결된다(rebuild 전 deployed 구 cysd 로도 동작). 가드 str-replace + 쓰기후
+# json 검증 + 리터럴 미발견 시 fail-closed(비격리 시드 금지). 멱등(재시드 시 account 만 갱신).
+seed_agents_account(){
+  local pk="$1" acct_dir="$2"
+  local src="${CYS_PACK_DIR:-$HOME/.cys/pack}/agents.json"
+  mkdir -p "$pk"
+  python3 - "$src" "$pk/agents.json" "$acct_dir" <<'PY'
+import json,sys,os,re
+src,dst,acct=sys.argv[1:4]
+d=json.load(open(src))                                  # 디코드된 문자열
+cmd=d["claude"]["cmd"]
+if not re.search(r'CLAUDE_CONFIG_DIR="[^"]*"', cmd):    # fail-closed: 패턴 없으면 비격리 시드 금지
+    sys.stderr.write("seed_agents_account: CLAUDE_CONFIG_DIR 리터럴 미발견 — abort\n"); sys.exit(1)
+d["claude"]["cmd"]=re.sub(r'CLAUDE_CONFIG_DIR="[^"]*"',
+                         lambda m: 'CLAUDE_CONFIG_DIR="%s"'%acct, cmd, count=1)  # 함수 repl=backref 무관
+tmp=dst+".tmp.%d"%os.getpid()
+with open(tmp,"w") as f: json.dump(d,f,ensure_ascii=False,indent=2); f.flush(); os.fsync(f.fileno())
+json.load(open(tmp))                                    # 쓰기후 파싱 검증
+os.replace(tmp,dst)
+PY
 }
 
 # 부서 schedule 시드 — owner-progress-report(5/15분 보고)는 최상위(owner/CEO) 데몬만 돌려야 한다.
@@ -98,7 +144,7 @@ ceo_demote(){
   echo "[cys-dept] CEO 강등(표준 master 원복)"
 }
 
-cmd="${1:?usage: cys-dept launch|down|list|sock <name> | <name> -- <cmd>}"
+cmd="${1:?usage: cys-dept launch|allocate|create|down|list|sock <name> | <name> -- <cmd>}"
 case "$cmd" in
   launch)
     name="${2:?usage: cys-dept launch <name>}"
@@ -113,16 +159,172 @@ case "$cmd" in
       disown
       # 기동 실패 시 reg_upsert 롤백 — 유령 부서(데몬 없는 레지스트리 항목) 잔류 방지
       ready "$sock" || { reg_remove "$name"; echo "[cys-dept] ERROR: $name 데몬 기동 실패"; exit 1; }
-      # 부서장 master는 데몬 첫 기동 시 1회만 — 재-launch(재사용)에선 생략(좀비 master 누적 방지).
-      # launch-agent로 진짜 부서장(claude) 에이전트 기동(빈 셸 아님 → 하트비트 정상 소비·지침 주입).
-      # ★백그라운드 — launch-agent는 readiness 폴링으로 수 초 막으므로, ＋부서(launch_dept_daemon)가
-      #   그동안 멈추지 않게 비차단 기동한다(부서장 surface는 잠시 후 등장·UI가 자동 입양).
-      ( CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" "$CYS" launch-agent --role master --agent claude >/dev/null 2>&1 || true ) &
-      disown
     fi
     seed_schedule "$pack"   # owner-progress-report 제거(부서는 최상위 보고 안 함) — 데몬 30초 핫리로드로 반영
     ceo_promote
     echo "[cys-dept] $name 가동 완료 (sock=$sock pack=$pack). 부서 수=$(reg_count)"
+    ;;
+  allocate)
+    # 번호계산+예약을 단일 flock 블록에 묶어 TOCTOU 제거 — lowest-unused dept-N을 발급·예약(원자).
+    # 시나리오2: 레지스트리엔 빠졌어도 소켓을 점유 중인(죽어가는) 데몬 번호는 alive() probe로 skip.
+    name=$(reg_init; python3 - "$REG" <<'PY'
+import json,sys,os,fcntl,re,socket as S
+p=sys.argv[1]
+lf=open(p+'.lock','w'); fcntl.flock(lf,fcntl.LOCK_EX)
+try:
+    try: d=json.load(open(p))
+    except Exception: d={'depts':{}}
+    depts=d.setdefault('depts',{})
+    used={int(m.group(1)) for k in depts if (m:=re.match(r'^dept-(\d+)$',k))}
+    home=os.path.expanduser('~')
+    def alive(n):  # 시나리오2: 레지스트리엔 빠졌어도 소켓 점유(죽어가는 데몬)면 그 번호 재사용 금지
+        sk=f"{home}/.local/state/cys-dept-dept-{n}/cys.sock"
+        if not os.path.exists(sk): return False
+        try:
+            c=S.socket(S.AF_UNIX); c.settimeout(0.2); c.connect(sk); c.close(); return True
+        except Exception: return False
+    N=1
+    while N in used or alive(N): N+=1
+    name=f"dept-{N}"
+    depts[name]={'socket':f"{home}/.local/state/cys-dept-{name}/cys.sock",
+                 'pack_dir':f"{home}/.cys/pack-dept-{name}",'role':'dept-master'}
+    tmp=p+'.tmp.%d'%os.getpid()
+    with open(tmp,'w') as f: json.dump(d,f,ensure_ascii=False,indent=2); f.flush(); os.fsync(f.fileno())
+    os.replace(tmp,p)
+    print(name)
+finally: fcntl.flock(lf,fcntl.LOCK_UN)
+PY
+)
+    [ -n "$name" ] || { echo "[cys-dept] allocate: 번호 발급 실패" >&2; exit 1; }
+    trap 'reg_remove "$name" 2>/dev/null || true' EXIT   # 예약 후 비정상종료=예약 회수(SIGKILL 제외)
+    sock="$(dept_sock "$name")"; pack="$(dept_pack "$name")"
+    mkdir -p "$(dirname "$sock")" "$pack/directives"
+    seed_acl "$pack"
+    if ready "$sock"; then echo "[cys-dept] $name 이미 가동 중 — 재사용" >&2
+    else
+      CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" nohup "$CYSD" >"$(dirname "$sock")/cysd.log" 2>&1 &
+      disown
+      ready "$sock" || { reg_remove "$name"; echo "[cys-dept] ERROR: $name 데몬 기동 실패" >&2; exit 1; }
+    fi
+    seed_schedule "$pack"
+    ceo_promote 1>&2   # ceo_promote의 승격 메시지를 stderr로 — allocate stdout은 name만(파서 오염 차단)
+    trap - EXIT   # 성공 — 회수 취소
+    echo "[cys-dept] $name allocate 완료 (sock=$sock)" >&2
+    echo "$name"   # ★stdout 마지막 줄 = 확정 name (Tauri 파싱). 진단은 전부 >&2
+    ;;
+  create)
+    # ＋부서 자동화: 카탈로그 기반 완전 자동 부서 생성(부서명·계정·미션·각성). 레거시 allocate 무변경.
+    key="${2:?usage: cys-dept create <catalog-key>}"
+    CAT="${CYS_DEPT_CATALOG:-$HOME/.cys/dept-catalog.json}"
+    MISS="${CYS_DEPT_MISSIONS:-$HOME/.cys/dept-missions}"
+    [ -f "$CAT" ] || { echo "[cys-dept] 카탈로그 부재: $CAT (GUI=레거시 allocate fallback)" >&2; exit 3; }  # fail-closed
+    # 카탈로그 조회 + account dir 해석($HOME 전개). 파싱실패/키부재=fail-closed.
+    IFS=$'\t' read -r disp acctkey acctdir mkey cwd < <(python3 - "$CAT" "$key" <<'PY'
+import json,sys,os
+cat,key=sys.argv[1:3]
+d=json.load(open(cat))                                   # 파싱실패=예외=비0=fail-closed
+dep=d['departments'].get(key)
+if not dep: sys.exit(4)
+acct=dep['account']; acctdir=os.path.expandvars(d['accounts'][acct])
+# 탭 구분(codex 비차단 하드닝): display/cwd 에 공백 있어도 필드 안 깨짐(공백필드 취약성 제거)
+print('\t'.join([dep['display'], acct, acctdir, dep['mission_key'], os.path.expandvars(dep['cwd'])]))
+PY
+) || { echo "[cys-dept] 카탈로그 키 미정의/손상: $key" >&2; exit 4; }
+    [ -d "$acctdir" ] || { echo "[cys-dept] account dir 미존재(계정누수 차단): $acctdir" >&2; exit 5; }  # fail-closed
+    # F3(codex): 멱등검사+예약을 단일 flock 원자. ★같은 mission_key 엔트리=청구됨 → REUSE(데몬 생사 무관·
+    #   호출부가 ensure-ready). 신규는 lowest-unused 예약 + ★엔트리에 mission_key 기록(동시/부팅중 다른
+    #   create가 즉시 발견 — codex: NEW 엔트리에 mission_key 누락 TOCTOU 해소).
+    res=$(reg_init; CYS_GRACE="${CYS_DEPT_RESERVE_GRACE:-25}" python3 - "$REG" "$mkey" "$cwd" "$acctdir" <<'PY'
+import json,sys,os,fcntl,re,time,socket as S
+p,mkey,cwd,acctdir=sys.argv[1:5]
+home=os.path.expanduser('~'); GRACE=float(os.environ.get("CYS_GRACE","25"))
+def alive_sock(sk):
+    if not sk or not os.path.exists(sk): return False
+    try: c=S.socket(S.AF_UNIX); c.settimeout(0.2); c.connect(sk); c.close(); return True
+    except Exception: return False
+lf=open(p+'.lock','w'); fcntl.flock(lf,fcntl.LOCK_EX)
+try:
+    try: d=json.load(open(p))
+    except Exception: d={'depts':{}}
+    depts=d.setdefault('depts',{}); now=time.time()
+    # 멱등(원자): 같은 mission_key 엔트리=청구됨 → REUSE. 死活+reserved_at grace로 3분기(CSO 봉인):
+    #   UP=서빙중 즉시반환 / BOOTING=생성자 부팅중(grace내)→신뢰·반환(boot tail 안 함=더블각성·더블미션 봉인)
+    #   DEAD=grace 경과·미생존→호출부 ensure-up revive. (grace 없으면 부팅중을 死로 오판→ensure-up 더블부트)
+    for n,e in depts.items():
+        if e.get('mission_key')!=mkey: continue
+        if alive_sock(e.get('socket','')): print("REUSE_UP "+n); sys.exit(0)
+        if now-float(e.get('reserved_at',0))<GRACE: print("REUSE_BOOTING "+n); sys.exit(0)
+        # ★R3.1(CSO·codex R3-REUSE-DEAD-CONCURRENT-REVIVE+META-STALE): 반환 전 같은 flock에서
+        #   reserved_at=now 재청구 + cwd/account_dir 최신 catalog로 갱신 → 동시 follower=REUSE_BOOTING(더블부트 봉인)·메타 최신.
+        e['reserved_at']=now; e['cwd']=cwd; e['account_dir']=acctdir
+        tmp=p+'.tmp.%d'%os.getpid()
+        with open(tmp,'w') as f: json.dump(d,f,ensure_ascii=False,indent=2); f.flush(); os.fsync(f.fileno())
+        os.replace(tmp,p)
+        print("REUSE_DEAD "+n); sys.exit(0)
+    # 신규 예약(lowest-unused·소켓 점유 번호 skip) — mission_key+reserved_at+메타 즉시 원자기록
+    used={int(m.group(1)) for k in depts if (m:=re.match(r'^dept-(\d+)$',k))}
+    N=1
+    while N in used or alive_sock(f"{home}/.local/state/cys-dept-dept-{N}/cys.sock"): N+=1
+    name=f"dept-{N}"
+    depts[name]={'socket':f"{home}/.local/state/cys-dept-{name}/cys.sock",
+                 'pack_dir':f"{home}/.cys/pack-dept-{name}",'role':'dept-master',
+                 'mission_key':mkey,'cwd':cwd,'account_dir':acctdir,'reserved_at':now}
+    tmp=p+'.tmp.%d'%os.getpid()
+    with open(tmp,'w') as f: json.dump(d,f,ensure_ascii=False,indent=2); f.flush(); os.fsync(f.fileno())
+    os.replace(tmp,p)
+    print("NEW "+name)
+finally: fcntl.flock(lf,fcntl.LOCK_UN)
+PY
+)
+    verb="${res%% *}"; name="${res#* }"
+    [ -n "$name" ] || { echo "[cys-dept] create: 예약 실패" >&2; exit 1; }
+    sock="$(dept_sock "$name")"; pack="$(dept_pack "$name")"
+    # 멱등 3분기 봉인(CSO): UP/BOOTING=즉시반환(boot tail 안 함=더블각성·더블미션 봉인)·DEAD=ensure-up revive·NEW=신규.
+    case "$verb" in
+      REUSE_UP)      echo "[cys-dept] $key 이미 생존($name) — 재사용" >&2; echo "$name"; exit 0 ;;
+      REUSE_BOOTING) echo "[cys-dept] $key 생성자 부팅중($name) — 신뢰·재사용(중복부트 차단)" >&2; echo "$name"; exit 0 ;;
+      REUSE_DEAD)    echo "[cys-dept] $key 등록부 잔존($name)·데몬 사망(grace 경과) → ensure-up 재기동" >&2 ;;
+      NEW)           : ;;
+      *)             echo "[cys-dept] create: 미지 verb '$verb'" >&2; exit 1 ;;
+    esac
+    # ── ensure-up: 데몬 기동 + 시드 + 격리 + 부서장 (NEW · REUSE-사망 공통) ──
+    if [ "$verb" = "NEW" ]; then trap 'reg_remove "$name" 2>/dev/null || true' EXIT; fi  # NEW만 실패 시 예약회수(REUSE는 기존 보존)
+    mkdir -p "$(dirname "$sock")" "$pack/directives"
+    seed_acl "$pack"
+    if ready "$sock"; then echo "[cys-dept] $name 이미 가동 — 재사용" >&2
+    else
+      # ★계정 격리: 데몬을 CYS_ACCOUNT_DIR 와 함께 spawn(patch2 있으면 자식 전파·없으면 F1 시드가 보장)
+      CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" CYS_ACCOUNT_DIR="$acctdir" nohup "$CYSD" >"$(dirname "$sock")/cysd.log" 2>&1 &
+      disown
+      ready "$sock" || { if [ "$verb" = "NEW" ]; then reg_remove "$name"; fi; echo "[cys-dept] ERROR: $name 데몬 기동 실패" >&2; exit 1; }
+    fi
+    # ★R3.1(CSO·codex R3-REG-SET-META-ORPHAN): 데몬 up 확정 후 실패 trap을 풀teardown(down=kill+소켓+reg)으로 업그레이드.
+    #   이후 reg_set_meta fail-closed/시드/각성에서 set -e 종료해도 이미 뜬 데몬 orphan 0. NEW·REUSE_DEAD 공통.
+    trap '"$0" down "$name" >/dev/null 2>&1 || true' EXIT
+    seed_schedule "$pack"
+    ceo_promote 1>&2
+    reg_set_meta "$name" "$disp" "$acctkey"   # display_name/account merge(mission_key는 예약시 원자기록·socket/role 보존)
+    # F1(codex#1) ★fail-closed: agents.json 계정시드 실패 시 부트 안 함·teardown(비격리 부서장 금지·fail-open 차단).
+    if ! seed_agents_account "$pack" "$acctdir"; then
+      echo "[cys-dept] ERROR: $name agents.json 계정시드 실패 — fail-closed: 부트 중단·teardown" >&2
+      "$0" down "$name" >/dev/null 2>&1 || true
+      exit 6
+    fi
+    trap - EXIT   # 격리 확정 — 이후 각성/미션
+    # ★부서장 자동 각성(verdict B: 부서 소켓 컨텍스트) — 미션은 ★boot 성공 시에만(codex: boot 실패 후 주입 금지)
+    if CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" CYS_ACCOUNT_DIR="$acctdir" \
+         python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_boot_node.py" \
+           --role master --agent claude --cwd "$cwd" 1>&2; then
+      if [ -f "$MISS/$key.md" ]; then
+        CYS_SOCKET="$sock" "$CYS" send --queued --to master "$(cat "$MISS/$key.md")" 1>&2 || true
+      else
+        echo "[cys-dept] WARN: 미션 파일 없음 $MISS/$key.md — 미션 미주입" >&2
+      fi
+    else
+      echo "[cys-dept] WARN: $name 부서장 각성 미확정 — 미션 주입 보류·read-screen 점검" >&2
+    fi
+    echo "[cys-dept] create '$disp'($name) 완료 (account=$acctkey sock=$sock)" >&2
+    echo "$name"   # stdout 마지막 = 확정 name(Tauri 파싱)
     ;;
   down)
     name="${2:?usage: cys-dept down <name>}"
