@@ -604,6 +604,69 @@ async fn launch_dept_daemon(app: AppHandle, name: String) -> Result<Value, Strin
     Ok(info)
 }
 
+/// 새 부서 번호 백엔드 원자 발급. 번호 계산을 UI가 아닌 레지스트리 flock RMW에 일임해
+/// lowest-unused 재사용 + 멀티창 충돌0을 보장한다. stdout 마지막 줄이 확정 name(dept-N).
+/// ＋부서 자동화(패치5): `catalog_key`=Some(k) → `cys-dept create <k>`(카탈로그 기반 부서명·계정·미션·각성),
+/// None → `cys-dept allocate`(레거시 무변경). create 경로는 레지스트리에서 display_name 을 조회해 반환한다.
+#[tauri::command]
+async fn allocate_dept_daemon(app: AppHandle, catalog_key: Option<String>) -> Result<Value, String> {
+    let tool = dept_tool();
+    let ck = catalog_key.clone();
+    let out = tokio::task::spawn_blocking(move || {
+        let mut cmd = std::process::Command::new("bash");
+        cmd.arg(&tool);
+        match &ck {
+            Some(k) => {
+                cmd.arg("create").arg(k);
+            } // ＋부서 자동화: 카탈로그 키 기반 생성(stdout 마지막 줄=name)
+            None => {
+                cmd.arg("allocate");
+            } // 레거시: 번호만 발급(회귀 무변경)
+        }
+        cmd.output()
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        // ＋부서 자동화(gemini R2 ①): create 경로는 exit code 를 'dept-create:<code>:<stderr>' 로 GUI 에 전달해
+        //   보안 분기를 가능케 한다 — exit5(account dir 미존재)=계정누수 → 레거시 폴백 절대 금지(하드 에러)·
+        //   exit4(키 부재)=에러·exit3(카탈로그 부재)=레거시 허용. 레거시 allocate(None) 경로는 평문 stderr 유지.
+        if catalog_key.is_some() {
+            let code = out.status.code().unwrap_or(-1);
+            return Err(format!("dept-create:{code}:{stderr}"));
+        }
+        return Err(stderr);
+    }
+    let name = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .last()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if name.is_empty() {
+        return Err("allocate: empty name".into());
+    }
+    let sock = dept_socket_path(&name);
+    spawn_event_forwarder(app.clone(), sock.clone());
+    let mut info = rpc_on(&sock, "system.identify", json!({"caller": "ui"})).await?;
+    if let Some(obj) = info.as_object_mut() {
+        obj.insert("socket".into(), json!(sock.to_string_lossy()));
+        obj.insert("socket_slug".into(), json!(sock_slug(&sock)));
+        obj.insert("name".into(), json!(name));
+        // ＋부서 자동화: create 경로면 레지스트리(cys-dept reg_set_meta 가 기록)에서 display_name 조회 →
+        // 탭 표시명. create stdout 은 name only(cys-dept 코어 재구현 금지)이므로 depts.json 이 표시명 진실원.
+        if catalog_key.is_some() {
+            if let Some(disp) = dept_display_name(&name) {
+                obj.insert("display_name".into(), json!(disp));
+            }
+        }
+    }
+    Ok(info)
+}
+
 /// 부서 workspace 닫기 = 부서 데몬 teardown. cys-dept down에 일임(SIGTERM·소켓 정리·레지스트리·CEO 강등).
 #[tauri::command]
 async fn stop_dept_daemon(name: String) -> Result<(), String> {
@@ -631,6 +694,39 @@ fn list_depts() -> Result<Value, String> {
     match std::fs::read_to_string(&reg) {
         Ok(s) => serde_json::from_str::<Value>(&s).map_err(|e| e.to_string()),
         Err(_) => Ok(json!({ "depts": {} })),
+    }
+}
+
+/// 부서 레지스트리(depts.json)에서 표시명 조회 — cys-dept reg_set_meta 가 기록한 display_name.
+/// create stdout 은 name only 이므로 표시명의 진실원은 레지스트리다. 부재/오류 시 None(=name 폴백).
+fn dept_display_name(name: &str) -> Option<String> {
+    let reg = std::env::var("CYS_DEPTS_JSON")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cys/depts.json")
+        });
+    let s = std::fs::read_to_string(&reg).ok()?;
+    let v: Value = serde_json::from_str(&s).ok()?;
+    v.get("depts")?
+        .get(name)?
+        .get("display_name")?
+        .as_str()
+        .map(|s| s.to_string())
+}
+
+/// 부서 카탈로그(dept-catalog.json) 조회 — ＋부서 선택 팝업용. cys-dept 와 동일 경로 규약
+/// (CYS_DEPT_CATALOG 또는 $HOME/.cys/dept-catalog.json). 부재/손상 시 빈 departments 반환(팝업=레거시 폴백).
+#[tauri::command]
+fn read_dept_catalog() -> Result<Value, String> {
+    let cat = std::env::var("CYS_DEPT_CATALOG")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+                .join(".cys/dept-catalog.json")
+        });
+    match std::fs::read_to_string(&cat) {
+        Ok(s) => serde_json::from_str::<Value>(&s).map_err(|e| e.to_string()),
+        Err(_) => Ok(json!({ "departments": {} })),
     }
 }
 
@@ -805,9 +901,11 @@ fn main() {
             live_session_count,
             install_update,
             launch_dept_daemon,
+            allocate_dept_daemon,
             stop_dept_daemon,
             stop_dept_daemon_by_socket,
             list_depts,
+            read_dept_catalog,
         ])
         .setup(|app| {
             let handle = app.handle().clone();

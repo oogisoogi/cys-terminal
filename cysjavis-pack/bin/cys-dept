@@ -230,6 +230,9 @@ acct=dep['account']; acctdir=os.path.expandvars(d['accounts'][acct])
 print('\t'.join([dep['display'], acct, acctdir, dep['mission_key'], os.path.expandvars(dep['cwd'])]))
 PY
 ) || { echo "[cys-dept] 카탈로그 키 미정의/손상: $key" >&2; exit 4; }
+    # 부서별 config dir 분리(박사님 결정): ysfuture 공유 계정→부서별 dir(~/.cys/claude-<key>)로 config state 경합 완화.
+    # Max 계정 토큰은 macOS Keychain(계정단위)으로 공유 유지·dir만 분리. cysinsight(미래연구부)는 이미 단독이라 불변.
+    if [ "$acctkey" = "ysfuture" ]; then acctdir="${acctdir%/}-$key"; mkdir -p "$acctdir"; fi
     [ -d "$acctdir" ] || { echo "[cys-dept] account dir 미존재(계정누수 차단): $acctdir" >&2; exit 5; }  # fail-closed
     # F3(codex): 멱등검사+예약을 단일 flock 원자. ★같은 mission_key 엔트리=청구됨 → REUSE(데몬 생사 무관·
     #   호출부가 ensure-ready). 신규는 lowest-unused 예약 + ★엔트리에 mission_key 기록(동시/부팅중 다른
@@ -330,7 +333,12 @@ PY
     name="${2:?usage: cys-dept down <name>}"
     sock="$(dept_sock "$name")"
     pid=$(CYS_SOCKET="$sock" "$CYS" identify 2>/dev/null | python3 -c "import json,sys;print(json.load(sys.stdin).get('daemon_pid',''))" 2>/dev/null || true)
-    [ -n "${pid:-}" ] && kill "$pid" 2>/dev/null || true
+    # orphan 방지(박사님 ③): kill 후 데몬 사망 확인·잔존 시 SIGKILL(down이 데몬 살린 채 reg_remove→orphan 재발 차단).
+    if [ -n "${pid:-}" ]; then
+      kill "$pid" 2>/dev/null || true
+      for _i in 1 2 3 4 5 6; do kill -0 "$pid" 2>/dev/null || break; sleep 0.3; done
+      kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+    fi
     rm -f "$sock" "$sock.lock" 2>/dev/null || true
     reg_remove "$name"
     [ "$(reg_count)" = "0" ] && ceo_demote || true
@@ -348,7 +356,11 @@ for n,e in d.items():
 PY
 )
     pid=$(CYS_SOCKET="$sock" "$CYS" identify 2>/dev/null | python3 -c "import json,sys;print(json.load(sys.stdin).get('daemon_pid',''))" 2>/dev/null || true)
-    [ -n "${pid:-}" ] && kill "$pid" 2>/dev/null || true
+    if [ -n "${pid:-}" ]; then
+      kill "$pid" 2>/dev/null || true
+      for _i in 1 2 3 4 5 6; do kill -0 "$pid" 2>/dev/null || break; sleep 0.3; done
+      kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+    fi
     rm -f "$sock" "$sock.lock" 2>/dev/null || true
     [ -n "$name" ] && reg_remove "$name" || true
     [ "$(reg_count)" = "0" ] && ceo_demote || true

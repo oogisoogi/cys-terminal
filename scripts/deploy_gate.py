@@ -30,7 +30,9 @@ import time
 import fcntl
 
 # ★SRC는 반드시 ~/dev(iCloud 밖). $HOME 기반(범용 배포 이식성).
-SRC = os.path.expanduser("~/dev/cys-terminal/target/release")
+# CYS_DEPLOY_SRC로 오버라이드 가능 — 동시 빌드가 target/를 휘젓는 환경에서 검증된 격리 스냅샷
+# 디렉토리에서 배포하기 위함(여전히 gate_src_path의 ~/dev 검증을 거친다).
+SRC = os.path.expanduser(os.environ.get("CYS_DEPLOY_SRC", "~/dev/cys-terminal/target/release"))
 APP_BUNDLE = "/Applications/cys.app"
 APP_MACOS = "/Applications/cys.app/Contents/MacOS"
 BREW = "/opt/homebrew/bin"
@@ -39,6 +41,9 @@ BACKUP_BASE = os.path.join(SRC, "deploy_backups")
 TARGETS = [
     ("cys", f"{APP_MACOS}/cys"),
     ("cysd", f"{APP_MACOS}/cysd"),
+    # cys-app = Tauri GUI(웹뷰). ui/dist를 generate_context!로 컴파일타임 임베드하므로 UI 변경은
+    # cys-app 재빌드로만 반영된다(brew엔 없음 — GUI 전용). UI 변경 배포 시 cargo build -p cys-app 선행 필수.
+    ("cys-app", f"{APP_MACOS}/cys-app"),
     ("cys", f"{BREW}/cys"),
     ("cysd", f"{BREW}/cysd"),
 ]

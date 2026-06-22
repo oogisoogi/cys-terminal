@@ -822,7 +822,7 @@ function saveLayout() {
   const a = Math.max(0, norm.findIndex((w) => w.id === activeId));
   localStorage.setItem(
     LAYOUT_KEY,
-    JSON.stringify({ workspaces: norm, active: a, counter: wsCounter, deptCounter }),
+    JSON.stringify({ workspaces: norm, active: a, counter: wsCounter }),
   );
 }
 
@@ -1540,19 +1540,35 @@ async function addWorkspace(): Promise<Workspace> {
   return ws;
 }
 
+// 부서 socket 경로(~/.local/state/cys-dept-<name>/cys.sock)에서 원래 부서명 역산.
+// rename으로 ws.name이 바뀌어도 socket은 불변이므로, 재-launch가 '다른 소켓 새 데몬'을 만들어
+// 원래 데몬을 고아화하는 것을 막는다(시나리오4).
+function deptNameFromSocket(sock: string | undefined): string | null {
+  const m = /\/cys-dept-(.+?)\/cys\.sock$/.exec(sock ?? "");
+  return m ? m[1] : null;
+}
+
 // 멀티마스터 F4: 새 '부서 workspace' 런칭 = 새 부서 데몬 spawn(cys-dept launch 단일 진입점).
 // 첫 부서가 생기면 백엔드(cys-dept)가 기본 데몬을 CEO로 자동 승격한다.
 // ① 표시 지연(안 C): 무거운 launch await(최대 ~12s) '전에' placeholder 탭을 즉시 render — 체감 지연 0.
 // ② 고아 방지(안 A): 빈 newSurface를 만들지 않는다. cys-dept가 띄우는 role=master surface가
 //    refreshPaneTitles 자동입양으로 '첫 pane'이 되게 한다(빈 셸 미생성 → 고아 0).
-async function addDeptWorkspace(name: string): Promise<Workspace> {
+async function addDeptWorkspace(catalogKey?: string): Promise<Workspace> {
   // 클릭 즉시 placeholder 탭(tree:null·socket 미정) push+render — launch await 동안 시각 피드백 제공.
-  const ws: Workspace = { id: wsCounter++, name, tree: null, pending: true };
+  // 번호는 백엔드 allocate(레지스트리 flock RMW)가 확정하므로 placeholder name은 미정("…")으로 두고
+  // 반환 info.name으로 확정한다(UI 번호 계산 폐기 → lowest-unused 재사용·멀티창 충돌0).
+  const ws: Workspace = { id: wsCounter++, name: "…", tree: null, pending: true };
   workspaces.push(ws);
   activeWs = workspaces.length - 1;
   render();
   try {
-    const info = (await invoke("launch_dept_daemon", { name })) as { socket: string; socket_slug?: string };
+    const info = (await invoke("allocate_dept_daemon", { catalogKey })) as {
+      socket: string;
+      socket_slug?: string;
+      name: string;
+      display_name?: string;
+    };
+    ws.name = info.display_name ?? info.name; // ★표시명(create 카탈로그) 또는 부서 번호(레거시)
     if (info.socket_slug && info.socket) socketForSlug.set(info.socket_slug, info.socket);
     // 멱등 합류 — 같은 부서 socket의 (이 placeholder가 아닌) 탭이 이미 있으면(연타·재호출이 같은 데몬을
     // 멱등 반환) placeholder를 폐기하고 기존 탭을 활성화한다. w !== ws 가드로 자기 자신과 오매칭 방지.
@@ -1572,17 +1588,29 @@ async function addDeptWorkspace(name: string): Promise<Workspace> {
       if (firstSid != null) setFocus(firstSid);
       return dup;
     }
-    // socket만 확정하고 빈 surface는 만들지 않는다 — master role surface를 자동입양이 첫 pane으로 채운다.
+    // master 자동기동을 제거했으므로 UI가 plain 셸 1개를 직접 만들어 첫 pane으로 채운다(고아 0).
+    // 순서 고정: socket 확정 → pending 유지한 채 newSurface await → tree 할당 후 pending=false
+    // (그래야 3초 자동입양 인터벌이 await 중 빈 placeholder를 오입양하지 않는다).
     ws.socket = info.socket;
+    const sid = await newSurface(null, info.socket);
+    // await 중 사용자가 placeholder ×를 눌렀으면(close 핸들러가 데몬 teardown 가능) — 좀비 방지.
+    if (workspaces.indexOf(ws) < 0) {
+      await invoke("close_surface", { socket: info.socket, surfaceId: sid }).catch(() => {});
+      if (info.socket) await invoke("stop_dept_daemon_by_socket", { socket: info.socket }).catch(() => {});
+      return ws;
+    }
+    ws.tree = { type: "pane", sid };
     ws.pending = false;
     render();
-    refreshPaneTitles(); // 즉시 1회 입양 시도 — 3초 인터벌을 기다리지 않게(master가 이미 떴으면 바로 입양)
+    refreshPaneTitles(); // 나중에 수동 boot한 master/노드 자동입양은 그대로 유지
     return ws;
   } catch (e) {
     // 실패 시 placeholder 롤백 — 유령 탭이 남지 않게 제거.
     const i = workspaces.indexOf(ws);
     if (i >= 0) workspaces.splice(i, 1);
     if (activeWs >= workspaces.length) activeWs = Math.max(0, workspaces.length - 1);
+    // newSurface가 데몬 spawn 후 실패하면 등록된 부서 데몬이 무탭 고아로 남는다 — socket 확정됐으면 회수.
+    if (ws.socket) await invoke("stop_dept_daemon_by_socket", { socket: ws.socket }).catch(() => {});
     render();
     throw e;
   }
@@ -1996,7 +2024,6 @@ async function start() {
       workspaces = saved.workspaces;
       activeWs = saved.active ?? 0;
       wsCounter = saved.counter ?? 1;
-      deptCounter = saved.deptCounter ?? deptCounter;
     }
   } catch {
     workspaces = [];
@@ -2006,25 +2033,24 @@ async function start() {
   workspaces = normalizeWorkspaces(workspaces);
   // 카운터 보정: 신규 id/이름이 항상 기존 최댓값 초과하도록(중복·손상 저장본에도 강건)
   wsCounter = Math.max(wsCounter, 0, ...workspaces.map((w) => w.id)) + 1;
-  deptCounter = Math.max(
-    deptCounter,
-    0,
-    ...workspaces.map((w) => {
-      const m = /^dept-(\d+)$/.exec(w.name);
-      return m ? +m[1] + 1 : 0;
-    }),
-  );
 
   // (order 8) 레지스트리 진실원 대조 — 죽은 socket이면서 레지스트리 미등록인 부서 ws는 유령(옛 테스트
   // 잔재·삭제된 부서)이므로 재-launch 안 하고 드롭. 조회 실패 시엔 보수적으로 전부 보존(기존 동작).
   let registered: Set<string> | null = null;
+  // ＋부서 자동화(패치5·§E-4): socket→display_name 맵 — 복원 시 부서 탭 표시명 회복(rename=표시명 레이어).
+  const displayBySocket = new Map<string, string>();
   try {
-    const reg = (await invoke("list_depts")) as { depts?: Record<string, { socket?: string }> };
+    const reg = (await invoke("list_depts")) as {
+      depts?: Record<string, { socket?: string; display_name?: string }>;
+    };
     registered = new Set(
       Object.values(reg.depts ?? {})
         .map((v) => v?.socket)
         .filter((s): s is string => !!s),
     );
+    for (const e of Object.values(reg.depts ?? {})) {
+      if (e?.socket && e.display_name) displayBySocket.set(e.socket, e.display_name);
+    }
   } catch {
     registered = null;
   }
@@ -2045,9 +2071,10 @@ async function start() {
       ghosts.add(ws.id);
       continue;
     }
-    // 등록된(또는 레지스트리 미조회) 부서 → 재-launch
+    // 등록된(또는 레지스트리 미조회) 부서 → 재-launch. ★시나리오4: rename으로 ws.name이 바뀌어도
+    // socket(진짜 정체·불변)에서 원래 부서명을 역산해 호출 — '다른 소켓 새 데몬'이 원래 데몬을 고아화하지 않게.
     try {
-      const info = (await invoke("launch_dept_daemon", { name: ws.name })) as { socket: string; socket_slug?: string };
+      const info = (await invoke("launch_dept_daemon", { name: deptNameFromSocket(ws.socket) ?? ws.name })) as { socket: string; socket_slug?: string };
       if (info.socket_slug && info.socket) socketForSlug.set(info.socket_slug, info.socket);
       if (info.socket) ws.socket = info.socket; // 재-launch된 실제 socket 반영(이후 집계·prune·병합 정합)
     } catch {
@@ -2085,15 +2112,25 @@ async function start() {
   }
   // 안 A: 부서 ws는 tree:null(빈 셸 미생성)로 저장될 수 있다 — 데몬이 살아있고 입양할 live surface가
   // 있으면(master 등) 드롭하지 말고 보존한다. 아래 입양 루프(병합)가 그 surface로 tree를 채운다.
-  workspaces = workspaces.filter(
-    (ws) =>
-      ws.tree !== null ||
-      liveBySock.get(ws.socket)?.ok === false ||
-      (ws.socket != null && (liveBySock.get(ws.socket)?.ids.size ?? 0) > 0),
-  );
+  // master 자동기동 제거 후: 비활성 부서가 재-launch로 surface 0개로 올라와도 데몬이 살아있으면(ok===true)
+  // 드롭하지 말고 보존한다 — 아래 빈-tree 충전 루프가 plain 셸로 채운다(비활성 부서 탭 소실 방지).
+  workspaces = workspaces.filter((ws) => {
+    if (ws.tree !== null) return true;
+    const lb = liveBySock.get(ws.socket);
+    if (lb?.ok === false) return true;
+    return ws.socket != null && lb?.ok === true;
+  });
   // 구버전 자동 번호 이름("ws N")은 미정 표시로 이행
   for (const ws of workspaces) {
     if (/^ws \d+$/.test(ws.name)) ws.name = UNTITLED;
+    // §E-4: 부서 탭 표시명 복원 — 표시명이 비었거나(미정·dept-N 번호) 레지스트리에 display_name 이 있으면
+    // 그 표시명으로 회복. 사용자가 의미있게 rename 한 이름(레지스트리와 다른 값)은 덮지 않는다.
+    if (ws.socket) {
+      const disp = displayBySocket.get(ws.socket);
+      if (disp && (ws.name === UNTITLED || ws.name === "…" || /^dept-\d+$/.test(ws.name))) {
+        ws.name = disp;
+      }
+    }
   }
   if (workspaces.length === 0) {
     workspaces = [{ id: wsCounter++, name: UNTITLED, tree: null }];
@@ -2115,8 +2152,23 @@ async function start() {
       }
     }
   }
+  // master 자동기동 제거 후: 데몬은 살아있으나(ok===true) 입양할 surface가 0개인 부서 ws(비활성 부서가
+  // 재-launch된 경우)는 위 병합 루프가 못 채운다 — plain 셸 1개로 충전해 빈 탭 소실/고아 placeholder 방지.
+  for (const ws of workspaces) {
+    if (ws.tree || ws.socket == null || liveBySock.get(ws.socket)?.ok !== true) continue;
+    const sid = await newSurface(null, ws.socket);
+    ws.tree = { type: "pane", sid };
+  }
   if (!current().tree) {
-    const sid = await newSurface(null, current().socket);
+    // 복원 시 current()가 미응답(ok===false) 부서 ws일 수 있다(필터의 ok===false 절로 보존·activeWs가 선택,
+    // 충전 루프는 ok!==true라 스킵) — 죽은 부서 socket에 newSurface하면 backend가 reject해 복원이 깨진다.
+    // 기본 데몬(socket undefined·상시 가용)으로 폴백해 빈 화면/미처리 rejection을 막는다(정상 경로 불변).
+    let sid: number;
+    try {
+      sid = await newSurface(null, current().socket);
+    } catch {
+      sid = await newSurface(null, undefined);
+    }
     current().tree = { type: "pane", sid };
   }
   render();
@@ -2177,24 +2229,85 @@ document.getElementById("cc-sessions-redact")!.addEventListener("click", (e) => 
 });
 document.getElementById("btn-update")!.addEventListener("click", () => promptInstall());
 document.getElementById("btn-ws-new")!.addEventListener("click", () => addWorkspace());
-// 멀티마스터 F4: 새 부서(독립 데몬) workspace 런칭. 부서명 자동(dept-N) — WKWebView prompt 무동작이라 자동 번호.
-let deptCounter = 1;
+// 멀티마스터 F4 + ＋부서 자동화(패치5): 새 부서(독립 데몬) workspace 런칭. 부서 번호는 백엔드가 확정.
 const deptBtn = document.getElementById("btn-ws-dept") as HTMLButtonElement | null;
-deptBtn?.addEventListener("click", () => {
-  if (deptBtn.disabled) return; // 연타 차단 — in-flight launch 중 재클릭이 별도 부서 데몬을 spawn하지 않게
-  const used = new Set(workspaces.map((w) => w.name));
-  while (used.has(`dept-${deptCounter}`)) deptCounter++;
-  const name = `dept-${deptCounter}`;
-  deptCounter++; // 동기 예약 — 빠른 연속 클릭이 addDeptWorkspace의 await(push) 전에 같은 이름을 재사용하지 않게
+// 부서 런칭 실행(공통) — placeholder 탭·in-flight 버튼 가드. catalogKey=undefined → 레거시 dept-N.
+// ⑤(gemini R2): invoke 실패 reject 를 try/catch 로 받아 토스트+버튼 disabled 해제(버튼 freeze 방지).
+// ①(gemini R2 ★BLOCKER): create exit code 별 분기 — exit5(account dir 미존재=계정누수)는 레거시 폴백 절대 금지.
+async function launchDept(catalogKey?: string) {
+  if (!deptBtn || deptBtn.disabled) return; // 연타 차단 — in-flight launch 중 재실행 방지
   const prevLabel = deptBtn.textContent;
   deptBtn.disabled = true;
   deptBtn.textContent = "…"; // 진행 표시 — launch await 동안(placeholder 탭은 즉시 보임)
-  addDeptWorkspace(name)
-    .catch((e) => toast("watchdog", "부서 런칭 실패", String(e)))
-    .finally(() => {
-      deptBtn.disabled = false;
-      deptBtn.textContent = prevLabel;
-    });
+  let fallbackLegacy = false;
+  try {
+    await addDeptWorkspace(catalogKey);
+  } catch (e) {
+    // main.rs 가 create 실패를 'dept-create:<code>:<stderr>' 로 전달(레거시 allocate 실패는 평문).
+    const msg = String(e);
+    const m = /^dept-create:(-?\d+):/.exec(msg);
+    const code = m ? parseInt(m[1], 10) : null;
+    if (code === 5) {
+      // ★보안: account dir 미존재 = 계정 격리 불가 → 비격리 레거시 dept-N 으로 우회 금지(계정누수 차단)·하드 에러.
+      toast("watchdog", "부서 생성 차단(계정 격리 불가)", "account dir 미존재 — 레거시 폴백 금지(보안). 카탈로그 account 경로 점검.");
+    } else if (code === 4) {
+      // 카탈로그에 정의되지 않은 키 → 에러(레거시 폴백 안 함 — 의도치 않은 무명 부서 방지).
+      toast("watchdog", "부서 생성 실패(카탈로그 키)", "카탈로그 미정의 부서 — 레거시 폴백 안 함.");
+    } else if (code === 3) {
+      // 카탈로그 파일 부재(비격리 위험 없음·번호만) → 레거시 dept-N 허용.
+      toast("watchdog", "카탈로그 없음", "레거시 dept-N 으로 생성합니다.");
+      fallbackLegacy = true;
+    } else {
+      toast("watchdog", "부서 런칭 실패", msg);
+    }
+  } finally {
+    deptBtn.disabled = false; // 버튼 freeze 방지 — 성공/실패 무관 항상 해제
+    deptBtn.textContent = prevLabel;
+  }
+  // exit3(카탈로그 부재)만 레거시 폴백 — 버튼 재활성 후 호출해 disabled 가드 통과(exit4/5 는 폴백 없음).
+  if (fallbackLegacy) await launchDept(undefined);
+}
+// 클릭 → 부서 선택 팝업(카탈로그 미사용 부서 + 레거시 dept-N). 선택 후 부서 데몬 런칭.
+deptBtn?.addEventListener("click", async () => {
+  if (deptBtn.disabled) return; // 연타 차단
+  if (!started) return; // ★시나리오3: 복원 진행 중 발급 금지(레지스트리 미확정 윈도우 회피)
+  // 현재 열린 부서 탭의 mission_key 집계 → '미사용 부서'만 제시. 레지스트리 socket↔mission_key 대조(데몬 호출 없음·경량).
+  const openSockets = new Set(workspaces.map((w) => w.socket).filter((s): s is string => !!s));
+  const runningKeys = new Set<string>();
+  try {
+    const reg = (await invoke("list_depts")) as {
+      depts?: Record<string, { socket?: string; mission_key?: string }>;
+    };
+    for (const e of Object.values(reg.depts ?? {})) {
+      if (e?.mission_key && e.socket && openSockets.has(e.socket)) runningKeys.add(e.mission_key);
+    }
+  } catch {
+    /* 레지스트리 미조회 — 필터 없이 전체 제시 */
+  }
+  let cat: { departments?: Record<string, { display?: string; mission_key?: string }> } = {};
+  try {
+    cat = (await invoke("read_dept_catalog")) as typeof cat;
+  } catch {
+    cat = {};
+  }
+  const items: { label: string; action: () => void }[] = [];
+  for (const [key, d] of Object.entries(cat.departments ?? {})) {
+    if (d.mission_key && runningKeys.has(d.mission_key)) continue; // 미사용 부서만
+    items.push({ label: d.display ?? key, action: () => launchDept(key) });
+  }
+  items.push({ label: "직접 입력(레거시 dept-N)", action: () => launchDept(undefined) });
+  // 미사용 부서가 하나도 없어 레거시만 남으면(카탈로그 부재/손상 OR 6부서 전부 가동중) 팝업 없이 바로 레거시
+  // — '버튼 한 번' 유지(클릭 추가 0)·버튼 브릭 방지. 단 카탈로그엔 부서가 있는데 전부 가동중이면
+  //   침묵 생성이 혼란스러우므로 토스트로 사유를 알린다(클릭은 여전히 한 번).
+  if (items.length === 1) {
+    if (Object.keys(cat.departments ?? {}).length > 0) {
+      toast("watchdog", "모든 부서 가동 중", "레거시 dept-N 워크스페이스를 생성합니다.");
+    }
+    launchDept(undefined);
+    return;
+  }
+  const r = deptBtn.getBoundingClientRect();
+  showCtxMenu(r.left, r.bottom, items);
 });
 
 window.addEventListener("keydown", (e) => {
