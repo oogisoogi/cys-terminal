@@ -14,16 +14,18 @@ master가 (a) "4개 노드 다 떴나"를 눈대중 판단, (b) 리뷰 프롬프
                                 리뷰 의뢰 프롬프트를 출력(제약 누락 구조 차단). --success는
                                 구현 위임과 동일한 평가 기준을 리뷰어에게도 투입(N6 영상 양방향 —
                                 "구현할 때도 먹이고 리뷰할 때도 똑같이"). 생략 시 출력 바이트 동일.
-  task-prompt  --task T --scope S [--success C] [--to ROLE]
+  task-prompt  --task T --scope S [--success C] [--to ROLE] [--dont D]
                                 위임 티켓 생성(절대지침 5차 work management 앵커):
                                 ①위임 직전 대상 노드 생존을 결정론 확인(미기동=티켓 미출력 —
                                 "워커 정상 작동 확인 후 작업 지시") ②WORKER §3
                                 절대 강조 4규칙(품질·할루시네이션 방지·의도 합의·요약 금지)을
                                 항상 주입 — 추출분이 마커 불완전하면 하드 폴백으로 강등·경고
-                                (약화 전파·강조 누락 구조 차단).
+                                (약화 전파·강조 누락 구조 차단). ③--dont 지정 시 무접촉
+                                (절대 수정·삭제·리팩터 금지) 음의 경계를 주입(외과적 변경
+                                4대 행동지침③ · 생략 시 출력 바이트 동일).
                                 exit: 0=티켓 출력(stdout은 티켓만, 경고는 stderr) /
                                 1=대상 미기동 / 2=확인 불가(데몬 다운·역할명 위반).
-  phase-plan   --task T --phases "p1;p2;p3" --scope S [--success X] [--to ROLE]
+  phase-plan   --task T --phases "p1;p2;p3" --scope S [--success X] [--to ROLE] [--dont D]
                                 Task를 세미콜론 분리 Phase로 분해해 각 Phase의 자기완결 티켓
                                 (P1/P2/… · build_task_ticket 재사용으로 절대 강조 4규칙 포함)을
                                 출력하고 round/PHASE-<task>.json 인덱스(상태 pending) 기록.
@@ -322,6 +324,11 @@ def cmd_review_prompt(args):
             "받은 경우에만 계약(파일·범위)을 선합의하고 수행한다.",
         ]
     rnd = args.round
+    # D4: --manifest/--phase가 있고 명시 --success가 없으면 매니페스트 평가기준·review_focus 해소
+    success = getattr(args, "success", None)
+    mfocus = []
+    if success is None:
+        success, mfocus = resolve_manifest_phase(getattr(args, "manifest", None), getattr(args, "phase", None))
     lines = []
     lines.append("[리뷰 의뢰 — 엄격 제약 준수 · 지정 범위만]")
     lines.append("검토 범위(이 파일/범위만, 무관 파일·repo 배회 금지): %s" % args.scope)
@@ -329,8 +336,10 @@ def cmd_review_prompt(args):
     # 평가 기준 양방향(영상 N3 — "구현할 때도 먹이고 리뷰할 때도 똑같이 먹임"): success가 있으면
     # 구현 위임(task-prompt --success)과 동일한 기준을 리뷰어에게도 투입한다. 없으면 라인 생략
     # (회귀 0 — 기존 출력 바이트 동일).
-    if getattr(args, "success", None):
-        lines.append("평가 기준(구현 위임과 동일 기준 — 이 기준 대비 채점하라): %s" % args.success)
+    if success:
+        lines.append("평가 기준(구현 위임과 동일 기준 — 이 기준 대비 채점하라): %s" % success)
+    if mfocus:
+        lines.append("리뷰 초점(매니페스트 review_focus): %s" % ", ".join(mfocus))
     lines.append("")
     lines.append("엄격 제약 (REVIEWER_DIRECTIVE §2 — 위반 금지):")
     lines.extend("  " + b for b in bullets)
@@ -408,7 +417,100 @@ FALLBACK_RULES = [
 ]
 
 
-def build_task_ticket(task, scope, success, to_role, rules, output_format=None):
+# ── 전제지식 자동주입(OpenMontage D6): 위임 티켓에 "어떤 증류 memory/스킬이 전제인지"를
+# 이름·읽기명령·순서만 stitch한다(본문 아님 = progressive disclosure). normalize_slug·색인 파싱은
+# javis_registry와 byte-동일 규칙(preflight는 orchestra를 import 안 함 → C39는 registry verify에 위임).
+_PREREQ_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
+_PREREQ_FENCED_CODE_RE = re.compile(r"```.*?```", re.S)
+_PREREQ_INDEX_LINK_RE = re.compile(r"\]\(([^)\s]+\.md)\)")
+
+
+def normalize_slug(ref):
+    """ref → 표준 슬러그(javis_registry.normalize_slug와 byte-동일): lower·.md 제거·타입접두 제거."""
+    s = (ref or "").strip().lower()
+    if s.endswith(".md"):
+        s = s[:-3]
+    for t in ("feedback_", "user_", "project_", "reference_"):
+        if s.startswith(t):
+            s = s[len(t):]
+            break
+    return s
+
+
+def parse_memory_index(memory_dir):
+    """MEMORY.md 색인 → {정규화 슬러그: 파일명}. 주석·코드펜스 예시 제외(registry/memory 동일 규칙).
+    색인 부재면 빈 dict — 호출부가 미해소를 인라인 표기한다(무음 드롭 금지)."""
+    idx = os.path.join(memory_dir, "MEMORY.md")
+    try:
+        text = open(idx, encoding="utf-8", errors="replace").read()
+    except OSError:
+        return {}
+    visible = _PREREQ_FENCED_CODE_RE.sub("", _PREREQ_HTML_COMMENT_RE.sub("", text))
+    out = {}
+    for m in _PREREQ_INDEX_LINK_RE.finditer(visible):
+        fn = m.group(1)
+        if "/" in fn or fn == "MEMORY.md":
+            continue
+        out[normalize_slug(fn)] = fn
+    return out
+
+
+def _split_csv(s):
+    """쉼표 구분 인자 → 정리된 항목 리스트(빈 항목 제거)."""
+    return [x.strip() for x in (s or "").split(",") if x.strip()]
+
+
+def resolve_prereq_block(requires_skills, related_memory, memory_dir):
+    """전제지식·읽기순서 블록 — 이름·읽기명령·순서만(본문 아님 = progressive disclosure).
+    skill 먼저, 그다음 memory. 미해소 memory 슬러그는 무음 드롭 금지·인라인 표기한다.
+    중복(같은 이름·정규화 슬러그)은 순서 보존하며 1회만 방출. 빈 입력이면 ""(티켓 무변)."""
+    skills = [s for s in (requires_skills or []) if s]
+    mems = [m for m in (related_memory or []) if m]
+    if not skills and not mems:
+        return ""
+    index = parse_memory_index(memory_dir)
+    lines = ["전제지식·읽기순서 (본문 아님 — 이름·읽기명령·순서만; 작업 전 읽어라):"]
+    seen_sk = set()
+    for name in skills:
+        if name in seen_sk:  # 중복 skill은 순서 보존하며 1회만 방출(노이즈 차단)
+            continue
+        seen_sk.add(name)
+        lines.append("  [skill] %s — cys skill show %s" % (name, name))
+    seen_mem = set()
+    for ref in mems:
+        slug = normalize_slug(ref)
+        if slug in seen_mem:  # 같은 슬러그로 정규화되는 ref는 1회만(collision collapse)
+            continue
+        seen_mem.add(slug)
+        fn = index.get(slug)
+        if fn:
+            lines.append("  [memory] %s — cat %s" % (slug, os.path.join(memory_dir, fn)))
+        else:
+            lines.append("  [memory] (해소 불가: %s — 색인에 없음)" % ref)
+    return "\n".join(lines)
+
+
+def resolve_manifest_phase(manifest, phase_id):
+    """타입드 워크플로우 매니페스트(D4) 단계 계약 해소 — javis_manifest phase에 위임.
+    → (success_criteria.statement, review_focus[]). 부재·미지정·실패 시 (None, []) —
+    호출부는 명시 --success를 우선(하위호환·byte-identical 보존)한다."""
+    if not manifest or not phase_id:
+        return None, []
+    tool = os.path.join(pack_dir(), "bin", "javis_manifest.py")
+    if not os.path.isfile(tool):
+        return None, []
+    try:
+        r = subprocess.run([sys.executable, tool, "phase", manifest, "--phase", phase_id, "--json"],
+                           capture_output=True, timeout=30)
+        if r.returncode != 0:
+            return None, []
+        data = json.loads(r.stdout.decode("utf-8", "replace") or "{}")
+        return (data.get("success") or None), (data.get("review_focus") or [])
+    except Exception:
+        return None, []
+
+
+def build_task_ticket(task, scope, success, to_role, rules, output_format=None, prereq_block="", dont=None):
     """위임 티켓 본문 생성. rules는 필수 — 호출자가 추출 성패를 알고 명시 주입한다
     (기본값 경유의 무경고 폴백 경로 제거 · self-test는 rules 주입으로 밀폐 검증)."""
     bullets = rules
@@ -416,6 +518,10 @@ def build_task_ticket(task, scope, success, to_role, rules, output_format=None):
     lines.append("[작업 위임 — 절대 강조 4규칙 포함 · work management 앵커]")
     lines.append("작업: %s" % task)
     lines.append("범위(이 파일/범위만 — 무관 파일·repo 배회 금지): %s" % scope)
+    # do/don't 쌍: scope=손댈 것(양) · dont=절대 손대지 말 것(음의 경계). 4대 행동지침③ 외과적
+    # 변경을 위임 티켓에 기계적으로 주입한다. dont=None이면 라인 부재 → 기존 티켓 byte-identical.
+    if dont:
+        lines.append("무접촉(절대 건드리지 마라 — 아래 대상은 수정·삭제·리팩터·포맷 금지): %s" % dont)
     if success:
         lines.append("성공 기준(완료 보고는 이 기준 대비 검증 결과를 포함하라): %s" % success)
     if output_format:
@@ -433,6 +539,9 @@ def build_task_ticket(task, scope, success, to_role, rules, output_format=None):
                  "로 직접 push하라(--queued는 자동 Return 배달 — send-key 불필요·타이핑 가드 "
                  "안전). 즉시 끼어들어야 할 긴급 보고만 직접 send 후 `cys send-key --to master "
                  "Return`(가드 차단 시 --queued로 전환).")
+    if prereq_block:
+        lines.append("")
+        lines.append(prereq_block)
     return "\n".join(lines)
 
 
@@ -474,8 +583,17 @@ def cmd_task_prompt(args):
               "마커 불완전 — 하드 폴백(FALLBACK_RULES)으로 주입한다. 디렉티브를 점검하라"
               "(preflight C03).", file=sys.stderr)
         rules = FALLBACK_RULES
-    print(build_task_ticket(args.task, args.scope, args.success, args.to, rules=rules,
-                            output_format=getattr(args, "output_format", None)))
+    # D4: 명시 --success가 없고 --manifest/--phase가 있으면 매니페스트 success_criteria 주입(명시 우선=하위호환)
+    success = args.success
+    if success is None:
+        success, _ = resolve_manifest_phase(getattr(args, "manifest", None), getattr(args, "phase", None))
+    prereq = resolve_prereq_block(
+        _split_csv(getattr(args, "requires_skills", None)),
+        _split_csv(getattr(args, "related_memory", None)),
+        os.path.join(pack_dir(), "memory"))
+    print(build_task_ticket(args.task, args.scope, success, args.to, rules=rules,
+                            output_format=getattr(args, "output_format", None),
+                            prereq_block=prereq, dont=getattr(args, "dont", None)))
     return 0
 
 
@@ -507,6 +625,10 @@ def cmd_phase_plan(args):
         print("[phase-plan] 경고: WORKER_DIRECTIVE '절대 강조 4규칙' 추출 실패 또는 "
               "마커 불완전 — 하드 폴백(전문)으로 강등 주입한다(약화 전파 차단).", file=sys.stderr)
         rules = FALLBACK_RULES
+    prereq = resolve_prereq_block(
+        _split_csv(getattr(args, "requires_skills", None)),
+        _split_csv(getattr(args, "related_memory", None)),
+        os.path.join(pack_dir(), "memory"))
     n = len(phases)
     tickets = []
     index = {"task": args.task, "scope": args.scope, "phases": []}
@@ -521,7 +643,8 @@ def cmd_phase_plan(args):
         phase_scope = ("%s | 이 Phase만 독립 실행(자기완결): %s. %s 다른 Phase 작업·범위는 "
                        "건드리지 마라." % (args.scope, prev,
                        "산출물은 작업 폴더에 남기고 완료를 master에 push해 다음 Phase를 잇는다."))
-        ticket = build_task_ticket(phase_task, phase_scope, args.success, args.to, rules=rules)
+        ticket = build_task_ticket(phase_task, phase_scope, args.success, args.to, rules=rules,
+                                   prereq_block=prereq, dont=getattr(args, "dont", None))
         tickets.append((pid, name, ticket))
         index["phases"].append({"id": pid, "name": name, "status": "pending"})
     p = phase_index_path(args.task)
@@ -651,6 +774,149 @@ APPROVE_PREFIXES = ("pass", "수렴", "approve", "ok", "green", "승인")
 REJECT_MARKERS = ("실패", "불가", "반려", "미달", "거부", "아님", "보류", "미흡", "미승인",
                   "fail", "reject", "deny", "denied", "no-go", "block", "not ")
 
+# ── 3-state 게이트(OpenMontage D5): 의도적 SKIP을 None(기록없음)·False(미승인)과 구분한다.
+# 안 돈 게이트가 PASS-by-absence(수렴)나 일반 미승인으로 위장하지 못하게 명시 상태로 기록.
+SKIP_PREFIXES = ("skipped:", "skip:", "스킵:", "건너뜀:")
+
+
+class Skip:
+    """게이트의 3번째 상태 — 의도적 스킵(+사유). None도 bool도 아니다(isinstance로 판정)."""
+    __slots__ = ("reason",)
+
+    def __init__(self, reason):
+        self.reason = reason
+
+
+def skip_reason(verdict):
+    """verdict가 'SKIPPED: <사유>' 형태면 사유 반환, 아니면 None. 빈 사유는 스킵 불인정(fail-closed)."""
+    v = (verdict or "").strip()
+    low = v.lower()
+    for p in SKIP_PREFIXES:
+        if low.startswith(p):
+            return v[len(p):].strip() or None
+    return None
+
+
+# ── 무음실패 카탈로그(OpenMontage D5 2부): cys엔 guard.sh가 없다 — denylist는 CLAUDE.md §6
+# 산문이다. 아래 SILENT_FAILURES가 그 산문을 손큐레이션한 source-of-record(런타임 prose 파싱
+# 아님). render_catalog()가 결정론으로 .md 뷰를 파생한다. 무점수(수치 등급 키·값 없음). 각 행:
+# {id, source(CLAUDE.md §ref), constraint, detection(위반 증명 아티팩트), kind}.
+# kind=deterministic(기계 아티팩트로 증명)|heuristic(아티팩트 부재·수기 대조). 행 추가는 임베드
+# .py라 cargo build 필요(CSO 공식 서명빌드). .md 재생성은 런타임(재컴파일 무관).
+SILENT_FAILURES = [
+    {"id": "SF-GATE-SCORE-FIELD",
+     "source": "§6 리뷰어 verdict 타입 계약",
+     "constraint": "verdict는 enum(ACCEPT|REVISE|BLOCK|ESCALATE)+evidence:file:line만 — 수치 score 금지(다수결·reward-hack 차단)",
+     "detection": "verdict/round-log 레코드에 score 키 또는 0-100·0-1 수치 등급 값이 있으면 위반 — javis_verdict.py 스키마 게이트가 차단",
+     "kind": "deterministic"},
+    {"id": "SF-GATE-SKIPPED-AS-FALSE",
+     "source": "§6 라운드 게이트·D5 3-state",
+     "constraint": "의도적 SKIP은 None(미기록)·False(미승인)과 구분돼 명시 기록 — PASS-by-absence 위장 금지",
+     "detection": "gate_verdicts가 'SKIPPED:' verdict를 Skip 인스턴스로 가로채는지(isinstance v,Skip) — False/None로 삼켜지면 위반; honest-skip만 남으면 gate-status exit 2",
+     "kind": "deterministic"},
+    {"id": "SF-DENY-CHARTER-EDIT",
+     "source": "§6 denylist② charter 편집",
+     "constraint": "soul.md·CLAUDE.md·*_DIRECTIVE.md·헌법 편집은 자율 금지 — 박사님(owner) 토큰 승인 필수",
+     "detection": "git diff 경로가 soul.md|CLAUDE.md|*_DIRECTIVE.md|directives/ 에 매칭되는데 owner 승인 토큰 레코드가 없으면 위반",
+     "kind": "deterministic"},
+    {"id": "SF-DENY-EXTERNAL-PUBLISH",
+     "source": "§6 denylist③ 외부발행",
+     "constraint": "외부발행/발송(git push·gh release·전송·공개)은 비가역 — 자율 금지·멈춰 승인(로컬커밋만 가역=허용)",
+     "detection": "실행 명령이 git push|gh release|gh pr create/merge|publish/deploy|외부 전송 패턴에 매칭되는데 승인 없이 실행 로그에 있으면 경계 침범(R1·R2 preflight)",
+     "kind": "deterministic"},
+    {"id": "SF-DENY-IRREVERSIBLE-DELETE",
+     "source": "§6 denylist④ 비가역 삭제",
+     "constraint": "비가역 삭제/이동(rm·mv·chmod·git clean·truncate) 자율 금지 — 매 action 효과기반 preflight",
+     "detection": "action 명령이 rm|mv|chmod|git clean|truncate 패턴에 매칭되는데 승인 없이 실행됐거나 preflight 로그가 비면 침범",
+     "kind": "deterministic"},
+    {"id": "SF-PLAN-DOWNGRADE",
+     "source": "라우팅(tier 격하 금지)",
+     "constraint": "라우터 판정 tier(slow>deliberate>fast)는 격상만 허용·격하 금지(과소발화가 안전)",
+     "detection": "tier 격하를 증명할 필드-diff 아티팩트가 없어 결정론 탐지 불가 — 라우터 로그 대 실제 처리 모드 수기 대조(heuristic only)",
+     "kind": "heuristic"},
+    {"id": "SF-CONSENSUS-AVERAGE",
+     "source": "§6 eval-driven·verdict 계약(독립 재유도)",
+     "constraint": "리뷰어(agy·codex) 불일치는 다수결·평균 금지 — master 독립 재유도로만 해소",
+     "detection": "agy.verdict≠codex.verdict인데 최종 확정 전 master 독립 재유도 레코드(별도 타임스탬프·증거)가 없으면 consensus-collapse",
+     "kind": "deterministic"},
+    {"id": "SF-PRODUCER-EQ-EVALUATOR",
+     "source": "§6 eval-driven(producer≠evaluator)",
+     "constraint": "측정 자기채점 금지 — 산출 노드(producer)와 채점 노드(evaluator) 분리, 채점=master LOCKED ref launcher·암호학적 핀",
+     "detection": "eval 레코드의 producer_node_id==evaluator_node_id 이거나 LOCKED ref 핀(해시) 누락·불일치면 measurement 무효",
+     "kind": "deterministic"},
+    {"id": "SF-RETENTION-DELETE",
+     "source": "§6 eval-driven(retention gate)",
+     "constraint": "점수 올리려 콘텐츠·테스트 삭제하는 reward-hack 차단 — 이전 산출물·테스트 보존 강제",
+     "detection": "라운드 N 항목집합이 N-1 집합을 포함하지 않으면(명시 deprecation 사유 없이) retention 위반·측정 무효",
+     "kind": "deterministic"},
+    {"id": "SF-ESCALATION-MISSING",
+     "source": "§6 라운드 루프 8(10R escalation)",
+     "constraint": "10R 도달·맥킨지급 미달이면 무한루프 금지 + 박사님 격차 보고·판단 요청 필수",
+     "detection": "기록 라운드>=10 AND 수렴 미달인데 SESSION_STATE에 ESCALATION 레코드+master→owner push가 없으면 위반",
+     "kind": "deterministic"},
+    {"id": "SF-DIRECTIVE-NOT-INJECTED",
+     "source": "§3 워커 즉시 지침 주입",
+     "constraint": "워커/리뷰어 생성 직후, 작업 티켓보다 선행해 DIRECTIVE 주입(각성) — 미주입 위임 금지(단일 sub-agent 수렴 치명에러)",
+     "detection": "launch-agent 후 첫 task-prompt timestamp가 directive-ack push timestamp보다 앞서면 inject-skip 위반",
+     "kind": "deterministic"},
+    {"id": "SF-CROSSVERIFY-GATE-SWALLOWED",
+     "source": "§8 품질 절대우선·§5② 교차검증 게이트",
+     "constraint": "교차검증 게이트 실패 시 후속 ③공통분모·④대립비교·⑤결론 전면 중단+보고 — 통과로 흘리기 금지",
+     "detection": "cross_verification_passed 플래그가 명시 True가 아닌데(누락 포함) ③④⑤ 산출물이 존재하면 swallowed-gate",
+     "kind": "deterministic"},
+    {"id": "SF-KILLSWITCH-IGNORED",
+     "source": "§6 자율주행 메타안전(kill-switch)",
+     "constraint": "박사님 아무 입력=즉시 일시정지(kill-switch) · CSO 2-phase handshake 부재 시 self-clear 금지",
+     "detection": "owner 입력 이벤트 timestamp 이후 autopilot 새 action 실행이 있으면 위반; self-clear에 대응 CSO handshake ack 레코드 없으면 unsafe-clear",
+     "kind": "deterministic"},
+    {"id": "SF-SUMMARY-COMPRESSION",
+     "source": "§8 최종 산출물(요약금지)",
+     "constraint": "최종 산출물 요약·압축 금지 — 분석·수치·표·단서 보존, 길이 원문 수준(쉬운 말 풀이 허용·항목 삭제 금지)",
+     "detection": "최종본 길이·표·수치 개수가 직전 검증본 대비 현저히 감소하면 content-loss 의심 — 항목 삭제 여부는 수기 대조(heuristic)",
+     "kind": "heuristic"},
+    {"id": "SF-HALLUCINATION-NO-SOURCE",
+     "source": "§8 환각방지·§5② 검색 선행",
+     "constraint": "출처·근거 없는 단정 금지 — 모든 사실 주장은 인용/출처(URL·file:line) 동반(garbage-in 차단)",
+     "detection": "사실 주장 문장에 출처 마커가 0이면 환각 의심 — 완결된 산문은 결정론 분리가 어려워 샘플 팩트체크 병행(heuristic)",
+     "kind": "heuristic"},
+    {"id": "SF-RENDER-RUNTIME-SWAP",
+     "source": "영상 v2 §3 — OM CRITICAL 거버넌스(매니페스트 locked runtime ≠ 실제 렌더 = 위반)",
+     "constraint": "edit가 고정한 render_runtime을 compose가 무음으로 교체 금지 — render_report.render_runtime이 edit_decisions의 고정값과 일치해야 한다(불일치·누락=무음 품질/포맷 강등)",
+     "detection": "아키타입 매니페스트(D4) edit/compose phase의 field_present:render_runtime 게이트가 필드 부재를 1차 차단(check-criteria) + render_report.render_runtime != edit_decisions.render_runtime 값 대조는 video-verify 독립 노드(D1 verdict)",
+     "kind": "deterministic"},
+]
+
+CATALOG_BANNER = (
+    "<!-- 생성됨: `javis_orchestra.py silent-failure-catalog` 가 SILENT_FAILURES에서 결정론 파생.\n"
+    "     손편집 금지 — 재생성: `javis_orchestra.py silent-failure-catalog`. "
+    "드리프트는 preflight C38(WARN)·`--check`가 탐지. -->"
+)
+
+
+def render_catalog():
+    """SILENT_FAILURES(소스-오브-레코드)에서 무음실패 카탈로그 .md를 결정론 파생한다.
+    런타임 prose(CLAUDE.md §6) 파싱이 아니라 손큐레이션 튜플의 렌더 뷰다(재컴파일 회피)."""
+    det = sum(1 for s in SILENT_FAILURES if s["kind"] == "deterministic")
+    heu = sum(1 for s in SILENT_FAILURES if s["kind"] == "heuristic")
+    lines = [
+        "# SILENT_FAILURE_CATALOG — 무음실패 카탈로그 (OpenMontage D5)",
+        "",
+        CATALOG_BANNER,
+        "",
+        "> cys엔 guard.sh가 없다 — denylist는 CLAUDE.md §6 산문이다. 이 표는 그 산문을 각 항목의 "
+        "**탐지절(위반 증명 아티팩트)**로 큐레이션한 것이다. 무점수(수치 등급 없음). source-of-record"
+        "=javis_orchestra.py 내부 `SILENT_FAILURES`.",
+        "",
+        "| id | source (CLAUDE.md §ref) | constraint | DETECTION CLAUSE | kind |",
+        "|---|---|---|---|---|",
+    ]
+    for sf in sorted(SILENT_FAILURES, key=lambda s: s["id"]):
+        lines.append("| %s | %s | %s | %s | %s |" % (
+            _cell(sf["id"]), _cell(sf["source"]), _cell(sf["constraint"]),
+            _cell(sf["detection"]), _cell(sf["kind"])))
+    lines += ["", "총 %d개 항목 — deterministic %d · heuristic %d." % (len(SILENT_FAILURES), det, heu), ""]
+    return "\n".join(lines)
+
 
 def verdict_approved(verdict):
     """verdict 문자열의 승인 판정 — 부정 토큰 우선 차단, 그 다음 승인 접두(순수 함수)."""
@@ -685,7 +951,10 @@ def gate_verdicts(rows, rnd):
             continue
         std = evaluator_std(r["evaluator"])
         if std:
-            out[std] = verdict_approved(r["verdict"])
+            # SKIP은 verdict_approved 호출 *전*에 가로챈다 — 안 그러면 'SKIPPED: x'가
+            # 승인접두도 부정토큰도 아니라 False(미승인)로 조용히 삼켜진다(D5 핵심).
+            sr = skip_reason(r["verdict"])
+            out[std] = Skip(sr) if sr is not None else verdict_approved(r["verdict"])
     return out
 
 
@@ -703,17 +972,28 @@ def cmd_gate_status(args):
     verdicts = gate_verdicts(rows, rnd)
     missing = [e for e, v in verdicts.items() if v is None]
     rejected = [e for e, v in verdicts.items() if v is False]
+    skipped = [e for e, v in verdicts.items() if isinstance(v, Skip)]
     print("게이트 4자 수렴 판정 — %s (라운드 %d)" % (args.task, rnd))
     for e in GATE_EVALUATORS:
         v = verdicts[e]
-        print("  %s %s — %s" % ("✓" if v else "✗", e,
-                                "승인" if v else ("기록 없음" if v is None else "미승인")))
+        if isinstance(v, Skip):  # Skip은 truthy 객체라 명시 분기(아니면 ✓로 오표기)
+            print("  ⊘ %s — SKIPPED: %s" % (e, v.reason))
+        elif v is True:
+            print("  ✓ %s — 승인" % e)
+        elif v is None:
+            print("  ✗ %s — 기록 없음" % e)
+        else:
+            print("  ✗ %s — 미승인" % e)
     if missing or rejected:
         print("종합: 미수렴 — %s%s. 자동 착수 불가(라운드 계속 또는 오너 보고)."
               % (("누락: " + ", ".join(missing)) if missing else "",
                  ((" / " if missing else "") + "미승인: " + ", ".join(rejected))
                  if rejected else ""))
         return 1
+    if skipped:  # 누락·미승인 없이 의도적 스킵만 남음 → exit 2(미승인과 구분: 스킵 수용 판단)
+        print("종합: 미수렴(정직한 SKIP) — %s. 스킵 수용 여부를 판단하라(미승인·누락과 구분)."
+              % ", ".join("%s(%s)" % (e, verdicts[e].reason) for e in skipped))
+        return 2
     # 보조 결정론(차단 아님): SESSION_STATE가 장부 마지막 기록보다 오래됐으면 "갱신" 요건
     # 미이행 가능성 경고 — 갱신은 전환 직전 수행이 규약이므로 순서상 이후일 수 있어 경고만.
     ss = os.path.join(pack_dir(), "round", "SESSION_STATE.md")
@@ -806,6 +1086,30 @@ def cmd_next_action(args):
     return 0
 
 
+def cmd_silent_failure_catalog(args):
+    # exit 계약: 0=재생성 완료 또는 (--check) 정합 / 1=(--check) 드리프트(파일 부재·SILENT_FAILURES와 불일치).
+    # 카탈로그는 런타임 아티팩트(pack/round/) — 재컴파일 무관, 테이블 행 변경만 cargo build(CSO).
+    rendered = render_catalog()
+    p = os.path.join(pack_dir(), "round", "SILENT_FAILURE_CATALOG.md")
+    if getattr(args, "check", False):
+        if not os.path.isfile(p):
+            print("[silent-failure-catalog] 드리프트: 카탈로그 파일 없음 — 재생성 필요: %s" % p,
+                  file=sys.stderr)
+            return 1
+        on_disk = open(p, encoding="utf-8", errors="replace").read()
+        if on_disk != rendered:
+            print("[silent-failure-catalog] 드리프트: 디스크 카탈로그가 SILENT_FAILURES와 불일치 — "
+                  "재생성 필요: %s" % p, file=sys.stderr)
+            return 1
+        print("[silent-failure-catalog] 정합: %d개 항목 (SILENT_FAILURES 파생)" % len(SILENT_FAILURES))
+        return 0
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p, "w", encoding="utf-8") as f:
+        f.write(rendered)
+    print("[silent-failure-catalog] 재생성: %s (%d개 항목)" % (p, len(SILENT_FAILURES)))
+    return 0
+
+
 def cmd_self_test(args):
     """순수 로직 자기검증 (cys 의존 없음) — preflight C19가 호출. assert 실패는 exit 1."""
     try:
@@ -885,6 +1189,21 @@ def cmd_self_test(args):
         assert gate_verdicts(rows2, 1)["codex"] is False, "재평가(마지막 기록 우선) 미반영"
         assert gate_verdicts(rows, 2) == {e: None for e in GATE_EVALUATORS}, \
             "다른 라운드 기록이 새 라운드에 새는 오염"
+        # ★3-state 게이트(D5): SKIP을 None(누락)·False(미승인)·True(승인)와 구분
+        assert skip_reason("SKIPPED: 호스트 오프라인") == "호스트 오프라인", "skip 사유 추출 실패"
+        assert skip_reason("스킵: 사유") == "사유" and skip_reason("건너뜀: x") == "x", "한국어 skip 미인식"
+        assert skip_reason("SKIPPED:") is None, "빈 사유 skip 인정(fail-closed 위반)"
+        assert skip_reason("수렴") is None and skip_reason("반려") is None, "비-skip을 skip으로 오인"
+        rows_sk = rows[:3] + [{"round": 1, "evaluator": "machine", "score": "-",
+                               "verdict": "SKIPPED: 머신 평가 호스트 다운"}]
+        gv = gate_verdicts(rows_sk, 1)
+        assert isinstance(gv["machine"], Skip), "SKIP이 Skip으로 안 잡힘(verdict_approved에 먼저 삼켜짐)"
+        assert gv["machine"] is not False and gv["machine"] is not None, "SKIP이 False/None과 혼동"
+        assert gv["machine"].reason == "머신 평가 호스트 다운", "Skip 사유 보존 실패"
+        # 사유에 'failed'가 있어도 SKIP은 미승인이 아니다(가로채기가 verdict_approved보다 먼저)
+        assert isinstance(gate_verdicts(rows[:3] + [{"round": 1, "evaluator": "machine",
+               "score": "-", "verdict": "SKIPPED: cargo build failed host"}], 1)["machine"], Skip), \
+            "사유에 fail 포함 시 SKIP이 미승인으로 오분류"
         # ★부정 verdict 차단(6차 R1 HIGH-1): 한국어 부정 접미·영문 부정이 승인으로 새면
         # 가짜 GATE CONVERGED로 자율 전진한다 — 전부 False여야 한다.
         for neg in ("수렴 실패", "수렴 미달", "승인 불가", "승인 보류", "승인 거부",
@@ -965,11 +1284,126 @@ def cmd_self_test(args):
             ["cso", "worker", "reviewer-claude-1", "reviewer-claude-2"], "유효 의무역할 치환 오류"
         assert effective_required_roles(detect=yes, agents=synth_ag) == REQUIRED_ROLES, \
             "감지 시 유효 의무역할이 표준과 불일치"
+
+        # ── 무음실패 카탈로그 배터리 (OpenMontage D5 2부 — render·무점수·드리프트) ──
+        sf_ids = [s["id"] for s in SILENT_FAILURES]
+        for must in ("SF-GATE-SCORE-FIELD", "SF-DENY-CHARTER-EDIT",
+                     "SF-PLAN-DOWNGRADE", "SF-CONSENSUS-AVERAGE"):
+            assert must in sf_ids, "필수 무음실패 id 누락: %s" % must
+        assert len(sf_ids) == len(set(sf_ids)), "무음실패 id 중복"
+        for s in SILENT_FAILURES:
+            assert s["kind"] in ("deterministic", "heuristic"), "kind enum 위반: %s" % s["id"]
+            assert not any(k in s for k in ("score", "grade", "rating")), \
+                "무점수 위반 — 수치 등급 키: %s" % s["id"]
+        pd = [s for s in SILENT_FAILURES if s["id"] == "SF-PLAN-DOWNGRADE"]
+        assert pd and pd[0]["kind"] == "heuristic", "SF-PLAN-DOWNGRADE는 heuristic이어야 한다"
+        cat = render_catalog()
+        for sid in sf_ids:
+            assert sid in cat, "카탈로그 렌더에 %s 누락" % sid
+        assert "deterministic" in cat and "heuristic" in cat, "kind 표기 누락"
+        # 무점수 트립와이어 — 알려진 등급 포맷(N/M·N점·0.x) 탐지용이지 망라적 탐지기는 아니다.
+        # 구조적 보증은 위의 score/grade/rating 키 부재 + kind enum이 담당한다.
+        assert not re.search(r"\d+\s*/\s*\d{1,3}|\b\d+\s*점\b|\b0\.\d+\b", cat), \
+            "카탈로그에 수치 등급 토큰(무점수 위반)"
+        assert render_catalog() == cat, "render_catalog 비결정론(2회 불일치)"
+        # 쓰기·--check 왕복(격리 tempdir — 라이브 pack 미접촉; CYS_PACK_DIR 재지정·복원)
+        import tempfile as _tf
+        _saved_pd = os.environ.get("CYS_PACK_DIR")
+        with _tf.TemporaryDirectory(prefix="javis-orch-sfc-") as _td:
+            os.environ["CYS_PACK_DIR"] = _td
+            try:
+                _sink = io.StringIO()
+                with contextlib.redirect_stdout(_sink), contextlib.redirect_stderr(_sink):
+                    assert cmd_silent_failure_catalog(argparse.Namespace(check=False)) == 0, "카탈로그 쓰기 exit≠0"
+                    _catp = os.path.join(_td, "round", "SILENT_FAILURE_CATALOG.md")
+                    assert os.path.isfile(_catp), "카탈로그 파일 미생성"
+                    assert cmd_silent_failure_catalog(argparse.Namespace(check=True)) == 0, "정합인데 --check 드리프트"
+                    with open(_catp, "a", encoding="utf-8") as _f:
+                        _f.write("\n변조행\n")
+                    assert cmd_silent_failure_catalog(argparse.Namespace(check=True)) == 1, "변조를 --check가 못 잡음"
+                    os.unlink(_catp)
+                    assert cmd_silent_failure_catalog(argparse.Namespace(check=True)) == 1, "파일 부재를 --check가 못 잡음"
+            finally:
+                if _saved_pd is None:
+                    os.environ.pop("CYS_PACK_DIR", None)
+                else:
+                    os.environ["CYS_PACK_DIR"] = _saved_pd
+
+        # ── 전제지식 자동주입 배터리 (OpenMontage D6 — normalize_slug 핀·resolver·티켓 byte-동일) ──
+        assert normalize_slug("feedback_decision-consult-cys-sot.md") == "decision-consult-cys-sot", \
+            "normalize_slug 접두·.md 제거 규칙 드리프트(registry와 byte-동일이어야)"
+        assert normalize_slug("Foo-Bar") == "foo-bar", "normalize_slug lower 규칙"
+        assert normalize_slug("project_x") == "x" and normalize_slug("user_y") == "y", \
+            "normalize_slug 타입접두 제거 규칙"
+        assert _split_csv("a, b ,,c") == ["a", "b", "c"], "_split_csv 정리 규칙"
+        assert _split_csv(None) == [] and _split_csv("") == [], "_split_csv 빈 입력"
+        assert resolve_prereq_block([], [], "/nonexistent-dir") == "", "빈 입력 → 빈 블록(티켓 무변)"
+        # 기존 티켓 byte-identical(prereq_block 기본 "") 회귀 — 무회귀 게이트
+        _t1 = build_task_ticket("T", "S", "C", "worker", FALLBACK_RULES, output_format=None)
+        _t2 = build_task_ticket("T", "S", "C", "worker", FALLBACK_RULES, output_format=None, prereq_block="")
+        assert _t1 == _t2, "prereq_block='' 가 기존 티켓을 변형(byte-identical 깨짐)"
+        assert "전제지식" not in _t1, "빈 prereq가 티켓에 누출"
+        _t3 = build_task_ticket("T", "S", "C", "worker", FALLBACK_RULES, prereq_block="ZZZ-PREREQ-MARK")
+        assert _t3.endswith("ZZZ-PREREQ-MARK"), "prereq_block append(끝) 실패"
+        # do/don't 무접촉 필드(C3) — dont=None byte-identical 회귀 + 주입·위치 실증
+        _tn = build_task_ticket("T", "S", "C", "worker", FALLBACK_RULES)
+        assert _tn == _t1, "dont 기본값(None)이 기존 티켓을 변형(byte-identical 깨짐)"
+        assert "무접촉" not in _tn, "dont 미지정 시 무접촉 라인 누출"
+        _td = build_task_ticket("T", "S", "C", "worker", FALLBACK_RULES, dont="ZZZ-DONT-MARK")
+        assert "무접촉" in _td and "ZZZ-DONT-MARK" in _td, "--dont 무접촉 라인 미주입"
+        assert _td.index("무접촉(절대") > _td.index("범위(이 파일"), "무접촉 라인이 범위 앞에 옴"
+        assert _td.index("무접촉(절대") < _td.index("절대 강조 4규칙 (WORKER"), \
+            "무접촉 라인 위치 오류(범위 직후·4규칙 섹션 앞이어야 — do/don't 인접)"
+        # resolver 해소/미해소/주석제외 (격리 tempdir 색인)
+        import tempfile as _tf2
+        with _tf2.TemporaryDirectory(prefix="javis-orch-d6-") as _td2:
+            _mdir = os.path.join(_td2, "memory")
+            os.makedirs(_mdir)
+            with open(os.path.join(_mdir, "MEMORY.md"), "w", encoding="utf-8") as _f:
+                _f.write("# Memory Index\n- [Foo](feedback_foo-bar.md) — 후크\n"
+                         "<!-- - [Hidden](feedback_hidden.md) — 주석은 무시 -->\n")
+            _blk = resolve_prereq_block(["grill-me"], ["foo-bar", "no-such-mem"], _mdir)
+            assert "[skill] grill-me — cys skill show grill-me" in _blk, "skill 읽기명령 누락"
+            assert "[memory] foo-bar — cat" in _blk and "feedback_foo-bar.md" in _blk, \
+                "해소된 memory 파일명·읽기명령 누락"
+            assert "해소 불가: no-such-mem" in _blk, "미해소 슬러그 무음 드롭(인라인 표기 누락)"
+            # 주석 strip 실증(비공허): 주석 속 hidden을 *요청*하면 색인에 없어 '해소 불가'여야 한다
+            # — strip이 실패했다면 hidden이 색인에 잡혀 cat 경로로 해소돼 이 assert가 깨진다.
+            _hb = resolve_prereq_block([], ["hidden"], _mdir)
+            assert "해소 불가: hidden" in _hb and "feedback_hidden.md" not in _hb, \
+                "주석 내 색인 예시가 실entry로 오탐(comment strip 실패)"
+            # 중복 collapse(같은 이름·정규화 슬러그는 1회만)
+            _dup = resolve_prereq_block(["grill-me", "grill-me"], ["foo-bar", "FEEDBACK_foo-bar.md"], _mdir)
+            assert _dup.count("[skill] grill-me — cys skill show grill-me") == 1, "중복 skill 방출"
+            assert _dup.count("[memory] foo-bar — cat") == 1, "중복 memory(같은 슬러그) 방출"
+
+        # ── D4 매니페스트 배선 배터리 (resolve_manifest_phase·명시 --success 우선·review_focus) ──
+        assert resolve_manifest_phase(None, None) == (None, []), "빈 입력 → (None,[])"
+        assert resolve_manifest_phase("/nonexistent-manifest.json", "x") == (None, []), "부재 매니페스트 → (None,[])"
+        import tempfile as _tf3
+        with _tf3.TemporaryDirectory(prefix="javis-orch-d4-") as _td3:
+            _mf = os.path.join(_td3, "workflow.json")
+            with open(_mf, "w", encoding="utf-8") as _f:
+                json.dump({"name": "w", "phases": [{"id": "g", "skill": "deep-research",
+                          "success_criteria": {"statement": "출처 3개 확보",
+                                               "checks": [{"kind": "citation_present"}]},
+                          "review_focus": ["source-quality"]}]}, _f)
+            _su, _fo = resolve_manifest_phase(_mf, "g")
+            if _su is not None:  # javis_manifest 배포 시에만 해소(환경 독립 — 부재 시 (None,[]) 계약은 위에서 핀)
+                assert _su == "출처 3개 확보", "매니페스트 success 해소 오류: %r" % _su
+                assert _fo == ["source-quality"], "review_focus 해소 오류: %r" % _fo
+            # cmd_review_prompt: 명시 --success가 매니페스트보다 우선(하위호환)
+            class _RA:
+                task, scope, reviewer, round, success, manifest, phase = "T", "S", None, 1, "명시기준ZZZ", _mf, "g"
+            _rbuf = io.StringIO()
+            with contextlib.redirect_stdout(_rbuf):
+                cmd_review_prompt(_RA())
+            assert "명시기준ZZZ" in _rbuf.getvalue(), "명시 --success가 리뷰 프롬프트에 미반영(하위호환 깨짐)"
     except AssertionError as e:
         print("javis_orchestra self-test FAIL: %s" % e, file=sys.stderr)
         return 1
     print("javis_orchestra self-test OK (4종 노드·라운드 상한·경로 탈출방지·제약 주입·"
-          "4규칙 티켓 주입·파싱·셀 새니타이즈)")
+          "4규칙 티켓 주입·do/don't 무접촉·파싱·셀 새니타이즈·무음실패 카탈로그·전제지식 주입·매니페스트 배선)")
     return 0
 
 
@@ -993,6 +1427,9 @@ def main():
     rp.add_argument("--round", type=int, default=1)
     rp.add_argument("--success", default=None,
                     help="평가 기준(구현 위임과 동일 — 리뷰어에게도 같은 기준 투입, N3 양방향)")
+    rp.add_argument("--manifest", default=None,
+                    help="워크플로우 매니페스트 경로 — 단계 평가기준·review_focus를 리뷰 프롬프트에 주입(D4·명시 --success 우선)")
+    rp.add_argument("--phase", default=None, help="매니페스트 단계 id (--manifest와 함께·D4)")
 
     tp = sub.add_parser("task-prompt", help="생존 게이트 + 절대 강조 4규칙 포함 위임 티켓 생성")
     tp.add_argument("--task", required=True)
@@ -1001,6 +1438,16 @@ def main():
     tp.add_argument("--to", default="worker", help="위임 대상 역할 (기본 worker)")
     tp.add_argument("--output-format", default=None,
                     help="산출 형식·구조 (W8 4-part output-format 슬롯 — 예: 'JSON {필드}', '마크다운 표', '보고서 PDF')")
+    tp.add_argument("--requires-skills", default=None,
+                    help="전제 스킬(쉼표 구분) — 티켓에 읽기순서 블록 주입(D6 progressive disclosure)")
+    tp.add_argument("--related-memory", default=None,
+                    help="전제 증류 memory 슬러그(쉼표 구분) — MEMORY.md 색인 해소·미해소 인라인 표기(D6)")
+    tp.add_argument("--manifest", default=None,
+                    help="워크플로우 매니페스트(workflow.json) 경로 — 단계 success_criteria를 --success로 주입(D4·명시 --success 우선)")
+    tp.add_argument("--phase", default=None, help="매니페스트 단계 id (--manifest와 함께·D4)")
+    tp.add_argument("--dont", default=None,
+                    help="무접촉(do-not-touch) — 워커가 절대 수정·삭제·리팩터·포맷하지 말 "
+                         "파일/영역(외과적 변경 음의 경계·4대 행동지침③). 미지정 시 티켓 byte-동일")
 
     pp = sub.add_parser("phase-plan",
                         help="Task를 자기완결 Phase 티켓으로 분해 (영상 N6 — Task/Phase 순차)")
@@ -1009,6 +1456,13 @@ def main():
     pp.add_argument("--scope", required=True, help="작업 대상 파일/범위")
     pp.add_argument("--success", default=None, help="성공 기준 (각 Phase 티켓에 동일 투입)")
     pp.add_argument("--to", default="worker", help="위임 대상 역할 (기본 worker)")
+    pp.add_argument("--requires-skills", default=None,
+                    help="전제 스킬(쉼표 구분) — 각 Phase 티켓에 주입(D6)")
+    pp.add_argument("--related-memory", default=None,
+                    help="전제 memory 슬러그(쉼표 구분) — 각 Phase 티켓에 주입(D6)")
+    pp.add_argument("--dont", default=None,
+                    help="무접촉(do-not-touch) — 각 Phase 티켓에 음의 경계 주입(외과적 변경·"
+                         "4대 행동지침③). 미지정 시 티켓 byte-동일")
 
     ri = sub.add_parser("round-init"); ri.add_argument("--task", required=True)
     rl = sub.add_parser("round-log")
@@ -1026,6 +1480,11 @@ def main():
 
     sub.add_parser("next-action", help="자율주행 축3 — SESSION_STATE 다음 액션 큐 첫 미완 항목")
 
+    sfc = sub.add_parser("silent-failure-catalog",
+                         help="무음실패 카탈로그(D5) 런타임 재생성 — pack/round/SILENT_FAILURE_CATALOG.md")
+    sfc.add_argument("--check", action="store_true",
+                     help="재생성 없이 디스크 카탈로그가 SILENT_FAILURES와 정합인지 드리프트 검사(불일치=exit 1)")
+
     args = ap.parse_args()
     return {
         "check": cmd_check,
@@ -1038,6 +1497,7 @@ def main():
         "round-status": cmd_round_status,
         "gate-status": cmd_gate_status,
         "next-action": cmd_next_action,
+        "silent-failure-catalog": cmd_silent_failure_catalog,
     }[args.cmd](args)
 
 

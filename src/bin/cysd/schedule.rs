@@ -70,8 +70,15 @@ pub struct Job {
     pub launch: Option<LaunchSpec>,
 }
 
+/// schedule_state.json 영속 스키마 버전 — 추가-전용 마이그레이션의 기준점.
+const SCHEDULE_STATE_VERSION: u32 = 1;
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct ScheduleState {
+    /// 영속 스키마 버전. 구파일(필드 부재)은 serde default로 0으로 로드된다. 향후 필드 변경 시
+    /// 이 버전을 올리고 변환기를 추가하라 — 기존 필드는 삭제·개명하지 말고 옆에 추가(추가-전용).
+    #[serde(default)]
+    schema_version: u32,
     /// job id → 마지막으로 처리(발화 또는 missed)한 예정 시각 epoch
     last_fired: HashMap<String, i64>,
 }
@@ -84,23 +91,88 @@ fn state_path(daemon: &Daemon) -> PathBuf {
     state_dir(&daemon.socket_path).join("schedule_state.json")
 }
 
+/// 손상 영속 파일 격리 — 조용히 기본값으로 덮어쓰지 않고 `<name>.corrupt-<epoch>`로 옮긴다.
+/// 데이터 보존 + 복원 가능 + loud 신호(호출부 eprintln). rename 성공 시 백업 경로를 반환한다.
+/// 부재 파일(첫 가동)은 정상이므로 격리 대상이 아니다 — 호출부가 NotFound를 먼저 분기한다.
+fn quarantine_corrupt(path: &std::path::Path) -> Option<PathBuf> {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let backup = path.with_file_name(format!("{name}.corrupt-{}", now_epoch() as u64));
+    std::fs::rename(path, &backup).ok().map(|_| backup)
+}
+
 pub fn load_jobs() -> Vec<Job> {
-    let Ok(content) = std::fs::read_to_string(schedule_path()) else {
-        return Vec::new();
+    let path = schedule_path();
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        // 부재 = 정상(스케줄 미설정). 빈 스케줄로 조용히 진행한다.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => {
+            eprintln!(
+                "[cysd] schedule.json 읽기 실패({}): {e} — 빈 스케줄로 진행",
+                path.display()
+            );
+            return Vec::new();
+        }
     };
-    let Ok(root) = serde_json::from_str::<serde_json::Value>(&content) else {
-        return Vec::new();
+    // 존재하나 파싱 불가 = 데이터 손상. 조용히 빈 스케줄로 대체하면 24/365 데몬의 전 하트비트가
+    // 신호 0으로 소실된다(헌장 복원 불변식 모순). 손상본을 격리하고 loud 신호를 남긴다.
+    let root: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(e) => {
+            let note = match quarantine_corrupt(&path) {
+                Some(b) => format!("손상본을 {}로 격리(데이터 보존)", b.display()),
+                None => "손상본 격리 실패".to_string(),
+            };
+            eprintln!("[cysd] schedule.json 파싱 실패: {e} — {note}; 빈 스케줄로 진행");
+            return Vec::new();
+        }
     };
-    root.get("jobs")
-        .and_then(|j| serde_json::from_value::<Vec<Job>>(j.clone()).ok())
-        .unwrap_or_default()
+    match root.get("jobs") {
+        None => Vec::new(), // jobs 키 부재 = 빈 스케줄(정상)
+        Some(j) => match serde_json::from_value::<Vec<Job>>(j.clone()) {
+            Ok(v) => v,
+            Err(e) => {
+                // root는 유효 JSON이나 jobs 스키마 불일치 — 전체 격리는 않되(다른 키 보존 가능)
+                // loud 신호로 무음 소실을 막는다. 스키마 점검이 필요한 운영 신호.
+                eprintln!(
+                    "[cysd] schedule.json 'jobs' 역직렬화 실패: {e} — 빈 스케줄(스키마 점검 필요)"
+                );
+                Vec::new()
+            }
+        },
+    }
 }
 
 fn load_state(daemon: &Daemon) -> ScheduleState {
-    std::fs::read_to_string(state_path(daemon))
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+    let path = state_path(daemon);
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        // 부재 = 정상(최초 가동). 기본 상태로 시작한다.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ScheduleState::default(),
+        Err(e) => {
+            eprintln!(
+                "[cysd] schedule_state.json 읽기 실패({}): {e} — 기본 상태로 진행",
+                path.display()
+            );
+            return ScheduleState::default();
+        }
+    };
+    match serde_json::from_str::<ScheduleState>(&content) {
+        Ok(s) => s,
+        Err(e) => {
+            // 손상 fire-state를 조용히 default로 대체하면 last_fired 소실 → 전 job 재발화.
+            // 격리 + loud로 운영자가 인지하게 한다(재발화는 보고성 job엔 무해하나 신호는 남긴다).
+            let note = match quarantine_corrupt(&path) {
+                Some(b) => format!("손상본을 {}로 격리", b.display()),
+                None => "손상본 격리 실패".to_string(),
+            };
+            eprintln!("[cysd] schedule_state.json 파싱 실패: {e} — {note}; 기본 상태로 진행");
+            ScheduleState::default()
+        }
+    }
 }
 
 fn save_state(daemon: &Daemon, state: &ScheduleState) {
@@ -176,6 +248,7 @@ fn scheduler_tick(daemon: &Arc<Daemon>) {
     let now = Local::now();
     let now_ts = now.timestamp();
     let mut state = load_state(daemon);
+    state.schema_version = SCHEDULE_STATE_VERSION; // 구파일(0) → 현재 버전 스탬프(다음 save 시 영속)
     let mut dirty = false;
     let today = now.date_naive();
     for job in jobs {
@@ -734,6 +807,50 @@ mod tests {
         oneshot.at = Some(1_900_000_000);
         oneshot.fresh = true;
         assert_eq!(effective_close_ttl(&oneshot), None);
+    }
+
+    #[test]
+    fn corrupt_persistence_is_quarantined_not_silently_dropped() {
+        // 회귀 가드 (W0-3): 존재하나 파싱 불가한 영속 파일은 조용히 기본값으로 대체되지 않고
+        // 손상본이 <name>.corrupt-<epoch>로 격리돼야 한다(24/365 데몬의 하트비트·fire-state
+        // 무음 소실 차단 — 헌장 복원 불변식). schedule_path()는 pack_dir 고정이라 핵심
+        // 격리 동작인 quarantine_corrupt를 직접 검증한다.
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!(
+            "cys-sched-corrupt-{}-{}",
+            std::process::id(),
+            now_epoch().to_bits()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("schedule.json");
+        std::fs::File::create(&p)
+            .unwrap()
+            .write_all(b"{ this is not valid json ]")
+            .unwrap();
+        let backup = quarantine_corrupt(&p).expect("손상 파일은 격리(rename)돼야 한다");
+        assert!(backup.exists(), "격리 백업 파일이 존재해야 한다(데이터 보존)");
+        assert!(!p.exists(), "원본 손상 파일은 이동돼 자리에 남지 않아야 한다");
+        assert!(
+            backup.file_name().unwrap().to_string_lossy().contains(".corrupt-"),
+            "백업 이름에 .corrupt- 표식이 있어야 한다"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn schedule_state_is_versioned_and_additive() {
+        // schema_version 도입은 추가-전용 — 구파일(필드 부재)도 default 0으로 로드돼야 하고
+        // (마이그레이션 호환), 신규 직렬화는 현재 버전을 실어야 한다.
+        let old: ScheduleState =
+            serde_json::from_str(r#"{"last_fired":{"j":5}}"#).expect("구파일도 로드돼야 함");
+        assert_eq!(old.schema_version, 0, "구파일은 schema_version 0으로 로드(추가-전용)");
+        assert_eq!(old.last_fired.get("j"), Some(&5));
+        let mut s = ScheduleState::default();
+        s.schema_version = SCHEDULE_STATE_VERSION;
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("schema_version"), "직렬화는 schema_version을 실어야 한다");
+        let back: ScheduleState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.schema_version, SCHEDULE_STATE_VERSION);
     }
 
     #[test]

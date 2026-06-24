@@ -44,6 +44,12 @@ import time
 VALID_STATUS = ("accepted", "proposed", "superseded")
 ADR_FILE_RE = re.compile(r"^(\d{4})-(.+)\.md$")
 NUM_RE = re.compile(r"^\d{4}$")
+VALID_CONFIDENCE = ("low", "medium", "high")  # 정성 enum — 수치 score 금지(reward-hack 채널 차단)
+DECISION_LOG = "DECISION_LOG.jsonl"           # ADR store에 동거하는 결정 근거 ledger(append-only)
+# rubber-stamp 이유 차단 — reason 전체가 보일러플레이트일 때만(단어 포함은 허용·오탐 방지).
+# 영상: "'best option'은 이유가 아니다" — 실 trade-off rationale를 강제한다.
+BANNED_REASON = ("best option", "the best option", "best choice", "obvious choice",
+                 "최선", "최선의 선택", "가장 좋은 선택", "당연", "그냥")
 
 
 def pack_dir():
@@ -131,18 +137,42 @@ def next_number(adir):
 def parse_adr(text):
     """ADR 본문에서 title·status·context·decision·consequences 추출.
     형식 불량 섹션은 빈 문자열. relevant 매칭·list 요약의 단일 파서."""
-    out = {"title": "", "status": "", "context": "", "decision": "", "consequences": ""}
+    out = {"title": "", "status": "", "context": "", "decision": "", "consequences": "",
+           "options": "", "reason": ""}
     # 제목: 첫 '# NNNN. <title>' 헤더
     m = re.search(r"(?m)^#\s+\d{4}\.\s*(.+?)\s*$", text)
     if m:
         out["title"] = m.group(1).strip()
     # 섹션 본문: '## <라벨>' 다음 '## ' 또는 끝까지
     for key, label in (("status", "Status"), ("context", "Context"),
-                       ("decision", "Decision"), ("consequences", "Consequences")):
+                       ("decision", "Decision"), ("consequences", "Consequences"),
+                       ("options", "Options Considered"), ("reason", "Reason")):
         sm = re.search(r"(?m)^##\s+%s\s*\n(.*?)(?:\n##\s|\Z)" % label, text, re.S)
         if sm:
             out[key] = sm.group(1).strip()
     return out
+
+
+def parse_options(raw_list):
+    """--options 값들을 [{option, rejected_because, selected}]로. 형식 'TEXT :: 거부이유'
+    또는 선택안 'TEXT :: SELECTED'(또는 '선택'). '::' 없으면 거부이유 빈 값."""
+    opts = []
+    for raw in (raw_list or []):
+        if "::" in raw:
+            text, _, why = raw.partition("::")
+            text, why = text.strip(), why.strip()
+        else:
+            text, why = raw.strip(), ""
+        selected = why.upper() == "SELECTED" or why == "선택"
+        opts.append({"option": text, "rejected_because": "" if selected else why,
+                     "selected": selected})
+    return opts
+
+
+def is_boilerplate_reason(reason):
+    """reason 전체가 rubber-stamp 보일러플레이트인가(보수적·whole-reason 매칭으로 오탐 방지)."""
+    r = (reason or "").strip().lower().rstrip(" .。!?·")
+    return r in BANNED_REASON
 
 
 def cmd_add(adir, args):
@@ -161,6 +191,28 @@ def cmd_add(adir, args):
     if not slug:
         return fail(2, "제목에서 유효한 슬러그를 만들 수 없다(영숫자·한글 없음): %r" % title)
 
+    # ── D3 의사결정 근거(Options Considered + rejected_because + 비보일러플레이트 reason) ──
+    # getattr 기본값으로 기존 호출(신 필드 없는 Namespace)과 완전 호환(회귀 0).
+    options = parse_options(getattr(args, "options", None))
+    reason = (getattr(args, "reason", None) or "").strip()
+    material = bool(getattr(args, "material", False)) or bool(options)
+    confidence = (getattr(args, "confidence", None) or "medium").strip().lower()
+    if confidence not in VALID_CONFIDENCE:
+        return fail(2, "confidence는 %s 중 하나" % "|".join(VALID_CONFIDENCE))
+    if material:
+        # 커버리지 게이트: 단일옵션 rubber-stamp 차단. 모두 잠금/생성 전 거부 → 잔재 0.
+        if len(options) < 2:
+            return fail(2, "material 결정은 옵션 >=2개 필요(--options 'A :: 거부이유' 반복). 현재 %d" % len(options))
+        if sum(1 for o in options if o["selected"]) != 1:
+            return fail(2, "옵션 중 정확히 1개를 'TEXT :: SELECTED'로 선택 표시해야 한다")
+        for o in options:
+            if not o["selected"] and not o["rejected_because"]:
+                return fail(2, "거부 옵션 %r에 rejected_because(:: 이유)가 필요하다" % o["option"])
+        if not reason:
+            return fail(2, "material 결정은 --reason(비보일러플레이트 근거)이 필요하다")
+        if is_boilerplate_reason(reason):
+            return fail(2, "reason이 보일러플레이트(%r)다 — 실 trade-off를 적어라('best option/최선'은 이유 아님)" % reason)
+
     os.makedirs(adir, exist_ok=True)
     lock_target = os.path.join(adir, ".adr")  # 채번 직렬화용 잠금 기준점
     try:
@@ -169,7 +221,8 @@ def cmd_add(adir, args):
             fname = "%04d-%s.md" % (num, slug)
             fpath = os.path.join(adir, fname)
             content = render_adr(num, title, status, args.context,
-                                 decision, args.consequences, args.supersedes)
+                                 decision, args.consequences, args.supersedes,
+                                 options, reason)
             # 원자적 생성(O_EXCL) — 잠금 하에서도 동일 슬러그 충돌 시 명확히 거부(덮어쓰기 0).
             try:
                 fd = os.open(fpath, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -177,6 +230,20 @@ def cmd_add(adir, args):
                 return fail(2, "이미 존재: %s (다른 제목을 쓰거나 파일을 직접 수정하라)" % fname)
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(content)
+            # D3: 동거 결정 ledger(append-only·같은 store) — rsi ledger.jsonl 패턴. score 키 없음.
+            if material:
+                subject = (getattr(args, "subject", None) or title).strip()
+                entry = {"event": "decision", "number": "%04d" % num, "ts": int(time.time()),
+                         "stage": getattr(args, "stage", None),
+                         "category": getattr(args, "category", None),
+                         "subject": subject,
+                         "options_considered": [{"option": o["option"],
+                                                 "rejected_because": o["rejected_because"]}
+                                                for o in options],
+                         "selected": next((o["option"] for o in options if o["selected"]), ""),
+                         "reason": reason, "confidence": confidence, "adr_file": fname}
+                with open(os.path.join(adir, DECISION_LOG), "a", encoding="utf-8") as lf:
+                    lf.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except TimeoutError as e:
         return fail(3, str(e))
 
@@ -185,8 +252,9 @@ def cmd_add(adir, args):
     return 0
 
 
-def render_adr(num, title, status, context, decision, consequences, supersedes):
-    """ADR 본문 렌더 — 영상의 SSOT 결정기록 형식(Status/Context/Decision/Consequences)."""
+def render_adr(num, title, status, context, decision, consequences, supersedes,
+               options=None, reason=None):
+    """ADR 본문 렌더 — SSOT 결정기록 형식. D3: 고려한 대안·거부이유·근거(rationale) 추가."""
     lines = []
     lines.append("# %04d. %s" % (num, title))
     lines.append("")
@@ -203,6 +271,19 @@ def render_adr(num, title, status, context, decision, consequences, supersedes):
     lines.append("## Decision")
     lines.append(decision.strip())
     lines.append("")
+    # D3: 온보딩 에이전트가 rubber-stamp와 실 trade-off를 구분하도록 대안·거부이유·근거 명시.
+    if options:
+        lines.append("## Options Considered")
+        for o in options:
+            if o.get("selected"):
+                lines.append("- %s — SELECTED" % o["option"])
+            else:
+                lines.append("- %s — rejected because: %s"
+                             % (o["option"], o.get("rejected_because") or "(미기재)"))
+        lines.append("")
+        lines.append("## Reason")
+        lines.append((reason or "").strip() or "(미기재)")
+        lines.append("")
     lines.append("## Consequences")
     lines.append((consequences or "").strip() or "(미기재)")
     lines.append("")
@@ -235,7 +316,8 @@ def query_norm(s):
 def matches(adr, terms):
     """ADR이 query 키워드에 매칭되는가 — 제목/context/decision을 합친 텍스트에 부분일치.
     영상: "이 작업과 관련된 것만 골라내는" 결정론 보조. 매칭된 키워드 목록을 함께 반환."""
-    hay = ("%s %s %s" % (adr["title"], adr["context"], adr["decision"])).lower()
+    hay = ("%s %s %s %s" % (adr["title"], adr["context"], adr["decision"],
+                            adr.get("reason", ""))).lower()
     hit = [t for t in terms if t in hay]
     return hit
 
@@ -380,6 +462,63 @@ def self_test():
         # 위 거부 add들이 디렉터리를 오염시키지 않았다(재 add 포함 3건 유지)
         if len(adr_files(adir)) != 3:
             failures.append("거부된 add가 파일을 남김")
+
+        # ── D3: 의사결정 근거(Options Considered + 동거 ledger + 커버리지 게이트) ──
+        before = len(adr_files(adir))
+        mns = argparse.Namespace(title="아키텍처 선택", decision="A 채택", context=None,
+                                 consequences=None, status="accepted", supersedes=None,
+                                 options=["A :: SELECTED", "B :: 비용 과다", "C :: 락인"],
+                                 reason="A는 무료 로컬이고 락인이 없어 cys 제약에 부합",
+                                 material=True, stage="design", category="provider",
+                                 subject=None, confidence="high")
+        with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+            if cmd_add(adir, mns) != 0:
+                failures.append("material add(옵션2+reason) 실패")
+        mfiles = adr_files(adir)
+        if len(mfiles) == before + 1:
+            mbody = open(os.path.join(adir, mfiles[-1][1]), encoding="utf-8").read()
+            for sec in ("## Options Considered", "— SELECTED",
+                        "rejected because: 비용 과다", "## Reason"):
+                if sec not in mbody:
+                    failures.append("material ADR 본문에 %r 누락" % sec)
+        else:
+            failures.append("material add가 새 ADR을 만들지 않음")
+        # 동거 ledger: 1줄·score 키 부재·confidence/selected/options 정합
+        logp = os.path.join(adir, DECISION_LOG)
+        if not os.path.isfile(logp):
+            failures.append("DECISION_LOG.jsonl 미생성")
+        else:
+            llines = [l for l in open(logp, encoding="utf-8").read().splitlines() if l.strip()]
+            ent = json.loads(llines[0]) if llines else {}
+            if len(llines) != 1:
+                failures.append("ledger 줄 수 오류: %d" % len(llines))
+            if "score" in json.dumps(ent, ensure_ascii=False):
+                failures.append("ledger에 금지된 score 키 존재")
+            if ent.get("confidence") != "high" or ent.get("selected") != "A" \
+                    or len(ent.get("options_considered", [])) != 3:
+                failures.append("ledger 메타 정합 오류: %s" % ent)
+        # 게이트: 단일옵션 material → exit 2
+        def _g(**kw):
+            base = dict(title="t", decision="d", context=None, consequences=None,
+                        status="accepted", supersedes=None, options=None, reason=None,
+                        material=False, stage=None, category=None, subject=None,
+                        confidence="medium")
+            base.update(kw)
+            with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+                return cmd_add(adir, argparse.Namespace(**base))
+        if _g(title="단일", options=["only :: SELECTED"], reason="r", material=True) != 2:
+            failures.append("단일옵션 material이 exit 2로 거부되지 않음")
+        if _g(title="보일러", options=["A :: SELECTED", "B :: x"], reason="최선", material=True) != 2:
+            failures.append("보일러플레이트 reason('최선')이 거부되지 않음")
+        if _g(title="노리즌", options=["A :: SELECTED", "B :: x"], reason=None, material=True) != 2:
+            failures.append("reason 없는 material이 거부되지 않음")
+        # 비-material 일반 add(회귀)·'최선' 포함 reason도 비material이면 통과(오탐 방지)
+        if _g(title="비머티리얼", reason="최선의 분석을 거쳐 채택") != 0:
+            failures.append("비-material 일반 add 실패(회귀)")
+        # 거부 게이트는 파일 무생성: material 정상 + 비material 통과 = before+2
+        if len(adr_files(adir)) != before + 2:
+            failures.append("게이트 거부 add가 파일을 남김: %d" % len(adr_files(adir)))
+
         # 잠금 잔류 없음
         if os.path.exists(os.path.join(adir, ".adr.lock")):
             failures.append("잠금파일 잔류")
@@ -404,6 +543,16 @@ def main():
     a.add_argument("--consequences", default=None, help="결과·trade-off")
     a.add_argument("--status", default="accepted", choices=VALID_STATUS)
     a.add_argument("--supersedes", default=None, help="대체하는 기존 ADR 번호(NNNN)")
+    # D3 의사결정 근거(rationale) — 신 인자. 미지정 시 기존 동작과 동일(비-material).
+    a.add_argument("--options", action="append", default=None,
+                   help="고려한 대안 'TEXT :: 거부이유'(선택안은 'TEXT :: SELECTED'). 반복. >=2면 material")
+    a.add_argument("--reason", default=None, help="선택 근거(비보일러플레이트 — 'best option/최선' 거부)")
+    a.add_argument("--material", action="store_true", help="중대 결정 — 옵션>=2 커버리지 게이트 강제")
+    a.add_argument("--stage", default=None, help="결정이 난 단계(ledger 메타)")
+    a.add_argument("--category", default=None, help="결정 분류(ledger 메타)")
+    a.add_argument("--subject", default=None, help="결정 주제(기본: 제목)")
+    a.add_argument("--confidence", default="medium", choices=VALID_CONFIDENCE,
+                   help="정성 신뢰도(수치 score 금지)")
 
     li = sub.add_parser("list", help="누적 ADR 한 줄 일람")
     li.add_argument("--json", action="store_true")

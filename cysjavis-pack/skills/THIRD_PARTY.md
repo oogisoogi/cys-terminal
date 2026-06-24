@@ -58,3 +58,18 @@ test-pressure-*·test-academic*)은 제외. hook·부트스트랩 메타 스킬(
 집필 3부작(writing-fragments·writing-beats·writing-shape — 업스트림 in-progress 단계,
 오너 결정으로 채택·자체 보강 예정). grill-me는 본 pack의 상위판(work 앵커 제작)이 이미
 존재해 업스트림판을 덮지 않는다. tdd·diagnose는 superpowers 채택분과 중복이라 불채택.
+
+## 설계 차용 (코드 미벤더링) — Voicebox (MIT License, Copyright (c) 2026 Voicebox Contributors)
+
+`voice-local` 스킬은 cysjavis **원작**이되, 로컬 음성 스택의 설계 DNA와 기법 근거를
+[jamiepine/voicebox](https://github.com/jamiepine/voicebox) (MIT License)에서 차용했다.
+전수조사: 보고서 `_research/Voicebox_박사급_연구보고서.md`, 메모리 `voicebox-upgrade-research`.
+
+차용한 기법·근거(설계 참조이며 현재 **코드 파일은 벤더링하지 않음**):
+엔진→언어/능력 매핑(`backend/backends/__init__.py`·`qwen_custom_voice_backend.py`),
+무제한 길이 문장경계 청킹+크로스페이드(`backend/utils/chunked_tts.py`),
+TTS 아티팩트 trim·결정론 정제(`backend/utils/audio.py`·`refinement.py`).
+
+★주의: 위 Voicebox 소스 파일을 **직접 이식(코드 복사)**하는 시점에는 그 파일 헤더에 본 MIT
+저작권 고지를 동봉해야 한다(MIT 4항). 현재 voice-local은 playbook(설계 차용)이라 벤더링
+대상이 아니다 — 코드 이식이 발생하면 이 절을 '벤더링'으로 격상하고 핀 커밋을 기재한다.

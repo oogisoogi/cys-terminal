@@ -1012,6 +1012,127 @@ class Preflight:
         if p:
             self.add(cid, PASS, "%s self-test OK (4종 노드·라운드·제약 주입 검증)" % p)
 
+    # ── C34 자기기술 능력 레지스트리 (OpenMontage D2 — 하드코딩 목록 폐기·파생 카탈로그) ──
+    def c34_registry(self):
+        cid = "C34.registry"
+        if self.skipped(cid):
+            return
+        p = self._check_bin_tool(cid, "javis_registry.py")
+        if p:
+            self.add(cid, PASS, "%s self-test OK (능력 카탈로그 파생·orphan lint·무점수)" % p)
+
+    # ── C35 채점식 provider 선택 엔진 (OpenMontage P5 — deny-by-default·무료우선) ──
+    def c35_select(self):
+        cid = "C35.select"
+        if self.skipped(cid):
+            return
+        p = self._check_bin_tool(cid, "javis_select.py")
+        if p:
+            self.add(cid, PASS, "%s self-test OK (7차원 채점·deny-by-default·무료우선)" % p)
+
+    # ── C36 리뷰어 verdict 스키마검증 + CHAI lint (OpenMontage D1 — 4자수렴 기계검증부) ──
+    def c36_verdict(self):
+        cid = "C36.verdict"
+        if self.skipped(cid):
+            return
+        p = self._check_bin_tool(cid, "javis_verdict.py")
+        if p:
+            self.add(cid, PASS, "%s self-test OK (verdict 계약·점수금지·CHAI R2 강등)" % p)
+
+    # ── C37 의사결정 로그(OpenMontage D3 — Options Considered·rejected_because·근거·무점수) ──
+    def c37_adr_engine(self):
+        cid = "C37.adr-engine"
+        if self.skipped(cid):
+            return
+        p = self._check_bin_tool(cid, "javis_adr.py")
+        if p:
+            self.add(cid, PASS, "%s self-test OK (결정근거 rationale·커버리지 게이트·동거 ledger)" % p)
+
+    # ── C38 무음실패 카탈로그 (OpenMontage D5 2부 — 런타임-write 미러[C10/C16/C25]·드리프트 WARN·--fix 재생성) ──
+    # _check_bin_tool 아님: 검사 대상은 bin 도구가 아니라 round/ 런타임 아티팩트다. SILENT_FAILURES
+    # 단일 source-of-record를 보존하려 렌더/드리프트 판정은 javis_orchestra에 위임(subprocess).
+    def c38_silent_failure_catalog(self):
+        cid = "C38.silent-failure-catalog"
+        if self.skipped(cid):
+            return
+        orch = os.path.join(pack_dir(), "bin", "javis_orchestra.py")
+        cat = os.path.join(pack_dir(), "round", "SILENT_FAILURE_CATALOG.md")
+        if not os.path.isfile(orch):
+            self.add(cid, WARN, "javis_orchestra.py 부재 — 무음실패 카탈로그 검사 보류")
+            return
+        try:
+            if self.fix:
+                r = subprocess.run([sys.executable, orch, "silent-failure-catalog"],
+                                   capture_output=True, timeout=30)
+                if r.returncode == 0:
+                    self.add(cid, FIXED, "무음실패 카탈로그 재생성: %s" % cat)
+                else:
+                    tail = (r.stderr or r.stdout or b"").decode("utf-8", "replace").strip()
+                    self.add(cid, WARN, "무음실패 카탈로그 재생성 실패: %s" % tail[-200:])
+                return
+            r = subprocess.run([sys.executable, orch, "silent-failure-catalog", "--check"],
+                               capture_output=True, timeout=30)
+            if r.returncode == 0:
+                self.add(cid, PASS, "무음실패 카탈로그 정합 (런타임 파생·D5 거버넌스)")
+            else:
+                self.add(cid, WARN, "무음실패 카탈로그 드리프트/부재 — `javis_preflight.py --fix` 또는 "
+                         "`javis_orchestra.py silent-failure-catalog`로 재생성")
+        except Exception as e:
+            # WARN-only 계약 유지: 카탈로그 검사 실패(타임아웃·OSError)가 전체 preflight를 죽이지
+            # 않게 한다(형제 검사 C18·_check_bin_tool의 except Exception 패턴 미러).
+            self.add(cid, WARN, "무음실패 카탈로그 검사 실행 불가 — 보류: %s" % e)
+
+    # ── C39 전제지식 고아 lint (OpenMontage D6 — requires_skills/related_memory 슬러그 해소·WARN-only) ──
+    # registry verify에 위임(normalize_slug·색인 규칙 단일 source-of-record 보존 — preflight는
+    # orchestra/registry를 import 안 함). orphan 문제만 골라 WARN(드리프트·점수 위반은 registry 몫).
+    # orphan 탐지 *로직* 정합은 C34(registry --self-test, synthetic orphan-ref/mem)가 핀하고,
+    # C39는 그 로직을 라이브 pack 데이터에 적용하는 표면이다(C19↔orchestra 쌍과 동형).
+    def c39_prereq_orphan_lint(self):
+        cid = "C39.prereq-orphan-lint"
+        if self.skipped(cid):
+            return
+        reg = os.path.join(pack_dir(), "bin", "javis_registry.py")
+        if not os.path.isfile(reg):
+            self.add(cid, WARN, "javis_registry.py 부재 — 전제지식 고아 lint 보류")
+            return
+        try:
+            # --root로 lint 대상을 preflight가 보는 pack에 핀(env 재유도 분기 차단).
+            r = subprocess.run([sys.executable, reg, "verify", "--root", pack_dir(), "--json"],
+                               capture_output=True, timeout=30)
+            data = json.loads((r.stdout or b"").decode("utf-8", "replace") or "{}")
+        except Exception as e:
+            self.add(cid, WARN, "전제지식 고아 lint 실행 불가 — 보류: %s" % e)
+            return
+        orphans = [p for p in data.get("problems", []) if p.startswith("orphan ")]
+        if orphans:
+            self.add(cid, WARN, "전제지식 고아 %d건(requires_skills/related_memory 색인 미해소) — %s"
+                     % (len(orphans), " · ".join(orphans[:3])))
+        else:
+            self.add(cid, PASS, "전제지식 고아 0 — requires_skills/related_memory 색인 해소 정합")
+
+    # ── C40 워크플로우 매니페스트 도구 (OpenMontage D4 — 신규 *옵션* 도구·WARN-only) ──
+    # _check_bin_tool 아님: 그건 부재·self-test 실패를 FAIL로 만든다. 매니페스트는 opt-in
+    # (없으면 resolve exit 4 → README 디스패치 폴백)이라 boot-blocker가 아니다 → WARN.
+    def c40_workflow_manifest(self):
+        cid = "C40.workflow-manifest"
+        if self.skipped(cid):
+            return
+        p = os.path.join(pack_dir(), "bin", "javis_manifest.py")
+        if not os.path.isfile(p):
+            self.add(cid, WARN, "javis_manifest.py 부재 — 타입드 워크플로우 매니페스트 미설치(opt-in·README 폴백)")
+            return
+        try:
+            r = subprocess.run([sys.executable, p, "--self-test"],
+                               capture_output=True, timeout=30)
+        except Exception as e:
+            self.add(cid, WARN, "javis_manifest.py --self-test 실행 불가 — 보류: %s" % e)
+            return
+        if r.returncode == 0:
+            self.add(cid, PASS, "javis_manifest.py self-test OK (매니페스트 계약·무점수·콘텐츠 checks·exit 4 폴백)")
+        else:
+            tail = (r.stdout or r.stderr or b"").decode("utf-8", "replace").strip()
+            self.add(cid, WARN, "javis_manifest.py self-test 실패(도구 점검 필요) — %s" % tail[-200:])
+
     # ── C18 장기기억 증류 결정론 도구 + 색인↔파일 정합 (§10 증류 게이트) ──
     def c18_memory_engine(self):
         cid = "C18.memory-engine"
@@ -1948,6 +2069,13 @@ class Preflight:
         self.c31_config_isolation()
         self.c32_statusline()
         self.c33_event_hooks()
+        self.c34_registry()
+        self.c35_select()
+        self.c36_verdict()
+        self.c37_adr_engine()
+        self.c38_silent_failure_catalog()
+        self.c39_prereq_orphan_lint()
+        self.c40_workflow_manifest()
         return self.results
 
 

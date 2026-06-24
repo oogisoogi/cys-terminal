@@ -43,6 +43,13 @@
   파생한다. **증거 없는 완료 불인정**(테스트 PASS 출력으로만), **검증자는 만든 페인이 아닌
   다른 페인**(producer≠evaluator). preflight C27이 스킬·hook 등재를 결정론 검증한다.
 
+## 2-B. ★영상·미디어 제작은 영상 아키타입 매니페스트 사용
+영상·미디어 제작은 등록된 **영상 아키타입 매니페스트**(`javis_manifest`·12 아키타입)와 **provider
+카탈로그**(`javis_select`·무료·로컬 바닥부터·deny-by-default)를 사용한다 — 갭스킬 transcription·
+scene-cut·caption-align·sfx-place 포함. 적합 아키타입을 골라 `javis_manifest phase`로 단계 계약을
+해소하고, 단계 success_criteria는 `check-criteria`가 기계검증한다(render_runtime 무음 swap =
+SF-RENDER-RUNTIME-SWAP 위반). provider는 하드코딩하지 말고 `javis_select`로 결정론 선택한다.
+
 ## 3. ★절대 강조 4규칙 — 품질·환각0 (work management 앵커 · 모든 작업 티켓 공통)
 master가 모든 위임 티켓에 이 4규칙을 자동 주입한다(`javis_orchestra.py task-prompt`).
 티켓에서 누락됐더라도 너는 이 절을 기본 계약으로 준수한다.
@@ -61,6 +68,10 @@ master가 모든 위임 티켓에 이 4규칙을 자동 주입한다(`javis_orch
 ## 5. 외과적 변경
 지시받은 항목만 수정한다. 요청 없는 기능 추가·무관 리팩토링 금지. 변경된 모든 줄이 지시로
 직접 추적 가능해야 한다. 기존 스타일을 따른다.
+- **primitives-vs-domains(leaf 배치)**: 새 공유 로직은 cys 도메인 개념(surface·agent·governance·pack)을
+  명명하지 않고 상위 의존(socket/pty/governance/pack)이 없으면 leaf(primitive)다 — domain 모듈 안이
+  아니라 leaf로 배치하라. accretion은 deliberate, bulk-move 금지. (실제 공유 모듈이 생길 때 적용 —
+  과조기 도입 금지. 근거: OpenCut notes/primitives-vs-domains.md)
 
 ## 6. 양방향 소켓 협업 (능동 push)
 - 너의 주소는 환경변수 `CYS_SURFACE_ID`·`CYS_ROLE`에 있다. `cys identify`로 확인 가능.

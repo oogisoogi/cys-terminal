@@ -35,12 +35,16 @@
     # 결정론 자기검증 (preflight C17이 부트마다 호출)
     python3 <이 파일> --self-test
 
+    # 타입드 워크플로우 매니페스트 해소 (D4 — 폴더의 workflow.json, 4=없음→README 폴백)
+    python3 <이 파일> --resolve-manifest /path/to/workflow-folder
+
 출력 (stdout, JSON):
     {"mode": "slow", "matched_token": "박사급으로", "group": "slow.quality"}
     {"mode": "deliberate", "matched_token": "교차검증해서", "group": "deliberate.quality"}
     {"mode": "fast", "matched_token": null, "group": null}
 
-종료 코드: 0 정상 판정 · 1 self-test 실패 · 2 트리거 파일 없음 · 3 JSON 파싱 실패
+종료 코드: 0 정상 판정 · 1 self-test 실패 · 2 트리거 파일 없음 · 3 JSON 파싱 실패 ·
+          4 (--resolve-manifest) 매니페스트 없음 → README 디스패치 폴백
 """
 
 import argparse
@@ -255,10 +259,24 @@ def main() -> int:
     p.add_argument("--request", help="사용자 요청 문자열")
     p.add_argument("--self-test", action="store_true",
                    help="결정론 자기검증 실행 (0=통과 1=실패)")
+    p.add_argument("--resolve-manifest", default=None, metavar="FOLDER",
+                   help="폴더의 워크플로우 매니페스트(workflow.json) 해소·검증 — javis_manifest 위임 "
+                        "(4=매니페스트 없음→README 디스패치 폴백·D4)")
     args = p.parse_args()
 
     if args.self_test:
         return self_test()
+    if args.resolve_manifest is not None:
+        # D4: 타입드 매니페스트 해소. route() TIER 로직과 무관한 별 branch(--request 요구 전 가로챔).
+        # javis_manifest에 위임 — exit 0/1/2/4 그대로 전달(4=README 폴백 신호). 도구 부재도 4(폴백).
+        import os as _os
+        import subprocess as _sp
+        _tool = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "javis_manifest.py")
+        if not _os.path.isfile(_tool):
+            print(json.dumps({"manifest": None, "fallback": "README", "note": "javis_manifest.py 부재"},
+                             ensure_ascii=False), file=sys.stderr)
+            return 4
+        return _sp.run([sys.executable, _tool, "resolve", args.resolve_manifest, "--json"]).returncode
     if args.request is None:  # 빈 문자열("")은 유효 입력 — 토큰 없음 = fast 판정
         p.error("--request 또는 --self-test 가 필요하다")
 

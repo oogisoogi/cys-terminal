@@ -26,6 +26,12 @@ enum Command {
     Ping,
     /// Identify daemon + caller (uses AITERM_SURFACE_ID env when inside a surface)
     Identify,
+    /// Emit the data-derived command catalog (self-describing index — agents/LLM read this
+    /// instead of re-parsing prose tables; the clap definition IS the single source of truth)
+    Actions {
+        #[arg(long)]
+        json: bool,
+    },
     /// Create a new surface (PTY session). Prints its surface ref.
     NewSurface {
         #[arg(long)]
@@ -859,6 +865,51 @@ fn run(command: Command) -> i32 {
                 .unwrap_or(Value::Null);
             request("system.identify", json!({"caller": caller}))
                 .map(|r| println!("{}", serde_json::to_string_pretty(&r).unwrap()))
+        }
+
+        Command::Actions { json } => {
+            // 데이터 파생 명령 카탈로그 — clap 정의가 단일 진실원천(self-describing). 에이전트/LLM
+            // 노드가 산문 표(CLAUDE.md) 재파싱 대신 이 기계 출력을 읽는다(eval-driven: 기계 산출만이 사실).
+            let app = <Cli as clap::CommandFactory>::command();
+            let mut actions: Vec<Value> = Vec::new();
+            for sub in app.get_subcommands() {
+                if sub.get_name() == "help" {
+                    continue;
+                }
+                let args: Vec<Value> = sub
+                    .get_arguments()
+                    .filter(|a| a.get_id() != "help")
+                    .map(|a| {
+                        json!({
+                            "name": a.get_id().as_str(),
+                            "long": a.get_long(),
+                            "required": a.is_required_set(),
+                            "positional": a.is_positional(),
+                        })
+                    })
+                    .collect();
+                let subs: Vec<String> =
+                    sub.get_subcommands().map(|s| s.get_name().to_string()).collect();
+                actions.push(json!({
+                    "name": sub.get_name(),
+                    "about": sub.get_about().map(|s| s.to_string()),
+                    "args": args,
+                    "subcommands": subs,
+                }));
+            }
+            let out = json!({"count": actions.len(), "actions": actions});
+            if json {
+                println!("{}", serde_json::to_string_pretty(&out).unwrap());
+            } else {
+                for a in &actions {
+                    println!(
+                        "{:<22} {}",
+                        a["name"].as_str().unwrap_or(""),
+                        a["about"].as_str().unwrap_or("")
+                    );
+                }
+            }
+            Ok(())
         }
 
         Command::NewSurface { cwd, cmd, title, role, rows, cols } => {
