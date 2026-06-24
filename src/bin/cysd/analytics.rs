@@ -39,10 +39,153 @@ pub fn open(socket_path: &Path) -> Option<Connection> {
             content TEXT, tool_name TEXT, tool_use_id TEXT, duration_ms INTEGER, ts REAL);
          CREATE TABLE IF NOT EXISTS daily_rollups(
             date TEXT PRIMARY KEY, payload TEXT, computed_at REAL);
-         CREATE TABLE IF NOT EXISTS stars(session_id TEXT PRIMARY KEY, note TEXT, starred_at REAL);",
+         CREATE TABLE IF NOT EXISTS stars(session_id TEXT PRIMARY KEY, note TEXT, starred_at REAL);
+         -- T2-3: append-only change-log + 단조 revn(낙관적 동시성) — ADDITIVE.
+         -- SESSION_STATE.md 산문 복원 경로는 불변(이건 그 위에 얹는 결정론 change-replay 능력).
+         -- penpot files_update.clj(:184-190 revn-conflict / :176-182 vern-conflict / :409 revn inc)의
+         -- 개념만 클린룸 차용 — Clojure 코드복사 0(MPL-2.0 파일전염 회피, 일반 event-sourcing 패턴).
+         CREATE TABLE IF NOT EXISTS state_scope(
+            scope       TEXT PRIMARY KEY,  -- 예: 'SESSION_STATE', 'MASTER_TODO'
+            revn        INTEGER NOT NULL,  -- 단조 ordering(penpot revn)
+            vern        INTEGER NOT NULL,  -- restore/branch 마커(penpot vern)
+            updated_at  REAL NOT NULL);
+         CREATE TABLE IF NOT EXISTS change_log(
+            seq           INTEGER PRIMARY KEY,  -- 전역 단조
+            scope         TEXT NOT NULL,
+            revn          INTEGER NOT NULL,     -- 이 변경이 만든 revn
+            vern          INTEGER NOT NULL,
+            kind          TEXT NOT NULL,        -- 변경 종류(자유 라벨)
+            payload       TEXT NOT NULL,        -- IR(JSON 등) — 형식 버전드
+            attest_hash   TEXT NOT NULL,        -- prev∥payload 해시체인(recall hash_step 동형)
+            ts            REAL NOT NULL);
+         CREATE INDEX IF NOT EXISTS ix_cl_scope_revn ON change_log(scope, revn);",
     )
     .ok()?;
     Some(conn)
+}
+
+// ── T2-3 append-only change-log + 단조 revn + 낙관적 동시성(restore-replay READER) ──
+// ADDITIVE: 기존 SESSION_STATE.md 산문 복원은 손대지 않는다. 이건 그 위에 얹는,
+// /clear 복원을 결정론 change-replay로 *추가* 재생할 수 있게 하는 능력층이다.
+
+const CL_GENESIS: [u8; 32] = [0u8; 32];
+
+/// change_log 해시체인 한 칸 — recall.rs hash_step과 동형(코드 재구현, 복사 아님).
+fn change_hash_step(prev: &[u8; 32], payload: &str) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(prev);
+    h.update(payload.as_bytes());
+    h.update(b"\n");
+    h.finalize().into()
+}
+
+fn hex32(b: &[u8; 32]) -> String {
+    let mut s = String::with_capacity(64);
+    for byte in b {
+        s.push_str(&format!("{byte:02x}"));
+    }
+    s
+}
+
+/// append 결과 — penpot files_update.clj의 revn/vern 2차원 판정을 enum으로.
+/// wire verb 노출(state.append)은 인-프로세스 편집기 배선(T2-1) 시점 — 현재는 능력층만 착륙.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppendOutcome {
+    /// 수용: 새 revn·vern·seq·해시체인 끝.
+    Accepted { revn: u64, vern: u64, seq: u64, attest_hash: String },
+    /// 낙관적 동시성 실패 — base_revn이 stored와 어긋남(다른 writer가 먼저 커밋).
+    RevnConflict { stored_revn: u64 },
+    /// restore-marker 충돌 — base_vern이 stored와 어긋남(다른 버전이 복원됨).
+    VernConflict { stored_vern: u64 },
+}
+
+/// change_log 한 줄을 revn-check-and-append 한 트랜잭션으로 적재.
+/// penpot의 Postgres MVCC 직렬화를 단일 cysd writer + 한 SQLite 트랜잭션으로 재현한다.
+/// 낙관적 동시성: base_revn != stored_revn → RevnConflict, base_vern != stored_vern → VernConflict.
+#[allow(dead_code)] // wire verb 노출은 T2-1 배선 시점 — 현재는 능력층 + 테스트만 소비.
+pub fn change_log_append(
+    conn: &mut Connection,
+    scope: &str,
+    base_revn: u64,
+    base_vern: u64,
+    kind: &str,
+    payload: &str,
+    ts: f64,
+) -> rusqlite::Result<AppendOutcome> {
+    let tx = conn.transaction()?; // BEGIN — check+append 원자성(인터리브 0)
+    let (stored_revn, stored_vern): (u64, u64) = tx
+        .query_row(
+            "SELECT revn, vern FROM state_scope WHERE scope=?1",
+            [scope],
+            |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64)),
+        )
+        .unwrap_or((0, 0));
+    // penpot :176-182 vern-conflict — restore/branch 마커 불일치(동시편집과 구별).
+    if base_vern != stored_vern {
+        return Ok(AppendOutcome::VernConflict { stored_vern });
+    }
+    // penpot :184-190 revn-conflict — base가 최신과 어긋나면 reject(단조 보장).
+    if base_revn != stored_revn {
+        return Ok(AppendOutcome::RevnConflict { stored_revn });
+    }
+    let new_revn = stored_revn + 1; // penpot :409 (update :revn inc)
+    let prev = tx
+        .query_row(
+            "SELECT attest_hash FROM change_log WHERE scope=?1 ORDER BY seq DESC LIMIT 1",
+            [scope],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|h| {
+            let bytes = (0..32)
+                .map(|i| u8::from_str_radix(h.get(i * 2..i * 2 + 2)?, 16).ok())
+                .collect::<Option<Vec<u8>>>()?;
+            let mut a = [0u8; 32];
+            a.copy_from_slice(&bytes);
+            Some(a)
+        })
+        .unwrap_or(CL_GENESIS);
+    let attest = hex32(&change_hash_step(&prev, payload));
+    tx.execute(
+        "INSERT INTO change_log(scope, revn, vern, kind, payload, attest_hash, ts)
+         VALUES(?1,?2,?3,?4,?5,?6,?7)",
+        rusqlite::params![scope, new_revn as i64, stored_vern as i64, kind, payload, attest, ts],
+    )?;
+    let seq = tx.last_insert_rowid() as u64;
+    tx.execute(
+        "INSERT INTO state_scope(scope, revn, vern, updated_at) VALUES(?1,?2,?3,?4)
+         ON CONFLICT(scope) DO UPDATE SET revn=?2, vern=?3, updated_at=?4",
+        rusqlite::params![scope, new_revn as i64, stored_vern as i64, ts],
+    )?;
+    tx.commit()?;
+    Ok(AppendOutcome::Accepted { revn: new_revn, vern: stored_vern, seq, attest_hash: attest })
+}
+
+/// restore-replay READER — /clear 복원을 결정론 재생으로.
+/// FRESH WAL reader(stale connection 비사용)로 since_revn 이후 변경을 seq 순서대로 모은다.
+/// 반환: (payloads in order, final_revn, vern, replayed_count). penpot :448-461 lagged-changes 동형.
+#[allow(dead_code)] // /clear 복원 배선은 T2-1 시점 — 현재는 능력층 + 테스트만 소비.
+pub fn change_log_restore(socket_path: &Path, scope: &str, since_revn: u64) -> Option<(Vec<String>, u64, u64, u64)> {
+    let path = state_dir(socket_path).join("analytics.db");
+    let conn = Connection::open(&path).ok()?; // FRESH reader — stale conn 안 잡음
+    let (final_revn, vern): (u64, u64) = conn
+        .query_row(
+            "SELECT revn, vern FROM state_scope WHERE scope=?1",
+            [scope],
+            |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64)),
+        )
+        .unwrap_or((0, 0));
+    let mut stmt = conn
+        .prepare("SELECT payload FROM change_log WHERE scope=?1 AND revn>?2 ORDER BY seq ASC")
+        .ok()?;
+    let rows = stmt
+        .query_map(rusqlite::params![scope, since_revn as i64], |row| row.get::<_, String>(0))
+        .ok()?;
+    let payloads: Vec<String> = rows.filter_map(|r| r.ok()).collect();
+    let replayed = payloads.len() as u64;
+    Some((payloads, final_revn, vern, replayed))
 }
 
 /// usage_record 1건 적재 — 수집기가 새 claude 메시지마다 호출. 실패는 무해히 무시.
@@ -1193,5 +1336,101 @@ mod tests {
         let red = redact_sessions(v);
         assert_eq!(red["sessions"][0]["session_id"], serde_json::Value::String(r));
         assert_eq!(red["sessions"][0]["tokens"], 5000, "집계 보존");
+    }
+
+    // ── T2-3 append-only change-log + 단조 revn + 낙관적 동시성 ──
+
+    /// 테스트용: open()의 실제 스키마로 analytics.db 생성(socket_path=dir/cys.sock → 부모 dir).
+    /// tag로 테스트별 고유 디렉터리(병렬 실행 시 WAL 충돌 회피).
+    fn open_change_db(tag: &str) -> (std::path::PathBuf, Connection) {
+        let dir = std::env::temp_dir().join(format!("cys-cl-{}-{}", std::process::id(), tag));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("cys.sock");
+        let conn = open(&socket).expect("open analytics.db");
+        (socket, conn)
+    }
+
+    #[test]
+    fn change_log_append_accepts_and_chains() {
+        let (_socket, mut conn) = open_change_db("append");
+        let out = change_log_append(&mut conn, "SESSION_STATE", 0, 0, "edit", "{\"a\":1}", 1000.0).unwrap();
+        match out {
+            AppendOutcome::Accepted { revn, vern, seq, attest_hash } => {
+                assert_eq!(revn, 1, "첫 append revn=1");
+                assert_eq!(vern, 0);
+                assert_eq!(seq, 1);
+                assert_eq!(attest_hash.len(), 64, "sha256 hex 64자");
+            }
+            other => panic!("기대 Accepted, 실제 {other:?}"),
+        }
+        // 두 번째 append는 base_revn=1로 수용, 해시체인 진행
+        let out2 = change_log_append(&mut conn, "SESSION_STATE", 1, 0, "edit", "{\"a\":2}", 1001.0).unwrap();
+        match out2 {
+            AppendOutcome::Accepted { revn, attest_hash, .. } => {
+                assert_eq!(revn, 2);
+                // 체인: 첫 payload와 다른 입력 → 다른 해시
+                let first: String = conn
+                    .query_row("SELECT attest_hash FROM change_log WHERE revn=1", [], |r| r.get(0))
+                    .unwrap();
+                assert_ne!(attest_hash, first, "해시체인 칸마다 상이");
+            }
+            other => panic!("기대 Accepted, 실제 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn revn_monotonic_rejects_stale_base() {
+        let (_socket, mut conn) = open_change_db("monotonic");
+        change_log_append(&mut conn, "S", 0, 0, "edit", "p0", 1.0).unwrap(); // revn→1
+        change_log_append(&mut conn, "S", 1, 0, "edit", "p1", 2.0).unwrap(); // revn→2
+        // stale base_revn=1(현재 stored=2) → RevnConflict, 단조 위반 0
+        let out = change_log_append(&mut conn, "S", 1, 0, "edit", "px", 3.0).unwrap();
+        assert_eq!(out, AppendOutcome::RevnConflict { stored_revn: 2 });
+        // change_log는 2건만(거부된 건 미적재) → restore replay 결정론
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM change_log WHERE scope='S'", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 2, "거부된 append는 change_log에 들어가지 않음");
+    }
+
+    #[test]
+    fn vern_conflict_distinguishes_restore_from_edit() {
+        let (_socket, mut conn) = open_change_db("vern");
+        change_log_append(&mut conn, "S", 0, 0, "edit", "p0", 1.0).unwrap();
+        // stored_vern=0인데 base_vern=5(다른 버전 복원 가정) → VernConflict(RevnConflict와 구별)
+        let out = change_log_append(&mut conn, "S", 1, 5, "edit", "p1", 2.0).unwrap();
+        assert_eq!(out, AppendOutcome::VernConflict { stored_vern: 0 });
+    }
+
+    /// R6 핵심: 같은 base_revn으로 동시에 두 writer가 append → 정확히 1 Accepted, 1 VernConflict 아닌
+    /// RevnConflict. 단일 cysd writer 직렬화(한 트랜잭션 check+append)가 단조성을 보장하므로,
+    /// 같은 base에서 둘째는 stored가 이미 증가해 RevnConflict로 reject됨.
+    #[test]
+    fn concurrent_same_base_exactly_one_accepted() {
+        let (_socket, mut conn) = open_change_db("concur");
+        change_log_append(&mut conn, "S", 0, 0, "edit", "seed", 1.0).unwrap(); // stored revn→1
+        // 두 writer가 둘 다 base_revn=1을 읽고(같은 base) 직렬로 cysd writer에 도달:
+        let a = change_log_append(&mut conn, "S", 1, 0, "edit", "writerA", 2.0).unwrap();
+        let b = change_log_append(&mut conn, "S", 1, 0, "edit", "writerB", 3.0).unwrap();
+        let accepted = [&a, &b].iter().filter(|o| matches!(o, AppendOutcome::Accepted { .. })).count();
+        let rejected = [&a, &b]
+            .iter()
+            .filter(|o| matches!(o, AppendOutcome::RevnConflict { stored_revn: 2 }))
+            .count();
+        assert_eq!(accepted, 1, "정확히 1건만 Accepted");
+        assert_eq!(rejected, 1, "다른 1건은 RevnConflict(stale base)");
+    }
+
+    #[test]
+    fn restore_replay_returns_changes_in_order() {
+        let (socket, mut conn) = open_change_db("restore");
+        for k in 0..5u64 {
+            change_log_append(&mut conn, "S", k, 0, "edit", &format!("p{k}"), 1.0 + k as f64).unwrap();
+        }
+        drop(conn); // writer 닫고 FRESH WAL reader로 복원(stale conn 비사용 증명)
+        let (payloads, revn, vern, replayed) = change_log_restore(&socket, "S", 2).unwrap();
+        assert_eq!(revn, 5);
+        assert_eq!(vern, 0);
+        assert_eq!(replayed, 3, "revn>2 = p2,p3,p4");
+        assert_eq!(payloads, vec!["p2".to_string(), "p3".to_string(), "p4".to_string()]);
     }
 }

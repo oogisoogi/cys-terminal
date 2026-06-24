@@ -988,6 +988,87 @@ class Preflight:
         else:
             self.add(cid, FAIL, "cys_kinds.json(build.rs codegen)이 schema/check_timeline과 드리프트")
 
+    # ── C45 state-db change-log 무결성 (T2-3 — append-only change-log + 단조 revn) ──
+    # 라이브 analytics.db(부재 시 graceful WARN)에서 change-log 스키마 존재 + revn 단조성을
+    # 결정론 확인한다. 스키마는 analytics.rs open()이 ADDITIVE로 보장(SESSION_STATE.md 산문
+    # 복원 경로는 불변 — 이 체크는 그 위에 얹은 change-replay 능력층의 무결성만 본다).
+    # ★owner c38=silent_failure_catalog이므로 stale spec ref "c38_statedb" 대신 신규 C45 사용.
+    def c45_statedb(self):
+        cid = "C45.state-db"
+        if self.skipped(cid):
+            return
+        import sqlite3
+        # analytics.db 위치: CYS_SOCKET 부모(데몬 state_dir) → 기본 ~/.local/state/cys.
+        sock = os.environ.get("CYS_SOCKET") or os.environ.get("JAVIS_SOCKET") \
+            or os.environ.get("AITERM_SOCKET")
+        if sock:
+            db = os.path.join(os.path.dirname(sock), "analytics.db")
+        else:
+            db = os.path.join(os.path.expanduser("~"), ".local", "state", "cys", "analytics.db")
+        if not os.path.isfile(db):
+            self.add(cid, WARN, "analytics.db 부재(데몬 미기동/미생성) — change-log 무결성 검사 보류")
+            return
+        try:
+            conn = sqlite3.connect("file:%s?mode=ro" % db, uri=True)
+        except sqlite3.Error as e:
+            self.add(cid, WARN, "analytics.db 열기 실패 — 보류: %s" % e)
+            return
+        try:
+            tabs = {r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+            need = {"state_scope", "change_log"}
+            if not need <= tabs:
+                self.add(cid, FAIL, "change-log 스키마 부재: %s (analytics.rs open() 갱신 필요)"
+                         % ", ".join(sorted(need - tabs)))
+                return
+            # revn 단조성: 각 scope에서 seq 오름차순일 때 revn이 단조 비감소여야 한다.
+            bad = []
+            scopes = [r[0] for r in conn.execute("SELECT DISTINCT scope FROM change_log")]
+            for sc in scopes:
+                prev = None
+                for (revn,) in conn.execute(
+                        "SELECT revn FROM change_log WHERE scope=? ORDER BY seq ASC", (sc,)):
+                    if prev is not None and revn < prev:
+                        bad.append(sc)
+                        break
+                    prev = revn
+            if bad:
+                self.add(cid, FAIL, "revn 단조성 위반 scope: %s" % ", ".join(bad))
+                return
+            self.add(cid, PASS, "change-log 스키마 존재 + revn 단조성 정합(scope %d개)" % len(scopes))
+        except sqlite3.Error as e:
+            self.add(cid, WARN, "change-log 조회 실패 — 보류: %s" % e)
+        finally:
+            conn.close()
+
+    # ── C46 SESSION_STATE 예약 엔티티 ensure (T3-5 — ensure-X 복원 불변식) ──
+    def c46_session_ensure(self):
+        cid = "C46.session-ensure"
+        if self.skipped(cid):
+            return
+        p = os.path.join(pack_dir(), "bin", "javis_session.py")
+        if not os.path.isfile(p):
+            self.add(cid, WARN, "javis_session.py 부재 — 예약 엔티티 검사 보류")
+            return
+        # bin 무결성: 그 bin의 --self-test를 subprocess로(c36/c43 패턴).
+        st = subprocess.run([sys.executable, p, "--self-test"], capture_output=True)
+        if st.returncode != 0:
+            self.add(cid, FAIL, "javis_session.py --self-test 실패(배터리 불통과)")
+            return
+        # producer≠evaluator: ensure 결과 파일을 verify로 독립 채점.
+        ss = os.path.join(pack_dir(), "round", "SESSION_STATE.md")
+        rc = subprocess.run([sys.executable, p, "verify", "--file", ss], capture_output=True).returncode
+        if rc != 0 and self.fix:
+            subprocess.run([sys.executable, p, "ensure", "--file", ss], capture_output=True)
+            rc = subprocess.run([sys.executable, p, "verify", "--file", ss], capture_output=True).returncode
+            if rc == 0:
+                self.add(cid, FIXED, "예약 필드 ensure 복구")
+                return
+        if rc == 0:
+            self.add(cid, PASS, "restore_pointer·open_gates 예약 엔티티 보장 + self-test ok")
+        else:
+            self.add(cid, FAIL, "예약 필드 부재/마커 깨짐 — --fix로 ensure")
+
     # ── C09 round 핵심 문서 ──
     def c09_round_core(self):
         cid = "C09.round-core"
@@ -2294,6 +2375,8 @@ class Preflight:
         self.c42_cleanroom()
         self.c43_verdict_literals()
         self.c44_kind_enum_parity()
+        self.c45_statedb()
+        self.c46_session_ensure()
         return self.results
 
 

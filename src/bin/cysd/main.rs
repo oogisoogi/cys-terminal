@@ -11,6 +11,7 @@ mod recall;
 mod schedule;
 mod severity;
 mod state;
+mod undo;
 mod usage;
 
 use cys::Request;

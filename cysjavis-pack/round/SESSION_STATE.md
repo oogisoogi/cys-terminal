@@ -26,3 +26,12 @@
      조건형 대기("오너 지시 수신 시: …")는 여기가 아니라 '미해결 게이트'에 적는다.
      완료한 항목은 삭제하거나 [x]로 표시한다(완료 항목은 next-action이 건너뛴다). -->
 1. (없음)
+
+<!-- CYS:RESERVED:restore_pointer __CYS__RESERVED__ -->
+- 복원 포인터: (없음)
+<!-- /CYS:RESERVED:restore_pointer -->
+
+<!-- CYS:RESERVED:open_gates __CYS__RESERVED__ -->
+## 미해결 게이트
+- (없음)
+<!-- /CYS:RESERVED:open_gates -->
