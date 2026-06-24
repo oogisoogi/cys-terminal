@@ -84,6 +84,10 @@ impl Alert {
         json!({"kind": self.kind, "key": self.key, "severity": self.severity,
                "message": self.message, "detail": self.detail})
     }
+    /// "warn"|"crit" String 표면을 단일 술어 Severity로 파생(기존 String 필드 불변·외과적).
+    pub fn severity_enum(&self) -> crate::severity::Severity {
+        crate::severity::Severity::from(self.severity.as_str())
+    }
 }
 
 /// 순수 평가 — 스냅샷+설정 → 현재 발화 중인 경보(key 오름차순 결정론 정렬).
@@ -231,6 +235,24 @@ mod tests {
         let mut sorted = keys.clone();
         sorted.sort();
         assert_eq!(keys, sorted);
+    }
+
+    #[test]
+    fn severity_enum_maps_warn_crit() {
+        use crate::severity::Severity;
+        let warn = Alert {
+            kind: "rate_limit".into(),
+            key: "k".into(),
+            severity: "warn".into(),
+            message: String::new(),
+            detail: json!({}),
+        };
+        let crit = Alert { severity: "crit".into(), ..warn.clone() };
+        assert_eq!(warn.severity_enum(), Severity::Recoverable);
+        assert_eq!(crit.severity_enum(), Severity::Critical);
+        // 기존 String wire 필드 불변(외과적 — 파생자만 추가)
+        assert_eq!(warn.severity, "warn");
+        assert_eq!(crit.severity, "crit");
     }
 
     #[test]

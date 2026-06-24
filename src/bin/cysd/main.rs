@@ -9,6 +9,7 @@ mod governance;
 mod handlers;
 mod recall;
 mod schedule;
+mod severity;
 mod state;
 mod usage;
 

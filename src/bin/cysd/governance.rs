@@ -139,6 +139,7 @@ fn check_agent_death(
             "surface",
             Some(s.id),
             json!({"agent": agent, "role": role, "surface_ref": cys::surface_ref(s.id),
+                   "severity": crate::severity::Severity::Recoverable.as_str(),
                    "restart_count": restart_counts.get(&s.id).copied().unwrap_or(0)}),
         );
         if !auto_restart {
@@ -167,6 +168,7 @@ fn check_agent_death(
                 "surface",
                 Some(s.id),
                 json!({"agent": agent, "role": role,
+                       "severity": crate::severity::Severity::Critical.as_str(),
                        "note": "3 auto-restarts exhausted — master 판단 필요"}),
             );
             continue;
@@ -349,9 +351,14 @@ fn check_alerts(daemon: &Arc<Daemon>, fired: &mut HashMap<String, f64>) {
         let due = fired.get(&a.key).is_none_or(|t| now - *t >= REMIND_SECS);
         if due {
             fired.insert(a.key.clone(), now);
+            // 기존 wire("warn"|"crit") 보존 + 단일 술어 파생 severity_class 추가(additive·외과적).
+            let sev = a.severity_enum();
+            let mut payload = a.to_value();
+            payload["severity_class"] = json!(sev.as_str());
+            payload["isolate"] = json!(sev.is_critical());
             daemon
                 .bus
-                .publish(&format!("alert.{}", a.kind), "alert", None, a.to_value());
+                .publish(&format!("alert.{}", a.kind), "alert", None, payload);
         }
     }
     // 해소된 경보 키 재무장(다음 교차 시 즉시 발화) — 태스크-로컬 맵 누수도 차단.

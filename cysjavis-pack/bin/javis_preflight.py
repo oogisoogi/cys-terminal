@@ -265,6 +265,60 @@ AUTOPILOT_MEMORY_INDEX_LINE = (
     "denylist에서만 정지·kill-switch 최우선 (🔒상주 필수 — 제거 금지)"
 )
 
+# ── C41 참조 무결성 — soul.md + directive 4종의 백틱/마커 안 named 참조가 실파일로
+# 해소되는지 결정론 대조. 스캔 표면은 pack 내부 문서 그래프로 한정한다(project 메모리는
+# 노드별 가변이라 비결정론 → C18 javis_memory verify 담당, 중복 회피).
+REF_FEEDBACK = re.compile(r"feedback_[a-z0-9_]+")          # (a) 메모리 슬러그
+REF_BIN = re.compile(r"javis_[a-z0-9_]+\.py")              # (b) bin 도구
+REF_DIRECTIVE = re.compile(r"[A-Z][A-Z0-9_]*_DIRECTIVE\.md")  # (c) directive 파일명
+BACKTICK_RE = re.compile(r"`([^`]+)`")
+MARKER_LINE_RE = re.compile(r"^.*(상세 |🔒색인 상주|🔒상주).*$", re.M)
+
+
+def _canon_feedback(s):
+    """슬러그·파일명을 단일 비교 정규형으로. feedback_ 접두·.md 제거·hyphen→underscore."""
+    if s.startswith("feedback_"):
+        s = s[len("feedback_"):]
+    return s.replace("-", "_").removesuffix(".md").removesuffix("_md").lower()
+
+
+def _scan_reference_integrity(pd):
+    """pack dir의 soul.md+directive 4종 백틱/마커 named 참조를 실파일과 대조.
+    반환: (missing_list, scanned_count). 순수 함수 — is_dept_pack 정책과 무관(self-test가
+    이 함수를 직접 호출해 FAIL/PASS를 결정론으로 증명한다 = producer≠evaluator)."""
+    roots = [os.path.join(pd, "soul.md")] + \
+        [os.path.join(pd, "directives", f) for f in DIRECTIVES]
+    mem_dir = os.path.join(pd, "memory")
+    have_feedback = {_canon_feedback(n) for n in os.listdir(mem_dir)
+                     if n.startswith("feedback_")} if os.path.isdir(mem_dir) else set()
+    bin_dir = os.path.join(pd, "bin")
+    have_bin = set(os.listdir(bin_dir)) if os.path.isdir(bin_dir) else set()
+    dir_dir = os.path.join(pd, "directives")
+    have_directive = set(os.listdir(dir_dir)) if os.path.isdir(dir_dir) else set()
+    missing, scanned = [], 0
+    for path in roots:
+        try:
+            text = open(path, encoding="utf-8", errors="replace").read()
+        except OSError:
+            continue
+        # 마커 한정: 백틱 안 토큰 + '상세 '/'🔒상주' 마커 라인만(산문 오탐 차단).
+        candidates = " ".join(BACKTICK_RE.findall(text)) + "\n" + \
+            "\n".join(MARKER_LINE_RE.findall(text))
+        src = os.path.basename(path)
+        for ref in REF_FEEDBACK.findall(candidates):
+            scanned += 1
+            if _canon_feedback(ref) not in have_feedback:
+                missing.append("MISSING_REF: %s (%s) — feedback 백킹 파일 없음" % (ref, src))
+        for ref in REF_BIN.findall(candidates):
+            scanned += 1
+            if ref not in have_bin:
+                missing.append("MISSING_REF: %s (%s) — bin 도구 없음" % (ref, src))
+        for ref in REF_DIRECTIVE.findall(candidates):
+            scanned += 1
+            if ref not in have_directive:
+                missing.append("MISSING_REF: %s (%s) — directive 파일 없음" % (ref, src))
+    return missing, scanned
+
 
 def pack_dir():
     """pack 위치 결정 — src/pack.rs pack_dir()의 4단 폴백을 그대로 미러링한다."""
@@ -773,6 +827,34 @@ class Preflight:
         else:
             self.add(cid, WARN, "이벤트 hook 미등록: %d건 — --fix로 설치(claude 재시작 후 적용)"
                      % len(pending))
+
+    # ── C41 참조 무결성 (T6-P1 — soul/directive inline 백틱 참조 dangling 검출) ──
+    # C18(MEMORY.md 색인↔파일)·C39(skill frontmatter 고아)와 비중첩: C41은 본문 inline
+    # 백틱/마커 named 참조라는 새 표면만 본다. 자동수리 없음(문서 내용은 오너·노드 소관).
+    def c41_reference_integrity(self):
+        cid = "C41.reference-integrity"
+        if self.skipped(cid):
+            return
+        if is_dept_pack():  # 부서/CEO pack은 표준 문서 그래프 면제(C03와 동형)
+            self.add(cid, WARN, "부서/CEO pack — 표준 참조 그래프 검사 면제")
+            return
+        missing, scanned = _scan_reference_integrity(pack_dir())
+        if missing:
+            self.add(cid, FAIL, "; ".join(sorted(set(missing)))
+                     + " — 깨진 참조를 고치거나 누락 파일을 추가하라(자동수리 없음)")
+        else:
+            self.add(cid, PASS, "참조 %d개 전부 해소(soul+directive %d파일·feedback/bin/directive 3클래스)"
+                     % (scanned, 1 + len(DIRECTIVES)))
+
+    # ── C42 MPL 클린룸 가드레일 (T6-P6 — 흡수 연구 코드복사0 박제) ──
+    # 도구 로직 정합은 javis_cleanroom.py --self-test에 위임(C17/C19 _check_bin_tool 패턴 동형).
+    def c42_cleanroom(self):
+        cid = "C42.cleanroom-guardrail"
+        if self.skipped(cid):
+            return
+        p = self._check_bin_tool(cid, "javis_cleanroom.py")
+        if p:
+            self.add(cid, PASS, "%s self-test OK (4원칙 키·마커쌍·라이선스 화이트리스트 검증)" % p)
 
     # ── C09 round 핵심 문서 ──
     def c09_round_core(self):
@@ -2076,6 +2158,8 @@ class Preflight:
         self.c38_silent_failure_catalog()
         self.c39_prereq_orphan_lint()
         self.c40_workflow_manifest()
+        self.c41_reference_integrity()
+        self.c42_cleanroom()
         return self.results
 
 
