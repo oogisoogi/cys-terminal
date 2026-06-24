@@ -641,13 +641,38 @@ async fn handle_connection(daemon: Arc<Daemon>, stream: Stream, caller_pid: Opti
     }
 }
 
+/// T1-6: cys↔cysd ABI producer 자기검증 경계. 응답 `Value`를 `cys::wire::frame_response`로
+/// 통과시켜 round-trip 동일성(선언==실제 직렬화)을 검증하고 `_flen`/`_pv`를 additive하게
+/// 부착한다(top-level `ok`/`result`는 보존 → 구 디코더 호환). 위반은 T1-3 `Severity`로
+/// 사상해 fail-loud 기록한다(Drift/LenMismatch=Critical 격리, VersionSkew=Recoverable).
+/// 검증 실패가 응답 자체를 삼켜 클라이언트를 무기한 대기시키지 않도록, 기록 후 legacy 직렬화로
+/// 폴백해 한 줄은 항상 내보낸다(가용성 보존 — 격리 판정은 Severity 로그가 담당).
+fn abi_severity(e: &cys::wire::AbiError) -> severity::Severity {
+    match e {
+        cys::wire::AbiError::Drift | cys::wire::AbiError::LenMismatch => severity::Severity::Critical,
+        cys::wire::AbiError::VersionSkew { .. } => severity::Severity::Recoverable,
+    }
+}
+
 async fn write_line<W: AsyncWrite + Unpin>(
     w: &mut W,
     value: &serde_json::Value,
 ) -> std::io::Result<()> {
-    let mut buf = serde_json::to_vec(value).unwrap_or_default();
-    buf.push(b'\n');
-    w.write_all(&buf).await?;
+    let line = match cys::wire::frame_response(value) {
+        Ok(framed) => framed,
+        Err(e) => {
+            let sev = abi_severity(&e);
+            eprintln!(
+                "[cysd] ABI producer self-verify {} ({:?}) — falling back to legacy serialization",
+                sev.as_str(),
+                e
+            );
+            let mut body = serde_json::to_string(value).unwrap_or_default();
+            body.push('\n');
+            body
+        }
+    };
+    w.write_all(line.as_bytes()).await?;
     w.flush().await
 }
 
@@ -786,6 +811,36 @@ mod env_scrub_tests {
             "무관 env까지 지우면 안 된다"
         );
         std::env::remove_var("CYS_SCRUB_TEST_KEEP");
+    }
+}
+
+#[cfg(test)]
+mod abi_severity_tests {
+    use crate::severity::Severity;
+
+    /// T1-6: AbiError → T1-3 Severity 사상이 §4.2 계약과 일치하는지 박제.
+    /// Drift/LenMismatch=Critical(격리), VersionSkew=Recoverable(graceful).
+    #[test]
+    fn abi_error_to_severity() {
+        assert_eq!(super::abi_severity(&cys::wire::AbiError::Drift), Severity::Critical);
+        assert_eq!(
+            super::abi_severity(&cys::wire::AbiError::LenMismatch),
+            Severity::Critical
+        );
+        assert_eq!(
+            super::abi_severity(&cys::wire::AbiError::VersionSkew {
+                peer_pv: 2,
+                local_pv: cys::wire::PROTO_PV
+            }),
+            Severity::Recoverable
+        );
+        // 격리 술어와의 정합: Critical만 격리, Recoverable은 재시도.
+        assert!(super::abi_severity(&cys::wire::AbiError::Drift).is_critical());
+        assert!(!super::abi_severity(&cys::wire::AbiError::VersionSkew {
+            peer_pv: 2,
+            local_pv: cys::wire::PROTO_PV
+        })
+        .is_critical());
     }
 }
 

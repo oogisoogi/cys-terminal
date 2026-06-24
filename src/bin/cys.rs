@@ -839,7 +839,10 @@ fn request(method: &str, params: Value) -> Result<Value, String> {
     reader
         .read_line(&mut resp_line)
         .map_err(|e| e.to_string())?;
-    let resp: Value = serde_json::from_str(resp_line.trim()).map_err(|e| e.to_string())?;
+    // T1-6: 디코더 대칭검증 — declared `_flen`/`_pv` 형제 메타가 있으면 트렁케이션/버전스큐를
+    // 검출한다. additive 계약이라 반환은 top-level 응답 객체 그대로(아래 resp["ok"] 호환 유지).
+    // 메타 없는 legacy peer 프레임은 graceful 수용. LenMismatch는 트렁케이션이므로 거부.
+    let resp: Value = cys::wire::parse_frame(resp_line.trim()).map_err(|e| format!("abi: {e:?}"))?;
     if resp["ok"].as_bool() == Some(true) {
         Ok(resp["result"].clone())
     } else {

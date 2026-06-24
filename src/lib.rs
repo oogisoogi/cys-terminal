@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 pub mod pack;
 pub mod overrides;
+pub mod wire;
 #[cfg(target_os = "macos")]
 pub mod launchd;
 
