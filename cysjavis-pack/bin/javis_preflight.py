@@ -329,6 +329,23 @@ def pack_dir():
     return os.path.join(os.path.expanduser("~"), ".cys/pack")
 
 
+def _find_codegen_kinds():
+    """build.rs 산출 OUT_DIR/cys_kinds.json 을 crate target/ 아래에서 탐색(C44 3자 대조용).
+    부재 시 None(빌드 미수행 — C44는 2자 대조로 강등). pack_dir의 부모(크레이트 루트) target/만
+    훑어 무관 경로 배회를 피한다."""
+    crate_root = os.path.dirname(os.path.abspath(pack_dir().rstrip("/")))
+    target = os.path.join(crate_root, "target")
+    if not os.path.isdir(target):
+        return None
+    for root, _dirs, files in os.walk(target):
+        if "cys_kinds.json" in files:
+            try:
+                return json.load(open(os.path.join(root, "cys_kinds.json"), encoding="utf-8"))
+            except Exception:
+                continue
+    return None
+
+
 def is_dept_pack():
     """부서/CEO pack 컨텍스트인가 — pack_dir이 기본(~/.cys/pack)이 아니면 부서/CEO 데몬이다.
     부서장·CEO의 MASTER_DIRECTIVE는 표준 핀이 없는 게 정상이라 C03 표준 핀 검사를 면제한다
@@ -855,6 +872,121 @@ class Preflight:
         p = self._check_bin_tool(cid, "javis_cleanroom.py")
         if p:
             self.add(cid, PASS, "%s self-test OK (4원칙 키·마커쌍·라이선스 화이트리스트 검증)" % p)
+
+    # ── C43 verdict 리터럴 단일진실 핀 (T1-1 — codegen 0 착륙형) ──
+    # 측정 결과 경계를 건너는 #[repr(u8)] 판별값 enum = 0개(grep "repr(u" src/ = 0) →
+    # build.rs enum→TS/JSON codegen은 빌드하지 않고(미래 착륙 조건만 문서화), verdict
+    # 4-리터럴(판별값 없는 문자열 집합)의 손동기 드리프트만 문자열-동치로 fail-loud 차단한다.
+    # ★C36과 중복 아님: C36은 verdict *인스턴스*를 계약에 맞춰 검증(javis_verdict --self-test).
+    #   C43은 verdict *리터럴-정의 집합*을 소스 간 대조 — 코드측 VERDICT_ENUM(javis_verdict.py:32)
+    #   ↔ 계약측 텍스트(REVIEWER_DIRECTIVE.md 임베드). C36은 이 정의 간 드리프트를 보지 않는다.
+    # 코드측 무결성은 C36과 동일하게 javis_verdict.py --self-test에 위임(중복 self-test 호출 회피).
+    def c43_verdict_literals(self):
+        cid = "C43.verdict-literals"
+        if self.skipped(cid):
+            return
+        vbin = os.path.join(pack_dir(), "bin", "javis_verdict.py")
+        if not os.path.isfile(vbin):
+            self.add(cid, WARN, "javis_verdict.py 부재 — verdict 단일진실 검사 보류")
+            return
+        # A = 코드측 단일진실 (INVESTIGATE 제외 = 리뷰어가 채우는 계약 enum 4개)
+        try:
+            src = open(vbin, encoding="utf-8").read()
+        except Exception as e:
+            self.add(cid, WARN, "javis_verdict.py 읽기 불가 — 보류: %s" % e)
+            return
+        m = re.search(r"VERDICT_ENUM\s*=\s*\(([^)]*)\)", src)
+        a = (set(re.findall(r'"([A-Z]+)"', m.group(1))) - {"INVESTIGATE"}) if m else set()
+        expect = {"ACCEPT", "REVISE", "BLOCK", "ESCALATE"}
+        if a != expect:
+            self.add(cid, FAIL, "javis_verdict.py:32 VERDICT_ENUM 기대 4리터럴과 불일치: %s "
+                     "(기대 %s)" % (sorted(a), sorted(expect)))
+            return
+        # B = 계약측 (pack 임베드 REVIEWER_DIRECTIVE.md 의 verdict 리터럴 텍스트)
+        # 형태: `{verdict: ACCEPT|REVISE|BLOCK|ESCALATE, ...}` 또는 `"verdict": "ACCEPT | REVISE | ..."`
+        contract = os.path.join(pack_dir(), "directives", "REVIEWER_DIRECTIVE.md")
+        if not os.path.isfile(contract):
+            self.add(cid, PASS, "verdict 4리터럴 self-consistent(javis_verdict.py:32) — "
+                     "계약파일 부재로 교차검증 보류")
+            return
+        try:
+            ctext = open(contract, encoding="utf-8").read()
+        except Exception as e:
+            self.add(cid, WARN, "REVIEWER_DIRECTIVE.md 읽기 불가 — 보류: %s" % e)
+            return
+        cm = re.search(r"verdict[\"'\s:]*\s*([A-Z]+(?:\s*\|\s*[A-Z]+)+)", ctext)
+        if not cm:
+            self.add(cid, PASS, "verdict 4리터럴 self-consistent(javis_verdict.py:32) — "
+                     "계약 verdict 텍스트 미검출로 교차검증 보류")
+            return
+        b = set(re.findall(r"[A-Z]+", cm.group(1)))
+        if a == b:
+            self.add(cid, PASS, "verdict 4리터럴 손동기 일치(코드:javis_verdict.py:32 ↔ "
+                     "계약:REVIEWER_DIRECTIVE.md)")
+        else:
+            self.add(cid, FAIL, "verdict 드리프트 — 코드만:%s / 계약만:%s"
+                     % (sorted(a - b), sorted(b - a)))
+
+    # ── C44 kind/mode/transition enum 파리티 (T1-2 — 다중 출력 경로 누락0·드리프트0 FLOOR) ──
+    # cys 다중 소비 경로가 공유하는 "종류 집합"의 단일진실 동기화를 결정론 검사한다:
+    #   schema(edit_decisions.schema.json) ↔ check_timeline.py 상수(TRACK_KINDS/EL_MODES/EL_TRANSITIONS).
+    # build.rs 산출 cys_kinds.json(OUT_DIR)이 보이면 3자, 안 보이면 2자(schema↔check_timeline) 대조.
+    # ★C43과 비충돌(별 cid·verdict 도메인 무관). 과신 금지: 누락0/드리프트0의 FLOOR이지 프레임 패리티
+    # 보장이 아니다(프레임 패리티는 별도 raster-diff 하네스 소관).
+    def c44_kind_enum_parity(self):
+        cid = "C44.kind-enum-parity"
+        if self.skipped(cid):
+            return
+        schema_p = os.path.join(pack_dir(), "schemas", "edit_decisions.schema.json")
+        ct_p = os.path.join(pack_dir(), "bin", "check_timeline.py")
+        if not os.path.isfile(schema_p) or not os.path.isfile(ct_p):
+            self.add(cid, WARN, "edit_decisions.schema.json 또는 check_timeline.py 부재 — "
+                     "enum 파리티 검사 보류")
+            return
+        try:
+            schema = json.load(open(schema_p, encoding="utf-8"))
+            ctext = open(ct_p, encoding="utf-8").read()
+        except Exception as e:
+            self.add(cid, WARN, "schema/check_timeline 읽기 불가 — 보류: %s" % e)
+            return
+        # schema 측 3개 enum(경로 고정 — 스키마 구조에 박제).
+        try:
+            s_kind = set(schema["properties"]["tracks"]["items"]["properties"]["kind"]["enum"])
+            s_mode = set(schema["$defs"]["element"]["properties"]["mode"]["enum"])
+            s_trans = set(schema["$defs"]["element"]["properties"]["transition"]["enum"])
+        except (KeyError, TypeError) as e:
+            self.add(cid, FAIL, "edit_decisions.schema.json enum 경로 변형 — %s" % e)
+            return
+        # check_timeline 측 상수(C43과 동형 regex 파싱 — import 부작용 회피).
+        def _tuple_literals(name):
+            m = re.search(name + r'\s*=\s*\(([^)]*)\)', ctext)
+            return set(re.findall(r'"([^"]+)"', m.group(1))) if m else None
+        ct_kind = _tuple_literals("TRACK_KINDS")
+        ct_mode = _tuple_literals("EL_MODES")
+        ct_trans = _tuple_literals("EL_TRANSITIONS")
+        if ct_kind is None or ct_mode is None or ct_trans is None:
+            self.add(cid, FAIL, "check_timeline.py TRACK_KINDS/EL_MODES/EL_TRANSITIONS 미검출")
+            return
+        for label, sset, cset in (("kind", s_kind, ct_kind),
+                                  ("mode", s_mode, ct_mode),
+                                  ("transition", s_trans, ct_trans)):
+            if sset != cset:
+                self.add(cid, FAIL, "%s enum 드리프트 — schema만:%s / check_timeline만:%s"
+                         % (label, sorted(sset - cset), sorted(cset - sset)))
+                return
+        # cys_kinds.json(build.rs 산출) 발견 시 3자 대조(없으면 2자로 PASS·빌드 후 재검 안내).
+        gen = _find_codegen_kinds()
+        if gen is None:
+            self.add(cid, PASS, "kind/mode/transition enum 2자 일치(schema ↔ check_timeline) — "
+                     "cys_kinds.json 미발견(빌드 후 3자 재검 가능)")
+            return
+        if (set(gen.get("edit_kind", [])) == s_kind
+                and set(gen.get("mode", [])) == s_mode
+                and set(gen.get("transition", [])) == s_trans):
+            self.add(cid, PASS, "kind/mode/transition enum 3자 일치"
+                     "(cys_kinds.json ↔ schema ↔ check_timeline)")
+        else:
+            self.add(cid, FAIL, "cys_kinds.json(build.rs codegen)이 schema/check_timeline과 드리프트")
 
     # ── C09 round 핵심 문서 ──
     def c09_round_core(self):
@@ -2160,6 +2292,8 @@ class Preflight:
         self.c40_workflow_manifest()
         self.c41_reference_integrity()
         self.c42_cleanroom()
+        self.c43_verdict_literals()
+        self.c44_kind_enum_parity()
         return self.results
 
 

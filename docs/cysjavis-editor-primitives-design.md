@@ -61,6 +61,40 @@ OpenCut `#[export]` 매크로(`bridge/src/bridge.rs:24-39`)의 규율을 우리 
 - 이는 `REVIEWER_VERDICT_CONTRACT.md`가 리뷰어 verdict에 적용한 타입 계약을 *모든 코어↔셸 호출*로
   일반화한 것(동일 원리·다른 층위).
 
+## 3.1 판별값 enum codegen 계약 — 미래 착륙 조건 (T1-1 · penpot ToJs 클린룸)
+
+penpot render-wasm는 Rust WASM ↔ CLJS가 ~30개 enum을 **독립 직렬화**하며 손동기 드리프트가 발생해,
+`#[repr(u8)]` 판별값 enum을 Rust 단일정의 → TS/JSON으로 **build.rs 코드젠**해 드리프트를 소멸시킨다
+(`render-wasm/macros/src/lib.rs:167-183 generate_js_for_enum`의 계약: kebab 정규화 + 판별값 정수강제
++ 판별값 정렬 직렬화). 이 *계약/패턴*만 개념으로 차용한다(코드복사 0 · MPL-2.0 파일전염 회피).
+
+★STEP 2 실측: cys에는 이 codegen이 풀 문제 자체가 없다. **경계를 건너는 판별값 enum = 0개.**
+
+| 측정 | 명령/위치 | 결과 |
+|---|---|---|
+| `#[repr(u8/u16/u32/i32)]` enum 전수 | `grep -rn "repr(u" src/` | **0건** |
+| cys↔cysd 이벤트 wire 형태 | `src/bin/cysd/events.rs` | 문자열-키 JSON (`"type":"event"`, 문자열 `name`/`category`) |
+| 유일 TS 소비자 | `ui/src/main.ts:318-319` | `r.verdict`를 **문자열**로 읽어 패스스루 — 판별값 정수 디코드 없음 |
+
+cys wire는 전부 문자열-키 JSON이라 정수 판별값 드리프트 표면이 0. penpot이 codegen으로 푸는 다중-enum
+손동기 드리프트가 **cys에 존재하지 않으므로**, build.rs enum→TS/JSON 코드젠은 *짓지 않는다*(추측 기반
+추상화 금지 — directive 2). 대신 미래 착륙 조건을 불변식으로 박제한다:
+
+> **불변식 INV-ABI-ENUM**: cys↔cysd 경계를 건너는 enum이 `#[repr(u8)]` 정수 판별값을 지니고 TS
+> 소비자가 그 정수를 디코드하게 되는 순간(현재 0개), `build.rs`가 그 enum 단일정의를
+> `OUT_DIR/cys_shared.{ts,json}`으로 코드젠한다 — kebab 정규화 + 판별값 정수강제 + 판별값 정렬
+> 직렬화(penpot ToJs 계약의 클린룸 등가). **그 전까지: 미빌드.**
+
+- **buildsOn(신규 메커니즘 도입 0)**: codegen 착륙 시 `build.rs:28-47`의 *기존* 디렉터리스캔→`OUT_DIR`
+  코드젠 패턴(`pack_skills.rs` 생성, `fs::write` 단발)을 그대로 재사용한다.
+- **truncate-once 차이**: penpot은 per-derive-macro 확장마다 append하며 `INIT: sync::Once`로 첫 호출만
+  truncate한다. cys `build.rs`는 `main` **1회 실행**이라 `sync::Once` 불요(`fs::write` 단발로 충분).
+- **append-only 규율**(판별값 결번보존·재배열금지)은 codegen 착륙과 *동시* 도입한다(미리 짓지 않음).
+- **verdict는 이 codegen 대상이 아니다**: verdict(ACCEPT|REVISE|BLOCK|ESCALATE)는 판별값 없는 **문자열
+  집합**이고 penpot `parse_discriminant_value`(`lib.rs:157-164`)가 정수 판별값을 하드 요구하므로 메커니즘상
+  codegen 불가 — verdict 4-리터럴 드리프트는 별도 문자열-동치 preflight **C43.verdict-literals**가 차단한다
+  (`javis_verdict.py:32 VERDICT_ENUM` ↔ `REVIEWER_DIRECTIVE.md` 계약 텍스트).
+
 ## 4. primitives-vs-domains 리프 규칙 — ★owner 승인·적용됨 (W2-6 · T1-P4 · 2026-06-24)
 
 OpenCut `notes/primitives-vs-domains.md`의 판정 규칙을 워커 디렉티브에 흡수. 디렉티브 변경은 owner
