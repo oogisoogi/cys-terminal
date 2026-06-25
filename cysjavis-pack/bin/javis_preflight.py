@@ -1069,6 +1069,124 @@ class Preflight:
         else:
             self.add(cid, FAIL, "예약 필드 부재/마커 깨짐 — --fix로 ensure")
 
+    # ── C47 능력 가드 (T4-4/T6-P3 — producer≠evaluator 물리 경화) ──
+    # 정적 검사: ① cysd 원장/surface caps 스키마(caps.rs Cap enum + state.rs caps 필드 +
+    # write⊇read 정규화)가 존재하는가 ② PreToolUse hook(role-capability-gate.sh)이 reviewer
+    # 역할 변형 도구(Edit/Write/NotebookEdit/Bash-write) 차단으로 배선됐고 self-test가 통과하는가.
+    # 라이브 데몬 불요(소스/hook 정적 + hook --self-test 배터리). 부재 시 FAIL(보안 게이트 = 강한 단정).
+    def c47_capability_guard(self):
+        cid = "C47.capability-guard"
+        if self.skipped(cid):
+            return
+        crate_root = os.path.dirname(os.path.abspath(pack_dir().rstrip("/")))
+        caps_rs = os.path.join(crate_root, "src", "bin", "cysd", "caps.rs")
+        state_rs = os.path.join(crate_root, "src", "bin", "cysd", "state.rs")
+        handlers_rs = os.path.join(crate_root, "src", "bin", "cysd", "handlers.rs")
+        hook = os.path.join(pack_dir(), "hooks", "role-capability-gate.sh")
+        # ① 원장 caps 스키마 — 소스 정적 핀.
+        if not os.path.isfile(caps_rs):
+            self.add(cid, FAIL, "caps.rs 부재 — 원장 capability 스키마 미구현 (%s)" % caps_rs)
+            return
+        try:
+            caps_src = open(caps_rs, encoding="utf-8").read()
+            state_src = open(state_rs, encoding="utf-8").read() if os.path.isfile(state_rs) else ""
+            handlers_src = open(handlers_rs, encoding="utf-8").read() if os.path.isfile(handlers_rs) else ""
+        except OSError as e:
+            self.add(cid, WARN, "cysd 소스 읽기 불가 — 보류: %s" % e)
+            return
+        need_caps = [
+            ("Cap enum", "pub enum Cap"),
+            ("write⊇read 정규화", "normalize_write_implies_read"),
+            ("reviewer/planner 식별", "is_reviewer_or_planner"),
+            ("deny-by-default none()", "fn none()"),
+        ]
+        miss = [label for label, tok in need_caps if tok not in caps_src]
+        if "pub caps: Option<crate::caps::Caps>" not in state_src and "caps: Option<crate::caps::Caps>" not in state_src:
+            miss.append("LedgerEntry.caps 필드")
+        if "check_caps_gate" not in handlers_src:
+            miss.append("handlers cysd-매개 게이트(check_caps_gate)")
+        if miss:
+            self.add(cid, FAIL, "capability 스키마/게이트 미배선: %s" % ", ".join(miss))
+            return
+        # ② PreToolUse hook 배선 — reviewer 변형 도구 denylist + self-test.
+        if not os.path.isfile(hook):
+            self.add(cid, FAIL, "role-capability-gate.sh(PreToolUse 물리 enforcer) 부재 (%s)" % hook)
+            return
+        try:
+            hook_src = open(hook, encoding="utf-8").read()
+        except OSError as e:
+            self.add(cid, WARN, "hook 읽기 불가 — 보류: %s" % e)
+            return
+        hook_miss = [label for label, tok in (
+            ("MUTATION_TOOLS denylist", "MUTATION_TOOLS"),
+            ("reviewer/planner 판정", "is_reviewer_or_planner"),
+            ("Edit 차단", '"Edit"'),
+            ("write-shell 차단", "WRITE_SHELL_CMDS"),
+        ) if tok not in hook_src]
+        if hook_miss:
+            self.add(cid, FAIL, "hook reviewer denylist 미배선: %s" % ", ".join(hook_miss))
+            return
+        st = subprocess.run(["bash", hook, "--self-test"], capture_output=True)
+        if st.returncode != 0:
+            detail = (st.stderr or st.stdout).decode("utf-8", "replace").strip()[:200]
+            self.add(cid, FAIL, "role-capability-gate.sh --self-test 실패: %s" % detail)
+            return
+        self.add(cid, PASS, "원장 caps 스키마(Cap·write⊇read·deny-by-default) + cysd 게이트 + "
+                 "PreToolUse hook reviewer denylist(self-test ok) 배선 확인")
+
+    # ── C48 거버넌스 경화 (Wave3 UNIT B — watchdog 무음크래시·바이트상한·오염격리·좀비) ──
+    # 정적 핀(라이브 데몬 불요): 네 가닥이 소스에 배선됐는지 토큰 존재로 박제한다.
+    # ① T5-6 strand-2 ProcessHealth{Reusable,Poisoned} + LedgerEntry.health + is_reusable
+    # ② T4-5A 단일 RPC 응답 바이트상한(MAX_RESPONSE_BYTES + cap_response, ONE guard)
+    # ③ T5-2 surface_crashed 술어 + check_surface_crash watchdog 결선 + 재진입 가드
+    # ④ T4-5B reap_zombie_surfaces watchdog 결선(3-miss 임계). 부재 시 FAIL(거버넌스 회귀).
+    def c48_governance_hardening(self):
+        cid = "C48.governance-hardening"
+        if self.skipped(cid):
+            return
+        crate_root = os.path.dirname(os.path.abspath(pack_dir().rstrip("/")))
+        cysd = os.path.join(crate_root, "src", "bin", "cysd")
+        state_rs = os.path.join(cysd, "state.rs")
+        gov_rs = os.path.join(cysd, "governance.rs")
+        wire_rs = os.path.join(crate_root, "src", "wire.rs")
+        try:
+            state_src = open(state_rs, encoding="utf-8").read() if os.path.isfile(state_rs) else ""
+            gov_src = open(gov_rs, encoding="utf-8").read() if os.path.isfile(gov_rs) else ""
+            wire_src = open(wire_rs, encoding="utf-8").read() if os.path.isfile(wire_rs) else ""
+        except OSError as e:
+            self.add(cid, WARN, "cysd 소스 읽기 불가 — 보류: %s" % e)
+            return
+        miss = []
+        # ① 오염 격리
+        if "pub enum ProcessHealth" not in state_src or "Poisoned" not in state_src:
+            miss.append("ProcessHealth{Reusable,Poisoned}")
+        if "pub health: ProcessHealth" not in state_src:
+            miss.append("LedgerEntry.health 필드")
+        if "fn is_reusable" not in state_src:
+            miss.append("is_reusable 재사용 술어")
+        if "poison_surface_ledger" not in gov_src:
+            miss.append("poison_surface_ledger 마킹")
+        # ② 바이트상한 (ONE guard)
+        if "MAX_RESPONSE_BYTES" not in wire_src or "fn cap_response" not in wire_src:
+            miss.append("MAX_RESPONSE_BYTES/cap_response 바이트상한")
+        # ③ 무음 크래시
+        if "fn surface_crashed" not in gov_src:
+            miss.append("surface_crashed 술어")
+        if "fn check_surface_crash" not in gov_src or "check_surface_crash(&daemon)" not in gov_src:
+            miss.append("check_surface_crash watchdog 결선")
+        if "CRASH_HANDLER_ACTIVE" not in gov_src:
+            miss.append("크래시 핸들러 재진입 가드")
+        # ④ 좀비 하트비트
+        if "fn reap_zombie_surfaces" not in gov_src or "reap_zombie_surfaces(&daemon" not in gov_src:
+            miss.append("reap_zombie_surfaces watchdog 결선")
+        if "ZOMBIE_MISS_THRESHOLD" not in gov_src:
+            miss.append("좀비 3-miss 임계")
+        if miss:
+            self.add(cid, FAIL, "거버넌스 경화 미배선: %s" % ", ".join(miss))
+        else:
+            self.add(cid, PASS, "오염격리(ProcessHealth)·바이트상한(cap_response)·무음크래시"
+                     "(surface_crashed+재진입가드)·좀비(reap_zombie_surfaces 3-miss) 4가닥 배선 확인")
+
     # ── C09 round 핵심 문서 ──
     def c09_round_core(self):
         cid = "C09.round-core"
@@ -2377,6 +2495,8 @@ class Preflight:
         self.c44_kind_enum_parity()
         self.c45_statedb()
         self.c46_session_ensure()
+        self.c47_capability_guard()
+        self.c48_governance_hardening()
         return self.results
 
 

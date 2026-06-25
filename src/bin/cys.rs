@@ -363,6 +363,9 @@ enum Command {
     },
     /// Print (creating if absent) this surface's role-specific TODO file path — 복수 워커가 같은 파일을 공유하지 않도록 역할별 고유 경로를 결정론적으로 산출
     TodoPath,
+    /// Print this surface's cysd-authoritative role (one word) — PreToolUse capability-gate hook용.
+    /// CYS_SURFACE_ID로 자기 surface를 찾아 데몬 roles 맵의 role을 출력(미등록 시 빈 줄·exit 0).
+    SurfaceRole,
 }
 
 #[derive(Subcommand)]
@@ -1232,6 +1235,8 @@ fn run(command: Command) -> i32 {
         Command::LaunchAgent { role, agent, cwd } => return run_launch_agent(&role, &agent, cwd),
         Command::Boot { cwd } => return run_boot(cwd),
         Command::TodoPath => return run_todo_path(),
+
+        Command::SurfaceRole => return run_surface_role(),
 
         Command::Resize { surface, rows, cols } => target_surface(&surface, &None).and_then(|sid| {
             request("surface.resize", json!({"surface_id": sid, "rows": rows, "cols": cols}))
@@ -2396,6 +2401,29 @@ fn boot_agent_on_surface(
 /// 워커 todo 경로 결정론 산출: 자기 surface의 (데몬 권위) 역할 → `<pack>/round/<ROLE>_TODO.md`.
 /// 역할은 데몬 roles 맵(dedup된 worker-N 포함)에서 읽으므로 LLM 치환·env 스냅샷에 의존하지 않는다.
 /// 복수 워커는 각자 distinct 역할 → distinct 파일 → 충돌 0. 파일이 없으면 골격을 만들어 둔다.
+/// 자기 surface의 cysd-권위 역할 한 단어를 stdout으로 출력 (PreToolUse capability-gate hook 전용).
+/// CYS_SURFACE_ID(데몬이 PTY에 주입·상속)로 자기 surface를 surface.list에서 찾아 데몬 roles 맵의
+/// role을 출력한다. 역할 미등록·env 부재·데몬 미응답이면 빈 줄 + exit 0(hook이 deny측 안전 판정).
+/// ★role은 self-declared가 아니라 데몬 권위 — claim_role/launch-agent가 신원검증 후 등록한 값.
+fn run_surface_role() -> i32 {
+    let Some(my_sid) = cys::env_compat(ENV_SURFACE_ID).and_then(|s| parse_surface_ref(&s)) else {
+        println!();
+        return 0;
+    };
+    let role = request("surface.list", json!({}))
+        .ok()
+        .and_then(|r| {
+            r["surfaces"].as_array().and_then(|arr| {
+                arr.iter()
+                    .find(|s| s["surface_id"].as_u64() == Some(my_sid))
+                    .and_then(|s| s["role"].as_str().map(|x| x.to_string()))
+            })
+        })
+        .unwrap_or_default();
+    println!("{role}");
+    0
+}
+
 fn run_todo_path() -> i32 {
     let Some(sref) = cys::env_compat(ENV_SURFACE_ID) else {
         eprintln!("CYS_SURFACE_ID 없음 — 데몬이 띄운 pane 안에서만 동작한다");

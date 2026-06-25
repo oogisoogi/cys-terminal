@@ -26,6 +26,7 @@ pub fn spawn_watchdog(daemon: Arc<Daemon>) {
         let mut deadman_last_alert: f64 = 0.0;
         let mut alert_fired: HashMap<String, f64> = HashMap::new();
         let mut learn_stuck_debounce: HashMap<u64, f64> = HashMap::new();
+        let mut zombie_miss: HashMap<u64, u32> = HashMap::new();
         let mut tick_no: u64 = 0;
         loop {
             tokio::time::sleep(Duration::from_secs(WATCHDOG_INTERVAL_SECS)).await;
@@ -40,7 +41,9 @@ pub fn spawn_watchdog(daemon: Arc<Daemon>) {
                 deliver_queued(&daemon, &mut queue_depth_alerted);
                 reap_orphan_ledger(&daemon, &sys);
                 reap_exited_surfaces(&daemon);
+                reap_zombie_surfaces(&daemon, &sys, &mut zombie_miss);
                 check_agent_death(&daemon, &sys, &mut restart_counts);
+                check_surface_crash(&daemon);
                 check_feed_aging(&daemon, &mut feed_reminded);
                 check_master_deadman(&daemon, &mut deadman_last_alert);
                 // 저빈도 검사(15초): 파일 stat·화면 렌더 — 5초마다 돌릴 필요 없음
@@ -68,6 +71,7 @@ pub fn spawn_watchdog(daemon: Arc<Daemon>) {
                 );
                 queue_depth_alerted.retain(|sid, _| live_surface_ids.contains(sid));
                 learn_stuck_debounce.retain(|sid, _| live_surface_ids.contains(sid));
+                zombie_miss.retain(|sid, _| live_surface_ids.contains(sid));
             });
             if std::panic::catch_unwind(tick).is_err() {
                 daemon.bus.publish(
@@ -86,6 +90,170 @@ fn env_u64(key: &str, default: u64) -> u64 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
+}
+
+/// T5-2 무음 크래시 윈도우(초): "성공 ack 직후 N초 내 후행 실패 헬스룰" = 크래시.
+fn crash_window_secs() -> f64 {
+    std::env::var("CYS_CRASH_WINDOW_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10.0)
+}
+
+/// T5-2 무음 크래시 술어(순수함수 — 부작용0·테스트 핀 가능, 주입 clock/events).
+/// "명령이 성공 ack를 보고했으나(last_ack_ts) 동일 surface에서 매칭 실패 헬스룰이 윈도우
+/// `window` 초 내 발화" = 무음 크래시. 프로세스 종료(agent.exited)와 **구분** — 그건
+/// check_agent_death가 이미 잡는다(이 술어는 프로세스 생존 여부를 보지 않는다).
+///
+/// 입력: `recent_health` = `{ts, surface_id, rule, line}` 시퀀스(읽기 전용·병렬 플래그 신설 0),
+/// `last_ack`= 직전 성공 ack 시각(없으면 ack 부재 → false), `surface_id`, `window`.
+/// 판정: ack 시각 T 직후 (T, T+window] 안에 같은 surface의 헬스 실패 엔트리가 존재하면 true.
+fn surface_crashed(
+    recent_health: &std::collections::VecDeque<serde_json::Value>,
+    last_ack: Option<f64>,
+    surface_id: u64,
+    window: f64,
+) -> bool {
+    let Some(ack_ts) = last_ack else {
+        return false; // 성공 ack가 없으면 "ack 후 후행 실패" 패턴 성립 불가
+    };
+    recent_health.iter().any(|h| {
+        h["surface_id"].as_u64() == Some(surface_id) && {
+            let ts = h["ts"].as_f64().unwrap_or(0.0);
+            ts > ack_ts && ts <= ack_ts + window
+        }
+    })
+}
+
+/// T5-2 무음 크래시 알림 핸들러 재진입 가드(전역) — 알림 발화 경로가 자기 자신을 다시
+/// 트리거(에러→알림→에러…)하는 무한루프를 차단한다(penpot errors.cljs `@handling-error?`
+/// 계약의 클린룸 등가). 알림은 fire-and-forget 비동기(bus.publish는 이미 비동기)라 이 가드는
+/// 한 watchdog 틱이 크래시 스캔 도중 재진입하지 않게만 보장한다.
+static CRASH_HANDLER_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// T5-2 무음 크래시 감지 watchdog 검사: "ack 후 후행 실패"를 `surface_crashed` 술어로 판정하고,
+/// 발화 시 NDJSON 이벤트 tail(~200)을 바이트상한(T4-5A) 적용해 첨부, surface별 swap 가드로
+/// 1회만 알림한다. 프로세스 종료(check_agent_death)와 직교 — 생존 프로세스의 후행실패만.
+fn check_surface_crash(daemon: &Arc<Daemon>) {
+    // 핸들러 재진입 가드 — 이미 처리 중이면 이 틱은 건너뛴다(에러→알림→에러 루프 차단).
+    if CRASH_HANDLER_ACTIVE.swap(true, Ordering::Acquire) {
+        return;
+    }
+    let window = crash_window_secs();
+    let surfaces: Vec<Arc<crate::state::Surface>> =
+        daemon.surfaces.lock().unwrap().values().cloned().collect();
+    for s in surfaces {
+        // 프로세스가 이미 종료됐으면 check_agent_death 영역 — 무음 크래시 아님.
+        if s.exited.load(Ordering::Relaxed) {
+            // 회복(또는 종료 회수)된 surface는 재진입 가드 해제 — 다음 라이프사이클에 재발화 가능.
+            s.crash_notified.store(false, Ordering::Relaxed);
+            continue;
+        }
+        let last_ack = *s.last_cmd_ack.lock().unwrap();
+        let crashed = {
+            let recent = daemon.recent_health.lock().unwrap();
+            surface_crashed(&recent, last_ack, s.id, window)
+        };
+        if !crashed {
+            // 후행 실패 윈도우를 벗어나 정상화되면 가드 해제(다음 크래시에 재발화).
+            s.crash_notified.store(false, Ordering::Relaxed);
+            continue;
+        }
+        if s.crash_notified.swap(true, Ordering::Relaxed) {
+            continue; // 이미 통지(1회성)
+        }
+        // 발화: NDJSON 이벤트 tail 첨부(바이트상한 T4-5A 적용 — 거대 페이로드 폭주 차단).
+        let mut timeline = serde_json::Value::Array(daemon.bus.tail(200));
+        if let Some(capped) = cys::wire::cap_response(&timeline) {
+            timeline = capped; // cap 초과 시 fail-loud sentinel로 대체
+        }
+        let role = s.role.lock().unwrap().clone();
+        // bus.publish는 이미 비동기(fire-and-forget) — 동기 재진입 publish 아님.
+        daemon.bus.publish(
+            "surface.crashed",
+            "surface",
+            Some(s.id),
+            json!({"surface_ref": cys::surface_ref(s.id), "role": role,
+                   "severity": crate::severity::Severity::Recoverable.as_str(),
+                   "window_secs": window, "timeline": timeline}),
+        );
+    }
+    CRASH_HANDLER_ACTIVE.store(false, Ordering::Release);
+}
+
+/// T4-5B 좀비 하트비트 임계: 연속 N회 ping 미스 시 좀비 surface로 판정·강제정리.
+const ZOMBIE_MISS_THRESHOLD: u32 = 3;
+
+/// T4-5B 좀비 판정 단일 술어(순수함수 — 테스트 핀): 연속 미스 카운트가 임계 이상이면 좀비.
+fn zombie_over_threshold(missed: u32) -> bool {
+    missed >= ZOMBIE_MISS_THRESHOLD
+}
+
+/// T4-5B 좀비 surface 정리: per-surface-connection 하트비트를 일반화한다. surface의 자식
+/// 프로세스가 사라졌는데 `exited` 플래그가 서지 않은(half-open/좀비) 상태가 watchdog 틱마다
+/// 한 번씩 "ping 미스"로 누적되고, 연속 `ZOMBIE_MISS_THRESHOLD`(3)회 미스면 좀비로 확정해
+/// 강제 정리(close_surface) + 원장 제거한다. 기존 reap_* sweep 패턴 위에 쌓는다.
+/// 한 번이라도 살아있는 신호(자식 생존)가 보이면 미스 카운트 리셋(half-open만 누적).
+fn reap_zombie_surfaces(
+    daemon: &Arc<Daemon>,
+    sys: &System,
+    zombie_miss: &mut HashMap<u64, u32>,
+) {
+    let mut to_cleanup: Vec<u64> = Vec::new();
+    {
+        let surfaces: Vec<Arc<crate::state::Surface>> =
+            daemon.surfaces.lock().unwrap().values().cloned().collect();
+        for s in surfaces {
+            // 정상 종료(exited)는 reap_exited_surfaces 영역 — 좀비 아님, 카운터 청소.
+            if s.exited.load(Ordering::Relaxed) {
+                zombie_miss.remove(&s.id);
+                continue;
+            }
+            // 하트비트 = surface의 셸 프로세스(pid) 생존. 살아있으면 미스 리셋.
+            let alive = sys.process(Pid::from_u32(s.pid)).is_some();
+            if alive {
+                zombie_miss.remove(&s.id);
+                continue;
+            }
+            // half-open: 프로세스는 사라졌는데 exited 플래그 미설정 → ping 미스 누적.
+            let missed = zombie_miss.entry(s.id).or_insert(0);
+            *missed += 1;
+            if zombie_over_threshold(*missed) {
+                to_cleanup.push(s.id);
+            }
+        }
+    }
+    for id in to_cleanup {
+        zombie_miss.remove(&id);
+        // 강제 정리: close_surface가 surface 등록 해제(이미 죽은 자식엔 kill/wait 무시).
+        if close_surface(daemon, id).is_ok() {
+            // 원장 제거: 이 surface가 소유한 스코프 항목을 원장에서 제거(좀비 잔존 차단).
+            {
+                let mut ledger = daemon.ledger.lock().unwrap();
+                ledger.retain(|_, e| e.surface_id != Some(id));
+            }
+            daemon.bus.publish(
+                "surface.zombie_reaped",
+                "surface",
+                Some(id),
+                json!({"surface_ref": cys::surface_ref(id),
+                       "reason": "heartbeat_missed", "missed": ZOMBIE_MISS_THRESHOLD}),
+            );
+        }
+    }
+}
+
+/// T5-6 strand-2: 한 surface가 소유한 원장 항목(들)을 Poisoned로 마킹 — 비정상 종료한
+/// 자식을 재사용 풀에서 영구 배제한다(watchdog 보강). 마킹만 수행(회수는 기존 reaper의
+/// 단일 소유 — 같은 pid를 이중 처리하지 않는다). 마킹된 항목이 없으면 무해한 no-op.
+fn poison_surface_ledger(daemon: &Arc<Daemon>, surface_id: u64) {
+    let mut ledger = daemon.ledger.lock().unwrap();
+    for entry in ledger.values_mut() {
+        if entry.surface_id == Some(surface_id) {
+            entry.health = crate::state::ProcessHealth::Poisoned;
+        }
+    }
 }
 
 /// T2-5 에이전트 사망 감지: 셸은 살았는데 그 위의 에이전트 프로세스만 죽은 상태를
@@ -153,6 +321,9 @@ fn check_agent_death(
                 && now - h["ts"].as_f64().unwrap_or(0.0) < 300.0
         });
         if auth_blocked {
+            // T5-6 strand-2: auth 차단(401·로그인 만료)으로 죽은 자식은 재기동도 막혔으니
+            // 재사용 풀에서도 배제 — 오염 격리.
+            poison_surface_ledger(daemon, s.id);
             daemon.bus.publish(
                 "agent.restart_blocked",
                 "surface",
@@ -163,6 +334,8 @@ fn check_agent_death(
         }
         let count = restart_counts.entry(s.id).or_insert(0);
         if *count >= 3 {
+            // T5-6 strand-2: 3회 재기동 소진 = 비정상 종료 확정 → Poisoned 마킹(재사용 금지).
+            poison_surface_ledger(daemon, s.id);
             daemon.bus.publish(
                 "agent.exit_unrecoverable",
                 "surface",
@@ -1259,7 +1432,121 @@ mod tests {
             surface_id: Some(1),
             scoped,
             registered_at: 0.0,
+            caps: None,
+            health: crate::state::ProcessHealth::Reusable,
         }
+    }
+
+    // ── T5-2: 무음 크래시 술어 (ack 후 N초 내 후행 실패 헬스룰 = crash) ──
+    // 주입 clock/events로 결정론 핀(실제 sleep·라이브 데몬 없음). 부작용0 순수함수.
+    #[test]
+    fn surface_crashed_predicate_window_semantics() {
+        use super::surface_crashed;
+        use serde_json::json;
+        let mk = |sid: u64, ts: f64| json!({"surface_id": sid, "ts": ts, "rule": "panic", "line": "x"});
+        let window = 10.0;
+
+        // (1) ack(t=100) 후 윈도우 내(t=105) 실패 = crash.
+        let mut rh = VecDeque::new();
+        rh.push_back(mk(7, 105.0));
+        assert!(surface_crashed(&rh, Some(100.0), 7, window), "ack 후 윈도우 내 실패 → crash");
+
+        // (2) ack만 있고 실패 헬스룰 없음 = false.
+        let empty: VecDeque<serde_json::Value> = VecDeque::new();
+        assert!(!surface_crashed(&empty, Some(100.0), 7, window), "ack만 → not crash");
+
+        // (3) 실패만 있고 ack 없음(last_ack=None) = false.
+        let mut rh3 = VecDeque::new();
+        rh3.push_back(mk(7, 105.0));
+        assert!(!surface_crashed(&rh3, None, 7, window), "ack 부재 → not crash");
+
+        // (4) 윈도우 초과(t=120 > 100+10) = false.
+        let mut rh4 = VecDeque::new();
+        rh4.push_back(mk(7, 120.0));
+        assert!(!surface_crashed(&rh4, Some(100.0), 7, window), "윈도우 초과 → not crash");
+
+        // (5) ack 이전(t=95 <= ack) 실패는 후행 아님 = false.
+        let mut rh5 = VecDeque::new();
+        rh5.push_back(mk(7, 95.0));
+        assert!(!surface_crashed(&rh5, Some(100.0), 7, window), "ack 이전 실패 → not crash");
+
+        // (6) 타 surface(sid=8) 실패는 본 surface(7) 크래시 아님 = false.
+        let mut rh6 = VecDeque::new();
+        rh6.push_back(mk(8, 105.0));
+        assert!(!surface_crashed(&rh6, Some(100.0), 7, window), "타 surface 실패 → not crash");
+    }
+
+    // ── T4-5B: 좀비 하트비트 — 연속 3회 ping 미스 시 좀비 정리 ──
+    // 순수 술어 + 카운터 누적 의미(주입 카운트, 실제 sleep·라이브 데몬 없음).
+    #[test]
+    fn zombie_threshold_fires_on_third_miss() {
+        use super::zombie_over_threshold;
+        // 술어: 1·2회 미스는 좀비 아님, 3회째부터 좀비.
+        assert!(!zombie_over_threshold(0));
+        assert!(!zombie_over_threshold(1));
+        assert!(!zombie_over_threshold(2));
+        assert!(zombie_over_threshold(3), "3회 미스 = 좀비");
+        assert!(zombie_over_threshold(4));
+
+        // 카운터 누적 의미: half-open(자식 사망·exited 미설정)이 3틱 연속 누적되면 cleanup 후보.
+        // reap_zombie_surfaces의 카운팅 본문과 동일한 누적·임계 판정을 순수하게 핀.
+        let mut zombie_miss: HashMap<u64, u32> = HashMap::new();
+        let mut cleanup_at: Option<u32> = None;
+        for tick in 1..=3 {
+            let missed = zombie_miss.entry(42).or_insert(0);
+            *missed += 1; // half-open 미스 누적(살아있으면 remove로 리셋되는 경로)
+            if zombie_over_threshold(*missed) && cleanup_at.is_none() {
+                cleanup_at = Some(tick);
+            }
+        }
+        assert_eq!(cleanup_at, Some(3), "정확히 3번째 미스에서 정리 트리거");
+
+        // 살아있는 신호가 한 번이라도 오면 리셋 — half-open만 누적됨을 핀.
+        zombie_miss.insert(99, 2);
+        zombie_miss.remove(&99); // alive 분기의 reset
+        assert!(!zombie_miss.contains_key(&99));
+    }
+
+    // ── T5-6 strand-2: 오염(Poisoned) 자식 풀 반환 금지 (재사용 후보 배제) ──
+    // 비정상 종료 ledger 엔트리가 Poisoned로 마킹되면 is_reusable이 false를 돌려
+    // 재사용 풀에서 배제된다. 기본(Reusable)은 재사용 가능. 순수함수 테스트 핀.
+    #[test]
+    fn poisoned_entry_is_excluded_from_reuse() {
+        use crate::state::{is_reusable, ProcessHealth};
+        let mut healthy = entry(100, 100, true);
+        assert_eq!(healthy.health, ProcessHealth::Reusable);
+        assert!(is_reusable(&healthy), "기본 Reusable 항목은 재사용 가능");
+        healthy.health = ProcessHealth::Poisoned;
+        assert!(!is_reusable(&healthy), "Poisoned 항목은 재사용 후보에서 배제");
+    }
+
+    // poison_surface_ledger가 해당 surface의 항목만 Poisoned로 마킹하고 타 surface는 불변.
+    #[test]
+    fn poison_marks_only_owning_surface_entries() {
+        use crate::state::{is_reusable, LedgerEntry, ProcessHealth};
+        let mk = |pid: u32, sid: u64| LedgerEntry {
+            pid,
+            pgid: pid as i32,
+            cmd: "x".into(),
+            surface_id: Some(sid),
+            scoped: true,
+            registered_at: 0.0,
+            caps: None,
+            health: ProcessHealth::Reusable,
+        };
+        let mut ledger: HashMap<u32, LedgerEntry> = HashMap::new();
+        ledger.insert(100, mk(100, 1));
+        ledger.insert(200, mk(200, 1));
+        ledger.insert(300, mk(300, 2));
+        // poison_surface_ledger의 본문과 동일한 순수 마킹(daemon 락 없이 핀).
+        for entry in ledger.values_mut() {
+            if entry.surface_id == Some(1) {
+                entry.health = ProcessHealth::Poisoned;
+            }
+        }
+        assert!(!is_reusable(&ledger[&100]));
+        assert!(!is_reusable(&ledger[&200]));
+        assert!(is_reusable(&ledger[&300]), "타 surface 항목은 불변");
     }
 
     // ── 종료 시 회수 대상 선별 회귀 가드 (크로스플랫폼 대칭 핵심) ──

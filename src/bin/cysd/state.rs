@@ -86,6 +86,16 @@ pub struct Surface {
     /// true=발화 가능(임계 미만 관측됨). 분리하면 같은 교차에 두 경로가 각각 발화해
     /// master/CSO가 cycle-agent를 이중 집행한다. swap(false)가 원자적 1회 발화를 보장.
     pub ctx_threshold_armed: AtomicBool,
+    /// T4-4/T6-P3 능력 가드: 이 surface의 정규화된 권한 집합(write⊇read·deny-by-default).
+    /// 역할 변경(claim_role)과 동기 갱신 — cysd-매개 변형 경로(send/scoped run)의 게이트 키.
+    /// role과 함께 도출하되 self-declared role을 신뢰하지 않고 cysd-인증 발신 surface를 키로 쓴다.
+    pub caps: Mutex<crate::caps::Caps>,
+    /// T5-2 무음 크래시 재진입 가드: "ack 후 후행 실패" 무음 크래시 발화의 1회성 swap 가드.
+    /// agent_exit_notified 패턴 확장 — 회복 시 swap(false). 제2의 AtomicBool 신설 금지(이 1개만).
+    pub crash_notified: AtomicBool,
+    /// T5-2 직전 성공 ack 시각(epoch초) — 명령(send/key)이 성공 보고한 시점. surface_crashed
+    /// 술어의 "성공 ack 후 N초 내 후행 실패" 윈도우 기준. None=아직 ack 없음.
+    pub last_cmd_ack: Mutex<Option<f64>>,
 }
 
 pub struct HealthRule {
@@ -99,6 +109,19 @@ pub struct HealthRule {
     pub pause_secs: u64,
 }
 
+/// T5-6 strand-2 오염 격리 — 비정상 종료한 자식 프로세스의 재사용 가능성 2분 분류.
+/// Exporter 교훈(penpot exporter/core.md:16 "on error the browser is destroyed instead of
+/// reused")의 클린룸 등가 — 계약만 차용, Playwright/Redis 엔진 미차용. 1-byte enum
+/// (severity.rs RECOVERABLE/CRITICAL 정신). 기본 Reusable, 비정상 종료 시 Poisoned로 마킹해
+/// 재사용 후보 조회에서 영구 배제한다(획득시점 RAII 신설 안 함 — 기존 sweep 모델 존중).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")] // -> "reusable" / "poisoned"
+pub enum ProcessHealth {
+    #[default]
+    Reusable,
+    Poisoned,
+}
+
 #[derive(Clone, Debug)]
 pub struct LedgerEntry {
     pub pid: u32,
@@ -107,6 +130,22 @@ pub struct LedgerEntry {
     pub surface_id: Option<u64>,
     pub scoped: bool,
     pub registered_at: f64,
+    /// T4-4/T6-P3 능력 가드: 이 원장 항목(스코프 프로세스)에 부여된 권한 집합.
+    /// launch-agent/claim-role 시점의 surface 역할에서 도출(deny-by-default·write⊇read 정규화).
+    /// 기존 필드 불변 — 순수 additive. None=원장에 caps 미기록(레거시 등록·외부 RPC).
+    pub caps: Option<crate::caps::Caps>,
+    /// T5-6 strand-2 오염 격리: 기본 Reusable, 비정상 종료(크래시·재시작 소진·auth 차단) 감지
+    /// 시 Poisoned로 마킹 → `is_reusable`이 false를 돌려 재사용 풀에서 배제. 순수 additive.
+    pub health: ProcessHealth,
+}
+
+/// T5-6 strand-2 재사용 후보 판정 단일 술어(순수함수 — 테스트 핀 가능, 부작용0).
+/// Poisoned 원장 항목은 어떤 재사용 풀에도 돌아가지 않는다. 현 코드베이스는 풀-재사용이
+/// 아니라 sweep-회수 모델이라 비-테스트 호출자가 아직 없다(풀 도입 시 이 술어가 게이트).
+/// poison-no-reuse 계약을 `is_reusable_excludes_poisoned` 테스트가 박제한다.
+#[allow(dead_code)]
+pub fn is_reusable(entry: &LedgerEntry) -> bool {
+    matches!(entry.health, ProcessHealth::Reusable)
 }
 
 /// T1-1 에이전트 자기보고 상태 — 화면 파싱 없이 에이전트가 `cys set-status`로 직접 신고.
@@ -736,6 +775,8 @@ impl Daemon {
             agent_meta: Mutex::new(None),
             agent_seen: AtomicBool::new(false),
             agent_exit_notified: AtomicBool::new(false),
+            crash_notified: AtomicBool::new(false),
+            last_cmd_ack: Mutex::new(None),
             last_human_input: Mutex::new(None),
             line_count: AtomicU64::new(0),
             queue_paused_until: Mutex::new(None),
@@ -743,6 +784,9 @@ impl Daemon {
             observed_usage: Mutex::new(None),
             registered_transcript: Mutex::new(None),
             ctx_threshold_armed: AtomicBool::new(true),
+            // 능력 가드: 생성 시 역할에서 도출(reviewer-*=read/search, full=worker/master/cso,
+            // 그 외 deny-by-default none). claim_role이 역할 전이 시 동기 재도출한다.
+            caps: Mutex::new(crate::caps::Caps::for_role(role.as_deref())),
         });
 
         {

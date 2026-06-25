@@ -80,6 +80,12 @@ pub const PACK: &[(&str, &str)] = &[
         "hooks/appbuild-gate.sh",
         include_str!("../cysjavis-pack/hooks/appbuild-gate.sh"),
     ),
+    // Wave3 T4-4⊕T6-P3 capability gate — DORMANT(미배선): cys-hook.sh:6 '훅은 절대 막지 않는다'
+    // 불변과 충돌하는 blocking PreToolUse 패턴이라, 임베드만 하고 PreToolUse 배선은 owner 결정 보류.
+    (
+        "hooks/role-capability-gate.sh",
+        include_str!("../cysjavis-pack/hooks/role-capability-gate.sh"),
+    ),
     (
         "bin/javis_preflight.py",
         include_str!("../cysjavis-pack/bin/javis_preflight.py"),

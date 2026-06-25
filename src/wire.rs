@@ -80,6 +80,48 @@ pub fn frame_response(resp: &Value) -> Result<String, AbiError> {
     Ok(format!("{line}\n"))
 }
 
+/// T4-5A(==T5-6 strand-3 == ONE guard): 단일 RPC 응답 페이로드 바이트 상한.
+/// **프로세스 수명·load = 기존 watchdog(governance.rs)** / **단일 RPC 응답 바이트 = 이 신규
+/// 직교 가드** — ADR 경계: 두 책임은 별개이며 이 가드는 watchdog와 중복이 아니다(한 곳에만 둔다).
+/// cap 수치는 로컬 실측 기본값이며 `CYS_MAX_RESPONSE_BYTES`로 조정(penpot 호스티드 MCP 15MB는
+/// 검증 상수 아님 — 상속 금지). screen-buffer FIFO `truncated`(handlers.rs:860)와 무관한 별 표면.
+pub const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
+/// 실측 가능한 cap 노브 — 기본 `MAX_RESPONSE_BYTES`, env로만 좁게 조정.
+fn max_response_bytes() -> usize {
+    std::env::var("CYS_MAX_RESPONSE_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(MAX_RESPONSE_BYTES)
+}
+
+/// cap 초과 응답을 **fail-loud + 트렁케이트**한 sentinel 응답으로 치환한다.
+/// 거대한 단일 응답이 클라이언트 컨텍스트·메모리를 폭주시키는 경로를 차단한다(스트림 폴백은
+/// 호출자 결정 — 여기선 결정론 트렁케이트 sentinel을 돌려 항상 한 줄은 내보낸다).
+///
+/// 반환: cap 이내면 `None`(원본 그대로 진행), 초과면 `Some(sentinel)` — 원본 `id`는 보존하고
+/// `result`를 `{response_truncated, original_bytes, cap_bytes}` fail-loud 페이로드로 교체.
+pub fn cap_response(resp: &Value) -> Option<Value> {
+    let cap = max_response_bytes();
+    let bytes = serde_json::to_string(resp).map(|s| s.len()).unwrap_or(0);
+    if bytes <= cap {
+        return None;
+    }
+    let id = resp.get("id").cloned().unwrap_or(Value::Null);
+    Some(serde_json::json!({
+        "id": id,
+        "ok": false,
+        "error": {
+            "code": "response_truncated",
+            "message": format!(
+                "RPC response {bytes} bytes exceeds cap {cap} — truncated (set CYS_MAX_RESPONSE_BYTES or use streaming)"
+            ),
+            "original_bytes": bytes,
+            "cap_bytes": cap,
+        }
+    }))
+}
+
 /// 디코더 대칭검증: declared `_flen` == 실제 payload 직렬화 길이.
 ///
 /// 반환은 **top-level 응답 객체 그대로**(additive 계약 — 구 디코더처럼 `resp["ok"]`/
@@ -190,5 +232,39 @@ mod tests {
         let legacy = r#"{"id":1,"ok":true,"result":{"x":1}}"#;
         let v = parse_frame(legacy).expect("legacy frame accepted");
         assert_eq!(v["ok"].as_bool(), Some(true));
+    }
+
+    /// T4-5A: cap 이내 응답은 통과(None), cap 초과 응답은 fail-loud sentinel로 트렁케이트.
+    /// env 노브로 cap을 작게 핀해 실측 sleep 없이 결정론 검증.
+    #[test]
+    fn wire_byte_cap_truncates_oversize() {
+        // cap을 512바이트로 좁혀 핀(테스트 전용 — sentinel(고정 메시지)은 이 안에 들어가되
+        // 거대 배열은 초과하도록). 직렬화는 lazy라 set 후 즉시 호출.
+        std::env::set_var("CYS_MAX_RESPONSE_BYTES", "512");
+
+        // cap 이내: 통과(None — 원본 그대로 진행).
+        let small = json!({"id": 1, "ok": true, "result": {"x": 1}});
+        assert!(
+            cap_response(&small).is_none(),
+            "cap 이내 응답은 트렁케이트하지 않는다"
+        );
+
+        // cap 초과: 거대 배열 → fail-loud sentinel(id 보존, error.code=response_truncated).
+        let big_rows: Vec<u64> = (0..1000).collect();
+        let big = json!({"id": 7, "ok": true, "result": {"rows": big_rows}});
+        let sentinel = cap_response(&big).expect("oversize → sentinel");
+        assert_eq!(sentinel["id"], json!(7), "원본 id 보존");
+        assert_eq!(sentinel["ok"].as_bool(), Some(false), "fail-loud");
+        assert_eq!(
+            sentinel["error"]["code"].as_str(),
+            Some("response_truncated")
+        );
+        // sentinel 자체는 cap 이내라 무한 재트렁케이트 루프가 없다(고정 크기 sentinel).
+        assert!(
+            cap_response(&sentinel).is_none(),
+            "sentinel은 cap 이내 — 재트렁케이트 안 함"
+        );
+
+        std::env::remove_var("CYS_MAX_RESPONSE_BYTES");
     }
 }

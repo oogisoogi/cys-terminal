@@ -3,6 +3,7 @@
 
 mod alerts;
 mod analytics;
+mod caps;
 mod cost;
 mod events;
 mod governance;
@@ -659,6 +660,10 @@ async fn write_line<W: AsyncWrite + Unpin>(
     w: &mut W,
     value: &serde_json::Value,
 ) -> std::io::Result<()> {
+    // T4-5A(==T5-6 strand-3, ONE guard): 단일 RPC 응답 바이트 상한. cap 초과 시 fail-loud
+    // 트렁케이트 sentinel로 치환(컨텍스트/메모리 폭주 차단). 직교 가드 — watchdog와 별개 책임.
+    let capped = cys::wire::cap_response(value);
+    let value: &serde_json::Value = capped.as_ref().unwrap_or(value);
     let line = match cys::wire::frame_response(value) {
         Ok(framed) => framed,
         Err(e) => {

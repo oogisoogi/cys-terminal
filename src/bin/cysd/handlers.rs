@@ -288,6 +288,55 @@ fn check_send_acl(
     Ok(from_sid)
 }
 
+/// T4-4/T6-P3 능력 가드 (cysd-매개 변형 경로 — check_send_acl과 병렬·별 층위).
+/// cysd-인증 발신 surface(resolve_caller_surface, self-declared role 신뢰 금지)의 caps를
+/// 키로, 요청 변형 능력(edit/commit/write-shell)을 deny-by-default·fail-CLOSED 판정한다.
+/// reviewer-*/planner는 변형 caps가 원장에 물리적으로 부재 → deny + acl.denied-style 이벤트.
+///
+/// ★정직(enforcement boundary): 이 게이트는 *cysd-매개* 변형(scoped run write-shell 등)만 막는다.
+///   에이전트 *내부* 도구(Claude Code Edit/Write/Bash)는 cysd가 직접 못 막는다 — 그건 PreToolUse
+///   hook(role-capability-gate.sh)이 실 enforcer다. cysd가 내부 Edit을 막는다고 주장하지 않는다.
+///
+/// 반환: Ok(())=허용 / Err(메시지)=deny(호출부가 acl_denied 응답). caller 미해석=fail-closed deny.
+fn check_caps_gate(
+    daemon: &Daemon,
+    caller_pid: Option<u32>,
+    need: crate::caps::Cap,
+    path: &str,
+) -> Result<(), String> {
+    let from_sid = caller_pid.and_then(|p| resolve_caller_surface(daemon, p));
+    // fail-CLOSED: 발신 신원 해석 불가(외부/추적 불가) → 변형 거부 (권한 게이트는 deny측 안전).
+    // (check_send_acl의 fail-OPEN과 반대 규약 — propmap T4-4 §4 명시.)
+    let caps = from_sid
+        .and_then(|sid| daemon.get_surface(sid))
+        .map(|s| s.caps.lock().unwrap().clone())
+        .unwrap_or_else(crate::caps::Caps::none);
+    if caps.allows(need) {
+        return Ok(());
+    }
+    let from_role = from_sid
+        .and_then(|sid| daemon.get_surface(sid))
+        .and_then(|s| s.role.lock().unwrap().clone())
+        .unwrap_or_else(|| {
+            if from_sid.is_some() {
+                "(pane)".into()
+            } else {
+                "external".into()
+            }
+        });
+    daemon.bus.publish(
+        "acl.denied",
+        "system",
+        from_sid,
+        json!({"reason": "capability", "need": need.as_str(), "path": path,
+               "from_role": from_role, "from_surface": from_sid, "caller_pid": caller_pid}),
+    );
+    Err(format!(
+        "capability denied: {from_role} lacks '{}' for {path} (deny-by-default)",
+        need.as_str()
+    ))
+}
+
 /// T3-13 타이핑 가드 창 (초). 0 = 비활성.
 fn typing_guard_secs() -> u64 {
     std::env::var("CYS_TYPING_GUARD_SECS")
@@ -727,6 +776,8 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     json!({"bytes": text.len(), "from": from, "from_verified": from_verified}),
                 );
             }
+            // T5-2: 명령 성공 ack 시각 스탬프 — surface_crashed 술어의 "ack 후 후행 실패" 기준.
+            *surface.last_cmd_ack.lock().unwrap() = Some(crate::state::now_epoch());
             Reply::Single(ok_response(&id, json!({"surface_id": sid, "sent": true})))
         }
 
@@ -1102,6 +1153,9 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 }
                 roles.insert(final_role.clone(), sid);
                 *srole = Some(final_role.clone());
+                // T4-4/T6-P3: 역할 전이와 동기로 능력 집합 재도출(reviewer-*=read/search,
+                // full=worker/master/cso, 그 외 deny-by-default). cysd-매개 변형 게이트의 키 갱신.
+                *surface.caps.lock().unwrap() = crate::caps::Caps::for_role(Some(&final_role));
                 claimed_role = final_role;
             }
             daemon.bus.publish(
@@ -1208,6 +1262,31 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     &format!("pid out of valid range (1..=2147483647): {pid}"),
                 ));
             }
+            let entry_surface_id = params.get("surface_id").and_then(|v| match v {
+                Value::Number(n) => n.as_u64(),
+                Value::String(s) => parse_surface_ref(s),
+                _ => None,
+            });
+            // T4-4/T6-P3 능력 가드: scoped 실행 = cysd-매개 write-shell 변형. reviewer-*/planner
+            // surface가 scoped 셸을 원장에 등록(=cysd가 생명주기를 책임지는 쓰기 셸 spawn)하려
+            // 하면 deny-by-default·fail-closed로 차단한다. 비-scoped(데몬이 책임지지 않는 외부
+            // 프로세스 관측 등록)는 변형이 아니므로 게이트 면제 — 과도차단 방지.
+            let is_scoped = params
+                .get("scoped")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            if is_scoped {
+                if let Err(e) =
+                    check_caps_gate(daemon, caller_pid, crate::caps::Cap::WriteShell, "ledger.register")
+                {
+                    return Reply::Single(err_response(&id, "acl_denied", &e));
+                }
+            }
+            // T4-4/T6-P3: 스코프 프로세스의 caps를 그 surface 역할에서 도출해 원장에 기록.
+            // surface 미해석(외부/익명 등록) 시 None — caps 가드는 None을 deny-by-default로 취급.
+            let entry_caps = entry_surface_id
+                .and_then(|sid| daemon.get_surface(sid))
+                .map(|s| s.caps.lock().unwrap().clone());
             let entry = LedgerEntry {
                 pid: pid as u32,
                 pgid: param_u64(&params, "pgid")
@@ -1215,16 +1294,14 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     .map(|p| p as i32)
                     .unwrap_or(0),
                 cmd: param_str(&params, "cmd").unwrap_or_default(),
-                surface_id: params.get("surface_id").and_then(|v| match v {
-                    Value::Number(n) => n.as_u64(),
-                    Value::String(s) => parse_surface_ref(s),
-                    _ => None,
-                }),
+                surface_id: entry_surface_id,
                 scoped: params
                     .get("scoped")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(true),
                 registered_at: crate::state::now_epoch(),
+                caps: entry_caps,
+                health: crate::state::ProcessHealth::Reusable,
             };
             daemon.bus.publish(
                 "ledger.registered",
@@ -1258,6 +1335,8 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         "pid": e.pid, "pgid": e.pgid, "cmd": e.cmd,
                         "surface_id": e.surface_id, "scoped": e.scoped,
                         "registered_at": e.registered_at,
+                        // T4-4/T6-P3: 원장 caps 스키마 관측용(부재=None) — preflight C47가 본다.
+                        "caps": e.caps,
                     })
                 })
                 .collect();
@@ -4372,5 +4451,115 @@ mod tests {
             "surface.create 특권 게이트와 close_surface가 교착됐다 — 락 순서 역전(roles→surfaces) AB-BA 데드락"
         );
         let _ = worker.join();
+    }
+
+    // ── T4-4/T6-P3 능력 가드: cysd-매개 변형(scoped run write-shell) 차단 회귀 ──
+    // reviewer surface는 write-shell caps가 원장에 물리적으로 부재 → scoped ledger.register
+    // 거부(deny-by-default). worker는 full caps → 허용. producer≠evaluator 물리 경화.
+    #[test]
+    fn reviewer_surface_denied_scoped_write_shell() {
+        let daemon = claim_daemon();
+        let reviewer = make_surface(&daemon, Some("reviewer-codex"));
+        let reviewer_pid = 991_201_u32;
+        bind_caller(&daemon, reviewer_pid, reviewer);
+
+        let req = Request {
+            id: json!(1),
+            method: "ledger.register".into(),
+            params: json!({ "pid": 424242, "scoped": true, "surface_id": reviewer }),
+        };
+        let Reply::Single(resp) = dispatch(&daemon, req, Some(reviewer_pid)) else {
+            panic!("expected single reply");
+        };
+        assert_eq!(
+            resp["error"]["code"], json!("acl_denied"),
+            "reviewer surface의 scoped write-shell 등록이 차단되지 않았다 (응답: {resp})"
+        );
+        // 차단됐으니 원장에 들어가지 않았어야 한다.
+        assert!(
+            !daemon.ledger.lock().unwrap().contains_key(&424242),
+            "거부됐는데 원장에 항목이 남았다"
+        );
+    }
+
+    #[test]
+    fn worker_surface_allowed_scoped_write_shell() {
+        let daemon = claim_daemon();
+        let worker = make_surface(&daemon, Some("worker"));
+        let worker_pid = 991_202_u32;
+        bind_caller(&daemon, worker_pid, worker);
+
+        let req = Request {
+            id: json!(1),
+            method: "ledger.register".into(),
+            params: json!({ "pid": 424243, "scoped": true, "surface_id": worker }),
+        };
+        let Reply::Single(resp) = dispatch(&daemon, req, Some(worker_pid)) else {
+            panic!("expected single reply");
+        };
+        assert_eq!(
+            resp["ok"], json!(true),
+            "worker surface의 scoped 등록이 허용돼야 한다 (응답: {resp})"
+        );
+        // 원장에 caps가 기록됐는지 확인(full-trust = write-shell 포함).
+        let led = daemon.ledger.lock().unwrap();
+        let entry = led.get(&424243).expect("원장 항목");
+        let caps = entry.caps.as_ref().expect("caps 기록됨");
+        assert!(
+            caps.allows(crate::caps::Cap::WriteShell),
+            "worker 원장 caps에 write-shell이 있어야 한다"
+        );
+    }
+
+    #[test]
+    fn unresolved_caller_fail_closed_on_write_shell() {
+        // fail-CLOSED: 발신 신원 미해석(caller_pid 없음) → 변형 거부.
+        let daemon = claim_daemon();
+        let w = make_surface(&daemon, Some("worker"));
+        let req = Request {
+            id: json!(1),
+            method: "ledger.register".into(),
+            params: json!({ "pid": 424244, "scoped": true, "surface_id": w }),
+        };
+        // caller_pid=None → resolve 실패 → deny-by-default
+        let Reply::Single(resp) = dispatch(&daemon, req, None) else {
+            panic!("expected single reply");
+        };
+        assert_eq!(
+            resp["error"]["code"], json!("acl_denied"),
+            "미해석 발신(외부 raw RPC)의 write-shell은 fail-closed 거부돼야 한다 (응답: {resp})"
+        );
+    }
+
+    #[test]
+    fn claim_role_rederives_caps_on_transition() {
+        // claim_role이 역할 전이 시 caps를 재도출한다: reviewer→(불가, master 가드 무관) 검증은
+        // reviewer로 시작해 caps가 read/search-only임을 확인하는 것으로 한다(전이 동기성).
+        let daemon = claim_daemon();
+        let sid = make_surface(&daemon, None); // 역할 없음 → deny-by-default
+        {
+            let s = daemon.get_surface(sid).unwrap();
+            assert_eq!(s.caps.lock().unwrap().allow.len(), 0, "무역할 = deny-by-default");
+        }
+        let caller = 991_205_u32;
+        bind_caller(&daemon, caller, sid);
+        let req = Request {
+            id: json!(1),
+            method: "system.claim_role".into(),
+            params: json!({ "role": "reviewer-gemini", "surface_id": sid }),
+        };
+        let Reply::Single(resp) = dispatch(&daemon, req, Some(caller)) else {
+            panic!("expected single reply");
+        };
+        assert_eq!(resp["ok"], json!(true), "self-claim 허용 (응답: {resp})");
+        let s = daemon.get_surface(sid).unwrap();
+        let caps = s.caps.lock().unwrap();
+        assert!(caps.allows(crate::caps::Cap::Read), "reviewer caps=read");
+        assert!(caps.allows(crate::caps::Cap::Search), "reviewer caps=search");
+        assert!(!caps.allows(crate::caps::Cap::Edit), "reviewer caps=no edit");
+        assert!(
+            !caps.allows(crate::caps::Cap::WriteShell),
+            "reviewer caps=no write-shell"
+        );
     }
 }

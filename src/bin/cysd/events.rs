@@ -102,6 +102,15 @@ impl EventBus {
         self.inner.lock().unwrap().seq
     }
 
+    /// T5-2: ring의 마지막 `n`개 이벤트(시간순) — 무음 크래시 알림의 NDJSON 타임라인 tail.
+    /// 바이트 상한(T4-5A)은 호출자가 응답 직렬화 경계에서 적용한다.
+    pub fn tail(&self, n: usize) -> Vec<Value> {
+        let inner = self.inner.lock().unwrap();
+        let len = inner.ring.len();
+        let start = len.saturating_sub(n);
+        inner.ring.iter().skip(start).cloned().collect()
+    }
+
     /// (ring에 남은 가장 오래된 이벤트의 seq, 현재 최신 seq) — replay 갭 감지용
     pub fn replay_bounds(&self) -> (Option<u64>, u64) {
         let inner = self.inner.lock().unwrap();
