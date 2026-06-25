@@ -190,6 +190,10 @@ pub const PACK: &[(&str, &str)] = &[
         include_str!("../cysjavis-pack/schemas/edit_decisions.schema.json"),
     ),
     (
+        "schemas/verdict_schema.json",
+        include_str!("../cysjavis-pack/schemas/verdict_schema.json"),
+    ),
+    (
         "round/video_provider_catalog.json",
         include_str!("../cysjavis-pack/round/video_provider_catalog.json"),
     ),

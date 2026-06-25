@@ -6,6 +6,11 @@ cys:
   stability: beta
   cost_class: wall-heavy
   best_for: 음성·영상 전사와 단어 단위 타임스탬프 — 자막·번역·클립 추출·점프컷의 공통 전처리
+  requires:
+    bins: [ffmpeg]
+  install:
+    - {kind: brew, formula: ffmpeg}
+    - {kind: apt, package: ffmpeg}
 ---
 
 # transcription (ASR)

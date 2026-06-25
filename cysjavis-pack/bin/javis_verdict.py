@@ -26,16 +26,65 @@ import argparse
 import contextlib
 import io
 import json
+import os
 import re
 import sys
 
-VERDICT_ENUM = ("ACCEPT", "REVISE", "BLOCK", "ESCALATE", "INVESTIGATE")
-SEVERITY_ENUM = ("blocking", "major", "minor")
-TOP_KEYS = ("verdict", "justification", "evidence", "issues", "missing")
-REQUIRED_TOP = ("verdict", "justification", "evidence", "issues")
-EVIDENCE_KEYS = ("claim", "ref", "verified")
-ISSUE_CONTRACT = ("severity", "where", "what", "fix")
-ISSUE_DRIFT = ("severity", "ref", "issue")
+# ── 단일 머신 SOT (T6-P5) ──
+# 리터럴(VERDICT_ENUM·SEVERITY·ISSUE_CONTRACT 등)을 schemas/verdict_schema.json 에서 런타임
+# 로드한다 — 한 소스에서 파생해 doc↔CI 드리프트 0. 스키마 부재·손상 시 아래 인라인 폴백으로
+# graceful degrade(네트워크·외부의존 0, 항상 동작). C51 이 "스키마 로드됨 + 스키마↔코드 정합"을
+# 결정론 검증한다. INVESTIGATE 는 검증기 emit 전용(reviewer enum 4 + R2 강등 타깃 1)이다.
+_INLINE = {
+    "VERDICT_ENUM": ["ACCEPT", "REVISE", "BLOCK", "ESCALATE", "INVESTIGATE"],
+    "SEVERITY_ENUM": ["blocking", "major", "minor"],
+    "TOP_KEYS": ["verdict", "justification", "evidence", "issues", "missing"],
+    "REQUIRED_TOP": ["verdict", "justification", "evidence", "issues"],
+    "EVIDENCE_KEYS": ["claim", "ref", "verified"],
+    "ISSUE_CONTRACT": ["severity", "where", "what", "fix"],
+    "ISSUE_DRIFT": ["severity", "ref", "issue"],
+}
+
+
+def _schema_path():
+    """schemas/verdict_schema.json 위치 — bin/ 의 형제 schemas/, 폴백으로 CYS_PACK_DIR."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    cand = os.path.join(os.path.dirname(here), "schemas", "verdict_schema.json")
+    if os.path.isfile(cand):
+        return cand
+    pd = os.environ.get("CYS_PACK_DIR") or os.environ.get("JAVIS_PACK_DIR")
+    if pd:
+        p = os.path.join(pd, "schemas", "verdict_schema.json")
+        if os.path.isfile(p):
+            return p
+    return cand  # 부재여도 경로 반환(로더가 폴백)
+
+
+SCHEMA_LOADED = False  # C51 이 검사: 스키마가 실제 로드됐는지(폴백이 아닌지)
+
+
+def _load_consts():
+    """스키마 로드(성공 시 SCHEMA_LOADED=True), 실패 시 인라인 폴백. 필수 키 누락도 폴백."""
+    global SCHEMA_LOADED
+    try:
+        with open(_schema_path(), encoding="utf-8") as f:
+            s = json.load(f)
+        vals = {k: tuple(s[k]) for k in _INLINE}  # 모든 키 존재 필수 — 누락 시 KeyError→폴백
+        SCHEMA_LOADED = True
+        return vals
+    except (OSError, ValueError, KeyError, TypeError):
+        SCHEMA_LOADED = False
+        return {k: tuple(v) for k, v in _INLINE.items()}
+
+
+_C = _load_consts()
+VERDICT_ENUM = _C["VERDICT_ENUM"]
+SEVERITY_ENUM = _C["SEVERITY_ENUM"]
+TOP_KEYS = _C["TOP_KEYS"]
+REQUIRED_TOP = _C["REQUIRED_TOP"]
+EVIDENCE_KEYS = _C["EVIDENCE_KEYS"]
+ISSUE_CONTRACT = _C["ISSUE_CONTRACT"]
+ISSUE_DRIFT = _C["ISSUE_DRIFT"]
 SCORE_KEY_RE = re.compile(r"score|grade|rating", re.I)
 
 

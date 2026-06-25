@@ -2224,6 +2224,11 @@ fn compose_directive(role: &str) -> Result<String, String> {
     let expert = std::env::var("CYS_OVERRIDE_EXPERT").map(|v| v == "1").unwrap_or(false);
     let ov = cys::overrides::load_overrides(role, expert);
     directive.push_str(&cys::overrides::render_block(&ov));
+    // T4-3 ②: 런타임 카탈로그 플레이스holder 치환 — 정적 본문에 `$action_catalog`가 있으면
+    // 실제 레지스트리(edit_kinds::EditKind)에서 파생한 카탈로그로 교체(하드코딩 미주입 = Max
+    // 토큰효율 + 반드리프트). 플레이스홀더 부재 시 무변(회귀 0). 단건 상세는 on-demand
+    // (`editor.action_info` RPC) — 전체 산문 미주입.
+    let directive = cys::action_catalog::substitute_catalog(&directive);
     Ok(directive)
 }
 

@@ -2273,6 +2273,26 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             ))
         }
 
+        // ─── T4-3: Editor 액션 카탈로그 (런타임 파생 — edit_kinds::EditKind 단일진실) ───
+        // 정적 온보딩 본문의 $action_catalog 치환·UI가 소비할 전체 카탈로그를 실제 레지스트리에서
+        // 파생해 반환(하드코딩 0 → 정적 본문과 실제 표면 드리프트 구조적 불가).
+        "editor.action_catalog" => {
+            Reply::Single(ok_response(&id, cys::action_catalog::catalog_json()))
+        }
+
+        // ─── T4-3: on-demand 단건 상세 (전체 미주입 — penpot PenpotApiInfoTool 등가) ───
+        "editor.action_info" => match param_str(&params, "name") {
+            Some(name) => match cys::action_catalog::action_info(&name) {
+                Some(info) => Reply::Single(ok_response(&id, info)),
+                None => Reply::Single(err_response(
+                    &id,
+                    "not_found",
+                    &format!("unknown action '{name}'"),
+                )),
+            },
+            None => Reply::Single(err_response(&id, "invalid_params", "missing 'name'")),
+        },
+
         // ─── T7 E5: 주간 다이제스트 (Control Center 추세·주간 탭) ───
         "control.weekly" => {
             let now = crate::state::now_epoch();

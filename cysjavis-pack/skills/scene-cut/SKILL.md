@@ -6,6 +6,11 @@ cys:
   stability: beta
   cost_class: wall-heavy
   best_for: 콘텐츠 인지 shot-detect·침묵 트림·자동 편집점 — 점프컷·클립 경계·몽타주 컷의 공통 편집 토대
+  requires:
+    bins: [ffmpeg]
+  install:
+    - {kind: brew, formula: ffmpeg}
+    - {kind: apt, package: ffmpeg}
 ---
 
 # scene-cut

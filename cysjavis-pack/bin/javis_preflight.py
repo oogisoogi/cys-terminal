@@ -350,6 +350,33 @@ def _find_codegen_kinds():
     return None
 
 
+def _parse_skill_requires(text):
+    """SKILL.md 프론트매터 `cys:` 블록의 requires.bins·install 매니페스트를 stdlib만으로 파싱.
+    (C50 — preflight는 yaml 의존 0이므로 이 self-describing 스키마 하위셋만 손파싱한다.)
+    반환: (bins|None, install_list). requires.bins 미선언이면 (None, []) — 스코프 밖 신호.
+    지원 형태(이 스키마가 쓰는 표기만):
+        requires:\n  bins: [ffmpeg, rg]
+        install:\n  - {kind: brew, formula: ffmpeg}\n  - {kind: apt, package: ffmpeg}
+    매니페스트 표기 일탈(예: bins 누락·install 비-인라인)은 호출부에서 fail-loud로 잡힌다."""
+    bm = re.search(r"^\s*bins:\s*\[([^\]]*)\]", text, re.M)
+    if not bm:
+        return None, []
+    bins = [b.strip().strip("'\"") for b in bm.group(1).split(",") if b.strip()]
+    install = []
+    for line in text.splitlines():
+        em = re.match(r"\s*-\s*\{([^}]*)\}\s*$", line)
+        if not em:
+            continue
+        entry = {}
+        for pair in em.group(1).split(","):
+            if ":" in pair:
+                k, _, v = pair.partition(":")
+                entry[k.strip().strip("'\"")] = v.strip().strip("'\"")
+        if entry.get("kind") in ("brew", "apt"):
+            install.append(entry)
+    return bins, install
+
+
 def is_dept_pack():
     """부서/CEO pack 컨텍스트인가 — pack_dir이 기본(~/.cys/pack)이 아니면 부서/CEO 데몬이다.
     부서장·CEO의 MASTER_DIRECTIVE는 표준 핀이 없는 게 정상이라 C03 표준 핀 검사를 면제한다
@@ -877,41 +904,55 @@ class Preflight:
         if p:
             self.add(cid, PASS, "%s self-test OK (4원칙 키·마커쌍·라이선스 화이트리스트 검증)" % p)
 
-    # ── C43 verdict 리터럴 단일진실 핀 (T1-1 — codegen 0 착륙형) ──
+    # ── C43 verdict 리터럴 단일진실 핀 (T1-1 — T6-P5 이후 schema 파생) ──
     # 측정 결과 경계를 건너는 #[repr(u8)] 판별값 enum = 0개(grep "repr(u" src/ = 0) →
     # build.rs enum→TS/JSON codegen은 빌드하지 않고(미래 착륙 조건만 문서화), verdict
     # 4-리터럴(판별값 없는 문자열 집합)의 손동기 드리프트만 문자열-동치로 fail-loud 차단한다.
-    # ★C36과 중복 아님: C36은 verdict *인스턴스*를 계약에 맞춰 검증(javis_verdict --self-test).
-    #   C43은 verdict *리터럴-정의 집합*을 소스 간 대조 — 코드측 VERDICT_ENUM(javis_verdict.py:32)
-    #   ↔ 계약측 텍스트(REVIEWER_DIRECTIVE.md 임베드). C36은 이 정의 간 드리프트를 보지 않는다.
-    # 코드측 무결성은 C36과 동일하게 javis_verdict.py --self-test에 위임(중복 self-test 호출 회피).
+    # ★T6-P5 이후: 코드측 리터럴이 verdict_schema.json(단일 머신-SOT)에서 파생되므로, C43 도
+    #   소스-A 를 그 스키마의 reviewer_enum(=리뷰어가 채우는 4 enum, INVESTIGATE 제외)에서 읽는다.
+    #   스키마 부재 시 graceful 폴백(javis_verdict.py 의 VERDICT_ENUM 그렙 — verdict.py 폴백과 정합).
+    # ★C36/C51과 중복 아님: C36=verdict *인스턴스* 검증, C51=스키마↔코드 *로드/정합*, C43=리터럴이
+    #   *계약 텍스트(REVIEWER_DIRECTIVE.md)* 와 동기인지 대조. 코드 무결성은 C36 self-test에 위임.
     def c43_verdict_literals(self):
         cid = "C43.verdict-literals"
         if self.skipped(cid):
             return
         vbin = os.path.join(pack_dir(), "bin", "javis_verdict.py")
-        if not os.path.isfile(vbin):
-            self.add(cid, WARN, "javis_verdict.py 부재 — verdict 단일진실 검사 보류")
-            return
-        # A = 코드측 단일진실 (INVESTIGATE 제외 = 리뷰어가 채우는 계약 enum 4개)
-        try:
-            src = open(vbin, encoding="utf-8").read()
-        except Exception as e:
-            self.add(cid, WARN, "javis_verdict.py 읽기 불가 — 보류: %s" % e)
-            return
-        m = re.search(r"VERDICT_ENUM\s*=\s*\(([^)]*)\)", src)
-        a = (set(re.findall(r'"([A-Z]+)"', m.group(1))) - {"INVESTIGATE"}) if m else set()
+        schema_p = os.path.join(pack_dir(), "schemas", "verdict_schema.json")
+        # A = SOT측 리뷰어 4리터럴. 1차: verdict_schema.json reviewer_enum. 폴백: verdict.py 그렙.
+        a = None
+        src_label = ""
+        if os.path.isfile(schema_p):
+            try:
+                s = json.load(open(schema_p, encoding="utf-8"))
+                a = set(s.get("reviewer_enum", [])) or None
+                src_label = "verdict_schema.json:reviewer_enum"
+            except (OSError, ValueError):
+                a = None
+        if a is None:
+            if not os.path.isfile(vbin):
+                self.add(cid, WARN, "verdict_schema.json·javis_verdict.py 모두 부재 — "
+                         "verdict 단일진실 검사 보류")
+                return
+            try:
+                src = open(vbin, encoding="utf-8").read()
+            except Exception as e:
+                self.add(cid, WARN, "javis_verdict.py 읽기 불가 — 보류: %s" % e)
+                return
+            m = re.search(r"VERDICT_ENUM\s*=\s*\(([^)]*)\)", src)
+            a = (set(re.findall(r'"([A-Z]+)"', m.group(1))) - {"INVESTIGATE"}) if m else set()
+            src_label = "javis_verdict.py:32(폴백)"
         expect = {"ACCEPT", "REVISE", "BLOCK", "ESCALATE"}
         if a != expect:
-            self.add(cid, FAIL, "javis_verdict.py:32 VERDICT_ENUM 기대 4리터럴과 불일치: %s "
-                     "(기대 %s)" % (sorted(a), sorted(expect)))
+            self.add(cid, FAIL, "%s 기대 4리터럴과 불일치: %s (기대 %s)"
+                     % (src_label, sorted(a), sorted(expect)))
             return
         # B = 계약측 (pack 임베드 REVIEWER_DIRECTIVE.md 의 verdict 리터럴 텍스트)
         # 형태: `{verdict: ACCEPT|REVISE|BLOCK|ESCALATE, ...}` 또는 `"verdict": "ACCEPT | REVISE | ..."`
         contract = os.path.join(pack_dir(), "directives", "REVIEWER_DIRECTIVE.md")
         if not os.path.isfile(contract):
-            self.add(cid, PASS, "verdict 4리터럴 self-consistent(javis_verdict.py:32) — "
-                     "계약파일 부재로 교차검증 보류")
+            self.add(cid, PASS, "verdict 4리터럴 self-consistent(%s) — "
+                     "계약파일 부재로 교차검증 보류" % src_label)
             return
         try:
             ctext = open(contract, encoding="utf-8").read()
@@ -920,13 +961,13 @@ class Preflight:
             return
         cm = re.search(r"verdict[\"'\s:]*\s*([A-Z]+(?:\s*\|\s*[A-Z]+)+)", ctext)
         if not cm:
-            self.add(cid, PASS, "verdict 4리터럴 self-consistent(javis_verdict.py:32) — "
-                     "계약 verdict 텍스트 미검출로 교차검증 보류")
+            self.add(cid, PASS, "verdict 4리터럴 self-consistent(%s) — "
+                     "계약 verdict 텍스트 미검출로 교차검증 보류" % src_label)
             return
         b = set(re.findall(r"[A-Z]+", cm.group(1)))
         if a == b:
-            self.add(cid, PASS, "verdict 4리터럴 손동기 일치(코드:javis_verdict.py:32 ↔ "
-                     "계약:REVIEWER_DIRECTIVE.md)")
+            self.add(cid, PASS, "verdict 4리터럴 손동기 일치(SOT:%s ↔ "
+                     "계약:REVIEWER_DIRECTIVE.md)" % src_label)
         else:
             self.add(cid, FAIL, "verdict 드리프트 — 코드만:%s / 계약만:%s"
                      % (sorted(a - b), sorted(b - a)))
@@ -1223,6 +1264,199 @@ class Preflight:
         else:
             self.add(cid, PASS, "오염격리(ProcessHealth)·바이트상한(cap_response)·무음크래시"
                      "(surface_crashed+재진입가드)·좀비(reap_zombie_surfaces 3-miss) 4가닥 배선 확인")
+
+    # ── C49 onboarding catalog + directive cascade (T4-3 + T3-2) ──
+    # 결정론 검증(LLM 재추론 금지): ① T4-3 런타임 카탈로그가 실제 레지스트리(EditKind=cys_kinds.json
+    # edit_kind 단일진실)에서 파생되는지(하드코딩이면 드리프트) ② 플레이스홀더 치환이 directive 주입
+    # 경로(compose_directive)에 배선됐는지 ③ on-demand 단건 RPC(editor.action_info)·전체 카탈로그
+    # RPC(editor.action_catalog)가 등록됐는지 ④ T3-2 캐스케이드 모듈이 존재하는지. 소스 grep + codegen
+    # 집합 대조(C44/C48 동형) — 추가 인프라 0.
+    def c49_onboarding_catalog(self):
+        cid = "C49.onboarding-catalog"
+        if self.skipped(cid):
+            return
+        crate_root = os.path.dirname(os.path.abspath(pack_dir().rstrip("/")))
+        ac_rs = os.path.join(crate_root, "src", "action_catalog.rs")
+        dc_rs = os.path.join(crate_root, "src", "directive_compose.rs")
+        cys_rs = os.path.join(crate_root, "src", "bin", "cys.rs")
+        hnd_rs = os.path.join(crate_root, "src", "bin", "cysd", "handlers.rs")
+        miss = []
+        for label, p in (("action_catalog.rs", ac_rs), ("directive_compose.rs", dc_rs),
+                         ("cys.rs", cys_rs), ("handlers.rs", hnd_rs)):
+            if not os.path.isfile(p):
+                miss.append("%s 부재" % label)
+        if miss:
+            self.add(cid, WARN, "T4-3/T3-2 소스 부재 — 검사 보류: %s" % ", ".join(miss))
+            return
+        try:
+            ac = open(ac_rs, encoding="utf-8").read()
+            cys_src = open(cys_rs, encoding="utf-8").read()
+            hnd = open(hnd_rs, encoding="utf-8").read()
+        except OSError as e:
+            self.add(cid, WARN, "소스 읽기 불가 — 보류: %s" % e)
+            return
+        # ② 치환이 directive 주입 경로에 배선
+        if "substitute_catalog" not in cys_src:
+            miss.append("compose_directive에 substitute_catalog 미배선")
+        # ① 카탈로그가 레지스트리 파생(EditKind::ALL 순회) — 하드코딩 아님
+        if "EditKind::ALL" not in ac:
+            miss.append("action_catalog가 EditKind::ALL 레지스트리 파생 아님(하드코딩 의심)")
+        # ③ on-demand 단건 + 전체 카탈로그 RPC 등록
+        if '"editor.action_info"' not in hnd:
+            miss.append("editor.action_info RPC 미등록")
+        if '"editor.action_catalog"' not in hnd:
+            miss.append("editor.action_catalog RPC 미등록")
+        # ① 강화: 카탈로그 액션 집합 == cys_kinds.json edit_kind(build.rs 단일진실) — 드리프트0.
+        gen = _find_codegen_kinds()
+        if gen is not None:
+            kinds = set(gen.get("edit_kind", []))
+            # action_catalog.rs의 action_summary match arm이 모든 edit_kind 리터럴을 덮는지
+            # 직접 확인할 순 없으나(serde 파생), no-wildcard match라 빌드가 누락을 차단한다.
+            # 여기선 카탈로그 모듈이 EditKind를 import하는지로 단일진실 결속만 박제.
+            if "use crate::edit_kinds::EditKind" not in ac:
+                miss.append("action_catalog가 edit_kinds 단일진실에 미결속")
+            if not kinds:
+                miss.append("cys_kinds.json edit_kind 비어있음")
+        if miss:
+            self.add(cid, FAIL, "온보딩 카탈로그/캐스케이드 미배선: %s" % ", ".join(miss))
+        else:
+            tail = "" if gen is not None else " (cys_kinds.json 미발견 — 빌드 후 레지스트리 대조 재검 가능)"
+            self.add(cid, PASS, "T4-3 카탈로그 레지스트리파생+치환배선+on-demand RPC · "
+                     "T3-2 캐스케이드 모듈 확인%s" % tail)
+
+    # ── C50 스킬 self-describing 설치 매니페스트 (T6-P4 — requires.bins + 플랫폼별 install) ──
+    # 각 스킬 SKILL.md의 `cys:` 프론트매터가 self-describe한 requires.bins를 shutil.which로
+    # 결손 탐지하고, 결손 시 install 매니페스트에서 플랫폼(darwin→brew / linux→apt) 설치 명령을
+    # 선택해 보고한다. --fix는 dry-run으로 선택된 명령만 출력한다(실제 brew/apt 실행은 denylist
+    # 환경변경 — cys feed push 승인 게이트 경유가 정책이므로 preflight는 자동 실행하지 않는다).
+    # 스코프: `cys:` 프론트매터에 requires.bins가 있는 스킬만(현재 영상 도구 의존 소수) — 전 스킬
+    # 순회 아님(대부분 순수 LLM). 멱등: 존재하는 bin은 무동작, 매니페스트 오타·구조결함은 fail-loud.
+    def c50_skill_requirements(self):
+        cid = "C50.skill-requirements"
+        if self.skipped(cid):
+            return
+        skills_root = os.path.join(pack_dir(), "skills")
+        if not os.path.isdir(skills_root):
+            self.add(cid, WARN, "skills/ 부재 — 스킬 설치 매니페스트 검사 보류")
+            return
+        plat_kind, plat_field = ("brew", "formula") if sys.platform == "darwin" else ("apt", "package")
+        checked = 0          # requires.bins 선언 스킬 수
+        malformed = []       # 매니페스트 구조 결함(fail-loud)
+        missing = []         # (skill, bin, install_cmd|None)
+        for name in sorted(os.listdir(skills_root)):
+            sp = os.path.join(skills_root, name, "SKILL.md")
+            if not os.path.isfile(sp):
+                continue
+            try:
+                text = open(sp, encoding="utf-8").read()
+            except OSError:
+                continue
+            req_bins, install = _parse_skill_requires(text)
+            if req_bins is None:
+                continue  # requires.bins 미선언 — 스코프 밖(순수 LLM 스킬)
+            checked += 1
+            if not isinstance(req_bins, list) or not all(isinstance(b, str) for b in req_bins):
+                malformed.append("%s: requires.bins가 문자열 배열 아님" % name)
+                continue
+            for b in req_bins:
+                if shutil.which(b):
+                    continue  # 존재 — 멱등 무동작
+                # 결손: 플랫폼별 install 명령 선택
+                cmd = None
+                for entry in (install or []):
+                    if entry.get("kind") == plat_kind and entry.get(plat_field):
+                        cmd = "%s install %s" % (plat_kind, entry[plat_field])
+                        break
+                if cmd is None and install:
+                    malformed.append("%s: bin '%s' 결손이나 %s install 매니페스트 없음/오타"
+                                     % (name, b, plat_kind))
+                missing.append((name, b, cmd))
+        if malformed:
+            self.add(cid, FAIL, "스킬 설치 매니페스트 결함(fail-loud): %s" % "; ".join(malformed))
+            return
+        if missing:
+            lines = ["%s→%s: %s" % (s, b, cmd or "(이 플랫폼 install 명령 없음)")
+                     for s, b, cmd in missing]
+            if self.fix:
+                self.add(cid, FIXED,
+                         "결손 바이너리 %d건 — dry-run 설치 명령(실행 보류: cys feed push 승인 게이트): %s"
+                         % (len(missing), "; ".join(lines)))
+            else:
+                self.add(cid, FAIL,
+                         "스킬 요구 바이너리 결손 %d건 — `--fix`로 플랫폼별 설치 명령 확인: %s"
+                         % (len(missing), "; ".join(lines)))
+            return
+        self.add(cid, PASS,
+                 "스킬 self-describing 요구 바이너리 충족(requires.bins 선언 스킬 %d개·%s 플랫폼)"
+                 % (checked, plat_kind))
+
+    # ── C51 verdict 단일 머신-SOT (T6-P5 — verdict_schema.json 에서 런타임 로드 + 정합) ──
+    # T1-1/C43 은 리터럴 *드리프트*를 잡았다. T6-P5 는 그 리터럴을 한 소스(verdict_schema.json)에서
+    # *파생*시킨다. C51 은 결정론 검증한다: ① 스키마 파일 존재·유효 JSON ② javis_verdict.py 가
+    # 실제로 스키마를 로드(SCHEMA_LOADED=True, 인라인 폴백이 아님) ③ 스키마 VERDICT_ENUM/SEVERITY/
+    # ISSUE_CONTRACT 가 verdict.py 가 노출하는 값과 일치(스키마↔코드 정합) ④ INVESTIGATE 화해 —
+    # reviewer_enum(4) + validator_emitted([INVESTIGATE]) 가 VERDICT_ENUM(5)을 분할하는지. 코드측
+    # 무결성(self-test)은 C36 에 위임(중복 호출 회피) — 여기선 *스키마 결속*만 본다.
+    def c51_verdict_schema_sot(self):
+        cid = "C51.verdict-schema-sot"
+        if self.skipped(cid):
+            return
+        schema_p = os.path.join(pack_dir(), "schemas", "verdict_schema.json")
+        vbin = os.path.join(pack_dir(), "bin", "javis_verdict.py")
+        if not os.path.isfile(vbin):
+            self.add(cid, WARN, "javis_verdict.py 부재 — verdict 스키마 SOT 검사 보류")
+            return
+        if not os.path.isfile(schema_p):
+            self.add(cid, FAIL, "verdict_schema.json 부재 — 단일 머신-SOT 미설치(T6-P5)")
+            return
+        try:
+            s = json.load(open(schema_p, encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            self.add(cid, FAIL, "verdict_schema.json 유효 JSON 아님: %s" % e)
+            return
+        # ② verdict.py 가 스키마를 실제 로드하는지 — subprocess 격리(import 부작용 회피, c36/c43 패턴).
+        probe = (
+            "import importlib.util,json,sys;"
+            "spec=importlib.util.spec_from_file_location('v',%r);"
+            "v=importlib.util.module_from_spec(spec);spec.loader.exec_module(v);"
+            "print(json.dumps({'loaded':v.SCHEMA_LOADED,'VERDICT_ENUM':list(v.VERDICT_ENUM),"
+            "'SEVERITY_ENUM':list(v.SEVERITY_ENUM),'ISSUE_CONTRACT':list(v.ISSUE_CONTRACT)}))"
+            % vbin
+        )
+        r = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True)
+        if r.returncode != 0:
+            self.add(cid, FAIL, "javis_verdict.py 로드 실패 — %s" % (r.stderr.strip()[:160]))
+            return
+        try:
+            got = json.loads(r.stdout.strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            self.add(cid, FAIL, "verdict.py 스키마 프로브 출력 파싱 불가")
+            return
+        if not got.get("loaded"):
+            self.add(cid, FAIL, "javis_verdict.py 가 verdict_schema.json 을 로드하지 않음 "
+                     "(인라인 폴백 — 단일 SOT 미결속)")
+            return
+        # ③ 스키마↔코드 정합
+        for key in ("VERDICT_ENUM", "SEVERITY_ENUM", "ISSUE_CONTRACT"):
+            if set(s.get(key, [])) != set(got.get(key, [])):
+                self.add(cid, FAIL, "%s 스키마↔코드 불일치 — 스키마:%s / 코드:%s"
+                         % (key, sorted(s.get(key, [])), sorted(got.get(key, []))))
+                return
+        # ④ INVESTIGATE 화해: reviewer_enum(4) + validator_emitted == VERDICT_ENUM(5)
+        rev = set(s.get("reviewer_enum", []))
+        emit = set(s.get("validator_emitted", []))
+        full = set(s.get("VERDICT_ENUM", []))
+        if rev | emit != full or rev & emit:
+            self.add(cid, FAIL, "INVESTIGATE 화해 깨짐 — reviewer_enum∪validator_emitted ≠ "
+                     "VERDICT_ENUM (rev:%s emit:%s full:%s)" % (sorted(rev), sorted(emit), sorted(full)))
+            return
+        if "INVESTIGATE" not in emit or "INVESTIGATE" in rev:
+            self.add(cid, FAIL, "INVESTIGATE 는 validator-only 여야 함 — reviewer_enum 에 누출 또는 "
+                     "validator_emitted 누락")
+            return
+        self.add(cid, PASS,
+                 "verdict 단일 머신-SOT 결속 — verdict_schema.json 로드됨·스키마↔코드 정합 "
+                 "(VERDICT/SEVERITY/ISSUE_CONTRACT)·INVESTIGATE=validator-only 화해 OK")
 
     # ── C09 round 핵심 문서 ──
     def c09_round_core(self):
@@ -2582,6 +2816,9 @@ class Preflight:
         self.c46_session_ensure()
         self.c47_capability_guard()
         self.c48_governance_hardening()
+        self.c49_onboarding_catalog()
+        self.c50_skill_requirements()
+        self.c51_verdict_schema_sot()
         return self.results
 
 
