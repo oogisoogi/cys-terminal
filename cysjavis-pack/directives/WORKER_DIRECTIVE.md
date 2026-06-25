@@ -61,6 +61,7 @@ master가 모든 위임 티켓에 이 4규칙을 자동 주입한다(`javis_orch
 
 ## 4. 실측 검증 (추측 금지)
 산출 전 반드시 실측한다(빌드·실행·렌더·테스트). "될 것이다"가 아니라 "확인했다"로 보고한다.
+- **차단 콘텐츠 수집 검증(E3)**: 차단·안티봇 웹 콘텐츠를 직접 fetch해 채택할 때, HTTP 200을 성공으로 단정하지 말고 결과를 `_round/VALIDATION_VERDICT_VOCAB.md` §2 2축(성공성×종결성)으로 분류한다 — **SUSPECT_OK·비종결을 성공으로 보고 금지**(애매하면 성공 아님·계속 탐색).
 
 ## 4-A. ★출처 동반 (provenance-on-every-value · 2026-06-14 gumloop 적용)
 산출물의 **각 핵심 값·주장에 출처(인용·URL·파일:라인·ID)와 신뢰도(confidence: High/Med/Low)를 첨부**한다. 환각0은 내부 검증을 넘어 **산출물 자체가 출처를 보유**하게 만드는 사용자대면 신뢰 기능이다(gumloop provenance — CRM write는 diff+출처, 리서치는 confidence rating). 근거 없는 단정 금지 — 모든 값은 추적 가능해야 한다.
@@ -104,6 +105,7 @@ master가 모든 위임 티켓에 이 4규칙을 자동 주입한다(`javis_orch
 ## 9. 막힘 즉시 보고 (hang 방지)
 빌드·생성·외부 도구가 막히면 무리한 재시도 금지 — 즉시 master에 '막힘'을 push한다.
 한 작업이 5분을 초과하면 상태를 보고한다.
+- **공개 웹 fetch 실패선언 게이트(E1·E5)**: 단, 공개 웹 콘텐츠 fetch가 차단(403/WAF/429)된 경우는 위 일반 hang과 별개다 — insane-search 엔진의 전수 경로를 거친 뒤에만 '접근 불가'로 결론낸다. "뚫을 수 없음/접근 불가" 선언은 `_round/SEARCH_EXHAUSTION_CONTRACT.md` §2 4조건(grid_exhausted·untried_routes==[]·must_invoke_playwright_mcp==false·stop_reason∈{auth_required,not_found})과 §4 실패보고 스키마를 충족할 때만 유효하다. **429(rate-limited)는 일시일 뿐 벽이 아니다** — 백오프 후 재시도. 미충족 상태의 실패선언은 조기실패(환각)이며 master/자율주행 다음액션큐가 반려한다.
 
 ## 10. ★스킬 수확·기억 검색 (쓸수록 똑똑해지는 루프)
 - **작업 시작 전**: `cys skill list`로 보유 스킬 표지를 훑고, 관련 스킬은 `cys skill show <name>`으로

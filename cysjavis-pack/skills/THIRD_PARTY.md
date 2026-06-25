@@ -73,3 +73,46 @@ TTS 아티팩트 trim·결정론 정제(`backend/utils/audio.py`·`refinement.py
 ★주의: 위 Voicebox 소스 파일을 **직접 이식(코드 복사)**하는 시점에는 그 파일 헤더에 본 MIT
 저작권 고지를 동봉해야 한다(MIT 4항). 현재 voice-local은 playbook(설계 차용)이라 벤더링
 대상이 아니다 — 코드 이식이 발생하면 이 절을 '벤더링'으로 격상하고 핀 커밋을 기재한다.
+
+## insane-search (MIT License, Copyright (c) 2026 fivetaku)
+
+`insane-search` 스킬은 [fivetaku/insane-search](https://github.com/fivetaku/insane-search)
+(gptaku-plugins 일부, MIT License)에서 **디렉터리째 vendoring**했다. 업스트림 커밋 핀:
+`49306346b59aa89b5e96d98e1104da0890deed72` (2026, "chore: revert to MIT"). 차단내성 공개페이지
+리더 — curl_cffi TLS 임퍼소네이션·yt-dlp(1,858 미디어)·Phase 0 무인증 공개 API·WAF-프로파일
+fetch chain·Playwright fallback. API 키 0(HC1 정합)·공개 콘텐츠 한정(인증 우회 아님, DISCLAIMER 승계).
+전수조사: 보고서 `_research/InsaneSearch_박사급_연구보고서.md`, 구현설계서
+`_research/InsaneSearch기반_cys_업그레이드_구현설계서.md`, 메모리 `insane-search-upgrade-research`.
+
+채택 시 cysjavis 패치(업스트림과의 차이 — 무인 세션·외부발행·프라이버시 부작용 제거):
+업스트림 `setup/`(GitHub star write `gh api -X PUT user/starred`·`~/.claude/settings.json` SessionStart
+hook 직접 기입·대화기록 언어감지)는 **벤더링하지 않음**(skills/ 디렉터리 외부). SKILL.md Step 0(setup.sh
+ask → AskUserQuestion star)도 **제거**. 의존성 무인 자동설치(pip -U / npm i -g)는 기본 OFF·graceful
+degrade·CSO 승인 게이트 경유. 갱신 시 업스트림 diff 후 동일 4부작용 제거 기준으로 재감사한다.
+
+DISCLAIMER 승계: 업스트림 `DISCLAIMER.md`(공개 콘텐츠 리더·인증 우회 도구 아님·자격증명 미저장)는
+본 고지로 포인터 승계한다. MIT 의무를 넘는 DISCLAIMER 전문 강제임베드 여부는 박사님 결정(ESCALATE).
+
+### MIT License (fivetaku/insane-search)
+
+MIT License
+
+Copyright (c) 2026 fivetaku
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
