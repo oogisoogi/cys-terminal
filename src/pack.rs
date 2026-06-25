@@ -146,6 +146,10 @@ pub const PACK: &[(&str, &str)] = &[
         include_str!("../cysjavis-pack/bin/javis_cleanroom.py"),
     ),
     (
+        "bin/javis_session.py",
+        include_str!("../cysjavis-pack/bin/javis_session.py"),
+    ),
+    (
         "bin/cys-dept",
         include_str!("../cysjavis-pack/bin/cys-dept"),
     ),
