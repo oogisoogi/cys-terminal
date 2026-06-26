@@ -170,6 +170,39 @@ def v_quote_binding(depts, doc_text, catalog):
             errs.append(f"{tag}: cwd가 규약 경로($HOME/Desktop/CYSjavis/{disp}) 불일치")
     return errs
 
+def intake_ok(surfaces, idle_max=600):
+    """착수 PASS = role=worker 별개 surface가 alive + 데몬 관측 하드신호(idle/line). 부서장 working은 불충분."""
+    for s in surfaces:
+        if s.get("role") != "worker": continue
+        if not s.get("agent_alive"): continue
+        active = (s.get("idle_secs", 1e9) < idle_max) or (s.get("line_count", 0) > 0) or (s.get("queue_depth", 0) > 0)
+        if active: return True
+    return False
+
+def dept_status(socket):
+    """부서 소켓의 cys status --json 회수."""
+    r = subprocess.run(["cys", "--socket", socket, "status", "--json"],
+                       capture_output=True, text=True, env={**os.environ, "CYS_NO_AUTOSTART": "1"})
+    if r.returncode != 0: return None
+    try: return json.loads(r.stdout)
+    except Exception: return None
+
+def cmd_status(path=None):
+    reg = load_json(DEPTS, {"depts":{}})
+    keys = None
+    if path:
+        m = load_json(path); keys = {d["key"] for d in m["departments"]}
+    rows = []
+    for name, e in reg.get("depts", {}).items():
+        if keys is not None and e.get("mission_key") not in keys: continue
+        st = dept_status(e["socket"])
+        surfaces = (st or {}).get("surfaces", [])
+        rows.append({"dept": name, "display": e.get("display_name", name),
+                     "alive": st is not None, "intake": intake_ok(surfaces)})
+    ok = all(r["intake"] for r in rows) if rows else False
+    print(json.dumps({"status": "ok" if ok else "incomplete", "depts": rows}, ensure_ascii=False))
+    return 0 if ok else 1
+
 def apply_plan(m):
     """부수효과 없는 실행계획. 순서: dept당 catalog→mission→ensure→create→backfill, 그 후 tasks."""
     plan = []
@@ -301,6 +334,13 @@ def self_test():
     chk("apply-create-after-cat",
         [p[0] for p in plan].index("catalog_upsert") < [p[0] for p in plan].index("create_dept"),
         "catalog upsert가 create보다 먼저가 아님(cross-file 순서)")
+    # --- Task7: intake_ok (부서장 자기 working 오집계 금지) ---
+    only_master = [{"role":"master","agent":"claude","agent_alive":True,"idle_secs":3,"line_count":50,"status":"working"}]
+    chk("intake-master-only", intake_ok(only_master)==False, "부서장만 있는데 착수 PASS(오집계)")
+    with_worker = only_master + [{"role":"worker","agent":"claude","agent_alive":True,"idle_secs":2,"line_count":10,"status":"working"}]
+    chk("intake-worker", intake_ok(with_worker)==True, "워커 착수인데 FAIL")
+    dead_worker = only_master + [{"role":"worker","agent":"claude","agent_alive":False,"idle_secs":9999,"line_count":0,"status":None}]
+    chk("intake-dead", intake_ok(dead_worker)==False, "죽은 워커를 착수로 오판")
     print(json.dumps({"self_test": "ok" if not failures else "fail",
                       "failures": failures}, ensure_ascii=False))
     return 1 if failures else 0
@@ -324,7 +364,8 @@ def main():
     if not args.cmd: ap.print_help(); return 2
     if args.cmd == "validate": return cmd_validate(args.manifest)
     if args.cmd == "apply": return cmd_apply(args.manifest)
-    return 2  # status·destroy는 Task 7·9에서 배선
+    if args.cmd == "status": return cmd_status(args.manifest)
+    return 2  # destroy는 Task 9에서 배선
 
 if __name__ == "__main__":
     sys.exit(main())
