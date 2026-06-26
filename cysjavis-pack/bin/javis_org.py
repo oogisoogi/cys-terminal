@@ -203,6 +203,59 @@ def cmd_status(path=None):
     print(json.dumps({"status": "ok" if ok else "incomplete", "depts": rows}, ensure_ascii=False))
     return 0 if ok else 1
 
+def tar_snapshot(key, workdir, dest_dir=None):
+    """--purge-workdir 의무 선행. 성공 시 경로 반환, 실패(소스 없음) 시 None → 호출자가 rm 중단."""
+    if not workdir or not os.path.isdir(workdir): return None
+    dest_dir = dest_dir or f"{HOME}/.cys/dept-snapshots"
+    os.makedirs(dest_dir, exist_ok=True)
+    stamp = os.environ.get("CYS_SNAP_STAMP", str(int(os.path.getmtime(workdir))))
+    out = os.path.join(dest_dir, f"{key}-{stamp}.tar.gz")
+    with tarfile.open(out, "w:gz") as tar:
+        tar.add(workdir, arcname=os.path.basename(workdir.rstrip("/")))
+    return out if os.path.exists(out) else None
+
+def destroy_dept(name, mission_key, purge=False, purge_workdir=False):
+    actions = []
+    # 1) 작업물 삭제는 의무 스냅샷 뒤에만 (fail-closed)
+    if purge_workdir:
+        reg = load_json(DEPTS, {"depts":{}}); e = reg["depts"].get(name, {})
+        workdir = expand(e.get("cwd",""))
+        snap = tar_snapshot(name, workdir)
+        if not snap:
+            return [("abort_no_snapshot", workdir)]  # hard abort
+        actions.append(("snapshot", snap))
+    # 2) cys-dept down 위임(CSO 상속)
+    r = subprocess.run(["cys-dept", "down", name], capture_output=True, text=True,
+                       env={**os.environ, "CYS_ROLE": "cso"})
+    actions.append(("down", r.returncode))
+    # 3) pack-dept rm (결정론) — forwarder는 self-reap(직접 회수 안 함)
+    if purge:
+        pack = f"{HOME}/.cys/pack-dept-{name}"
+        if os.path.isdir(pack):
+            subprocess.run(["rm", "-rf", pack]); actions.append(("rm_pack", pack))
+    if purge_workdir:
+        reg = load_json(DEPTS, {"depts":{}}); e = reg["depts"].get(name, {})
+        wd = expand(e.get("cwd",""))
+        if wd and os.path.isdir(wd):
+            subprocess.run(["rm", "-rf", wd]); actions.append(("rm_workdir", wd))
+    return actions
+
+def cmd_destroy(args):
+    require_cso()
+    reg = load_json(DEPTS, {"depts":{}})
+    targets = list(reg.get("depts", {}).keys()) if args.all else ([args.dept] if args.dept else [])
+    if not targets: sys.stderr.write("[destroy] 대상 없음(--dept 또는 --all)\n"); return 4
+    allres = {}
+    for name in targets:
+        mk = reg["depts"].get(name, {}).get("mission_key")
+        res = destroy_dept(name, mk, purge=args.purge, purge_workdir=args.purge_workdir)
+        allres[name] = res
+        if any(a[0]=="abort_no_snapshot" for a in res):
+            sys.stderr.write(f"[destroy] {name}: 스냅샷 실패 → 작업물 삭제 중단(fail-closed)\n"); return 1
+    print(json.dumps({"destroy": "done", "targets": allres,
+                      "note": "forwarder는 소켓 소멸 후 ~30s self-reap(직접 회수 안 함)"}, ensure_ascii=False))
+    return 0
+
 def classify_dept(alive, intake):
     if not alive: return "redeploy"   # 소켓 死 → 멱등 apply 재실행(cys-dept REUSE_DEAD 재spawn)
     if not intake: return "hang"       # 소켓 alive·worker 미착수 → CSO 명시 개입 필요
@@ -364,6 +417,12 @@ def self_test():
     chk("cls-dead", classify_dept(alive=False, intake=False)=="redeploy", "데몬死 분류 오류")
     chk("cls-hang", classify_dept(alive=True, intake=False)=="hang", "hang 분류 오류")
     chk("cls-ok", classify_dept(alive=True, intake=True)=="ok", "정상 분류 오류")
+    # --- Task9: tar_snapshot fail-closed ---
+    src = os.path.join(td, "workdir"); os.makedirs(src, exist_ok=True)
+    open(os.path.join(src,"a.txt"),"w").write("data")
+    snap = tar_snapshot("authoring", src, dest_dir=td)
+    chk("snap-made", snap and os.path.exists(snap), "스냅샷 미생성")
+    chk("snap-missing-src", tar_snapshot("x", os.path.join(td,"nope"), dest_dir=td) is None, "없는 소스에 스냅샷 성공(위험)")
     print(json.dumps({"self_test": "ok" if not failures else "fail",
                       "failures": failures}, ensure_ascii=False))
     return 1 if failures else 0
@@ -388,7 +447,8 @@ def main():
     if args.cmd == "validate": return cmd_validate(args.manifest)
     if args.cmd == "apply": return cmd_apply(args.manifest)
     if args.cmd == "status": return cmd_status(args.manifest)
-    return 2  # destroy는 Task 9에서 배선
+    if args.cmd == "destroy": return cmd_destroy(args)
+    return 2
 
 if __name__ == "__main__":
     sys.exit(main())
