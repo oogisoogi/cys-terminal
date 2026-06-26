@@ -110,9 +110,9 @@ def validate_manifest(m, doc_text=None, catalog=None):
         doc_text = open(dd, encoding="utf-8").read() if os.path.exists(dd) else ""
         errs += v_sha256(sha256_text(doc_text) if doc_text else "", m["source"]["design_doc_sha256"])
     errs += v_quote_binding(m.get("departments", []), doc_text, catalog)
-    errs += v_quote_binding(  # tasks도 동일 doc 존재성(정체결속은 dept만)
+    errs += v_quote_binding(  # tasks는 quote-수준(길이/존재/고유)만 — 정체결속·account·cwd는 dept만
         [{"key":t.get("dept"),"display":"","account":"","cwd":"","source_quote":t.get("source_quote","")}
-         for t in m.get("tasks", [])], doc_text, {"accounts":{},"departments":{}})
+         for t in m.get("tasks", [])], doc_text, {"accounts":{},"departments":{}}, dept_level=False)
     errs += v_refs(m.get("departments", []), m.get("tasks", []))
     return errs
 
@@ -131,8 +131,9 @@ def cmd_validate(path):
 
 def _norm(s): return " ".join((s or "").split())
 
-def v_quote_binding(depts, doc_text, catalog):
-    """F1: quote 존재+정체결속+key↔account+cwd패턴+span유일+길이/고유성."""
+def v_quote_binding(depts, doc_text, catalog, dept_level=True):
+    """F1: quote 존재+정체결속+key↔account+cwd패턴+span유일+길이/고유성.
+    dept_level=False(tasks)면 dept-수준 검사(정체·account·cwd)를 건너뛰고 quote-수준(길이/존재/고유/span)만."""
     errs = []
     ndoc = _norm(doc_text)
     accounts = (catalog.get("accounts") or {}).keys()
@@ -150,24 +151,25 @@ def v_quote_binding(depts, doc_text, catalog):
         elif ndoc.count(q) != 1:
             errs.append(f"{tag}: source_quote 고유성 위반(doc 내 {ndoc.count(q)}회)")
         else:
-            # 정체 결속: quote가 display 또는 key 변별토큰 포함
-            if disp not in q and key not in q:
+            # 정체 결속: quote가 display 또는 key 변별토큰 포함 (dept-수준만)
+            if dept_level and disp not in q and key not in q:
                 errs.append(f"{tag}: quote가 부서 정체(display/key) 미포함 — 결속 실패")
-            # span 유일성
+            # span 유일성 (quote-수준)
             if q in seen_quotes:
                 errs.append(f"{tag}: source_quote가 {seen_quotes[q]}와 동일 span 재사용")
             seen_quotes[q] = tag
-        # key↔account 일관성
-        if key in cat_depts:
-            want = cat_depts[key].get("account")
-            if want and acct != want:
-                errs.append(f"{tag}: account 오배정({acct}≠catalog {want})")
-        elif acct not in accounts:
-            errs.append(f"{tag}: 신규 key의 account '{acct}'가 승인 accounts에 없음(박사님 승인 필요)")
-        # cwd 규약 경로
-        cwd = d.get("cwd", "")
-        if disp and not cwd.replace("\\", "/").endswith(f"Desktop/CYSjavis/{disp}"):
-            errs.append(f"{tag}: cwd가 규약 경로($HOME/Desktop/CYSjavis/{disp}) 불일치")
+        if dept_level:
+            # key↔account 일관성
+            if key in cat_depts:
+                want = cat_depts[key].get("account")
+                if want and acct != want:
+                    errs.append(f"{tag}: account 오배정({acct}≠catalog {want})")
+            elif acct not in accounts:
+                errs.append(f"{tag}: 신규 key의 account '{acct}'가 승인 accounts에 없음(박사님 승인 필요)")
+            # cwd 규약 경로
+            cwd = d.get("cwd", "")
+            if disp and not cwd.replace("\\", "/").endswith(f"Desktop/CYSjavis/{disp}"):
+                errs.append(f"{tag}: cwd가 규약 경로($HOME/Desktop/CYSjavis/{disp}) 불일치")
     return errs
 
 def intake_ok(surfaces, idle_max=600):
