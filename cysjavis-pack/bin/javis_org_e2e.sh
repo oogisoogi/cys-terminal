@@ -47,4 +47,18 @@ if [ "$RC" != "0" ]; then echo "E2E FAIL: workdir 부재 destroy rc=$RC (영구 
 echo "$OUT" | grep -q workdir_absent_skip || { echo "E2E FAIL: workdir_absent_skip 미포함"; exit 1; }
 echo "  → 기대대로 rc0·skip"
 
+echo "== mutation 본체 직접호출 CSO 게이트 (REVISE-1·exit3 기대) =="
+# 게이트를 명령 래퍼가 아니라 '효과를 일으키는 함수'에 둠 — import 직접호출 우회 차단(defense-in-depth)
+BINDIR="$(dirname "$BIN")"
+if PATH="$T/bin:$PATH" CYS_ROLE=worker python3 -c "
+import sys; sys.path.insert(0,'$BINDIR'); import javis_org
+ok=True
+for fn,args in [('apply_manifest',({},)),('destroy_dept',('x','x')),('create_dept',('x',))]:
+    try: getattr(javis_org,fn)(*args); print('FAIL',fn,'no exit'); ok=False
+    except SystemExit as e:
+        if e.code!=3: print('FAIL',fn,'code',e.code); ok=False
+    except Exception as ex: print('FAIL',fn,'raised',type(ex).__name__); ok=False
+sys.exit(0 if ok else 1)
+"; then echo "  → 3개 본체(apply_manifest·destroy_dept·create_dept) 모두 exit3 차단"; else echo "E2E FAIL: mutation 본체 무가드"; exit 1; fi
+
 echo "ALL E2E PASS (라이브 무접촉)"; rm -rf "$T"

@@ -239,6 +239,7 @@ def _snapshot_gate(name, workdir):
     return True, ("snapshot", snap)
 
 def destroy_dept(name, mission_key, purge=False, purge_workdir=False):
+    require_cso()  # 게이트를 효과 함수에 (R1 REVISE-1) — import 직접호출 우회 차단
     actions = []
     # 1) 작업물 삭제는 의무 스냅샷 뒤에만 — 단 workdir 부재면 skip(no-op·abort 금지)
     if purge_workdir:
@@ -248,9 +249,9 @@ def destroy_dept(name, mission_key, purge=False, purge_workdir=False):
         actions.append(action)
         if not proceed:
             return actions  # abort_no_snapshot (workdir 존재+스냅샷 실패만)
-    # 2) cys-dept down 위임(CSO 상속)
+    # 2) cys-dept down 위임 — 부모 role 상속(require_cso로 이미 cso 보장·하류 가드 무력화 방지·R1 REVISE-1)
     r = subprocess.run(["cys-dept", "down", name], capture_output=True, text=True,
-                       env={**os.environ, "CYS_ROLE": "cso"})
+                       env={**os.environ})
     actions.append(("down", r.returncode))
     # 3) pack-dept rm (결정론) — forwarder는 self-reap(직접 회수 안 함)
     if purge:
@@ -313,9 +314,10 @@ def apply_plan(m):
     return plan
 
 def create_dept(key):
-    """cys-dept create 위임(CSO env 상속). 부서장 각성·미션주입·격리·멱등 전부 cys-dept 책임."""
+    """cys-dept create 위임. 부서장 각성·미션주입·격리·멱등 전부 cys-dept 책임."""
+    require_cso()  # 게이트를 효과 함수에 (R1 REVISE-1) — import 직접호출 우회 차단
     r = subprocess.run(["cys-dept", "create", key], capture_output=True, text=True,
-                       env={**os.environ, "CYS_ROLE": "cso"})
+                       env={**os.environ})  # 부모 role 상속(require_cso로 cso 보장·하류 가드 유지)
     return r.returncode, (r.stdout or "") + (r.stderr or "")
 
 def dispatch_task(t):
@@ -328,6 +330,7 @@ def dispatch_task(t):
     return r.returncode, (r.stdout or "") + (r.stderr or "")
 
 def apply_manifest(m):
+    require_cso()  # 게이트를 효과 함수에 (R1 REVISE-1) — import 직접호출 우회 차단
     results = []
     for action, arg in apply_plan(m):
         if action == "catalog_upsert": catalog_upsert(CATALOG, arg); results.append((action, arg["key"], 0))
