@@ -170,6 +170,62 @@ def v_quote_binding(depts, doc_text, catalog):
             errs.append(f"{tag}: cwd가 규약 경로($HOME/Desktop/CYSjavis/{disp}) 불일치")
     return errs
 
+def apply_plan(m):
+    """부수효과 없는 실행계획. 순서: dept당 catalog→mission→ensure→create→backfill, 그 후 tasks."""
+    plan = []
+    for d in m["departments"]:
+        plan.append(("catalog_upsert", d))
+        plan.append(("write_mission", d))
+        plan.append(("ensure_dirs", d))
+        plan.append(("create_dept", d["key"]))
+        plan.append(("backfill_mission_key", d["key"]))
+    for t in m["tasks"]:
+        plan.append(("dispatch_task", t))
+    return plan
+
+def create_dept(key):
+    """cys-dept create 위임(CSO env 상속). 부서장 각성·미션주입·격리·멱등 전부 cys-dept 책임."""
+    r = subprocess.run(["cys-dept", "create", key], capture_output=True, text=True,
+                       env={**os.environ, "CYS_ROLE": "cso"})
+    return r.returncode, (r.stdout or "") + (r.stderr or "")
+
+def dispatch_task(t):
+    """첫 프로젝트 = 유일 실행 티켓(task-prompt). 미션 md의 첫프로젝트와 중복 금지(DUP-4)."""
+    cmd = ["python3", f"{HOME}/.cys/pack/bin/javis_orchestra.py", "task-prompt",
+           "--task", t["task"], "--scope", t["scope"], "--to", t.get("to","worker")]
+    if t.get("success"): cmd += ["--success", t["success"]]
+    if t.get("dont"): cmd += ["--dont", t["dont"]]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    return r.returncode, (r.stdout or "") + (r.stderr or "")
+
+def apply_manifest(m):
+    results = []
+    for action, arg in apply_plan(m):
+        if action == "catalog_upsert": catalog_upsert(CATALOG, arg); results.append((action, arg["key"], 0))
+        elif action == "write_mission": write_mission(arg["key"], arg["mission_md"]); results.append((action, arg["key"], 0))
+        elif action == "ensure_dirs": ensure_dirs(arg); results.append((action, arg["key"], 0))
+        elif action == "create_dept":
+            rc, out = create_dept(arg); results.append((action, arg, rc))
+        elif action == "backfill_mission_key": backfill_mission_key(DEPTS, arg, arg); results.append((action, arg, 0))
+        elif action == "dispatch_task":
+            rc, out = dispatch_task(arg); results.append((action, arg["dept"], rc))
+    return results
+
+def cmd_apply(path):
+    require_cso()
+    try: m = load_json(path)
+    except Exception as e: sys.stderr.write(f"[apply] 로드 실패: {e}\n"); return 2
+    errs = validate_manifest(m)
+    if errs:
+        sys.stderr.write("[apply] validate FAIL — apply 중단:\n" + "\n".join(f"  - {e}" for e in errs) + "\n")
+        return 1
+    results = apply_manifest(m)
+    fails = [(a,k) for a,k,rc in results if rc != 0]
+    print(json.dumps({"apply": "done" if not fails else "partial",
+                      "results": [[a,str(k),rc] for a,k,rc in results],
+                      "fails": [[a,str(k)] for a,k in fails]}, ensure_ascii=False))
+    return 0 if not fails else 1
+
 def self_test():
     failures = []
     def chk(name, cond, msg=""):
@@ -239,6 +295,12 @@ def self_test():
     chk("cat-upsert", "authoring" in c2["departments"], "upsert 미반영")
     chk("cat-idem", len(c2["departments"])==1, "멱등 위반(중복)")
     chk("cat-mkey", c2["departments"]["authoring"]["mission_key"]=="authoring", "mission_key 미설정")
+    # --- Task6: apply 분해(부수효과 없는 plan 생성) ---
+    plan = apply_plan(m_ok)  # [(action, key/args), ...]
+    chk("apply-order", plan[0][0]=="catalog_upsert" and "create_dept" in [p[0] for p in plan], "apply 순서/구성 오류")
+    chk("apply-create-after-cat",
+        [p[0] for p in plan].index("catalog_upsert") < [p[0] for p in plan].index("create_dept"),
+        "catalog upsert가 create보다 먼저가 아님(cross-file 순서)")
     print(json.dumps({"self_test": "ok" if not failures else "fail",
                       "failures": failures}, ensure_ascii=False))
     return 1 if failures else 0
@@ -261,7 +323,8 @@ def main():
     if args.self_test: return self_test()
     if not args.cmd: ap.print_help(); return 2
     if args.cmd == "validate": return cmd_validate(args.manifest)
-    return 2  # apply·status·destroy는 Task 6·7·9에서 배선
+    if args.cmd == "apply": return cmd_apply(args.manifest)
+    return 2  # status·destroy는 Task 7·9에서 배선
 
 if __name__ == "__main__":
     sys.exit(main())
