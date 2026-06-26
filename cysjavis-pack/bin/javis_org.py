@@ -88,7 +88,8 @@ def backfill_mission_key(depts_path, key, mission_key):
         fcntl.flock(lf, fcntl.LOCK_EX)
         reg = load_json(depts_path, {"depts":{}})
         for name, e in reg.get("depts", {}).items():
-            if e.get("cwd","").endswith(key) or e.get("mission_key")==mission_key:
+            cwd_base = os.path.basename(e.get("cwd","").rstrip("/"))  # 경로 마지막 세그먼트 정확일치(R1 BLOCK-1)
+            if cwd_base == key or e.get("mission_key")==mission_key:
                 if not e.get("mission_key"):
                     e["mission_key"] = mission_key
         _atomic_write(depts_path, reg)
@@ -425,6 +426,20 @@ def self_test():
     chk("cat-upsert", "authoring" in c2["departments"], "upsert 미반영")
     chk("cat-idem", len(c2["departments"])==1, "멱등 위반(중복)")
     chk("cat-mkey", c2["departments"]["authoring"]["mission_key"]=="authoring", "mission_key 미설정")
+    # --- R1 BLOCK-1: backfill suffix 오탐 — basename 정확일치 (무관 레거시 메타 오염 차단) ---
+    dpath = os.path.join(td, "depts.json")
+    # cwd가 'future-research'로 끝나는 레거시(mission_key 없음) — key='research'로 backfill 시도
+    json.dump({"depts":{"dept-1":{"cwd":"/x/future-research","socket":"s1"}}}, open(dpath,"w"))
+    backfill_mission_key(dpath, "research", "research")  # endswith면 future-research에 오염
+    r1 = json.load(open(dpath))
+    chk("backfill-no-suffix-bleed", r1["depts"]["dept-1"].get("mission_key") != "research",
+        "suffix 오탐: 무관 레거시(future-research)에 key='research' 오염")
+    # 정확한 basename 일치는 backfill 됨
+    json.dump({"depts":{"dept-2":{"cwd":"/x/research","socket":"s2"}}}, open(dpath,"w"))
+    backfill_mission_key(dpath, "research", "research")
+    r2 = json.load(open(dpath))
+    chk("backfill-exact-match", r2["depts"]["dept-2"].get("mission_key") == "research",
+        "정확 basename 일치인데 backfill 안 됨")
     # --- Task6: apply 분해(부수효과 없는 plan 생성) ---
     plan = apply_plan(m_ok)  # [(action, key/args), ...]
     chk("apply-order", plan[0][0]=="catalog_upsert" and "create_dept" in [p[0] for p in plan], "apply 순서/구성 오류")
