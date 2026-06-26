@@ -53,6 +53,42 @@ def v_schema(m):
             errs.append(f"tasks[{i}].to enum 위반: {t.get('to')}")
     return errs
 
+def v_refs(depts, tasks):
+    keys = {d.get("key") for d in depts}
+    return [f"tasks[{i}].dept '{t.get('dept')}' 미존재(참조 무결성)"
+            for i, t in enumerate(tasks) if t.get("dept") not in keys]
+
+def v_sha256(actual, expected):
+    return [] if actual == expected else [f"design_doc sha256 불일치(SOT 드리프트): 실제 {actual[:12]}… ≠ 매니페스트 {expected[:12]}…"]
+
+def validate_manifest(m, doc_text=None, catalog=None):
+    errs = v_schema(m)
+    if errs: return errs  # 스키마 깨지면 이후 검사 무의미
+    catalog = catalog if catalog is not None else load_json(CATALOG, {})
+    if doc_text is None:
+        dd = expand(m["source"]["design_doc"])
+        doc_text = open(dd, encoding="utf-8").read() if os.path.exists(dd) else ""
+        errs += v_sha256(sha256_text(doc_text) if doc_text else "", m["source"]["design_doc_sha256"])
+    errs += v_quote_binding(m.get("departments", []), doc_text, catalog)
+    errs += v_quote_binding(  # tasks도 동일 doc 존재성(정체결속은 dept만)
+        [{"key":t.get("dept"),"display":"","account":"","cwd":"","source_quote":t.get("source_quote","")}
+         for t in m.get("tasks", [])], doc_text, {"accounts":{},"departments":{}})
+    errs += v_refs(m.get("departments", []), m.get("tasks", []))
+    return errs
+
+def cmd_validate(path):
+    try:
+        m = load_json(path)
+    except Exception as e:
+        sys.stderr.write(f"[validate] 매니페스트 로드 실패: {e}\n"); return 2
+    errs = validate_manifest(m)
+    if errs:
+        sys.stderr.write("[validate] FAIL:\n" + "\n".join(f"  - {e}" for e in errs) + "\n")
+        return 1
+    print(json.dumps({"validate": "ok", "departments": len(m["departments"]),
+                      "tasks": len(m["tasks"])}, ensure_ascii=False))
+    return 0
+
 def _norm(s): return " ".join((s or "").split())
 
 def v_quote_binding(depts, doc_text, catalog):
@@ -145,6 +181,11 @@ def self_test():
     # 짧은 quote
     d_short = {**d_ok, "source_quote":"미래연구부"}
     chk("f1-short", any("길이" in e or "고유" in e for e in v_quote_binding([d_short], doc, cat)), "짧은 quote 미검출")
+    # --- Task4: v_refs / v_sha256 / validate_manifest ---
+    chk("refs-ok", v_refs([good_dept],[{"dept":"future-research","to":"worker","task":"t","scope":"s","source_quote":"q"}])==[], "정상 참조 오류")
+    chk("refs-bad", v_refs([good_dept],[{"dept":"no-such","to":"worker","task":"t","scope":"s","source_quote":"q"}])!=[], "붕뜬 task 미검출")
+    chk("sha-ok", v_sha256("abc","abc")==[], "sha 일치 오탐")
+    chk("sha-bad", v_sha256("abc","def")!=[], "sha 불일치 미검출")
     print(json.dumps({"self_test": "ok" if not failures else "fail",
                       "failures": failures}, ensure_ascii=False))
     return 1 if failures else 0
@@ -166,7 +207,8 @@ def main():
     args = ap.parse_args()
     if args.self_test: return self_test()
     if not args.cmd: ap.print_help(); return 2
-    return 2  # 각 명령은 Task 4·6·7·9에서 배선
+    if args.cmd == "validate": return cmd_validate(args.manifest)
+    return 2  # apply·status·destroy는 Task 6·7·9에서 배선
 
 if __name__ == "__main__":
     sys.exit(main())
