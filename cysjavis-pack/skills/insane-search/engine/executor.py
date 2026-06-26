@@ -26,6 +26,7 @@ import tempfile
 import time
 from typing import Optional
 
+from .proc import utf8_env
 from .validators import Verdict, validate
 from .waf_detector import load_profile
 from .fetch_chain import Attempt
@@ -91,6 +92,9 @@ def _run_node_template(template: str, args: dict, timeout: int = 90) -> tuple[in
             cwd=TEMPLATES_DIR,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",  # OPP-16: HTML fail-soft — validators still read challenge markers
+            env=utf8_env(),
             timeout=timeout,
         )
         return proc.returncode, proc.stdout, proc.stderr
@@ -163,7 +167,15 @@ def run_playwright_fallback(
         return att, ""
 
     if not _chrome_channel_available():
+        # OPP-11: present an install-source-aware PRESCRIPTION (run only — never
+        # executed here). playwright is a 2-layer dep: package vs downloaded
+        # chromium binary; dep_doctor distinguishes them. Best-effort.
         att.error = "node/npx not available for local Playwright template"
+        try:
+            from . import dep_doctor
+            att.error += " · " + dep_doctor.hint_for("playwright_chromium", code_ref="executor.py:57")
+        except Exception:
+            pass
         att.verdict = Verdict.UNKNOWN.value
         att.elapsed_s = round(time.time() - t0, 3)
         return att, ""

@@ -87,6 +87,14 @@ fn parse_report_rate(params: &Value) -> Vec<crate::usage::RateWindow> {
 const MAX_ROWS: u64 = 1000;
 const MAX_COLS: u64 = 4000;
 
+/// 적대검증 벡터-9 방어심화: master role을 (재)claim한 직후 approval.sign을 동결하는 쿨다운(초).
+/// master surface가 죽는 윈도우(crash·reap)에 다른 노드가 claim_role("master")로 합법 승계 →
+/// 즉시 위험명령을 정당 서명 → guard.sh denylist 무력화하는 승계-윈도우 남용을 차단한다.
+/// 장수 master(정당)는 서명이 드물고 claim 후 60초를 훌쩍 넘으므로 무영향. ★단일UID·신뢰노드
+/// 모델에선 claim_role이 권한 메커니즘이라 legit/usurper를 암호학적으로 완전 구분 불가 —
+/// 이 쿨다운은 공격 윈도우 축소·탐지(방어심화)이지 암호보증이 아니다.
+const SIGN_COOLDOWN_SECS: f64 = 60.0;
+
 /// health_rules 하드 캡: 룰 전부가 run_health_rules의 `for line × for rule` 핫패스에서
 /// 매 완성 라인마다 정규식 평가되므로(O(rules×lines)), 룰 벡터 무한 성장은 메모리 누수일
 /// 뿐 아니라 모든 surface 출력 처리의 CPU 비용 증폭이다. caller_cache(4096)·feed_items(5000)
@@ -537,6 +545,73 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     }
                 }
             }
+            // ── 워커 기동 게이트 ② (cmux beginCreate 보상 트랜잭션 흡수) ──
+            // (1) idempotency: 같은 key 재시도면 기존 surface 재반환(추가 spawn 0).
+            let idem_key = param_str(&params, "idempotency_key");
+            if let Some(ref key) = idem_key {
+                // ★락 규약: create_idem 가드를 surfaces 락보다 먼저 닫는다(lock-ordering 오염 회피).
+                //   조회·lazy GC만 별도 스코프로 감싸 sid만 들고 나오고, surfaces 락은 그 다음에 잡는다.
+                let cached_sid = {
+                    let now = crate::state::now_epoch();
+                    let mut idem = daemon.create_idem.lock().unwrap();
+                    idem.retain(|_, (_, ts)| now - *ts < crate::state::CREATE_IDEM_TTL_SECS); // lazy GC
+                    idem.get(key).map(|&(sid, _)| sid)
+                };
+                if let Some(sid) = cached_sid {
+                    // 살아있는 surface면 재반환, 죽었으면 스루(아래서 새로 생성).
+                    let reuse = {
+                        let surfaces = daemon.surfaces.lock().unwrap();
+                        surfaces.get(&sid).and_then(|s| {
+                            if !s.exited.load(Ordering::Relaxed) {
+                                Some(s.pid)
+                            } else {
+                                None
+                            }
+                        })
+                    };
+                    if let Some(pid) = reuse {
+                        return Reply::Single(ok_response(
+                            &id,
+                            json!({"surface_id": sid, "surface_ref": surface_ref(sid),
+                                   "pid": pid, "idempotent_reuse": true}),
+                        ));
+                    }
+                }
+            }
+            // (2) active-limit: 살아있는 worker-* 수 한도. role=="worker" 요청에만 적용
+            //     (master/cso는 위 하이재킹 게이트가, reviewer-*는 단일 latest-wins가 커버).
+            if param_str(&params, "role").as_deref() == Some("worker") {
+                let limit = daemon.config.max_active_workers;
+                if limit > 0 {
+                    // 락 순서 규약: surfaces → roles (하이재킹 게이트·create_surface와 동일).
+                    let count = {
+                        let surfaces = daemon.surfaces.lock().unwrap();
+                        let roles = daemon.roles.lock().unwrap();
+                        crate::state::live_worker_count(&roles, |h| {
+                            surfaces
+                                .get(&h)
+                                .map(|s| !s.exited.load(Ordering::Relaxed))
+                                .unwrap_or(false)
+                        })
+                    };
+                    if count >= limit {
+                        daemon.bus.publish(
+                            "worker.limit_denied",
+                            "system",
+                            None,
+                            json!({"limit": limit, "active": count, "path": "surface.create",
+                                   "caller_pid": caller_pid}),
+                        );
+                        return Reply::Single(err_response(
+                            &id,
+                            "worker_limit_exceeded",
+                            &format!(
+                                "worker active-limit reached: {count}/{limit} (max_active_workers)"
+                            ),
+                        ));
+                    }
+                }
+            }
             match daemon.create_surface(
                 param_str(&params, "cwd"),
                 param_str(&params, "cmd"),
@@ -545,10 +620,20 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 rows,
                 cols,
             ) {
-                Ok(s) => Reply::Single(ok_response(
-                    &id,
-                    json!({"surface_id": s.id, "surface_ref": surface_ref(s.id), "pid": s.pid}),
-                )),
+                Ok(s) => {
+                    // (E-e) 멱등 캐시 기록 — 다음 동일 key 재시도가 이 surface를 재반환.
+                    if let Some(key) = idem_key {
+                        daemon
+                            .create_idem
+                            .lock()
+                            .unwrap()
+                            .insert(key, (s.id, crate::state::now_epoch()));
+                    }
+                    Reply::Single(ok_response(
+                        &id,
+                        json!({"surface_id": s.id, "surface_ref": surface_ref(s.id), "pid": s.pid}),
+                    ))
+                }
                 Err(e) => Reply::Single(err_response(&id, "spawn_failed", &e)),
             }
         }
@@ -1093,6 +1178,12 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             // 동시 close/claim과의 경합으로 dangling 역할 주소가 남는 것을 차단.
             // 락 순서 규약: surfaces → roles → surface.role (close_surface와 동일)
             let claimed_role; // worker dedup 결과를 블록 밖 event/reply로 전달 (블록 내 단일 대입)
+            // 벡터-9 방어심화: master 보유자 전이를 (락 보유 중) 관찰해 블록 밖에서
+            // master_claimed_at 갱신·승계 감사 이벤트를 처리한다(락 순서에 master_claimed_at
+            // 락을 끼우지 않아 surfaces→roles 순서 보존). (이전 master 보유자, 새 master 보유자).
+            // 블록 정상 종료(fall-through)에서만 읽힌다 — 조기 return 경로는 arm 전체를 종료한다.
+            let master_before: Option<u64>;
+            let master_after: Option<u64>;
             {
                 let surfaces = daemon.surfaces.lock().unwrap();
                 let Some(surface) = surfaces.get(&sid) else {
@@ -1103,6 +1194,8 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     ));
                 };
                 let mut roles = daemon.roles.lock().unwrap();
+                // 전이 관찰: 이 임계영역 진입 시점의 master 보유자 (insert/remove 전).
+                master_before = roles.get("master").copied();
                 // 특권 역할 탈취 차단: master·cso는 조직의 단일 장애점·감시 기준점이라,
                 // 이미 살아있는 다른 surface가 점유 중이면 재지정을 거부한다. 자기 surface가
                 // 이미 보유 중인 경우(idempotent re-claim)와 직전 보유자가 죽은(없거나 exited)
@@ -1156,7 +1249,29 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 // T4-4/T6-P3: 역할 전이와 동기로 능력 집합 재도출(reviewer-*=read/search,
                 // full=worker/master/cso, 그 외 deny-by-default). cysd-매개 변형 게이트의 키 갱신.
                 *surface.caps.lock().unwrap() = crate::caps::Caps::for_role(Some(&final_role));
+                // 전이 관찰: insert/remove 반영 후의 master 보유자.
+                master_after = roles.get("master").copied();
                 claimed_role = final_role;
+            }
+            // 벡터-9 방어심화 — master_claimed_at 갱신 (surfaces·roles 락 해제 후, master_claimed_at
+            // 단일 락만 보유 → 락 순서 무변경). 이미 같은 surface가 master면 갱신 안 함(연속성 보존),
+            // 새 surface가 master가 되면 now 기록, master가 비워지면 None.
+            if master_before != master_after {
+                let now = crate::state::now_epoch();
+                let mut mca = daemon.master_claimed_at.lock().unwrap();
+                *mca = match master_after {
+                    Some(_) => Some(now), // 새 보유자(승계·신규 claim) → 쿨다운 시작
+                    None => None,         // master 해제(이 claim으로 master가 비워짐)
+                };
+                drop(mca);
+                // 승계 감사: master가 다른 surface로 바뀔 때만(이전 보유자≠새 보유자, 둘 다 Some이
+                // 아니어도 변화면 발행) 박사님·감사가 승계를 본다. 신규 등록(None→Some)도 포함.
+                daemon.bus.publish(
+                    "autopilot.master_changed",
+                    "autopilot",
+                    master_after,
+                    json!({"from_sid": master_before, "to_sid": master_after, "now": now}),
+                );
             }
             daemon.bus.publish(
                 "role.claimed",
@@ -1238,10 +1353,24 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         .collect()
                 })
                 .unwrap_or_default();
+            // (1) resume 블록: replay_bounds로 갭을 선제 신호. 요청 커서가 ring 보존범위보다
+            // 오래되면(밀림) gap=true → 클라이언트가 즉시 snapshot 판단. main.rs:706 replay_gap 공식과 동일.
+            let (oldest, latest) = daemon.bus.replay_bounds();
+            let after = after_seq.unwrap_or(0);
+            let gap_until = oldest.map(|o| o.saturating_sub(1)).unwrap_or(latest);
+            let gap = after_seq.is_some() && gap_until > after;
             Reply::EventStream {
                 ack: json!({
                     "type": "ack", "ok": true,
-                    "latest_seq": daemon.bus.latest_seq(),
+                    "latest_seq": latest,
+                    "heartbeat_interval_seconds": 15,
+                    "resume": {
+                        "after_seq": after_seq,
+                        "oldest_seq": oldest,
+                        "latest_seq": latest,
+                        "next_seq": latest + 1,
+                        "gap": gap,
+                    },
                 }),
                 after_seq,
                 names,
@@ -1803,22 +1932,33 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 task: task.clone(),
                 updated_at: crate::state::now_epoch(),
             };
-            let changed = {
+            let (changed, task_changed) = {
                 let mut cur = surface.agent_status.lock().unwrap();
                 let changed = cur
                     .as_ref()
                     .map(|c| c.state != state || c.context_pct != context_pct)
                     .unwrap_or(true);
+                // Tasks Control Center: task 텍스트만 바뀐 변경도 보드에 실시간 흘린다(state/context가
+                // 그대로면 status.changed는 미발행되므로). 동일 task 재보고는 미발행(노이즈 차단).
+                let task_changed = cur
+                    .as_ref()
+                    .map(|c| c.task != task)
+                    .unwrap_or(task.is_some());
                 *cur = Some(status);
-                changed
+                (changed, task_changed)
             };
+            let status_evt =
+                json!({"role": role, "state": state, "context_pct": context_pct, "task": task});
             if changed {
-                daemon.bus.publish(
-                    "status.changed",
-                    "status",
-                    Some(sid),
-                    json!({"role": role, "state": state, "context_pct": context_pct, "task": task}),
-                );
+                daemon
+                    .bus
+                    .publish("status.changed", "status", Some(sid), status_evt.clone());
+            }
+            // task 전용 이벤트(category "task") — Tasks Control Center가 부서×노드 셀을 갱신한다.
+            if task_changed {
+                daemon
+                    .bus
+                    .publish("task.changed", "task", Some(sid), status_evt);
             }
             // ─── 결정론 컨텍스트 임계 (절대지침: 60% 도달 시 저장→clear→복원 사이클) ───
             // "무거워진 것 같다"는 LLM 재량 판단을 트리거에서 배제한다 — 자기보고 pct와 임계의
@@ -2021,6 +2161,32 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     exit_code, crate::state::now_epoch(),
                 );
             }
+            // ── agent.hook 이벤트 발행 (P1-3) — SQLite 적재에 더해 이벤트 버스로 push.
+            //    master/reviewer가 `cys events --category agent` 구독만으로 워커 hook 실시간 수신.
+            //    ★분류기는 에이전트를 막지 않는다 — actionable은 라우팅 신호일 뿐(승인=pack 정책).
+            //    E-a에서 데몬이 받는 값은 CLI 변환명(PRE_TOOL/POST_TOOL)뿐이라 event_type 폴백.
+            //    E-b에서 CLI가 raw_hook_event를 동봉하면 이 한 줄이 자동으로 raw 우선 분류한다.
+            let hook_event =
+                param_str(&params, "raw_hook_event").unwrap_or_else(|| event_type.clone());
+            let (wire_name, is_actionable) =
+                crate::classifier::classify(&agent, &hook_event, &tool_name);
+            daemon.bus.publish(
+                &format!("agent.hook.{wire_name}"),
+                "agent",
+                Some(sid),
+                json!({
+                    "source": agent,
+                    "role": role,
+                    "wire_event": wire_name,
+                    "raw_event": event_type,
+                    "tool_name": tool_name,
+                    "is_actionable": is_actionable,
+                    "exit_code": exit_code,
+                    // ★R6: session_id는 redact, tool_input 원문 미발행 — 길이 메타만(PII·시크릿 차단).
+                    "session_id": crate::analytics::redact_session_id(&session),
+                    "tool_input_len": tool_input.to_string().len(),
+                }),
+            );
             Reply::Single(ok_response(&id, json!({"surface_id": sid})))
         }
 
@@ -2246,6 +2412,29 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     "window": window,
                     "since": since,
                     "summary": summary,
+                }),
+            ))
+        }
+
+        // ─── D3: 비용·효율 eval baseline (producer≠evaluator — by_tier+rework+cache_roi 합본) ───
+        "control.cost_baseline" => {
+            let now = crate::state::now_epoch();
+            let window = param_str(&params, "window").unwrap_or_else(|| "7d".to_string()); // baseline 기본 7d
+            let since = crate::analytics::window_since(now, &window);
+            let baseline = {
+                let guard = daemon.analytics.lock().unwrap();
+                match guard.as_ref() {
+                    Some(conn) => crate::analytics::cost_baseline(conn, since),
+                    None => json!({}),
+                }
+            };
+            Reply::Single(ok_response(
+                &id,
+                json!({
+                    "now": now,
+                    "window": window,
+                    "since": since,
+                    "baseline": baseline,
                 }),
             ))
         }
@@ -2624,6 +2813,156 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 Ok(v) => Reply::Single(ok_response(&id, v)),
                 Err(e) => Reply::Single(err_response(&id, "attest_failed", &e)),
             }
+        }
+
+        // ── HMAC signed-prefix 승인 ① (approval.rs primitive 호출) ──
+        // guard.sh가 매 위험명령 직전 호출 — 서명된 prefix면 자동 통과(exit code로 판정).
+        "approval.check" => {
+            let Some(command) = param_str(&params, "command") else {
+                return Reply::Single(err_response(&id, "invalid_params", "missing command"));
+            };
+            let cwd = param_str(&params, "cwd");
+            let env = params
+                .get("env")
+                .map(crate::approval::env_from_json)
+                .unwrap_or_default();
+            let Some(secret) = crate::approval::signing_secret() else {
+                // 시크릿 부재(파일·env·생성 모두 실패) = fail-closed(미서명 취급).
+                return Reply::Single(ok_response(&id, json!({"approved": false})));
+            };
+            let mut records = crate::approval::load_records();
+            // best_match는 불변 참조라 갱신을 위해 id/prefix를 먼저 복제한다.
+            let hit = crate::approval::best_match(&records, &secret, &command, cwd.as_deref(), &env)
+                .map(|r| (r.id.clone(), r.command_prefix.clone()));
+            match hit {
+                Some((matched_id, matched_prefix)) => {
+                    // updated_at(lastUsed) 갱신 후 재서명·persist — 최장매칭 동률 tie-break 유지.
+                    if let Some(r) = records.iter_mut().find(|r| r.id == matched_id) {
+                        r.updated_at = crate::state::now_epoch();
+                        r.sign(&secret);
+                    }
+                    let _ = crate::approval::save_records(&records);
+                    daemon.bus.publish(
+                        "autopilot.approval_checked",
+                        "autopilot",
+                        None,
+                        json!({"approved": true, "matched_id": matched_id,
+                               "matched_prefix": matched_prefix}),
+                    );
+                    Reply::Single(ok_response(
+                        &id,
+                        json!({"approved": true, "matched_id": matched_id,
+                               "matched_prefix": matched_prefix}),
+                    ))
+                }
+                None => {
+                    daemon.bus.publish(
+                        "autopilot.approval_checked",
+                        "autopilot",
+                        None,
+                        json!({"approved": false}),
+                    );
+                    Reply::Single(ok_response(&id, json!({"approved": false})))
+                }
+            }
+        }
+
+        // master가 feed 승인 직후 트리거 — 새 서명 승인 레코드 생성.
+        // ★caller 검증 필수: master role surface 발신만 허용(위조 서명 생성 차단).
+        "approval.sign" => {
+            // caller가 master role을 보유한 surface인지 확인(self-declared role 신뢰 금지).
+            let caller_sid = caller_pid.and_then(|p| resolve_caller_surface(daemon, p));
+            let is_master = caller_sid.is_some_and(|sid| {
+                daemon.roles.lock().unwrap().get("master") == Some(&sid)
+            });
+            if !is_master {
+                return Reply::Single(err_response(
+                    &id,
+                    "forbidden",
+                    "approval.sign requires master role surface caller",
+                ));
+            }
+            // ── 벡터-9 방어심화 (caller=master 검증 통과 후 추가 인가 레이어) ──
+            // 승계 쿨다운 + deadman 동결: master가 갓 claim되었거나(승계-윈도우 usurper) 부재면
+            // 서명을 거부한다. master surface가 죽는 윈도우에 다른 노드가 claim_role("master")로
+            // 합법 승계 → 즉시 위험명령을 정당 서명 → guard.sh denylist 무력화하는 경로를 막는다.
+            // ★단일UID·신뢰노드 모델에선 claim_role이 권한 메커니즘이라 legit/usurper를
+            // 암호학적으로 완전 구분 불가 — 이건 윈도우 축소·탐지(방어심화)이지 암호보증이 아니다.
+            let claimed_at = *daemon.master_claimed_at.lock().unwrap();
+            let now_check = crate::state::now_epoch();
+            match claimed_at {
+                // deadman: master_claimed_at이 None이면 master 부재/해제(roles에 master 없음과 동치)
+                // → 서명 동결. (위 caller=master 검증이 부재 caller를 이미 거르지만, 승계 추적이
+                // 누락된 경계 케이스까지 명시적으로 동결한다 — 비대칭 보정.)
+                None => {
+                    return Reply::Single(err_response(
+                        &id,
+                        "master_unstable",
+                        "master role claimed <60s ago or absent; signing frozen to block succession-window abuse",
+                    ));
+                }
+                // 승계 쿨다운: 갓 claim한 master(승계 윈도우 usurper)는 60초간 서명 불가.
+                Some(ts) if now_check - ts < SIGN_COOLDOWN_SECS => {
+                    return Reply::Single(err_response(
+                        &id,
+                        "master_unstable",
+                        "master role claimed <60s ago or absent; signing frozen to block succession-window abuse",
+                    ));
+                }
+                Some(_) => {} // 안정된 장수 master → 통과
+            }
+            let prefix: Vec<String> = match params.get("command_prefix") {
+                Some(Value::Array(a)) => {
+                    a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()
+                }
+                _ => Vec::new(),
+            };
+            let prefix: Vec<String> = prefix.into_iter().filter(|t| !t.is_empty()).collect();
+            if prefix.is_empty() {
+                return Reply::Single(err_response(
+                    &id,
+                    "invalid_params",
+                    "command_prefix must be a non-empty array (폴백 차단)",
+                ));
+            }
+            let cwd = crate::approval::normalize_cwd(param_str(&params, "cwd").as_deref());
+            let env = params
+                .get("env")
+                .map(crate::approval::env_from_json)
+                .unwrap_or_default();
+            let Some(secret) = crate::approval::signing_secret() else {
+                return Reply::Single(err_response(
+                    &id,
+                    "secret_unavailable",
+                    "signing secret unavailable",
+                ));
+            };
+            let now = crate::state::now_epoch();
+            let mut rec = crate::approval::ApprovalRecord {
+                version: 1,
+                id: crate::approval::new_record_id(),
+                command_prefix: prefix,
+                cwd,
+                environment: env, // env_from_json이 이미 sort_norm_env(민감키 drop·정렬)
+                created_at: now,
+                updated_at: now,
+                signature: String::new(),
+            };
+            rec.sign(&secret);
+            let new_id = rec.id.clone();
+            let mut records = crate::approval::load_records();
+            records.push(rec);
+            if let Err(e) = crate::approval::save_records(&records) {
+                return Reply::Single(err_response(&id, "persist_failed", &e));
+            }
+            // 감사: 서명 추적용으로 서명자 surface와 master 승계 시각을 함께 발행(벡터-9).
+            daemon.bus.publish(
+                "autopilot.approval_signed",
+                "autopilot",
+                caller_sid,
+                json!({"id": new_id, "signer_surface_id": caller_sid, "master_claimed_at": claimed_at}),
+            );
+            Reply::Single(ok_response(&id, json!({"id": new_id, "signed": true})))
         }
 
         other => Reply::Single(err_response(
@@ -3561,6 +3900,171 @@ mod tests {
             panic!("expected single reply");
         };
         resp
+    }
+
+    /// (E-g) idempotency_key를 동봉한 surface.create — 멱등 게이트 테스트 전용.
+    /// create_surface_rpc는 키를 안 보내므로 멱등 경로를 못 친다(설계 §6② 헬퍼 확장).
+    fn create_surface_rpc_idem(
+        daemon: &Arc<Daemon>,
+        role: Option<&str>,
+        idem_key: &str,
+        caller_pid: Option<u32>,
+    ) -> Value {
+        let params = match role {
+            Some(r) => json!({ "cmd": "sleep 30", "role": r, "idempotency_key": idem_key }),
+            None => json!({ "cmd": "sleep 30", "idempotency_key": idem_key }),
+        };
+        let req = Request {
+            id: json!(1),
+            method: "surface.create".into(),
+            params,
+        };
+        let Reply::Single(resp) = dispatch(daemon, req, caller_pid) else {
+            panic!("expected single reply");
+        };
+        resp
+    }
+
+    /// fresh Arc<Daemon>는 refcount 1이라 get_mut으로 config를 테스트값으로 고정한다.
+    /// 프로세스 전역 env(CYS_MAX_ACTIVE_WORKERS)를 건드리지 않아 병렬 테스트 레이스가 없다.
+    fn set_max_active_workers(daemon: &mut Arc<Daemon>, limit: usize) {
+        Arc::get_mut(daemon)
+            .expect("fresh daemon should be uniquely owned")
+            .config
+            .max_active_workers = limit;
+    }
+
+    /// 발견(워커 기동 게이트 ② active-limit): RSI 다중워커 모드에서 워커가 무한 fork되거나
+    /// 클라이언트 재시도가 중복 기동을 만들면 자원이 폭주한다(soul RISK ANCHOR). max_active_workers
+    /// 한도 초과 시 surface.create가 worker_limit_exceeded로 거부되고 한도 워커는 등록되지 않음 — 박제.
+    #[test]
+    fn worker_active_limit_denies() {
+        let mut daemon = claim_daemon();
+        set_max_active_workers(&mut daemon, 2);
+
+        // 살아있는 워커 2개를 정상 부트 경로로 세운다(create_surface 직접 — 게이트 우회).
+        let _w1 = make_surface(&daemon, Some("worker"));
+        let _w2 = make_surface(&daemon, Some("worker"));
+        assert_eq!(
+            crate::state::live_worker_count(&daemon.roles.lock().unwrap(), |_| true),
+            2,
+            "2개 워커가 등록돼야 한다"
+        );
+
+        // 3번째 워커 기동 시도 → 한도 초과 거부.
+        let resp = create_surface_rpc(&daemon, Some("worker"), Some(992_001_u32));
+        assert_eq!(
+            resp["ok"],
+            json!(false),
+            "한도 2인데 3번째 워커 기동이 통과했다 (응답: {resp})"
+        );
+        assert_eq!(resp["error"]["code"], json!("worker_limit_exceeded"));
+        // worker-3가 등록되지 않았어야 한다(PTY 생성 전 차단).
+        assert!(
+            daemon.roles.lock().unwrap().get("worker-3").is_none(),
+            "한도 초과인데 worker-3가 등록됐다"
+        );
+    }
+
+    /// 발견(active-limit 적용 범위): 한도는 worker-* 역할에만 — master/cso는 하이재킹 게이트가
+    /// 커버하므로 active-limit 무관. limit=1이어도 master/cso 생성은 한도와 무관하게 진행 — 박제.
+    #[test]
+    fn worker_limit_excludes_master_cso() {
+        let mut daemon = claim_daemon();
+        set_max_active_workers(&mut daemon, 1);
+
+        // 워커 1개로 한도를 채운다.
+        let _w1 = make_surface(&daemon, Some("worker"));
+
+        // master 기동 — active-limit과 무관하므로 통과(살아있는 master 없음 → 하이재킹 게이트도 통과).
+        let resp_m = create_surface_rpc(&daemon, Some("master"), Some(992_101_u32));
+        assert_eq!(
+            resp_m["ok"],
+            json!(true),
+            "워커 한도가 master 기동을 막았다 (응답: {resp_m})"
+        );
+        // cso도 동일.
+        let resp_c = create_surface_rpc(&daemon, Some("cso"), Some(992_102_u32));
+        assert_eq!(
+            resp_c["ok"],
+            json!(true),
+            "워커 한도가 cso 기동을 막았다 (응답: {resp_c})"
+        );
+
+        // 반면 2번째 워커는 한도 1 초과로 거부돼야 한다(active-limit이 워커엔 산다).
+        let resp_w = create_surface_rpc(&daemon, Some("worker"), Some(992_103_u32));
+        assert_eq!(
+            resp_w["ok"],
+            json!(false),
+            "워커 한도 1인데 2번째 워커가 통과했다 (응답: {resp_w})"
+        );
+        assert_eq!(resp_w["error"]["code"], json!("worker_limit_exceeded"));
+    }
+
+    /// 발견(멱등 기동): 같은 idempotency_key 재시도는 추가 spawn 없이 기존 surface를 재반환하고
+    /// idempotent_reuse:true 플래그를 단다. 클라이언트 재시도가 중복 surface를 만들지 않음 — 박제.
+    #[test]
+    fn idempotent_reuse_returns_same() {
+        let daemon = claim_daemon();
+        let before = daemon.surfaces.lock().unwrap().len();
+
+        let r1 = create_surface_rpc_idem(&daemon, None, "idem-A", Some(992_201_u32));
+        assert_eq!(r1["ok"], json!(true), "1차 멱등 생성이 실패했다 (응답: {r1})");
+        let sid1 = r1["result"]["surface_id"].as_u64().expect("surface_id");
+        assert_eq!(
+            daemon.surfaces.lock().unwrap().len(),
+            before + 1,
+            "1차 생성으로 surface가 정확히 1개 늘어야 한다"
+        );
+
+        let r2 = create_surface_rpc_idem(&daemon, None, "idem-A", Some(992_202_u32));
+        assert_eq!(r2["ok"], json!(true), "2차 멱등 재시도가 실패했다 (응답: {r2})");
+        let sid2 = r2["result"]["surface_id"].as_u64().expect("surface_id");
+        assert_eq!(sid1, sid2, "같은 key인데 다른 surface가 반환됐다");
+        assert_eq!(
+            r2["result"]["idempotent_reuse"],
+            json!(true),
+            "재사용인데 idempotent_reuse 플래그가 없다 (응답: {r2})"
+        );
+        assert_eq!(
+            daemon.surfaces.lock().unwrap().len(),
+            before + 1,
+            "멱등 재시도가 추가 surface를 만들었다(+1만이어야 한다)"
+        );
+    }
+
+    /// 발견(멱등 + 죽은 슬롯): key의 surface가 exited면 캐시 hit이라도 재사용하지 않고
+    /// 새 surface를 생성한다(죽은 셸 재반환 방지). dedup의 죽은-슬롯 재사용과 정합 — 박제.
+    #[test]
+    fn idempotent_key_dead_surface_recreates() {
+        let daemon = claim_daemon();
+
+        let r1 = create_surface_rpc_idem(&daemon, None, "idem-B", Some(992_301_u32));
+        let sid1 = r1["result"]["surface_id"].as_u64().expect("surface_id");
+
+        // 그 surface를 죽은 것으로 표시(exited) — 캐시 엔트리는 그대로 남는다.
+        {
+            let surfaces = daemon.surfaces.lock().unwrap();
+            surfaces
+                .get(&sid1)
+                .expect("surface present")
+                .exited
+                .store(true, Ordering::Relaxed);
+        }
+
+        // 같은 key 재시도 → 죽은 surface는 재사용 불가 → 새 surface 생성(다른 id).
+        let r2 = create_surface_rpc_idem(&daemon, None, "idem-B", Some(992_302_u32));
+        assert_eq!(r2["ok"], json!(true), "죽은 슬롯 재생성이 실패했다 (응답: {r2})");
+        let sid2 = r2["result"]["surface_id"].as_u64().expect("surface_id");
+        assert_ne!(
+            sid1, sid2,
+            "key의 surface가 죽었는데 죽은 surface를 그대로 재반환했다"
+        );
+        assert_ne!(
+            r2["result"]["idempotent_reuse"],
+            json!(true),
+            "죽은 슬롯 재생성인데 idempotent_reuse:true가 붙었다 (응답: {r2})"
+        );
     }
 
     /// 발견(특권 역할 탈취 — create 경로 우회): create_surface(state.rs)가 요청 role을 roles에
@@ -4581,5 +5085,154 @@ mod tests {
             !caps.allows(crate::caps::Cap::WriteShell),
             "reviewer caps=no write-shell"
         );
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // 적대검증 벡터-9 방어심화: approval.sign 승계 쿨다운 + deadman 동결
+    //
+    // master surface가 죽는 윈도우(crash·reap)에 다른 노드가 claim_role("master")로 합법
+    // 승계 → 즉시 approval.sign으로 위험명령을 정당 서명 → guard.sh denylist 무력화하는 경로를
+    // master_claimed_at 쿨다운(60초)으로 동결한다. ★단일UID·신뢰노드 모델에선 claim_role이
+    // 권한 메커니즘이라 legit/usurper를 암호학적으로 완전 구분 불가 — 이 테스트들이 박제하는 건
+    // "윈도우 축소+탐지"(방어심화)이지 "완전 차단"(암호보증)이 아니다.
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /// master 역할 surface를 만들고 roles["master"]=sid 등록 + caller pid 바인딩 후 sid 반환.
+    /// master_claimed_at은 호출자가 직접 세팅해 쿨다운 상태를 제어한다.
+    fn setup_master(daemon: &Arc<Daemon>, caller_pid: u32) -> u64 {
+        let s = daemon
+            .create_surface(None, Some("sleep 30".into()), None, Some("master".into()), 24, 80)
+            .expect("create master surface");
+        let sid = s.id;
+        daemon.surfaces.lock().unwrap().insert(sid, s);
+        daemon.roles.lock().unwrap().insert("master".into(), sid);
+        bind_caller(daemon, caller_pid, sid);
+        sid
+    }
+
+    fn approval_sign_req() -> Request {
+        Request {
+            id: json!(1),
+            method: "approval.sign".into(),
+            params: json!({ "command_prefix": ["echo", "hi"], "cwd": "/tmp" }),
+        }
+    }
+
+    /// 승계 쿨다운: master가 방금(now) claim된 상태면 서명 거부(master_unstable).
+    /// 승계-윈도우 usurper가 합법 master 승계 직후 위험명령을 서명하는 것을 막는다.
+    #[test]
+    fn approval_sign_denied_when_master_just_claimed() {
+        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let (daemon, dir) =
+            daemon_with_acl("vec9-just-claimed", r#"{"default":"allow","rules":[]}"#);
+        let caller = 992_001_u32;
+        let _sid = setup_master(&daemon, caller);
+        // 갓 claim: claimed_at = now → now - claimed_at ≈ 0 < 60 → 거부.
+        *daemon.master_claimed_at.lock().unwrap() = Some(crate::state::now_epoch());
+
+        let Reply::Single(resp) = dispatch(&daemon, approval_sign_req(), Some(caller)) else {
+            panic!("expected single reply");
+        };
+        assert_eq!(resp["ok"], json!(false), "갓 claim한 master 서명이 통과됨 (응답: {resp})");
+        assert_eq!(
+            resp["error"]["code"], json!("master_unstable"),
+            "쿨다운 거부가 아닌 다른 경로 (응답: {resp})"
+        );
+
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 안정된 장수 master(claimed_at = now-120, 쿨다운 경과)면 서명 통과.
+    /// 정당 master는 claim 후 60초를 훌쩍 넘으므로 쿨다운에 무영향임을 박제 +
+    /// 기존 caller=master 검증이 정상 통과함을 확인한다.
+    #[test]
+    fn approval_sign_allowed_when_master_stable() {
+        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let (daemon, dir) =
+            daemon_with_acl("vec9-stable", r#"{"default":"allow","rules":[]}"#);
+        // 서명 부작용(secret·approvals.json)을 임시 HOME으로 격리 — 실제 ~/.cys 오염 방지.
+        let prev_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &dir);
+
+        let caller = 992_002_u32;
+        let _sid = setup_master(&daemon, caller);
+        // 안정 master: 120초 전 claim → now - claimed_at = 120 ≥ 60 → 통과.
+        *daemon.master_claimed_at.lock().unwrap() =
+            Some(crate::state::now_epoch() - 120.0);
+
+        let Reply::Single(resp) = dispatch(&daemon, approval_sign_req(), Some(caller)) else {
+            panic!("expected single reply");
+        };
+        assert_eq!(
+            resp["ok"], json!(true),
+            "안정 master 서명이 거부됨 — 쿨다운이 장수 master를 막았다 (응답: {resp})"
+        );
+        assert_eq!(resp["result"]["signed"], json!(true), "서명 미완료 (응답: {resp})");
+
+        // HOME 복원
+        match prev_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// deadman 동결: master_claimed_at이 None(master 부재/해제)이면 서명 거부(master_unstable).
+    /// caller=master 검증과 별개로, 승계 추적이 비어 있으면 명시적으로 동결한다(비대칭 보정).
+    #[test]
+    fn approval_sign_denied_when_no_master() {
+        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let (daemon, dir) =
+            daemon_with_acl("vec9-no-master", r#"{"default":"allow","rules":[]}"#);
+        let caller = 992_003_u32;
+        // caller=master 검증은 통과시키되(roles["master"]=sid) master_claimed_at만 None으로 둔다 —
+        // deadman 분기가 caller=master 통과 이후에도 부재를 동결함을 박제.
+        let _sid = setup_master(&daemon, caller);
+        *daemon.master_claimed_at.lock().unwrap() = None;
+
+        let Reply::Single(resp) = dispatch(&daemon, approval_sign_req(), Some(caller)) else {
+            panic!("expected single reply");
+        };
+        assert_eq!(resp["ok"], json!(false), "master 부재인데 서명 통과됨 (응답: {resp})");
+        assert_eq!(
+            resp["error"]["code"], json!("master_unstable"),
+            "deadman 동결이 아닌 다른 경로 (응답: {resp})"
+        );
+
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 기존 caller=master 검증 유지(회귀 박제): caller가 master role이 아니면 forbidden.
+    /// 쿨다운 강화가 기존 1차 인가(caller=master)를 무손상 보존하는지 확인한다.
+    #[test]
+    fn approval_sign_denied_when_caller_not_master() {
+        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let (daemon, dir) =
+            daemon_with_acl("vec9-not-master", r#"{"default":"allow","rules":[]}"#);
+        // worker 역할 surface가 발신 — master가 아니므로 forbidden(쿨다운 검사 이전 단계).
+        let s = daemon
+            .create_surface(None, Some("sleep 30".into()), None, Some("worker-1".into()), 24, 80)
+            .expect("create worker surface");
+        daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        let caller = 992_004_u32;
+        bind_caller(&daemon, caller, s.id);
+        // 쿨다운이 통과 상태여도(stable) caller=master가 아니면 forbidden이어야 한다.
+        *daemon.master_claimed_at.lock().unwrap() =
+            Some(crate::state::now_epoch() - 120.0);
+
+        let Reply::Single(resp) = dispatch(&daemon, approval_sign_req(), Some(caller)) else {
+            panic!("expected single reply");
+        };
+        assert_eq!(resp["ok"], json!(false), "비-master 발신이 서명에 성공함 (응답: {resp})");
+        assert_eq!(
+            resp["error"]["code"], json!("forbidden"),
+            "기존 caller=master 검증이 손상됨 (응답: {resp})"
+        );
+
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

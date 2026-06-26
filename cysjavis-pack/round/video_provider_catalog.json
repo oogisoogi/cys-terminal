@@ -470,6 +470,26 @@
     ],
     "transcription": [
       {
+        "id": "ytdlp_subs",
+        "best_for": [
+          "existing publisher captions",
+          "auto-generated captions",
+          "zero-compute transcript from url"
+        ],
+        "quality_tier": "fair",
+        "cost_tier": "free",
+        "key_env": null,
+        "runtime": "local",
+        "supports": {
+          "url_input": true,
+          "word_timestamps": false,
+          "needs_media_download": false
+        },
+        "probe": {
+          "bin": "yt-dlp"
+        }
+      },
+      {
         "id": "transcriber_whisperx",
         "best_for": [
           "local transcription",

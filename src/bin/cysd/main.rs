@@ -3,7 +3,9 @@
 
 mod alerts;
 mod analytics;
+mod approval;
 mod caps;
+mod classifier;
 mod cost;
 mod events;
 mod governance;
@@ -695,7 +697,13 @@ async fn run_event_stream<W: AsyncWrite + Unpin>(
     let mut rx = daemon.bus.subscribe();
     // dispatch 시점이 아닌 구독 직후의 최신 seq로 갱신 — 클라이언트 커서 시드 정확화
     let mut ack = ack;
-    ack["latest_seq"] = json!(daemon.bus.latest_seq());
+    let live_latest = daemon.bus.latest_seq();
+    ack["latest_seq"] = json!(live_latest);
+    // (1)-sync: resume 블록도 구독 직후 최신값으로 동기 — dispatch 시점 값과 어긋나지 않게
+    if ack.get("resume").is_some() {
+        ack["resume"]["latest_seq"] = json!(live_latest);
+        ack["resume"]["next_seq"] = json!(live_latest + 1);
+    }
     if write_line(w, &ack).await.is_err() {
         return;
     }
@@ -721,27 +729,40 @@ async fn run_event_stream<W: AsyncWrite + Unpin>(
             }
         }
     }
+    // (2b) live 루프: 15s heartbeat 타이머와 함께 select! — 이벤트 무발생 구간에서도
+    // half-open 소켓을 조기 감지·재연결 유도. 패턴은 run_attach(아래)의 select! 동일.
+    let mut hb = tokio::time::interval(std::time::Duration::from_secs(15));
+    hb.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    hb.tick().await; // 첫 tick은 즉시 발화 — 소비해 15s 후부터 heartbeat
     loop {
-        match rx.recv().await {
-            Ok(event) => {
-                let seq = event["seq"].as_u64().unwrap_or(0);
-                if seq <= last_seq {
-                    continue; // already replayed
+        tokio::select! {
+            r = rx.recv() => match r {
+                Ok(event) => {
+                    let seq = event["seq"].as_u64().unwrap_or(0);
+                    if seq <= last_seq {
+                        continue; // already replayed
+                    }
+                    last_seq = seq; // 중복 차단 커서 전진(원본 누락 — 의도 명확화, 동작 동일)
+                    if events::event_matches(&event, &names, &categories)
+                        && write_line(w, &event).await.is_err()
+                    {
+                        return;
+                    }
                 }
-                if events::event_matches(&event, &names, &categories)
-                    && write_line(w, &event).await.is_err()
-                {
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    let warn = json!({"type": "error", "ok": false,
+                        "error": {"code": "slow_consumer", "message": format!("dropped {n} events")}});
+                    let _ = write_line(w, &warn).await;
+                    return; // (2a) 종료해 클라이언트가 last_seq부터 재replay로 갭을 메우게 강제
+                }
+                Err(_) => return,
+            },
+            _ = hb.tick() => {
+                let beat = json!({"type": "heartbeat", "latest_seq": daemon.bus.latest_seq()});
+                if write_line(w, &beat).await.is_err() {
                     return;
                 }
             }
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                let warn = json!({"type": "error", "ok": false,
-                    "error": {"code": "slow_consumer", "message": format!("dropped {n} events")}});
-                if write_line(w, &warn).await.is_err() {
-                    return;
-                }
-            }
-            Err(_) => return,
         }
     }
 }

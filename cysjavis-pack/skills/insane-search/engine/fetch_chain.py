@@ -98,6 +98,16 @@ class FetchResult:
     # which escalation routes the engine could not perform itself remain to try.
     untried_routes: list[str] = field(default_factory=list)
     must_invoke_playwright_mcp: bool = False
+    # Success gate (OPP-12): even when ok=True, sibling routes that died with a
+    # route-decay verdict (CHALLENGE/BLOCKED) are surfaced here with an
+    # actionable recovery hint — success does not absolve a broken sibling.
+    broken_siblings: list[dict] = field(default_factory=list)
+    # OPP-10: side-effect-free disk signal of content-channel deps
+    # ({curl_cffi|yt_dlp|playwright|playwright_chromium: ready_dormant|absent|unknown}).
+    # OBSERVATION-ONLY — never a gate. It does NOT touch must_invoke_playwright_mcp
+    # (which stays unconditionally true for every non-terminal stop), it only lets
+    # the caller tell a dormant dep from a genuinely absent one without a misread.
+    dep_signals: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -114,6 +124,8 @@ class FetchResult:
             "stop_reason": self.stop_reason,
             "untried_routes": self.untried_routes,
             "must_invoke_playwright_mcp": self.must_invoke_playwright_mcp,
+            "broken_siblings": self.broken_siblings,
+            "dep_signals": self.dep_signals,
         }
 
 
@@ -295,6 +307,67 @@ def _build_plan(
     return merged
 
 
+# --- Broken-sibling recovery hints on success (OPP-12) -----------------------
+# Route-decay verdicts: the route itself was rebuffed (WAF challenge / generic
+# block). Aligned with learning.PENALIZE_REASONS {"exhausted","challenge",
+# "blocked"} — these strike a route. URL-level terminals (AUTH/NOT_FOUND/
+# RATE_LIMITED) are EXCLUDED: they exonerate the route (learning does not strike
+# them either; 429 is transient per _untried_routes).
+_BROKEN_VERDICTS = frozenset({Verdict.CHALLENGE.value, Verdict.BLOCKED.value})
+
+
+def _sibling_hint(att: Attempt) -> str:
+    """Derive an agent-actionable recovery prescription from the verdict alone.
+
+    PHIL-09 stale-docstring avoidance: no date/site hard-coding — hints are
+    derived only from cys's own verdict vocabulary. Hints are limited to actions
+    the AGENT can deterministically take (user_hint retry / Playwright MCP
+    escalation); engine-internal auto-deprioritize is NOT suggested (the agent
+    cannot act on it)."""
+    if att.verdict == Verdict.CHALLENGE.value:
+        return (
+            f"TLS 패밀리 {_family(att.impersonate or '')} 라우트가 WAF 챌린지로 부패 의심 — "
+            "user_hint={'impersonate_first':'<다른 패밀리>'} 재시도 또는 Playwright MCP 승격 권장"
+        )
+    # BLOCKED
+    return (
+        f"라우트 {att.url_transform}/{att.impersonate} 가 일반 차단(non-2xx) 의심 — "
+        "referer 전략 교체 후 user_hint 재시도 또는 Playwright MCP 승격 권장"
+    )
+
+
+def _broken_siblings(trace: list[Attempt], winner: Optional[Attempt]) -> list[dict]:
+    """Scan the trace for sibling routes that died with a route-decay verdict.
+
+    Pure: no network, no I/O — derived 100% from Attempt records already in the
+    trace. The winning route is never included; (transform,impersonate,referer)
+    is deduped to first occurrence. Empty/None inputs return [] (fail-safe)."""
+    if not trace:
+        return []
+    win_key = (
+        (winner.url_transform, winner.impersonate, winner.referer)
+        if winner else None
+    )
+    seen: set = set()
+    out: list[dict] = []
+    for att in trace:
+        key = (att.url_transform, att.impersonate, att.referer)
+        if key == win_key or key in seen:
+            continue
+        if att.verdict not in _BROKEN_VERDICTS:
+            continue
+        seen.add(key)
+        out.append({
+            "transform": att.url_transform,
+            "impersonate": att.impersonate,
+            "referer": att.referer,
+            "verdict": att.verdict,
+            "reasons": att.reasons,
+            "hint": _sibling_hint(att),
+        })
+    return out
+
+
 # --- Public entrypoint: self-learning wrapper (U5) ---------------------------
 def _winning_route(result: FetchResult) -> Optional[dict]:
     """Extract the curl route that produced the OK result, from the trace.
@@ -373,6 +446,16 @@ def fetch(
     except Exception:
         pass
 
+    # OPP-10: attach the side-effect-free disk signal of content-channel deps as
+    # an OBSERVATION-ONLY diagnostic field (never a gate — must_invoke_playwright_mcp
+    # is untouched). Lets the caller tell dormant from absent. Best-effort: any
+    # error leaves dep_signals = {} and never breaks a fetch.
+    try:
+        from . import disk_signal
+        result.dep_signals = disk_signal.content_dep_signals()
+    except Exception:
+        pass
+
     return result
 
 
@@ -444,7 +527,9 @@ def _fetch_core(
                     phase="phase0", executor=a["route"], url=url, url_transform="-",
                     impersonate=None, referer="",
                     status=a.get("status", 0), body_size=a.get("bytes", 0),
-                    verdict=(Verdict.STRONG_OK.value if a["ok"] else Verdict.BLOCKED.value),
+                    verdict=(Verdict.STRONG_OK.value if a["ok"]
+                             else Verdict.AUTH_REQUIRED.value if a.get("auth")
+                             else Verdict.BLOCKED.value),
                     reasons=[a["note"]] if a.get("note") else [],
                 ))
             if p0["ok"]:
@@ -454,6 +539,7 @@ def _fetch_core(
                     profile_used=f"phase0:{p0['platform']}", trace=trace,
                     summary=f"Phase 0 official route: {p0['platform']}:{p0['route']}",
                     stop_reason="success",
+                    broken_siblings=_broken_siblings(trace, None),
                 )
             # Recognised platform but every official route failed → fall through
             # to the generic grid (don't give up; R6).
@@ -488,7 +574,8 @@ def _fetch_core(
         if probe_attempt.verdict in _OK_VALUES:
             return _build_result(probe_resp, probe_attempt, trace, profile_used=None,
                                  planned=0, executed=curl_attempts,
-                                 grid_exhausted=False, stop_reason="success")
+                                 grid_exhausted=False, stop_reason="success",
+                                 broken=_broken_siblings(trace, probe_attempt))
         if probe_attempt.verdict == Verdict.SUSPECT_OK.value:
             best_suspect = (probe_resp, probe_attempt)
         elif probe_attempt.verdict in _TERMINAL_NONSUCCESS_VALUES:
@@ -527,7 +614,8 @@ def _fetch_core(
             if att.verdict in _OK_VALUES:
                 return _build_result(resp, att, trace, profile_used=cand.profile_id,
                                      planned=planned, executed=curl_attempts,
-                                     grid_exhausted=False, stop_reason="success")
+                                     grid_exhausted=False, stop_reason="success",
+                                     broken=_broken_siblings(trace, att))
             if att.verdict == Verdict.SUSPECT_OK.value and best_suspect is None:
                 best_suspect = (resp, att)
             if att.verdict in _TERMINAL_NONSUCCESS_VALUES:
@@ -568,6 +656,7 @@ def _fetch_core(
                         trace=trace, summary=f"Playwright fallback succeeded via {fb_name}",
                         planned_attempts=planned, executed_attempts=curl_attempts,
                         grid_exhausted=grid_exhausted, stop_reason="success",
+                        broken_siblings=_broken_siblings(trace, pw_attempt),
                     )
                 if pw_attempt.verdict == Verdict.SUSPECT_OK.value and best_suspect is None:
                     best_suspect = (None, pw_attempt)
@@ -676,7 +765,8 @@ def fetch_many(urls: list[str], **kwargs) -> list[FetchResult]:
 
 
 def _build_result(resp, attempt: Attempt, trace: list[Attempt], profile_used: Optional[str],
-                  *, planned: int, executed: int, grid_exhausted: bool, stop_reason: str) -> FetchResult:
+                  *, planned: int, executed: int, grid_exhausted: bool, stop_reason: str,
+                  broken=None) -> FetchResult:
     return FetchResult(
         ok=True,
         content=getattr(resp, "text", "") or "",
@@ -687,6 +777,7 @@ def _build_result(resp, attempt: Attempt, trace: list[Attempt], profile_used: Op
         summary=f"{attempt.executor} {attempt.impersonate} + {attempt.url_transform} + referer:{attempt.referer} → {attempt.verdict}",
         planned_attempts=planned, executed_attempts=executed,
         grid_exhausted=grid_exhausted, stop_reason=stop_reason,
+        broken_siblings=broken or [],
     )
 
 

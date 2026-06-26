@@ -78,6 +78,14 @@ html, body {
 .ws-tab.active .ws-name { color: #fff; }
 .ws-tab.active .ws-sub { color: rgba(255, 255, 255, .75); }
 .ws-tab .ws-sub-pending { color: #58a6ff; animation: cc-blink 1.4s infinite; }
+/* 사이드바 노드 신호(B3): 상태 dot + 심각도 색 + 승인대기 배지 (CC_STATE working/idle/error 명명 재사용) */
+.ws-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 5px; vertical-align: middle; }
+.ws-dot.working { background: var(--ok); }
+.ws-dot.idle { background: var(--warn); }
+.ws-dot.error { background: var(--error); }
+.ws-tab .ws-sub .sev-warn { color: var(--warn); }
+.ws-tab .ws-sub .sev-crit { color: var(--error); }
+.ws-approve-badge { margin-left: 6px; color: var(--error); font-weight: 700; font-size: 11px; }
 #btn-ws-dept:disabled { opacity: .5; cursor: default; }
 .ws-tab .ws-close {
   flex: none; opacity: 0; cursor: pointer; color: inherit; font-size: 12px;
@@ -90,6 +98,26 @@ html, body {
   padding: 0 2px;
 }
 #btn-ws-new:hover { color: var(--accent); }
+
+/* 06: 워크스페이스 그룹 헤더·body (기존 .ws-tab 변수·팔레트 재사용) */
+.ws-group { display: flex; flex-direction: column; }
+.ws-group-head {
+  display: flex; align-items: center; gap: 6px;
+  padding: 6px 10px; border-radius: 7px; cursor: default;
+  border-left: 3px solid transparent; /* 그룹 색 바 (JS가 색 지정) */
+  font-size: 12px; font-weight: 700; color: #adbac7;
+}
+.ws-group-head:hover { background: #1c2128; }
+.ws-group-head.pinned .ws-group-name::after { content: " ·"; color: var(--accent); }
+.ws-group-chevron { flex: none; width: 12px; cursor: pointer; color: #6e7681; }
+.ws-group-name { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ws-group-count { flex: none; font-size: 10px; color: #6e7681; }
+.ws-group-add { flex: none; opacity: 0; cursor: pointer; color: #8b949e; font-size: 14px; }
+.ws-group-head:hover .ws-group-add { opacity: .7; }
+.ws-group-add:hover { color: var(--accent); }
+.ws-group.collapsed .ws-group-body { display: none; }
+.ws-group-body { display: flex; flex-direction: column; gap: 2px; }
+.ws-tab.in-group { margin-left: 10px; } /* 멤버 들여쓰기 */
 
 #ctx-menu {
   position: fixed; z-index: 1000; min-width: 120px;
@@ -387,6 +415,11 @@ body.pane-dragging .pane .pane-title { cursor: grabbing; }
 .toast.health { border-color: var(--error); }
 .toast.watchdog { border-color: var(--warn); }
 .toast.feed { border-color: var(--accent); }
+.toast.approval { border-color: var(--error); }
+.toast.threshold { border-color: var(--warn); }
+.toast.idle { border-color: var(--border); }
+.toast.alert { border-color: var(--error); }
+.toast.osc { border-color: var(--accent); }
 
 /* 업데이트 확인 모달 */
 .modal-overlay {
@@ -407,6 +440,28 @@ body.pane-dragging .pane .pane-title { cursor: grabbing; }
 }
 .modal-btns .modal-yes { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
 
+/* 07 Command Palette (⌘K) — modal-overlay + ctx-menu 패턴 합성 */
+.palette-overlay {
+  /* z 1600: #cc-panel(1500) 위 — modal/ctx-menu(1000)도 위. #drag-ghost(2000)는 pointer-events:none 일시 프리뷰라 무관. confirm은 close 후 호출. */
+  position: fixed; inset: 0; z-index: 1600;
+  background: rgba(0,0,0,.45); display: flex; align-items: flex-start; justify-content: center;
+}
+.palette {
+  margin-top: 12vh; width: 540px; max-width: 90vw; max-height: 60vh; display: flex; flex-direction: column;
+  background: var(--bar); border: 1px solid var(--border); border-radius: 10px;
+  box-shadow: 0 8px 32px rgba(0,0,0,.6); overflow: hidden;
+}
+.palette-input {
+  padding: 12px 14px; font-size: 14px; border: none; outline: none;
+  background: var(--bg); color: var(--text); border-bottom: 1px solid var(--border);
+}
+.palette-list { overflow-y: auto; padding: 4px; }
+.palette-item { padding: 7px 12px; border-radius: 6px; cursor: pointer; }
+.palette-item.sel, .palette-item:hover { background: var(--accent); }
+.palette-item.sel .pi-title, .palette-item:hover .pi-title { color: #fff; }
+.pi-title { font-size: 13px; color: var(--text); }
+.pi-sub { font-size: 11px; color: var(--muted, #94a3b8); margin-top: 2px; }
+
 /* RSI 학습 탭 (cc-* 패턴 따름) */
 .cc-learn-row { display: flex; align-items: center; gap: 10px; margin-bottom: 5px; font-size: 12px; }
 .cc-learn-round { flex: 0 0 110px; color: #e2e8f0; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -417,3 +472,78 @@ body.pane-dragging .pane .pane-title { cursor: grabbing; }
 .cc-learn-ribbon.rollback { background: rgba(239,68,68,0.14); color: #ef4444; }
 .cc-learn-pending-item { font-size: 12px; color: #e2e8f0; padding: 4px 0; }
 .cc-dim { color: #64748b; font-size: 11px; }
+
+/* ───────── HUD-5 글랜서블 모드 (body.cc-glance) — 자산 0폐기 재배치(숨기기+키우기만) ───────── */
+/* 1) 탭 바·분석 전용 위젯 숨김 — Live의 큰 정보만 남긴다 */
+body.cc-glance #cc-tabs { display: none; }
+body.cc-glance #cc-view-live .cc-spark,
+body.cc-glance #cc-view-live .cc-mix,
+body.cc-glance #cc-view-live .cc-token-stats,
+body.cc-glance #cc-view-live #cc-sys { display: none; }
+/* 2) 큰 글씨·한국어 가독성(비기술자) — 다크 유지하되 본문 대비 상향. 레이아웃/크기/가시성만 변경 */
+body.cc-glance #cc-body { max-width: 920px; }
+body.cc-glance .cc-card-val { font-size: 40px; }
+body.cc-glance .cc-card-name { font-size: 15px; color: #cbd5e1; }
+body.cc-glance .cc-h { font-size: 14px; }
+body.cc-glance .cc-radar-val { font-size: 44px; }
+/* 3) 출처/신선도 배지 — Glance에서 더 또렷이(환각0 UI 강제) */
+body.cc-glance .cc-source-badge { font-size: 12px; }
+
+/* HUD-5 출처/신선도 배지 — .pane-usage.stale 토큰 계승 */
+.cc-source-badge {
+  display: inline-flex; align-items: center; gap: 3px;
+  font-size: 10px; color: #64748b; padding: 1px 6px;
+  border: 1px solid rgba(255,255,255,.10); border-radius: 8px;
+}
+.cc-source-badge .stale { opacity: .55; }
+
+/* HUD-2 근거 점프 행 — .cc-tl-row 계승 */
+.cc-tl-row.cc-evidence { cursor: pointer; }
+.cc-tl-row.cc-evidence:hover { background: rgba(0,212,255,.08); }
+.cc-tl-jump { color: #00d4ff; margin-left: 4px; font-size: 11px; }
+
+/* ───────── D5 스킬 버튼 보드 (.cc-board-*) — .cc-section·.cc-tab 톤 따름 ───────── */
+.cc-board-note { font-size: 12px; color: #94a3b8; padding: 8px 10px; margin-bottom: 8px; border: 1px solid rgba(255,255,255,.08); border-radius: 8px; background: rgba(255,255,255,.02); }
+.cc-board-domain { margin-bottom: 12px; }
+.cc-board-domain-h { font-size: 12px; font-weight: 700; color: #cbd5e1; margin-bottom: 6px; }
+.cc-board-btns { display: flex; flex-wrap: wrap; gap: 8px; }
+.cc-board-btn { font-size: 13px; font-weight: 600; color: #e2e8f0; background: rgba(0,212,255,.10); border: 1px solid rgba(0,212,255,.30); border-radius: 9px; padding: 8px 14px; cursor: pointer; }
+.cc-board-btn:hover { background: rgba(0,212,255,.20); }
+.cc-board-out-item { display: block; width: 100%; text-align: left; font-size: 12px; color: #e2e8f0; background: rgba(255,255,255,.03); border: 1px solid rgba(255,255,255,.08); border-radius: 6px; padding: 6px 10px; margin-bottom: 4px; cursor: pointer; }
+.cc-board-out-item:hover { background: rgba(255,255,255,.07); }
+/* Glance 모드에서 보드 버튼 더 크게(비기술자 가독성) */
+body.cc-glance .cc-board-btn { font-size: 16px; padding: 12px 20px; }
+
+/* D6 제품 모드 입력 모달 (.modal 재사용 + 입력/신뢰선) */
+.modal-label { color: #94a3b8; font-size: 12px; margin: 2px 0 8px; }
+.modal-input { width: 100%; box-sizing: border-box; min-height: 140px; resize: vertical; font-size: 13px;
+  color: #e2e8f0; background: rgba(255,255,255,.04); border: 1px solid rgba(255,255,255,.12);
+  border-radius: 8px; padding: 10px; font-family: inherit; }
+.modal-trust { font-size: 11px; color: #f59e0b; margin: 8px 0; padding: 6px 10px;
+  border: 1px solid rgba(245,158,11,.30); border-radius: 6px; background: rgba(245,158,11,.06); }
+
+/* ───────── Tasks Control Center (부서×노드×현재업무) — .cc-section·.cc-dot·.cc-tbar 톤 따름 ───────── */
+.cc-tasks-dept { margin-bottom: 10px; }
+.cc-tasks-dept-h { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+.cc-tasks-dept-name { font-size: 13px; font-weight: 700; color: #e2e8f0; }
+.cc-tasks-dept-meta { font-size: 11px; color: #64748b; }
+.cc-task-row { display: flex; align-items: center; gap: 9px; padding: 6px 8px; border-radius: 7px; cursor: pointer; }
+.cc-task-row:hover { background: rgba(0,212,255,.06); }
+.cc-task-row.stale { opacity: .5; }
+.cc-task-role { font-size: 12px; font-weight: 600; min-width: 64px; flex: none; }
+.cc-task-text { font-size: 12px; color: #cbd5e1; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cc-task-row.expanded .cc-task-text { white-space: normal; overflow: visible; }
+.cc-task-meta { font-size: 11px; color: #64748b; flex: none; }
+.cc-trust-badge { font-size: 10px; padding: 0 4px; border-radius: 6px; }
+.cc-trust-badge.self { color: #00e676; }
+.cc-trust-badge.derived { color: #94a3b8; }
+/* 헤더 Glance 면 토글(Live↔작업) — Glance 모드에서만 보인다 */
+#btn-cc-glance-face { display: none; background: none; border: 1px solid rgba(255,255,255,.15);
+  color: #cbd5e1; font-size: 11px; padding: 2px 8px; border-radius: 6px; cursor: pointer; }
+#btn-cc-glance-face:hover { background: rgba(255,255,255,.07); }
+body.cc-glance #btn-cc-glance-face { display: inline-block; }
+/* Glance: 작업 면 큰 글씨(박사님 한눈에) */
+body.cc-glance #cc-view-tasks .cc-task-text { font-size: 20px; white-space: normal; }
+body.cc-glance #cc-view-tasks .cc-task-role { font-size: 16px; min-width: 90px; }
+body.cc-glance #cc-view-tasks .cc-tasks-dept-name { font-size: 18px; }
+body.cc-glance #cc-view-tasks .cc-task-meta { font-size: 13px; }

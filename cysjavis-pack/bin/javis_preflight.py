@@ -25,6 +25,8 @@ import sys
 import time
 
 PASS, FAIL, WARN, FIXED, SKIP = "PASS", "FAIL", "WARN", "FIXED", "SKIP"
+# OPP-17 Mutation 게이트 status — dry/safe 미리보기·무변경진단·비가역 차단(WARN-first).
+DRYRUN, SAFE_GAP, BLOCKED = "DRYRUN", "SAFE-GAP", "BLOCKED"
 
 DIRECTIVES = [
     "MASTER_DIRECTIVE.md",
@@ -148,6 +150,28 @@ TODO_FILES = ["MASTER_TODO.md", "CSO_TODO.md", "WORKER_TODO.md", "REVIEWER_TODO.
 KLAW_MIN_VERSION = (4, 4, 1)
 KLAW_PIN = "korean-law-mcp@4.4.1"
 
+# ── Serena 코드-의미 인덱스 MCP(uvx 온디맨드 채택 — 미설치) · 2026-06-25 오너 채택 ──
+# 심볼 단위 nav(get_symbols_overview/find_symbol/find_referencing_symbols)로 통째-Read·
+# 전체-Grep을 대체해 code-nav 슬라이스의 토큰을 줄인다(산문/SOT/설교/markdown=비코드 0).
+# 등록은 기계(--fix), 노드 활성화·신뢰(enable/trust)는 사람 전용 단계(denylist).
+SERENA_PKG     = "serena-agent"
+SERENA_PIN     = "serena-agent==1.5.3"   # server.json 공개판(uvx 해석). 1.5.4.dev0(로컬 dev·PyPI 미배포) 금지
+SERENA_PYTHON  = "3.13"                   # server.json runtimeArguments -p 3.13 (requires-python >=3.11,<3.15)
+SERENA_CONTEXT = "claude-code"            # Claude 노드용 shipped context(무료 심볼-tool steering). desktop-app 디폴트는 오답
+SERENA_PROJECT = os.environ.get("CYS_SERENA_PROJECT") or os.path.expanduser("~/Desktop/CYSjavis")  # 절대경로(노드 spawn·cwd 미보장)·env override·배포 SOT 개인경로 0
+# stdio per-node 런치 args — S1+S2 등록 + S8 메모리격리(no-onboarding/no-memories) +
+# S4 stray-dashboard 차단(--enable/open-web-dashboard false)을 한 entry로 통합.
+SERENA_STDIO_ARGS = [
+    "--python", SERENA_PYTHON, "--from", SERENA_PIN, "serena", "start-mcp-server",
+    "--context", SERENA_CONTEXT,
+    "--transport", "stdio",
+    "--project", SERENA_PROJECT,
+    "--mode", "no-onboarding",            # S8: 온보딩 write-burst 차단
+    "--mode", "no-memories",              # S8: 메모리 tool 전부 drop(javis_memory FileLock SOT 보호)
+    "--enable-web-dashboard", "false",    # S4: stray 24282 리스너 제거(stdio 라이브니스=노드 자체)
+    "--open-web-dashboard", "false",      # S4: 브라우저 spawn 방지
+]
+
 # cys-video-creator 영상 자동제작 스킬(오너 제작 32종) — pack 임베드로 배포되고, C26이
 # 네이티브 Claude Code(/goal) 발견을 위해 프로필 skills/ 로 심링크한다. 대표 7기둥 +
 # 하위 + 공통 규약. 새 스킬 추가 시 이 목록과 pack.rs 임베드 불변식을 함께 갱신한다.
@@ -188,10 +212,6 @@ APPBUILD_SKILLS = [
     "appbuild-orchestrate-verify", "appbuild-orchestrate-route",
 ]
 APPBUILD_HOOK = "appbuild-gate.sh"  # PreToolUse 코드선행 금지 게이트
-# 역할-능력 GATE hook(2번째 GATE 사례 — appbuild-gate와 동급): reviewer/planner surface의
-# 변형 도구를 PreToolUse에서 deny(producer≠evaluator). matcher에 MultiEdit·Bash 포함.
-CAPGATE_HOOK = "role-capability-gate.sh"
-CAPGATE_HOOK_MATCHER = "Edit|Write|NotebookEdit|MultiEdit|Bash"
 
 # C28 자기교정·영속성 hook(외부 메모리 아키텍처 접목 이관) — (스크립트, [(event, matcher)…]).
 # inject/save 는 .config 구체계에서 패키지로 이관, reflect-scan·commit-nudge 는 신규.
@@ -269,60 +289,6 @@ AUTOPILOT_MEMORY_INDEX_LINE = (
     "denylist에서만 정지·kill-switch 최우선 (🔒상주 필수 — 제거 금지)"
 )
 
-# ── C41 참조 무결성 — soul.md + directive 4종의 백틱/마커 안 named 참조가 실파일로
-# 해소되는지 결정론 대조. 스캔 표면은 pack 내부 문서 그래프로 한정한다(project 메모리는
-# 노드별 가변이라 비결정론 → C18 javis_memory verify 담당, 중복 회피).
-REF_FEEDBACK = re.compile(r"feedback_[a-z0-9_]+")          # (a) 메모리 슬러그
-REF_BIN = re.compile(r"javis_[a-z0-9_]+\.py")              # (b) bin 도구
-REF_DIRECTIVE = re.compile(r"[A-Z][A-Z0-9_]*_DIRECTIVE\.md")  # (c) directive 파일명
-BACKTICK_RE = re.compile(r"`([^`]+)`")
-MARKER_LINE_RE = re.compile(r"^.*(상세 |🔒색인 상주|🔒상주).*$", re.M)
-
-
-def _canon_feedback(s):
-    """슬러그·파일명을 단일 비교 정규형으로. feedback_ 접두·.md 제거·hyphen→underscore."""
-    if s.startswith("feedback_"):
-        s = s[len("feedback_"):]
-    return s.replace("-", "_").removesuffix(".md").removesuffix("_md").lower()
-
-
-def _scan_reference_integrity(pd):
-    """pack dir의 soul.md+directive 4종 백틱/마커 named 참조를 실파일과 대조.
-    반환: (missing_list, scanned_count). 순수 함수 — is_dept_pack 정책과 무관(self-test가
-    이 함수를 직접 호출해 FAIL/PASS를 결정론으로 증명한다 = producer≠evaluator)."""
-    roots = [os.path.join(pd, "soul.md")] + \
-        [os.path.join(pd, "directives", f) for f in DIRECTIVES]
-    mem_dir = os.path.join(pd, "memory")
-    have_feedback = {_canon_feedback(n) for n in os.listdir(mem_dir)
-                     if n.startswith("feedback_")} if os.path.isdir(mem_dir) else set()
-    bin_dir = os.path.join(pd, "bin")
-    have_bin = set(os.listdir(bin_dir)) if os.path.isdir(bin_dir) else set()
-    dir_dir = os.path.join(pd, "directives")
-    have_directive = set(os.listdir(dir_dir)) if os.path.isdir(dir_dir) else set()
-    missing, scanned = [], 0
-    for path in roots:
-        try:
-            text = open(path, encoding="utf-8", errors="replace").read()
-        except OSError:
-            continue
-        # 마커 한정: 백틱 안 토큰 + '상세 '/'🔒상주' 마커 라인만(산문 오탐 차단).
-        candidates = " ".join(BACKTICK_RE.findall(text)) + "\n" + \
-            "\n".join(MARKER_LINE_RE.findall(text))
-        src = os.path.basename(path)
-        for ref in REF_FEEDBACK.findall(candidates):
-            scanned += 1
-            if _canon_feedback(ref) not in have_feedback:
-                missing.append("MISSING_REF: %s (%s) — feedback 백킹 파일 없음" % (ref, src))
-        for ref in REF_BIN.findall(candidates):
-            scanned += 1
-            if ref not in have_bin:
-                missing.append("MISSING_REF: %s (%s) — bin 도구 없음" % (ref, src))
-        for ref in REF_DIRECTIVE.findall(candidates):
-            scanned += 1
-            if ref not in have_directive:
-                missing.append("MISSING_REF: %s (%s) — directive 파일 없음" % (ref, src))
-    return missing, scanned
-
 
 def pack_dir():
     """pack 위치 결정 — src/pack.rs pack_dir()의 4단 폴백을 그대로 미러링한다."""
@@ -333,48 +299,22 @@ def pack_dir():
     return os.path.join(os.path.expanduser("~"), ".cys/pack")
 
 
-def _find_codegen_kinds():
-    """build.rs 산출 OUT_DIR/cys_kinds.json 을 crate target/ 아래에서 탐색(C44 3자 대조용).
-    부재 시 None(빌드 미수행 — C44는 2자 대조로 강등). pack_dir의 부모(크레이트 루트) target/만
-    훑어 무관 경로 배회를 피한다."""
-    crate_root = os.path.dirname(os.path.abspath(pack_dir().rstrip("/")))
-    target = os.path.join(crate_root, "target")
-    if not os.path.isdir(target):
-        return None
-    for root, _dirs, files in os.walk(target):
-        if "cys_kinds.json" in files:
-            try:
-                return json.load(open(os.path.join(root, "cys_kinds.json"), encoding="utf-8"))
-            except Exception:
-                continue
-    return None
+def _utf8_env(extra=None):
+    """자식 프로세스 텍스트 I/O를 UTF-8로 고정한 env (AgentReach utf8_subprocess 계약 클린룸 포트).
 
-
-def _parse_skill_requires(text):
-    """SKILL.md 프론트매터 `cys:` 블록의 requires.bins·install 매니페스트를 stdlib만으로 파싱.
-    (C50 — preflight는 yaml 의존 0이므로 이 self-describing 스키마 하위셋만 손파싱한다.)
-    반환: (bins|None, install_list). requires.bins 미선언이면 (None, []) — 스코프 밖 신호.
-    지원 형태(이 스키마가 쓰는 표기만):
-        requires:\n  bins: [ffmpeg, rg]
-        install:\n  - {kind: brew, formula: ffmpeg}\n  - {kind: apt, package: ffmpeg}
-    매니페스트 표기 일탈(예: bins 누락·install 비-인라인)은 호출부에서 fail-loud로 잡힌다."""
-    bm = re.search(r"^\s*bins:\s*\[([^\]]*)\]", text, re.M)
-    if not bm:
-        return None, []
-    bins = [b.strip().strip("'\"") for b in bm.group(1).split(",") if b.strip()]
-    install = []
-    for line in text.splitlines():
-        em = re.match(r"\s*-\s*\{([^}]*)\}\s*$", line)
-        if not em:
-            continue
-        entry = {}
-        for pair in em.group(1).split(","):
-            if ":" in pair:
-                k, _, v = pair.partition(":")
-                entry[k.strip().strip("'\"")] = v.strip().strip("'\"")
-        if entry.get("kind") in ("brew", "apt"):
-            install.append(entry)
-    return bins, install
+    부모 로케일(Windows cp949/cp936)이 아니라 UTF-8로 디코드/인코드하도록 PYTHONUTF8/
+    PYTHONIOENCODING을 강제한다. 엔진(skills/insane-search/engine/proc.py)을 import 하지 않고
+    독립 재구현한다 — preflight(pack/bin)는 엔진을 import 하면 안 된다(레이어 역전·배포 경계).
+    불변식: 멱등(이미 적용된 env에 재적용해도 동일)·비파괴(운영자 명시 LC_ALL/LANG은 setdefault로
+    보존)·순수(os.environ 미변경, copy만). 부작용 0(PHIL-04)."""
+    env = os.environ.copy()
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    env.setdefault("LC_ALL", "C.UTF-8")   # 운영자 명시값은 보존(fail-safe)
+    env.setdefault("LANG", "C.UTF-8")
+    if extra:
+        env.update(extra)
+    return env
 
 
 def is_dept_pack():
@@ -389,24 +329,59 @@ def is_dept_pack():
 
 
 def discover_claude_settings():
-    """$HOME 직하 .claude*/settings.json 전부 (존재 파일만, 사전순) — cys.rs와 동일 규칙."""
+    """$HOME 직하 .claude*/settings.json 전부(존재 파일만·사전순) + cys 계정 config dir.
+
+    home-glob 부분은 cys.rs와 동일 규칙(unchanged·isfile 게이트·사전순). 추가로 master 및
+    ~/.cys/claude 를 공유하는 claude-adapter 리뷰어가 기동하는 cys 전용 config dir
+    (${CYS_ACCOUNT_DIR:-dirname(pack_dir())/claude})의 settings.json을 마지막에 append한다 —
+    agents.json claude.cmd 의 CLAUDE_CONFIG_DIR 해석(C31 L2022)과 byte-identical.
+    init-pack(여전히 ~/.claude* 만 glob)과 **의도적 분기**: event-hook 배포는 init-pack이 아니라
+    preflight 소관(C08/C27/C28/C32/C33가 이 함수를 소비). agy/codex는 Claude-config 노드가
+    아니므로 미대상. 함수는 절대 raise 안 함(부재/이상 dir은 부분 커버리지로 graceful 강등)."""
     home = os.path.expanduser("~")
     found = []
     try:
         names = os.listdir(home)
     except OSError:
-        return found
+        names = []
     for n in sorted(names):
         if n == ".claude" or n.startswith(".claude-"):
             p = os.path.join(home, n, "settings.json")
             if os.path.isfile(p):
                 found.append(p)
+    # cys 계정 config dir(master + ~/.cys/claude 공유 claude-adapter 리뷰어) 포함.
+    # env-first: dept 데몬은 CYS_ACCOUNT_DIR=~/.cys/claude-<key>로 기동되므로 자기 dir이 정답
+    # (하드코딩 ~/.cys/claude는 dept 오타깃). 디렉터리 존재 시에만 포함(미기동 노드 config dir
+    # 생성 방지). 파일 부재여도 포함 — _register_event_hook이 makedirs+create.
+    try:
+        account_dir = os.environ.get("CYS_ACCOUNT_DIR") or os.path.join(
+            os.path.dirname(os.path.normpath(pack_dir())), "claude")
+        if account_dir and os.path.isdir(account_dir):
+            cand = os.path.join(account_dir, "settings.json")
+            seen = {os.path.realpath(p) for p in found}
+            if os.path.realpath(cand) not in seen:
+                found.append(cand)
+    except Exception:
+        pass  # 부재/이상 dir → home-glob만 반환(preflight 부트 게이트라 crash 금지)
     return found
 
 
 class Preflight:
-    def __init__(self, fix, skips):
-        self.fix = fix
+    def __init__(self, fix, skips, mode="report", allow_irreversible=False):
+        # OPP-17: mode ∈ report(관찰만)|fix(집행)|dry(미리보기)|safe(무변경+갭만).
+        # self.fix 는 *집행 모드일 때만* True — dry/safe 에선 False 라 기존 50+ `if self.fix and …`
+        # 가역 부작용 분기(c04 soul·c07 hook·c08 settings·c10 todo·c32 statusline·c33 event_hooks
+        # 등)가 self.fix=False 로 **일괄 비집행**된다. may_mutate() 게이트는 *비가역 외부설치*
+        # (denylist external_install)만 명시 미리보기/차단한다(아래 게이트 docstring 참조).
+        # back-compat: 호출자가 mode 미지정 시 fix 인자로 report/fix 결정(기존 시그니처 보존).
+        if mode == "report" and fix:
+            mode = "fix"
+        self.mode = mode
+        self.fix = (mode == "fix")
+        self.allow_irreversible = allow_irreversible
+        # planned: may_mutate() 가 기록하는 *비가역 외부설치* 계획 버퍼. 가역 로컬 변경(soul/hook/
+        # settings/todo 등)은 self.fix=False 로 일괄 비집행되므로 이 버퍼에 기록되지 않는다(정직 범위).
+        self.planned = []
         self.skips = set(skips)
         self.results = []
         self._init_pack_ran = None  # None=미시도, True/False=시도 결과
@@ -419,6 +394,34 @@ class Preflight:
             self.add(cid, SKIP, "skipped by --skip")
             return True
         return False
+
+    # ── OPP-17 비가역 외부설치 Mutation 게이트 — "관찰이 상태를 바꾸지 않는다"(PHIL-04) 동형 ──
+    # ★범위 정직(적대검증 REVISE 교정): may_mutate() 는 **비가역 외부설치(denylist external_install
+    # — npm install -g·git clone) 전용 게이트**다. 가역적 로컬 변경(soul/hook/settings/todo/
+    # statusline/event_hooks 등 50+ `if self.fix` 분기)은 may_mutate() 를 거치지 않고, dry/safe
+    # 모드에서 self.fix=False 로 **일괄 비집행**된다(자연 게이팅). 따라서 dry/safe 의 무변경
+    # 보장은 전 사이트에 성립하나, `--json` planned 미리보기 충실성은 비가역 외부설치 2건에
+    # 한정된다 — "단일 Mutation 게이트·전 사이트 1:1 미리보기" 는 의도적으로 *주장하지 않는다*.
+    # 비가역만 게이트한 이유: 가역(.bak·kill·재실행 가능)은 dry/safe 비집행으로 충분하고, 비가역은
+    # 사전 확인·denylist 차단이 *반드시* 필요하기 때문(자율주행 denylist ④ 정합).
+    def may_mutate(self, cid, kind, target, summary, denylist_class=None):
+        """이 *비가역 외부설치* 부작용을 지금 집행해도 되는가? 계획 기록 + 모드별 분기. 집행=True."""
+        self.planned.append({"cid": cid, "kind": kind, "target": target,
+                             "summary": summary, "denylist_class": denylist_class})
+        if self.mode == "dry":
+            self.add(cid, DRYRUN, "[dry-run] Would %s → %s" % (kind, target))
+            return False
+        if self.mode == "safe":
+            self.add(cid, SAFE_GAP, "[safe] 누락: %s (무변경 — 수리 보류)" % summary)
+            return False
+        if self.mode == "fix":
+            if denylist_class and not self.allow_irreversible:
+                # 첫 도입 WARN-first(BLOCK 아님) — 부트 ⓪ 표준 호출 회귀(NOT READY) 방지.
+                self.add(cid, WARN, "비가역 변경(%s) 보류 — --allow-irreversible 없이 자동집행 안 함: %s"
+                         % (denylist_class, target))
+                return False
+            return True
+        return False  # report 모드: 관찰만, 부작용 없음
 
     # ── 공용 수리: cys init-pack (누락 템플릿만 재설치 — 사용자 수정본 불가침) ──
     def repair_via_init_pack(self):
@@ -838,7 +841,7 @@ class Preflight:
     # cysd events 테이블에 적재(E3 스킬 TOP·반복실패 토대). hook은 fail-open(에이전트 무차단)이라
     # 무관 작업 불간섭. C32와 동일 규약(체인보존·symlink/파손 거부·원자적). FAIL 없음(미등록=WARN).
     EVENT_HOOK = "cys-hook.sh"
-    EVENT_HOOK_EVENTS = ("PreToolUse", "PostToolUse")
+    EVENT_HOOK_EVENTS = ("PreToolUse", "PostToolUse", "PermissionRequest", "ExitPlanMode", "AskUserQuestion")
 
     def c33_event_hooks(self):
         cid = "C33.event-hooks"
@@ -875,588 +878,6 @@ class Preflight:
         else:
             self.add(cid, WARN, "이벤트 hook 미등록: %d건 — --fix로 설치(claude 재시작 후 적용)"
                      % len(pending))
-
-    # ── C41 참조 무결성 (T6-P1 — soul/directive inline 백틱 참조 dangling 검출) ──
-    # C18(MEMORY.md 색인↔파일)·C39(skill frontmatter 고아)와 비중첩: C41은 본문 inline
-    # 백틱/마커 named 참조라는 새 표면만 본다. 자동수리 없음(문서 내용은 오너·노드 소관).
-    def c41_reference_integrity(self):
-        cid = "C41.reference-integrity"
-        if self.skipped(cid):
-            return
-        if is_dept_pack():  # 부서/CEO pack은 표준 문서 그래프 면제(C03와 동형)
-            self.add(cid, WARN, "부서/CEO pack — 표준 참조 그래프 검사 면제")
-            return
-        missing, scanned = _scan_reference_integrity(pack_dir())
-        if missing:
-            self.add(cid, FAIL, "; ".join(sorted(set(missing)))
-                     + " — 깨진 참조를 고치거나 누락 파일을 추가하라(자동수리 없음)")
-        else:
-            self.add(cid, PASS, "참조 %d개 전부 해소(soul+directive %d파일·feedback/bin/directive 3클래스)"
-                     % (scanned, 1 + len(DIRECTIVES)))
-
-    # ── C42 MPL 클린룸 가드레일 (T6-P6 — 흡수 연구 코드복사0 박제) ──
-    # 도구 로직 정합은 javis_cleanroom.py --self-test에 위임(C17/C19 _check_bin_tool 패턴 동형).
-    def c42_cleanroom(self):
-        cid = "C42.cleanroom-guardrail"
-        if self.skipped(cid):
-            return
-        p = self._check_bin_tool(cid, "javis_cleanroom.py")
-        if p:
-            self.add(cid, PASS, "%s self-test OK (4원칙 키·마커쌍·라이선스 화이트리스트 검증)" % p)
-
-    # ── C43 verdict 리터럴 단일진실 핀 (T1-1 — T6-P5 이후 schema 파생) ──
-    # 측정 결과 경계를 건너는 #[repr(u8)] 판별값 enum = 0개(grep "repr(u" src/ = 0) →
-    # build.rs enum→TS/JSON codegen은 빌드하지 않고(미래 착륙 조건만 문서화), verdict
-    # 4-리터럴(판별값 없는 문자열 집합)의 손동기 드리프트만 문자열-동치로 fail-loud 차단한다.
-    # ★T6-P5 이후: 코드측 리터럴이 verdict_schema.json(단일 머신-SOT)에서 파생되므로, C43 도
-    #   소스-A 를 그 스키마의 reviewer_enum(=리뷰어가 채우는 4 enum, INVESTIGATE 제외)에서 읽는다.
-    #   스키마 부재 시 graceful 폴백(javis_verdict.py 의 VERDICT_ENUM 그렙 — verdict.py 폴백과 정합).
-    # ★C36/C51과 중복 아님: C36=verdict *인스턴스* 검증, C51=스키마↔코드 *로드/정합*, C43=리터럴이
-    #   *계약 텍스트(REVIEWER_DIRECTIVE.md)* 와 동기인지 대조. 코드 무결성은 C36 self-test에 위임.
-    def c43_verdict_literals(self):
-        cid = "C43.verdict-literals"
-        if self.skipped(cid):
-            return
-        vbin = os.path.join(pack_dir(), "bin", "javis_verdict.py")
-        schema_p = os.path.join(pack_dir(), "schemas", "verdict_schema.json")
-        # A = SOT측 리뷰어 4리터럴. 1차: verdict_schema.json reviewer_enum. 폴백: verdict.py 그렙.
-        a = None
-        src_label = ""
-        if os.path.isfile(schema_p):
-            try:
-                s = json.load(open(schema_p, encoding="utf-8"))
-                a = set(s.get("reviewer_enum", [])) or None
-                src_label = "verdict_schema.json:reviewer_enum"
-            except (OSError, ValueError):
-                a = None
-        if a is None:
-            if not os.path.isfile(vbin):
-                self.add(cid, WARN, "verdict_schema.json·javis_verdict.py 모두 부재 — "
-                         "verdict 단일진실 검사 보류")
-                return
-            try:
-                src = open(vbin, encoding="utf-8").read()
-            except Exception as e:
-                self.add(cid, WARN, "javis_verdict.py 읽기 불가 — 보류: %s" % e)
-                return
-            m = re.search(r"VERDICT_ENUM\s*=\s*\(([^)]*)\)", src)
-            a = (set(re.findall(r'"([A-Z]+)"', m.group(1))) - {"INVESTIGATE"}) if m else set()
-            src_label = "javis_verdict.py:32(폴백)"
-        expect = {"ACCEPT", "REVISE", "BLOCK", "ESCALATE"}
-        if a != expect:
-            self.add(cid, FAIL, "%s 기대 4리터럴과 불일치: %s (기대 %s)"
-                     % (src_label, sorted(a), sorted(expect)))
-            return
-        # B = 계약측 (pack 임베드 REVIEWER_DIRECTIVE.md 의 verdict 리터럴 텍스트)
-        # 형태: `{verdict: ACCEPT|REVISE|BLOCK|ESCALATE, ...}` 또는 `"verdict": "ACCEPT | REVISE | ..."`
-        contract = os.path.join(pack_dir(), "directives", "REVIEWER_DIRECTIVE.md")
-        if not os.path.isfile(contract):
-            self.add(cid, PASS, "verdict 4리터럴 self-consistent(%s) — "
-                     "계약파일 부재로 교차검증 보류" % src_label)
-            return
-        try:
-            ctext = open(contract, encoding="utf-8").read()
-        except Exception as e:
-            self.add(cid, WARN, "REVIEWER_DIRECTIVE.md 읽기 불가 — 보류: %s" % e)
-            return
-        cm = re.search(r"verdict[\"'\s:]*\s*([A-Z]+(?:\s*\|\s*[A-Z]+)+)", ctext)
-        if not cm:
-            self.add(cid, PASS, "verdict 4리터럴 self-consistent(%s) — "
-                     "계약 verdict 텍스트 미검출로 교차검증 보류" % src_label)
-            return
-        b = set(re.findall(r"[A-Z]+", cm.group(1)))
-        if a == b:
-            self.add(cid, PASS, "verdict 4리터럴 손동기 일치(SOT:%s ↔ "
-                     "계약:REVIEWER_DIRECTIVE.md)" % src_label)
-        else:
-            self.add(cid, FAIL, "verdict 드리프트 — 코드만:%s / 계약만:%s"
-                     % (sorted(a - b), sorted(b - a)))
-
-    # ── C44 kind/mode/transition enum 파리티 (T1-2 — 다중 출력 경로 누락0·드리프트0 FLOOR) ──
-    # cys 다중 소비 경로가 공유하는 "종류 집합"의 단일진실 동기화를 결정론 검사한다:
-    #   schema(edit_decisions.schema.json) ↔ check_timeline.py 상수(TRACK_KINDS/EL_MODES/EL_TRANSITIONS).
-    # build.rs 산출 cys_kinds.json(OUT_DIR)이 보이면 3자, 안 보이면 2자(schema↔check_timeline) 대조.
-    # ★C43과 비충돌(별 cid·verdict 도메인 무관). 과신 금지: 누락0/드리프트0의 FLOOR이지 프레임 패리티
-    # 보장이 아니다(프레임 패리티는 별도 raster-diff 하네스 소관).
-    def c44_kind_enum_parity(self):
-        cid = "C44.kind-enum-parity"
-        if self.skipped(cid):
-            return
-        schema_p = os.path.join(pack_dir(), "schemas", "edit_decisions.schema.json")
-        ct_p = os.path.join(pack_dir(), "bin", "check_timeline.py")
-        if not os.path.isfile(schema_p) or not os.path.isfile(ct_p):
-            self.add(cid, WARN, "edit_decisions.schema.json 또는 check_timeline.py 부재 — "
-                     "enum 파리티 검사 보류")
-            return
-        try:
-            schema = json.load(open(schema_p, encoding="utf-8"))
-            ctext = open(ct_p, encoding="utf-8").read()
-        except Exception as e:
-            self.add(cid, WARN, "schema/check_timeline 읽기 불가 — 보류: %s" % e)
-            return
-        # schema 측 3개 enum(경로 고정 — 스키마 구조에 박제).
-        try:
-            s_kind = set(schema["properties"]["tracks"]["items"]["properties"]["kind"]["enum"])
-            s_mode = set(schema["$defs"]["element"]["properties"]["mode"]["enum"])
-            s_trans = set(schema["$defs"]["element"]["properties"]["transition"]["enum"])
-        except (KeyError, TypeError) as e:
-            self.add(cid, FAIL, "edit_decisions.schema.json enum 경로 변형 — %s" % e)
-            return
-        # check_timeline 측 상수(C43과 동형 regex 파싱 — import 부작용 회피).
-        def _tuple_literals(name):
-            m = re.search(name + r'\s*=\s*\(([^)]*)\)', ctext)
-            return set(re.findall(r'"([^"]+)"', m.group(1))) if m else None
-        ct_kind = _tuple_literals("TRACK_KINDS")
-        ct_mode = _tuple_literals("EL_MODES")
-        ct_trans = _tuple_literals("EL_TRANSITIONS")
-        if ct_kind is None or ct_mode is None or ct_trans is None:
-            self.add(cid, FAIL, "check_timeline.py TRACK_KINDS/EL_MODES/EL_TRANSITIONS 미검출")
-            return
-        for label, sset, cset in (("kind", s_kind, ct_kind),
-                                  ("mode", s_mode, ct_mode),
-                                  ("transition", s_trans, ct_trans)):
-            if sset != cset:
-                self.add(cid, FAIL, "%s enum 드리프트 — schema만:%s / check_timeline만:%s"
-                         % (label, sorted(sset - cset), sorted(cset - sset)))
-                return
-        # cys_kinds.json(build.rs 산출) 발견 시 3자 대조(없으면 2자로 PASS·빌드 후 재검 안내).
-        gen = _find_codegen_kinds()
-        if gen is None:
-            self.add(cid, PASS, "kind/mode/transition enum 2자 일치(schema ↔ check_timeline) — "
-                     "cys_kinds.json 미발견(빌드 후 3자 재검 가능)")
-            return
-        if (set(gen.get("edit_kind", [])) == s_kind
-                and set(gen.get("mode", [])) == s_mode
-                and set(gen.get("transition", [])) == s_trans):
-            self.add(cid, PASS, "kind/mode/transition enum 3자 일치"
-                     "(cys_kinds.json ↔ schema ↔ check_timeline)")
-        else:
-            self.add(cid, FAIL, "cys_kinds.json(build.rs codegen)이 schema/check_timeline과 드리프트")
-
-    # ── C45 state-db change-log 무결성 (T2-3 — append-only change-log + 단조 revn) ──
-    # 라이브 analytics.db(부재 시 graceful WARN)에서 change-log 스키마 존재 + revn 단조성을
-    # 결정론 확인한다. 스키마는 analytics.rs open()이 ADDITIVE로 보장(SESSION_STATE.md 산문
-    # 복원 경로는 불변 — 이 체크는 그 위에 얹은 change-replay 능력층의 무결성만 본다).
-    # ★owner c38=silent_failure_catalog이므로 stale spec ref "c38_statedb" 대신 신규 C45 사용.
-    def c45_statedb(self):
-        cid = "C45.state-db"
-        if self.skipped(cid):
-            return
-        import sqlite3
-        # analytics.db 위치: CYS_SOCKET 부모(데몬 state_dir) → 기본 ~/.local/state/cys.
-        sock = os.environ.get("CYS_SOCKET") or os.environ.get("JAVIS_SOCKET") \
-            or os.environ.get("AITERM_SOCKET")
-        if sock:
-            db = os.path.join(os.path.dirname(sock), "analytics.db")
-        else:
-            db = os.path.join(os.path.expanduser("~"), ".local", "state", "cys", "analytics.db")
-        if not os.path.isfile(db):
-            self.add(cid, WARN, "analytics.db 부재(데몬 미기동/미생성) — change-log 무결성 검사 보류")
-            return
-        try:
-            conn = sqlite3.connect("file:%s?mode=ro" % db, uri=True)
-        except sqlite3.Error as e:
-            self.add(cid, WARN, "analytics.db 열기 실패 — 보류: %s" % e)
-            return
-        try:
-            tabs = {r[0] for r in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'")}
-            need = {"state_scope", "change_log"}
-            if not need <= tabs:
-                self.add(cid, FAIL, "change-log 스키마 부재: %s (analytics.rs open() 갱신 필요)"
-                         % ", ".join(sorted(need - tabs)))
-                return
-            # revn 단조성: 각 scope에서 seq 오름차순일 때 revn이 단조 비감소여야 한다.
-            bad = []
-            scopes = [r[0] for r in conn.execute("SELECT DISTINCT scope FROM change_log")]
-            for sc in scopes:
-                prev = None
-                for (revn,) in conn.execute(
-                        "SELECT revn FROM change_log WHERE scope=? ORDER BY seq ASC", (sc,)):
-                    if prev is not None and revn < prev:
-                        bad.append(sc)
-                        break
-                    prev = revn
-            if bad:
-                self.add(cid, FAIL, "revn 단조성 위반 scope: %s" % ", ".join(bad))
-                return
-            self.add(cid, PASS, "change-log 스키마 존재 + revn 단조성 정합(scope %d개)" % len(scopes))
-        except sqlite3.Error as e:
-            self.add(cid, WARN, "change-log 조회 실패 — 보류: %s" % e)
-        finally:
-            conn.close()
-
-    # ── C46 SESSION_STATE 예약 엔티티 ensure (T3-5 — ensure-X 복원 불변식) ──
-    def c46_session_ensure(self):
-        cid = "C46.session-ensure"
-        if self.skipped(cid):
-            return
-        p = os.path.join(pack_dir(), "bin", "javis_session.py")
-        if not os.path.isfile(p):
-            self.add(cid, WARN, "javis_session.py 부재 — 예약 엔티티 검사 보류")
-            return
-        # bin 무결성: 그 bin의 --self-test를 subprocess로(c36/c43 패턴).
-        st = subprocess.run([sys.executable, p, "--self-test"], capture_output=True)
-        if st.returncode != 0:
-            self.add(cid, FAIL, "javis_session.py --self-test 실패(배터리 불통과)")
-            return
-        # producer≠evaluator: ensure 결과 파일을 verify로 독립 채점.
-        ss = os.path.join(pack_dir(), "round", "SESSION_STATE.md")
-        rc = subprocess.run([sys.executable, p, "verify", "--file", ss], capture_output=True).returncode
-        if rc != 0 and self.fix:
-            subprocess.run([sys.executable, p, "ensure", "--file", ss], capture_output=True)
-            rc = subprocess.run([sys.executable, p, "verify", "--file", ss], capture_output=True).returncode
-            if rc == 0:
-                self.add(cid, FIXED, "예약 필드 ensure 복구")
-                return
-        if rc == 0:
-            self.add(cid, PASS, "restore_pointer·open_gates 예약 엔티티 보장 + self-test ok")
-        else:
-            self.add(cid, FAIL, "예약 필드 부재/마커 깨짐 — --fix로 ensure")
-
-    # ── C47 능력 가드 (T4-4/T6-P3 — producer≠evaluator 물리 경화) ──
-    # 정적 검사: ① cysd 원장/surface caps 스키마(caps.rs Cap enum + state.rs caps 필드 +
-    # write⊇read 정규화)가 존재하는가 ② PreToolUse hook(role-capability-gate.sh)이 reviewer
-    # 역할 변형 도구(Edit/Write/NotebookEdit/Bash-write) 차단으로 배선됐고 self-test가 통과하는가
-    # ③ 그 hook이 프로필 settings.json hooks.PreToolUse 에 **실제 등록**됐는가(파일존재+self-test만으론
-    #    DORMANT 미배선을 못 잡는다 — 미등록이면 FAIL + `--fix` 힌트, --fix면 자동 배선).
-    # caps 스키마/hook self-test는 라이브 데몬 불요. 부재 시 FAIL(보안 게이트 = 강한 단정).
-    def c47_capability_guard(self):
-        cid = "C47.capability-guard"
-        if self.skipped(cid):
-            return
-        crate_root = os.path.dirname(os.path.abspath(pack_dir().rstrip("/")))
-        caps_rs = os.path.join(crate_root, "src", "bin", "cysd", "caps.rs")
-        state_rs = os.path.join(crate_root, "src", "bin", "cysd", "state.rs")
-        handlers_rs = os.path.join(crate_root, "src", "bin", "cysd", "handlers.rs")
-        hook = os.path.join(pack_dir(), "hooks", "role-capability-gate.sh")
-        # ① 원장 caps 스키마 — 소스 정적 핀.
-        if not os.path.isfile(caps_rs):
-            self.add(cid, FAIL, "caps.rs 부재 — 원장 capability 스키마 미구현 (%s)" % caps_rs)
-            return
-        try:
-            caps_src = open(caps_rs, encoding="utf-8").read()
-            state_src = open(state_rs, encoding="utf-8").read() if os.path.isfile(state_rs) else ""
-            handlers_src = open(handlers_rs, encoding="utf-8").read() if os.path.isfile(handlers_rs) else ""
-        except OSError as e:
-            self.add(cid, WARN, "cysd 소스 읽기 불가 — 보류: %s" % e)
-            return
-        need_caps = [
-            ("Cap enum", "pub enum Cap"),
-            ("write⊇read 정규화", "normalize_write_implies_read"),
-            ("reviewer/planner 식별", "is_reviewer_or_planner"),
-            ("deny-by-default none()", "fn none()"),
-        ]
-        miss = [label for label, tok in need_caps if tok not in caps_src]
-        if "pub caps: Option<crate::caps::Caps>" not in state_src and "caps: Option<crate::caps::Caps>" not in state_src:
-            miss.append("LedgerEntry.caps 필드")
-        if "check_caps_gate" not in handlers_src:
-            miss.append("handlers cysd-매개 게이트(check_caps_gate)")
-        if miss:
-            self.add(cid, FAIL, "capability 스키마/게이트 미배선: %s" % ", ".join(miss))
-            return
-        # ② PreToolUse hook 배선 — reviewer 변형 도구 denylist + self-test.
-        if not os.path.isfile(hook):
-            self.add(cid, FAIL, "role-capability-gate.sh(PreToolUse 물리 enforcer) 부재 (%s)" % hook)
-            return
-        try:
-            hook_src = open(hook, encoding="utf-8").read()
-        except OSError as e:
-            self.add(cid, WARN, "hook 읽기 불가 — 보류: %s" % e)
-            return
-        hook_miss = [label for label, tok in (
-            ("MUTATION_TOOLS denylist", "MUTATION_TOOLS"),
-            ("reviewer/planner 판정", "is_reviewer_or_planner"),
-            ("Edit 차단", '"Edit"'),
-            ("write-shell 차단", "WRITE_SHELL_CMDS"),
-        ) if tok not in hook_src]
-        if hook_miss:
-            self.add(cid, FAIL, "hook reviewer denylist 미배선: %s" % ", ".join(hook_miss))
-            return
-        st = subprocess.run(["bash", hook, "--self-test"], capture_output=True)
-        if st.returncode != 0:
-            detail = (st.stderr or st.stdout).decode("utf-8", "replace").strip()[:200]
-            self.add(cid, FAIL, "role-capability-gate.sh --self-test 실패: %s" % detail)
-            return
-        # ③ PreToolUse 실제 등록 검증 — 파일 존재+self-test만으론 'DORMANT(미배선)'를 못 잡는다.
-        #    프로필 settings.json hooks.PreToolUse 에 role-capability-gate가 들어있어야 PASS.
-        #    --fix 면 자동 등록(appbuild-gate 등록과 동형·멱등).
-        targets = discover_claude_settings()
-        if not targets:
-            # 프로필 미발견 — 라이브 wiring은 claude 노드 기동 후. 게이트 자체는 self-test로 검증됨.
-            self.add(cid, WARN, "caps 스키마+cysd 게이트+hook self-test OK이나 ~/.claude*/settings.json "
-                     "미발견 — claude 노드 기동 후 `preflight --fix`로 PreToolUse 등록 필요")
-            return
-        registered = [t for t in targets if self._capgate_hook_registered(t)]
-        unwired = [t for t in targets if t not in registered]
-        if unwired and self.fix:
-            done, errs = [], []
-            for t in unwired:
-                err = self._register_capgate_hook(t)
-                errs.append("%s: %s" % (os.path.basename(os.path.dirname(t)), err)) if err \
-                    else done.append(os.path.basename(os.path.dirname(t)))
-            if errs:
-                self.add(cid, FAIL, "능력 GATE hook PreToolUse 등록 실패: %s%s"
-                         % ("; ".join(errs),
-                            " | 성공: %s" % ", ".join(done) if done else ""))
-                return
-            unwired = []  # 전부 등록됨
-        if unwired:
-            # 파일·self-test는 OK이고 등록만 남았다(deploy 시 --fix가 배선) → WARN+힌트로 보고하되
-            # 게이트 자체 결함과 구분한다(스키마/hook 결함은 위에서 이미 FAIL). C45/C10 외 신규 FAIL 방지.
-            self.add(cid, WARN, "role-capability-gate.sh 파일·self-test OK이나 PreToolUse 미배선"
-                     "(DORMANT) — %d개 프로필 미등록. `preflight --fix`로 배선(claude 재시작 후 적용)"
-                     % len(unwired))
-            return
-        self.add(cid, PASS, "원장 caps 스키마(Cap·write⊇read·deny-by-default) + cysd 게이트 + "
-                 "PreToolUse hook reviewer denylist(self-test ok) + %d개 프로필 PreToolUse 등록 확인"
-                 % len(targets))
-
-    # ── C48 거버넌스 경화 (Wave3 UNIT B — watchdog 무음크래시·바이트상한·오염격리·좀비) ──
-    # 정적 핀(라이브 데몬 불요): 네 가닥이 소스에 배선됐는지 토큰 존재로 박제한다.
-    # ① T5-6 strand-2 ProcessHealth{Reusable,Poisoned} + LedgerEntry.health + is_reusable
-    # ② T4-5A 단일 RPC 응답 바이트상한(MAX_RESPONSE_BYTES + cap_response, ONE guard)
-    # ③ T5-2 surface_crashed 술어 + check_surface_crash watchdog 결선 + 재진입 가드
-    # ④ T4-5B reap_zombie_surfaces watchdog 결선(3-miss 임계). 부재 시 FAIL(거버넌스 회귀).
-    def c48_governance_hardening(self):
-        cid = "C48.governance-hardening"
-        if self.skipped(cid):
-            return
-        crate_root = os.path.dirname(os.path.abspath(pack_dir().rstrip("/")))
-        cysd = os.path.join(crate_root, "src", "bin", "cysd")
-        state_rs = os.path.join(cysd, "state.rs")
-        gov_rs = os.path.join(cysd, "governance.rs")
-        wire_rs = os.path.join(crate_root, "src", "wire.rs")
-        try:
-            state_src = open(state_rs, encoding="utf-8").read() if os.path.isfile(state_rs) else ""
-            gov_src = open(gov_rs, encoding="utf-8").read() if os.path.isfile(gov_rs) else ""
-            wire_src = open(wire_rs, encoding="utf-8").read() if os.path.isfile(wire_rs) else ""
-        except OSError as e:
-            self.add(cid, WARN, "cysd 소스 읽기 불가 — 보류: %s" % e)
-            return
-        miss = []
-        # ① 오염 격리
-        if "pub enum ProcessHealth" not in state_src or "Poisoned" not in state_src:
-            miss.append("ProcessHealth{Reusable,Poisoned}")
-        if "pub health: ProcessHealth" not in state_src:
-            miss.append("LedgerEntry.health 필드")
-        if "fn is_reusable" not in state_src:
-            miss.append("is_reusable 재사용 술어")
-        if "poison_surface_ledger" not in gov_src:
-            miss.append("poison_surface_ledger 마킹")
-        # ② 바이트상한 (ONE guard)
-        if "MAX_RESPONSE_BYTES" not in wire_src or "fn cap_response" not in wire_src:
-            miss.append("MAX_RESPONSE_BYTES/cap_response 바이트상한")
-        # ③ 무음 크래시
-        if "fn surface_crashed" not in gov_src:
-            miss.append("surface_crashed 술어")
-        if "fn check_surface_crash" not in gov_src or "check_surface_crash(&daemon)" not in gov_src:
-            miss.append("check_surface_crash watchdog 결선")
-        if "CRASH_HANDLER_ACTIVE" not in gov_src:
-            miss.append("크래시 핸들러 재진입 가드")
-        # ④ 좀비 하트비트
-        if "fn reap_zombie_surfaces" not in gov_src or "reap_zombie_surfaces(&daemon" not in gov_src:
-            miss.append("reap_zombie_surfaces watchdog 결선")
-        if "ZOMBIE_MISS_THRESHOLD" not in gov_src:
-            miss.append("좀비 3-miss 임계")
-        if miss:
-            self.add(cid, FAIL, "거버넌스 경화 미배선: %s" % ", ".join(miss))
-        else:
-            self.add(cid, PASS, "오염격리(ProcessHealth)·바이트상한(cap_response)·무음크래시"
-                     "(surface_crashed+재진입가드)·좀비(reap_zombie_surfaces 3-miss) 4가닥 배선 확인")
-
-    # ── C49 onboarding catalog + directive cascade (T4-3 + T3-2) ──
-    # 결정론 검증(LLM 재추론 금지): ① T4-3 런타임 카탈로그가 실제 레지스트리(EditKind=cys_kinds.json
-    # edit_kind 단일진실)에서 파생되는지(하드코딩이면 드리프트) ② 플레이스홀더 치환이 directive 주입
-    # 경로(compose_directive)에 배선됐는지 ③ on-demand 단건 RPC(editor.action_info)·전체 카탈로그
-    # RPC(editor.action_catalog)가 등록됐는지 ④ T3-2 캐스케이드 모듈이 존재하는지. 소스 grep + codegen
-    # 집합 대조(C44/C48 동형) — 추가 인프라 0.
-    def c49_onboarding_catalog(self):
-        cid = "C49.onboarding-catalog"
-        if self.skipped(cid):
-            return
-        crate_root = os.path.dirname(os.path.abspath(pack_dir().rstrip("/")))
-        ac_rs = os.path.join(crate_root, "src", "action_catalog.rs")
-        dc_rs = os.path.join(crate_root, "src", "directive_compose.rs")
-        cys_rs = os.path.join(crate_root, "src", "bin", "cys.rs")
-        hnd_rs = os.path.join(crate_root, "src", "bin", "cysd", "handlers.rs")
-        miss = []
-        for label, p in (("action_catalog.rs", ac_rs), ("directive_compose.rs", dc_rs),
-                         ("cys.rs", cys_rs), ("handlers.rs", hnd_rs)):
-            if not os.path.isfile(p):
-                miss.append("%s 부재" % label)
-        if miss:
-            self.add(cid, WARN, "T4-3/T3-2 소스 부재 — 검사 보류: %s" % ", ".join(miss))
-            return
-        try:
-            ac = open(ac_rs, encoding="utf-8").read()
-            cys_src = open(cys_rs, encoding="utf-8").read()
-            hnd = open(hnd_rs, encoding="utf-8").read()
-        except OSError as e:
-            self.add(cid, WARN, "소스 읽기 불가 — 보류: %s" % e)
-            return
-        # ② 치환이 directive 주입 경로에 배선
-        if "substitute_catalog" not in cys_src:
-            miss.append("compose_directive에 substitute_catalog 미배선")
-        # ① 카탈로그가 레지스트리 파생(EditKind::ALL 순회) — 하드코딩 아님
-        if "EditKind::ALL" not in ac:
-            miss.append("action_catalog가 EditKind::ALL 레지스트리 파생 아님(하드코딩 의심)")
-        # ③ on-demand 단건 + 전체 카탈로그 RPC 등록
-        if '"editor.action_info"' not in hnd:
-            miss.append("editor.action_info RPC 미등록")
-        if '"editor.action_catalog"' not in hnd:
-            miss.append("editor.action_catalog RPC 미등록")
-        # ① 강화: 카탈로그 액션 집합 == cys_kinds.json edit_kind(build.rs 단일진실) — 드리프트0.
-        gen = _find_codegen_kinds()
-        if gen is not None:
-            kinds = set(gen.get("edit_kind", []))
-            # action_catalog.rs의 action_summary match arm이 모든 edit_kind 리터럴을 덮는지
-            # 직접 확인할 순 없으나(serde 파생), no-wildcard match라 빌드가 누락을 차단한다.
-            # 여기선 카탈로그 모듈이 EditKind를 import하는지로 단일진실 결속만 박제.
-            if "use crate::edit_kinds::EditKind" not in ac:
-                miss.append("action_catalog가 edit_kinds 단일진실에 미결속")
-            if not kinds:
-                miss.append("cys_kinds.json edit_kind 비어있음")
-        if miss:
-            self.add(cid, FAIL, "온보딩 카탈로그/캐스케이드 미배선: %s" % ", ".join(miss))
-        else:
-            tail = "" if gen is not None else " (cys_kinds.json 미발견 — 빌드 후 레지스트리 대조 재검 가능)"
-            self.add(cid, PASS, "T4-3 카탈로그 레지스트리파생+치환배선+on-demand RPC · "
-                     "T3-2 캐스케이드 모듈 확인%s" % tail)
-
-    # ── C50 스킬 self-describing 설치 매니페스트 (T6-P4 — requires.bins + 플랫폼별 install) ──
-    # 각 스킬 SKILL.md의 `cys:` 프론트매터가 self-describe한 requires.bins를 shutil.which로
-    # 결손 탐지하고, 결손 시 install 매니페스트에서 플랫폼(darwin→brew / linux→apt) 설치 명령을
-    # 선택해 보고한다. --fix는 dry-run으로 선택된 명령만 출력한다(실제 brew/apt 실행은 denylist
-    # 환경변경 — cys feed push 승인 게이트 경유가 정책이므로 preflight는 자동 실행하지 않는다).
-    # 스코프: `cys:` 프론트매터에 requires.bins가 있는 스킬만(현재 영상 도구 의존 소수) — 전 스킬
-    # 순회 아님(대부분 순수 LLM). 멱등: 존재하는 bin은 무동작, 매니페스트 오타·구조결함은 fail-loud.
-    def c50_skill_requirements(self):
-        cid = "C50.skill-requirements"
-        if self.skipped(cid):
-            return
-        skills_root = os.path.join(pack_dir(), "skills")
-        if not os.path.isdir(skills_root):
-            self.add(cid, WARN, "skills/ 부재 — 스킬 설치 매니페스트 검사 보류")
-            return
-        plat_kind, plat_field = ("brew", "formula") if sys.platform == "darwin" else ("apt", "package")
-        checked = 0          # requires.bins 선언 스킬 수
-        malformed = []       # 매니페스트 구조 결함(fail-loud)
-        missing = []         # (skill, bin, install_cmd|None)
-        for name in sorted(os.listdir(skills_root)):
-            sp = os.path.join(skills_root, name, "SKILL.md")
-            if not os.path.isfile(sp):
-                continue
-            try:
-                text = open(sp, encoding="utf-8").read()
-            except OSError:
-                continue
-            req_bins, install = _parse_skill_requires(text)
-            if req_bins is None:
-                continue  # requires.bins 미선언 — 스코프 밖(순수 LLM 스킬)
-            checked += 1
-            if not isinstance(req_bins, list) or not all(isinstance(b, str) for b in req_bins):
-                malformed.append("%s: requires.bins가 문자열 배열 아님" % name)
-                continue
-            for b in req_bins:
-                if shutil.which(b):
-                    continue  # 존재 — 멱등 무동작
-                # 결손: 플랫폼별 install 명령 선택
-                cmd = None
-                for entry in (install or []):
-                    if entry.get("kind") == plat_kind and entry.get(plat_field):
-                        cmd = "%s install %s" % (plat_kind, entry[plat_field])
-                        break
-                if cmd is None and install:
-                    malformed.append("%s: bin '%s' 결손이나 %s install 매니페스트 없음/오타"
-                                     % (name, b, plat_kind))
-                missing.append((name, b, cmd))
-        if malformed:
-            self.add(cid, FAIL, "스킬 설치 매니페스트 결함(fail-loud): %s" % "; ".join(malformed))
-            return
-        if missing:
-            lines = ["%s→%s: %s" % (s, b, cmd or "(이 플랫폼 install 명령 없음)")
-                     for s, b, cmd in missing]
-            if self.fix:
-                self.add(cid, FIXED,
-                         "결손 바이너리 %d건 — dry-run 설치 명령(실행 보류: cys feed push 승인 게이트): %s"
-                         % (len(missing), "; ".join(lines)))
-            else:
-                self.add(cid, FAIL,
-                         "스킬 요구 바이너리 결손 %d건 — `--fix`로 플랫폼별 설치 명령 확인: %s"
-                         % (len(missing), "; ".join(lines)))
-            return
-        self.add(cid, PASS,
-                 "스킬 self-describing 요구 바이너리 충족(requires.bins 선언 스킬 %d개·%s 플랫폼)"
-                 % (checked, plat_kind))
-
-    # ── C51 verdict 단일 머신-SOT (T6-P5 — verdict_schema.json 에서 런타임 로드 + 정합) ──
-    # T1-1/C43 은 리터럴 *드리프트*를 잡았다. T6-P5 는 그 리터럴을 한 소스(verdict_schema.json)에서
-    # *파생*시킨다. C51 은 결정론 검증한다: ① 스키마 파일 존재·유효 JSON ② javis_verdict.py 가
-    # 실제로 스키마를 로드(SCHEMA_LOADED=True, 인라인 폴백이 아님) ③ 스키마 VERDICT_ENUM/SEVERITY/
-    # ISSUE_CONTRACT 가 verdict.py 가 노출하는 값과 일치(스키마↔코드 정합) ④ INVESTIGATE 화해 —
-    # reviewer_enum(4) + validator_emitted([INVESTIGATE]) 가 VERDICT_ENUM(5)을 분할하는지. 코드측
-    # 무결성(self-test)은 C36 에 위임(중복 호출 회피) — 여기선 *스키마 결속*만 본다.
-    def c51_verdict_schema_sot(self):
-        cid = "C51.verdict-schema-sot"
-        if self.skipped(cid):
-            return
-        schema_p = os.path.join(pack_dir(), "schemas", "verdict_schema.json")
-        vbin = os.path.join(pack_dir(), "bin", "javis_verdict.py")
-        if not os.path.isfile(vbin):
-            self.add(cid, WARN, "javis_verdict.py 부재 — verdict 스키마 SOT 검사 보류")
-            return
-        if not os.path.isfile(schema_p):
-            self.add(cid, FAIL, "verdict_schema.json 부재 — 단일 머신-SOT 미설치(T6-P5)")
-            return
-        try:
-            s = json.load(open(schema_p, encoding="utf-8"))
-        except (OSError, ValueError) as e:
-            self.add(cid, FAIL, "verdict_schema.json 유효 JSON 아님: %s" % e)
-            return
-        # ② verdict.py 가 스키마를 실제 로드하는지 — subprocess 격리(import 부작용 회피, c36/c43 패턴).
-        probe = (
-            "import importlib.util,json,sys;"
-            "spec=importlib.util.spec_from_file_location('v',%r);"
-            "v=importlib.util.module_from_spec(spec);spec.loader.exec_module(v);"
-            "print(json.dumps({'loaded':v.SCHEMA_LOADED,'VERDICT_ENUM':list(v.VERDICT_ENUM),"
-            "'SEVERITY_ENUM':list(v.SEVERITY_ENUM),'ISSUE_CONTRACT':list(v.ISSUE_CONTRACT)}))"
-            % vbin
-        )
-        r = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True)
-        if r.returncode != 0:
-            self.add(cid, FAIL, "javis_verdict.py 로드 실패 — %s" % (r.stderr.strip()[:160]))
-            return
-        try:
-            got = json.loads(r.stdout.strip().splitlines()[-1])
-        except (ValueError, IndexError):
-            self.add(cid, FAIL, "verdict.py 스키마 프로브 출력 파싱 불가")
-            return
-        if not got.get("loaded"):
-            self.add(cid, FAIL, "javis_verdict.py 가 verdict_schema.json 을 로드하지 않음 "
-                     "(인라인 폴백 — 단일 SOT 미결속)")
-            return
-        # ③ 스키마↔코드 정합
-        for key in ("VERDICT_ENUM", "SEVERITY_ENUM", "ISSUE_CONTRACT"):
-            if set(s.get(key, [])) != set(got.get(key, [])):
-                self.add(cid, FAIL, "%s 스키마↔코드 불일치 — 스키마:%s / 코드:%s"
-                         % (key, sorted(s.get(key, [])), sorted(got.get(key, []))))
-                return
-        # ④ INVESTIGATE 화해: reviewer_enum(4) + validator_emitted == VERDICT_ENUM(5)
-        rev = set(s.get("reviewer_enum", []))
-        emit = set(s.get("validator_emitted", []))
-        full = set(s.get("VERDICT_ENUM", []))
-        if rev | emit != full or rev & emit:
-            self.add(cid, FAIL, "INVESTIGATE 화해 깨짐 — reviewer_enum∪validator_emitted ≠ "
-                     "VERDICT_ENUM (rev:%s emit:%s full:%s)" % (sorted(rev), sorted(emit), sorted(full)))
-            return
-        if "INVESTIGATE" not in emit or "INVESTIGATE" in rev:
-            self.add(cid, FAIL, "INVESTIGATE 는 validator-only 여야 함 — reviewer_enum 에 누출 또는 "
-                     "validator_emitted 누락")
-            return
-        self.add(cid, PASS,
-                 "verdict 단일 머신-SOT 결속 — verdict_schema.json 로드됨·스키마↔코드 정합 "
-                 "(VERDICT/SEVERITY/ISSUE_CONTRACT)·INVESTIGATE=validator-only 화해 OK")
 
     # ── C09 round 핵심 문서 ──
     def c09_round_core(self):
@@ -1667,7 +1088,7 @@ class Preflight:
             os.chmod(p, 0o755)
         try:
             r = subprocess.run([sys.executable, p, "--self-test"],
-                               capture_output=True, timeout=30)
+                               capture_output=True, timeout=30, env=_utf8_env())
         except Exception as e:
             self.add(cid, FAIL, "%s --self-test 실행 불가: %s" % (fname, e))
             return None
@@ -1695,6 +1116,25 @@ class Preflight:
         p = self._check_bin_tool(cid, "javis_orchestra.py")
         if p:
             self.add(cid, PASS, "%s self-test OK (4종 노드·라운드·제약 주입 검증)" % p)
+
+    # ── C41 스킬 보안·품질 결정론 게이트 (SkillSpector 규칙 stdlib 포트) ──
+    def c41_skillscan(self):
+        cid = "C41.skillscan"
+        if self.skipped(cid):
+            return
+        p = self._check_bin_tool(cid, "javis_skillscan.py",
+                                 extra_files=("skillscan_rules.json",))
+        if p:
+            self.add(cid, PASS, "%s self-test OK (포트 규칙 + fixture recall + verdict 검증)" % p)
+
+    # ── C42 MCP 거버넌스 결정론 게이트 (tool-poisoning·rug-pull) ──
+    def c42_mcpgate(self):
+        cid = "C42.mcpgate"
+        if self.skipped(cid):
+            return
+        p = self._check_bin_tool(cid, "javis_mcpgate.py")
+        if p:
+            self.add(cid, PASS, "%s self-test OK (TP1~3·RP1~3 검증)" % p)
 
     # ── C34 자기기술 능력 레지스트리 (OpenMontage D2 — 하드코딩 목록 폐기·파생 카탈로그) ──
     def c34_registry(self):
@@ -1747,7 +1187,7 @@ class Preflight:
         try:
             if self.fix:
                 r = subprocess.run([sys.executable, orch, "silent-failure-catalog"],
-                                   capture_output=True, timeout=30)
+                                   capture_output=True, timeout=30, env=_utf8_env())
                 if r.returncode == 0:
                     self.add(cid, FIXED, "무음실패 카탈로그 재생성: %s" % cat)
                 else:
@@ -1755,7 +1195,7 @@ class Preflight:
                     self.add(cid, WARN, "무음실패 카탈로그 재생성 실패: %s" % tail[-200:])
                 return
             r = subprocess.run([sys.executable, orch, "silent-failure-catalog", "--check"],
-                               capture_output=True, timeout=30)
+                               capture_output=True, timeout=30, env=_utf8_env())
             if r.returncode == 0:
                 self.add(cid, PASS, "무음실패 카탈로그 정합 (런타임 파생·D5 거버넌스)")
             else:
@@ -1782,7 +1222,7 @@ class Preflight:
         try:
             # --root로 lint 대상을 preflight가 보는 pack에 핀(env 재유도 분기 차단).
             r = subprocess.run([sys.executable, reg, "verify", "--root", pack_dir(), "--json"],
-                               capture_output=True, timeout=30)
+                               capture_output=True, timeout=30, env=_utf8_env())
             data = json.loads((r.stdout or b"").decode("utf-8", "replace") or "{}")
         except Exception as e:
             self.add(cid, WARN, "전제지식 고아 lint 실행 불가 — 보류: %s" % e)
@@ -1807,7 +1247,7 @@ class Preflight:
             return
         try:
             r = subprocess.run([sys.executable, p, "--self-test"],
-                               capture_output=True, timeout=30)
+                               capture_output=True, timeout=30, env=_utf8_env())
         except Exception as e:
             self.add(cid, WARN, "javis_manifest.py --self-test 실행 불가 — 보류: %s" % e)
             return
@@ -1829,7 +1269,7 @@ class Preflight:
         # 자동 수리 없음: 기억 내용은 오너·노드 소관이라 preflight가 임의 재작성하지 않는다.
         try:
             r = subprocess.run([sys.executable, p, "verify", "--json"],
-                               capture_output=True, timeout=15)
+                               capture_output=True, timeout=15, env=_utf8_env())
         except Exception as e:
             self.add(cid, FAIL, "javis_memory verify 실행 불가: %s" % e)
             return
@@ -1871,10 +1311,12 @@ class Preflight:
                 continue
         return False
 
-    def _register_mcp(self, mcp_path, name, binary, env=None):
+    def _register_mcp(self, mcp_path, name, binary, env=None, args=None):
         """프로젝트 .mcp.json에 MCP 서버 등록(merge). 성공=None, 실패=사유.
         binary는 PATH에서 절대경로로 해석해 박는다. env는 그대로 기입
-        (값에 ${VAR}를 쓰면 Claude Code가 세션 환경변수로 전개한다)."""
+        (값에 ${VAR}를 쓰면 Claude Code가 세션 환경변수로 전개한다).
+        args는 list[str](argv 토큰) — uvx 온디맨드 런치처럼 서브커맨드 체인이
+        필요한 stdio 서버용. truthy일 때만 기입(env 경로와 동형, back-compat)."""
         if os.path.islink(mcp_path):
             return "symlink 거부: %s" % mcp_path
         server = shutil.which(binary)
@@ -1894,6 +1336,8 @@ class Preflight:
         entry = {"command": server}
         if env:
             entry["env"] = env
+        if args:
+            entry["args"] = args
         data.setdefault("mcpServers", {})[name] = entry
         # 원자적 쓰기 — settings.json 쓰기와 동일 사유(파손 시 수리 불능 차단).
         tmp = mcp_path + ".tmp"
@@ -1913,6 +1357,436 @@ class Preflight:
         except (OSError, ValueError):
             return False
         return isinstance(cfg, dict) and name in cfg.get("mcpServers", {})
+
+    # ── C43 보조: Serena 활성화(enable/trust) 탐지·write + sub-stage 탐지기 ──
+    # 등록(.mcp.json)은 기계가, 활성화(노드 .claude.json enable/trust)는 사람 전용(denylist).
+    # 기계는 gap을 탐지해 WARN만 내고, _serena_enable_approved() 토큰이 있을 때만 write한다.
+    @staticmethod
+    def _serena_nodes():
+        return [("master", os.path.expanduser("~/.cys/claude/.claude.json"), False),
+                ("worker", os.path.expanduser("~/.claude-cysinsight/.claude.json"), True)]
+
+    @staticmethod
+    def _mcp_enabled(config_path, project_root, name):
+        """(enabled_bool, trust_bool) — 노드 .claude.json의 project별 활성화·신뢰 상태."""
+        try:
+            d = json.load(open(config_path, encoding="utf-8"))
+        except (OSError, ValueError):
+            return (False, False)
+        pe = (d.get("projects", {}) or {}).get(project_root, {}) or {}
+        en = (name in (pe.get("enabledMcpjsonServers", []) or [])) \
+            or bool(pe.get("enableAllProjectMcpServers"))
+        return (en, bool(pe.get("hasTrustDialogAccepted")))
+
+    def _serena_activation_gaps(self):
+        """읽기전용 탐지 — .claude.json 미변경. enable/trust 미충족 항목 리스트."""
+        gaps = []
+        for label, path, needs_trust in self._serena_nodes():
+            if not os.path.isfile(path):
+                continue
+            enabled, trust = self._mcp_enabled(path, SERENA_PROJECT, "serena")
+            if not enabled:
+                gaps.append("%s: enabledMcpjsonServers += 'serena'" % label)
+            if needs_trust and not trust:
+                gaps.append("%s: hasTrustDialogAccepted=true" % label)
+        return gaps
+
+    @staticmethod
+    def _serena_enable_approved():
+        """1회 오너 승인 토큰 — sentinel 파일 OR env. 없으면 절대 .claude.json write 금지."""
+        if os.environ.get("CYS_SERENA_ENABLE_APPROVED") == "1":
+            return True
+        return os.path.isfile(os.path.expanduser("~/.cys/state/serena-enable-approved"))
+
+    def _enable_mcp_server(self, config_path, project_root, name, set_trust=False):
+        """None=ok/no-change, str=사유. denylist write — _serena_enable_approved() True일 때만 호출."""
+        if os.path.islink(config_path):
+            return "symlink 거부: %s" % config_path
+        try:
+            data = json.load(open(config_path, encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            return "파싱 실패 — 거부: %s" % e
+        pr = data.setdefault("projects", {}).setdefault(project_root, {})
+        ml = pr.setdefault("enabledMcpjsonServers", [])
+        changed = False
+        if name not in ml:
+            ml.append(name); changed = True
+        if set_trust and not pr.get("hasTrustDialogAccepted"):
+            pr["hasTrustDialogAccepted"] = True; changed = True
+        if not changed:
+            return None
+        backup = config_path + ".bak-preflight"
+        if not os.path.exists(backup):
+            shutil.copy2(config_path, backup)
+        tmp = config_path + ".tmp"
+        open(tmp, "w", encoding="utf-8").write(
+            json.dumps(data, ensure_ascii=False, indent=2))
+        os.replace(tmp, config_path)
+        return None
+
+    @staticmethod
+    def _serena_reviewer_gap():
+        """S6 sub-stage(detect-only, never write): codex serena-ro 등록·read-only yml 존재 탐지."""
+        toml = os.path.expanduser("~/.codex/config.toml")
+        yml = os.path.join(pack_dir(), "resources", "contexts", "cys-codex-readonly.yml")
+        miss = []
+        if not (os.path.isfile(toml)
+                and "serena-ro" in open(toml, encoding="utf-8", errors="replace").read()):
+            miss.append("codex serena-ro 미등록")
+        if not os.path.isfile(yml):
+            miss.append("cys-codex-readonly.yml 부재")
+        return (" · 리뷰어RO: " + ", ".join(miss)) if miss else ""
+
+    @staticmethod
+    def _serena_memory_isolated():
+        """S8: serena args에 no-memories/no-onboarding 또는 project.yml excluded_tools(메모리)."""
+        try:
+            ent = json.load(open(".mcp.json", encoding="utf-8")) \
+                .get("mcpServers", {}).get("serena", {})
+            a = ent.get("args", []) or []
+            if "no-memories" in a or "no-onboarding" in a:
+                return True
+        except (OSError, ValueError):
+            pass
+        pyml = os.path.join(SERENA_PROJECT, ".serena", "project.yml")
+        if os.path.isfile(pyml):
+            try:
+                txt = open(pyml, encoding="utf-8", errors="replace").read()
+                if "write_memory" in txt or "onboarding" in txt:
+                    return True
+            except OSError:
+                pass
+        return False
+
+    def _serena_governance_gap(self):
+        """S4/S8 sub-stage(detect-only WARN): probe·schedule job·메모리 격리 탐지. auto-register 금지."""
+        miss = []
+        probe = os.path.join(pack_dir(), "bin", "javis_serena_probe.py")
+        if not os.path.isfile(probe):
+            miss.append("probe 부재")
+        else:
+            try:
+                rc = subprocess.run([sys.executable, probe, "--self-test"],
+                                    capture_output=True, timeout=30, env=_utf8_env()).returncode
+                if rc != 0:
+                    miss.append("probe --self-test 실패")
+            except Exception:
+                miss.append("probe --self-test 실행불가")
+        sched = os.path.join(pack_dir(), "schedule.json")
+        try:
+            jobs = json.load(open(sched, encoding="utf-8")).get("jobs", [])
+            if not any(j.get("id") == "serena-heartbeat" for j in jobs):
+                miss.append("serena-heartbeat job 부재(cys schedule add — 사람단계)")
+        except (OSError, ValueError):
+            miss.append("schedule.json 읽기불가")
+        if not self._serena_memory_isolated():
+            miss.append("메모리 미격리(S8 runbook)")
+        return (" · 거버넌스: " + ", ".join(miss)) if miss else ""
+
+    # ── C43 Serena 코드-의미 인덱스 MCP 채택 (등록 + 활성화 탐지 + reviewer/거버넌스 sub-stage) ──
+    # 단일 c43_serena에 등록(기계)·활성화(사람·denylist 탐지)·reviewer RO(S6)·거버넌스/격리(S4/S8)를
+    # sub-stage로 통합한다(별도 c43_ def 금지 = 중복 충돌). 등록≠활성: enable/trust는 사람 전용
+    # (승인 토큰 있을 때만 write). 모든 사람-게이트는 WARN(never FAIL/block). C34~C42 점유 → C43.
+    def c43_serena(self):
+        cid = "C43.serena"
+        if self.skipped(cid):
+            return
+        fixed = []
+        # (a) 게이트: uvx PATH 필수 (Serena는 온디맨드, 미설치)
+        uvx = shutil.which("uvx")
+        if not uvx:
+            self.add(cid, FAIL,
+                     "uvx 미발견 — Serena 심볼 네비게이션 불가. uv/uvx 설치 후 재시도")
+            return
+        # (b) MCP 등록 — 등록 .mcp.json 디렉터리 = enable-key root 일치 필수(§1.4). CYSjavis는
+        #     NOT git(실측)이라 c24의 .git 게이트만으론 영영 미등록 → cwd가 SERENA_PROJECT면
+        #     .git 없이도 등록(P0.5 결정: 등록 스코프를 SERENA_PROJECT cwd로 확장, 무관 cwd는 제외).
+        mcp_note = ""
+        mcp_err = False
+        cwd = os.path.abspath(".")
+        if cwd == SERENA_PROJECT or os.path.exists(".git"):
+            if not self._mcp_registered(".mcp.json", "serena"):
+                if self.fix:
+                    err = self._register_mcp(".mcp.json", "serena", "uvx",
+                                             args=list(SERENA_STDIO_ARGS))
+                    if err:
+                        mcp_note = " · MCP 등록 실패: %s" % err
+                        mcp_err = True
+                    else:
+                        fixed.append("./.mcp.json에 serena 등록(uvx args)")
+                else:
+                    mcp_note = " · ./.mcp.json MCP 미등록(--fix로 등록 가능)"
+        else:
+            mcp_note = (" · 등록 스코프 밖(cwd≠SERENA_PROJECT·.git 없음 · §1.5 P0.5) — "
+                        "SERENA_PROJECT cwd에서 preflight 실행 필요")
+        # (c) S5 Layer-0 assert: --context claude-code 무료 steering args가 실제 등록됐는지
+        if self._mcp_registered(".mcp.json", "serena"):
+            try:
+                a = json.load(open(".mcp.json", encoding="utf-8")) \
+                    .get("mcpServers", {}).get("serena", {}).get("args", []) or []
+                if "claude-code" not in a:
+                    mcp_note += " · ⚠ --context claude-code 누락(S5 steering inert)"
+            except (OSError, ValueError):
+                pass
+        # (d) 활성화·신뢰 — 사람 전용(denylist). 기계는 상태만 알리고 명시 토큰 있을 때만 write.
+        gaps = self._serena_activation_gaps()   # 읽기전용 탐지, .claude.json 미변경
+        if gaps and self.fix and self._serena_enable_approved():
+            for label, path, needs_trust in self._serena_nodes():
+                if os.path.isfile(path):
+                    self._enable_mcp_server(path, SERENA_PROJECT, "serena",
+                                            set_trust=needs_trust)
+            gaps = self._serena_activation_gaps()   # 재탐지(멱등 검증)
+            if not gaps:
+                fixed.append("노드 .claude.json serena 활성화(승인 토큰)")
+        # (e) reviewer(codex) read-only 탐지 — S6 sub-stage (detect-only, never write)
+        rev_note = self._serena_reviewer_gap()
+        # (f) 거버넌스·격리 탐지 — S4/S8 sub-stage (detect-only WARN)
+        gov_note = self._serena_governance_gap()
+        suffix = (" · " + "; ".join(fixed)) if fixed else ""
+        tail = mcp_note + rev_note + gov_note + suffix
+        if mcp_err:
+            self.add(cid, WARN, "serena(uvx)%s" % tail)
+            return
+        if gaps:
+            self.add(cid, WARN,
+                     "serena 등록됨%s · 미활성: %s — 사람 단계(노드 .claude.json 편집·cys feed push 승인)"
+                     % (tail, "; ".join(gaps)))
+            return
+        self.add(cid, FIXED if fixed else PASS, "serena(uvx) · 등록+활성 OK%s" % tail)
+
+    # ── C44 Serena crossover eval 하베스터 게이트 (S7) ──
+    # 분석기 javis_serena_eval.py 의 --self-test(기계 게이트)는 FAIL 할 수 있으나(코드 결함),
+    # 루브릭 작성·핀·측정 실행은 사람-게이트(master STEP1 PREP + worker serena 마운트=human-hold)
+    # → 미populate/미핀은 WARN-not-FAIL. C43 다음 free id = C44(C34~C42·C43 점유).
+    def c44_serena_eval(self):
+        cid = "C44.serena-eval"
+        if self.skipped(cid):
+            return
+        p = self._check_bin_tool(cid, "javis_serena_eval.py")
+        if not p:
+            return  # _check_bin_tool 이 이미 FAIL 등록(harness 결함)
+        rubric = os.path.join(SERENA_PROJECT, "_round", "SERENA_EVAL_RUBRIC.json")
+        if not os.path.isfile(rubric):
+            self.add(cid, WARN, "eval harness self-test OK · 루브릭 부재"
+                     "(_round/SERENA_EVAL_RUBRIC.json) — 사람단계(master STEP1 PREP)")
+            return
+        try:
+            rb = json.load(open(rubric, encoding="utf-8"))
+            tasks = rb.get("tasks", []) or []
+            unpinned = [t.get("id") for t in tasks if not t.get("ground_truth_diff_sha")]
+        except (OSError, ValueError) as e:
+            self.add(cid, WARN, "eval harness self-test OK · 루브릭 파싱 실패: %s" % e)
+            return
+        if unpinned:
+            self.add(cid, WARN,
+                     "eval harness self-test OK · 루브릭 미populate(%d task ground_truth_diff_sha=null)·미핀 "
+                     "— 측정 선행=worker serena 마운트(human-hold) + master cys attest pin" % len(unpinned))
+            return
+        self.add(cid, PASS, "eval harness self-test OK · 루브릭 populate·존재(측정은 master LOCKED launcher)")
+
+    # ── C45 semver strictly-newer 비교 도구 (AgentReach PHIL-07 — 신규 *옵션* advisory·WARN-only) ──
+    # _check_bin_tool 아님: 그건 부재·self-test 실패를 FAIL로 만든다. javis_semver.py 는 순수
+    # advisory(재시작·발행 0행동)이고 즉시 소비자가 적은 신규 opt-in 도구라 boot-blocker가
+    # 아니다 → 부재=WARN(C40 패턴 동형). self-test 가 strictly-newer 불변식(반사·반대칭·전이·
+    # main-ahead 회귀) 박제가 깨지지 않았나를 결정론으로 잠근다(PHIL-03 도구 *건강* 핀).
+    def c45_semver_selftest(self):
+        cid = "C45.semver-selftest"
+        if self.skipped(cid):
+            return
+        p = os.path.join(pack_dir(), "bin", "javis_semver.py")
+        if not os.path.isfile(p):
+            self.add(cid, WARN, "javis_semver.py 부재 — strictly-newer 버전 비교 advisory 미설치"
+                     "(opt-in·자율주행 ESCALATE 게이트 보완)")
+            return
+        try:
+            r = subprocess.run([sys.executable, p, "--self-test"],
+                               capture_output=True, timeout=30, env=_utf8_env())
+        except Exception as e:
+            self.add(cid, WARN, "javis_semver.py --self-test 실행 불가 — 보류: %s" % e)
+            return
+        if r.returncode == 0:
+            self.add(cid, PASS, "javis_semver.py self-test OK (strictly-newer 불변식 박제·"
+                     "main-ahead 거부·fail-safe·무점수·advisory only)")
+        else:
+            tail = (r.stdout or r.stderr or b"").decode("utf-8", "replace").strip()
+            self.add(cid, WARN, "javis_semver.py self-test 실패(도구 점검 필요) — %s" % tail[-200:])
+
+    # ── C46 bias_check CI 게이트 실배선 (AgentReach OPP-16 GO조건 — 계약 박제 aspirational→실배선) ──
+    # bias_check.py(engine No-Site-Name 린터)는 SKILL.md·주석 참조뿐 어디서도 호출 안 됨(grep 0건)
+    # 이라 "계약을 테스트로 박제"가 권고에 머물렀다. preflight C-check가 engine 에 대해 직접
+    # 호출해 게이트로 강제한다 — PHIL-07 성립의 실배선부. 신규 utf8 린트 *규칙 자체*는 bias_check.py
+    # 소관(다른 작업), 본 C46는 preflight가 그 린터를 게이트로 *돌리는* 배선만이다. WARN-first
+    # (부재·위반 모두 WARN) — 규칙이 안정화 중이라 boot-blocker로 만들지 않는다(SkillSpector 선례).
+    def c46_bias_check(self):
+        cid = "C46.bias-check"
+        if self.skipped(cid):
+            return
+        engine = os.path.join(pack_dir(), "skills", "insane-search", "engine")
+        bc = os.path.join(engine, "bias_check.py")
+        if not os.path.isfile(bc):
+            self.add(cid, WARN, "bias_check.py 부재(%s) — No-Site-Name CI 린터 미설치(opt-in)" % bc)
+            return
+        try:
+            # --root = 스킬 루트(engine 의 부모). bias_check 가 engine/·references/ 를 스캔한다.
+            skill_root = os.path.dirname(engine)
+            r = subprocess.run([sys.executable, bc, "--root", skill_root],
+                               capture_output=True, timeout=30, env=_utf8_env())
+        except Exception as e:
+            self.add(cid, WARN, "bias_check 실행 불가 — 보류: %s" % e)
+            return
+        if r.returncode == 0:
+            self.add(cid, PASS, "bias_check OK (engine No-Site-Name·인코딩 린터 게이트 통과)")
+        else:
+            tail = (r.stdout or r.stderr or b"").decode("utf-8", "replace").strip()
+            self.add(cid, WARN, "bias_check 위반 검출(규칙 안정화 중 WARN-first) — %s" % tail[-300:])
+
+    # ── C47 URL→자막/전사 단일 채널 글루 (OPP-09 — 존재·자기검증 결정론) ──
+    # AGENTREACH OPP-09: transcribe_channel.py 부재면 "URL→자막/전사 단일 채널"이 없어 에이전트가
+    # 매번 산문으로 자막/ASR 분기를 재추론(환각 표면)한다. build.rs 가 skills/ 를 자동 walk 임베드하므로
+    # PACK 수동 등재는 불요 — 여기선 존재 + --self-test 만 결정론 검증한다(LLM 재추론 금지).
+    def c47_transcribe_channel(self):
+        cid = "C47.transcribe-channel"
+        if self.skipped(cid):
+            return
+        p = os.path.join(pack_dir(), "skills", "transcription", "bin", "transcribe_channel.py")
+        if not os.path.isfile(p):
+            self.add(cid, WARN, "transcribe_channel.py 부재(%s) — URL→자막/전사 단일 채널 미설치(OPP-09)" % p)
+            return
+        try:
+            r = subprocess.run([sys.executable, p, "--self-test"],
+                               capture_output=True, timeout=30, env=_utf8_env())
+        except Exception as e:
+            self.add(cid, WARN, "transcribe_channel --self-test 실행 불가 — 보류: %s" % e)
+            return
+        if r.returncode == 0:
+            self.add(cid, PASS, "transcribe_channel self-test OK (자막우선·ASR폴백·channel_trace 박제)")
+        else:
+            tail = (r.stdout or r.stderr or b"").decode("utf-8", "replace").strip()
+            self.add(cid, FAIL, "transcribe_channel --self-test 실패: %s" % tail[-400:])
+
+    # ── C48 콘텐츠 채널 의존성 dormant/absent 디스크 신호 (OPP-10 — 부작용0·결정론) ──
+    # AGENTREACH OPP-10: insane-search 우회 의존성(curl_cffi/yt-dlp/playwright)을
+    # "잠자는(dormant·디스크 흔적 있음) vs 부재(absent·흔적 없음)"로 부작용0 디스크 신호로
+    # 선분류한다. engine/disk_signal.py(stdlib only·네트워크0·import 미실행)를 서브프로세스로
+    # 호출 — preflight 계약(표준 라이브러리만·네트워크0) 불변. ABSENT=WARN(우회 의존성은 graceful
+    # degrade·선택사항이라 부트 비차단), READY_DORMANT=PASS, UNKNOWN=WARN(런타임 probe 필요).
+    # --fix 자동 pip install 금지 — 설치는 CSO 승인·OPP-17 Mutation 게이트 경유.
+    def c48_content_channel_deps(self):
+        cid = "C48.content-channel-deps"
+        if self.skipped(cid):
+            return
+        engine = os.path.join(pack_dir(), "skills", "insane-search", "engine")
+        ds = os.path.join(engine, "disk_signal.py")
+        if not os.path.isfile(ds):
+            self.add(cid, WARN, "disk_signal.py 부재(%s) — dormant/absent 디스크 신호 미설치(OPP-10)" % ds)
+            return
+        # stdlib only·네트워크0·import 미실행(find_spec) — preflight 계약 준수.
+        driver = (
+            "import json,sys; sys.path.insert(0, %r); "
+            "import disk_signal as d; print(json.dumps(d.content_dep_signals()))"
+            % engine
+        )
+        try:
+            r = subprocess.run([sys.executable, "-c", driver],
+                               capture_output=True, timeout=20, env=_utf8_env())
+        except Exception as e:
+            self.add(cid, WARN, "disk_signal 실행 불가 — 보류: %s" % e)
+            return
+        if r.returncode != 0:
+            tail = (r.stdout or r.stderr or b"").decode("utf-8", "replace").strip()
+            self.add(cid, WARN, "disk_signal 신호 판독 실패(런타임 probe 필요) — %s" % tail[-300:])
+            return
+        try:
+            sigs = json.loads((r.stdout or b"{}").decode("utf-8", "replace"))
+        except Exception as e:
+            self.add(cid, WARN, "disk_signal 출력 파싱 실패 — %s" % e)
+            return
+        dormant, absent, unknown = [], [], []
+        for dep, sig in sorted(sigs.items()):
+            av = (sig or {}).get("avail")
+            if av == "ready_dormant":
+                dormant.append(dep)
+            elif av == "absent":
+                absent.append(dep)
+            else:
+                unknown.append(dep)
+        detail = "dormant=%s absent=%s unknown=%s" % (
+            ",".join(dormant) or "-", ",".join(absent) or "-", ",".join(unknown) or "-")
+        if absent or unknown:
+            # 우회 의존성은 선택사항·graceful degrade → FAIL 아닌 WARN(부트 비차단).
+            self.add(cid, WARN,
+                     "콘텐츠 채널 의존성 일부 미흔적/판독불가(우회 graceful degrade·부트 비차단) — %s "
+                     "· 설치는 CSO 승인·OPP-17 게이트 경유(자동 pip install 금지)" % detail)
+        else:
+            self.add(cid, PASS, "콘텐츠 채널 의존성 전부 dormant(디스크 흔적 존재) — %s" % detail)
+
+    # ── C49 콘텐츠 채널 per-channel 헬스 doctor (AGENTREACH OPP-02) ──
+    # javis_channels.py 가 배선됐고 self-test(네트워크0·집계/verdict/permutation/429비종결/tier
+    # enum 박제)를 통과하나만 결정론 검증. 실제 채널 타격은 cron(OPP-06 watch)이 담당 —
+    # C49 는 부트에서 네트워크 안 침(부트 결정론·속도 보존). coverage_battery 함정 봉인:
+    # self-test 는 battery 부재 시 UNKNOWN graceful 을 박제하므로 배포 머신(tests-제외)에서도 통과.
+    def c49_channel_health(self):
+        cid = "C49.channel-health"
+        if self.skipped(cid):
+            return
+        p = self._check_bin_tool(cid, "javis_channels.py")
+        if p:
+            self.add(cid, PASS, "%s self-test OK (2-pass·tier enum·429비종결·permutation·트랩봉인 박제) "
+                     "— 채널 생존은 cron watch 참조(배선만 보증)" % p)
+
+    # ── C50 silence-first 콘텐츠 채널 watch (AGENTREACH OPP-06) ──
+    # javis_channel_watch.py 배선·self-test(네트워크0·diff/2-strike/silence-first/snapshot
+    # round-trip 박제) 결정론 검증. 채널건강≠노드건강(javis_report 와 별개 층위·중복 회피).
+    def c50_channel_watch(self):
+        cid = "C50.channel-watch"
+        if self.skipped(cid):
+            return
+        p = self._check_bin_tool(cid, "javis_channel_watch.py")
+        if p:
+            self.add(cid, PASS, "%s self-test OK (2-strike·diff·silence-first·atomic snapshot 박제) "
+                     "— cron 미등록은 사람 결정(자율 설치 안 함)" % p)
+
+    # ── C51 클린룸 벤더링 무결성 게이트 (AGENTREACH OPP-19 — NEVER-modify-upstream 자동강제) ──
+    # javis_cleanroom.py 의 self-test 가 vendor 변이검증(1바이트 tamper→DRIFTED·삭제→MISSING·
+    # 미핀→UNPINNED·snapshot 승인게이트 exit3)을 박제하나만 결정론 검증. 라이브 트리 vendor-check
+    # 는 빌드/SOT 머신 소관(REPO_ROOT 부재 시 환각 회피) — C51 은 "도구·자기공격 박제됐나"만 본다.
+    def c51_cleanroom_vendor(self):
+        cid = "C51.cleanroom-vendor"
+        if self.skipped(cid):
+            return
+        p = self._check_bin_tool(cid, "javis_cleanroom.py")
+        if p:
+            self.add(cid, PASS, "%s self-test OK (벤더링 5상태 분류·1바이트 변이→DRIFTED 자기공격·"
+                     "snapshot owner 승인게이트 박제)" % p)
+
+    # ── C52 THIRD_PARTY/NOTICE 라이선스 추적 게이트 (AGENTREACH OPP-20 — AGPL copyleft 박사님 승인) ──
+    # 동일 javis_cleanroom.py self-test 가 라이선스 변이검증(MIT vendored=ACCEPT·AGPL embed=
+    # ESCALATE·unknown SPDX=BLOCK·SPDX 정규화)을 박제하나만 검증. AGPL 은 박사님 승인됨 →
+    # copyleft 추적·ESCALATE 큐잉(부트 비차단). C51 과 동일 도구라 self-test 1회로 양쪽 보증.
+    def c52_license_gate(self):
+        cid = "C52.license-gate"
+        if self.skipped(cid):
+            return
+        p = os.path.join(pack_dir(), "bin", "javis_cleanroom.py")
+        if not os.path.isfile(p):
+            self.add(cid, FAIL, "javis_cleanroom.py 부재 — C51 과 동일 도구(`cys init-pack`)")
+            return
+        # C51 이 이미 self-test 를 돌렸으므로 여기선 존재만 재확인(중복 subprocess 회피·외과적).
+        self.add(cid, PASS, "javis_cleanroom.py license self-test 박제 OK (MIT=ACCEPT·AGPL embed="
+                 "ESCALATE·unknown SPDX=BLOCK·정규화) — AGPL copyleft 추적(박사님 승인·ESCALATE 큐잉)")
+
+    # ── C53 관찰 명령 부작용 금지 멱등성 봉인 (AGENTREACH OPP-21) ──
+    # javis_idempotency.py self-test 가 spy/AST 배터리를 결정론 실행: cmd_check 관찰멱등
+    # (calls∩MUTATE=∅ negative assertion)·C12.daemon fix=False Popen 0·coverage_battery
+    # 관찰전용(POST/--cookies/yt-dlp 다운로드 토큰 AST 부재)·표면커버리지(cys actions⊆OBSERVE∪MUTATE).
+    def c53_idempotency(self):
+        cid = "C53.idempotency"
+        if self.skipped(cid):
+            return
+        p = self._check_bin_tool(cid, "javis_idempotency.py")
+        if p:
+            self.add(cid, PASS, "%s self-test OK (관찰 멱등성 봉인 — cmd_check negative assertion·"
+                     "C12.daemon fix=False Popen 0·coverage_battery AST 관찰전용·표면커버리지)" % p)
 
     def _register_nlm_mcp(self, mcp_path):
         return self._register_mcp(mcp_path, "notebooklm-mcp", "notebooklm-mcp")
@@ -2002,7 +1876,16 @@ class Preflight:
                      % (root, len(HARNESS_KEY_FILES)))
             return
         dst = os.path.join(os.path.expanduser("~"), ".cys/harness-creator")
-        if self.fix and shutil.which("git"):
+        if self.mode in ("dry", "safe"):
+            # OPP-17: git clone 은 external_install(전역 디렉터리 신설·사실상 비가역) → 미리보기/무변경.
+            self.may_mutate(cid, "subprocess_install", "git clone %s → %s" % (HARNESS_REPO, dst),
+                            "harness-creator 툴체인 git clone(핀 %s)" % HARNESS_PIN[:8],
+                            denylist_class="external_install")
+            return
+        if self.fix and shutil.which("git") and self.may_mutate(
+                cid, "subprocess_install", "git clone %s → %s" % (HARNESS_REPO, dst),
+                "harness-creator 툴체인 git clone(핀 %s)" % HARNESS_PIN[:8],
+                denylist_class="external_install"):
             try:
                 ok = subprocess.run(["git", "clone", HARNESS_REPO, dst],
                                     capture_output=True, timeout=300).returncode == 0
@@ -2154,7 +2037,16 @@ class Preflight:
         # FAIL 없이 통과하던 무성 폴스루를 차단하고, 설치 후 버전을 재탐침한다.
         if cli is None or ver is None or ver < KLAW_MIN_VERSION:
             cur = ".".join(map(str, ver)) if ver else "미설치/판독불가"
-            if self.fix and shutil.which("npm"):
+            if self.mode in ("dry", "safe"):
+                # OPP-17: npm install -g 은 external_install(전역 환경 변경·사실상 비가역) → 미리보기/무변경.
+                self.may_mutate(cid, "subprocess_install", "npm install -g %s" % KLAW_PIN,
+                                "korean-law MCP CLI 전역 설치(핀 %s)" % KLAW_PIN,
+                                denylist_class="external_install")
+                return
+            if self.fix and shutil.which("npm") and self.may_mutate(
+                    cid, "subprocess_install", "npm install -g %s" % KLAW_PIN,
+                    "korean-law MCP CLI 전역 설치(핀 %s)" % KLAW_PIN,
+                    denylist_class="external_install"):
                 try:
                     if subprocess.run(["npm", "install", "-g", KLAW_PIN],
                                       capture_output=True, timeout=600).returncode == 0:
@@ -2422,54 +2314,6 @@ class Preflight:
                 os.makedirs(d, exist_ok=True)
         arr = data.setdefault("hooks", {}).setdefault("PreToolUse", [])
         arr.append({"matcher": "Edit|Write|NotebookEdit",
-                    "hooks": [{"type": "command", "command": cmd}]})
-        tmp = settings_path + ".tmp"
-        open(tmp, "w", encoding="utf-8").write(
-            json.dumps(data, ensure_ascii=False, indent=2))
-        os.replace(tmp, settings_path)
-        return None
-
-    # ── 역할-능력 GATE hook 등록 (appbuild-gate 등록과 동형 — PreToolUse 차단 클래스) ──
-    # role-capability-gate.sh 를 PreToolUse(matcher Edit|Write|NotebookEdit|MultiEdit|Bash)로 등록.
-    # 멱등: command 경로에 스크립트명이 들어간 PreToolUse 엔트리가 이미 있으면 재등록 안 함.
-    @staticmethod
-    def _capgate_hook_registered(settings_path):
-        try:
-            data = json.load(open(settings_path, encoding="utf-8"))
-        except (OSError, ValueError):
-            return False
-        if not isinstance(data, dict):
-            return False
-        for entry in data.get("hooks", {}).get("PreToolUse", []):
-            for h in entry.get("hooks", []):
-                if CAPGATE_HOOK in h.get("command", ""):
-                    return True
-        return False
-
-    def _register_capgate_hook(self, settings_path):
-        """PreToolUse(Edit|Write|NotebookEdit|MultiEdit|Bash)로 능력 GATE hook 등록.
-        성공=None, 실패=사유. _register_appbuild_hook 과 동일 규약(symlink 거부·파싱실패 거부·백업·원자적)."""
-        if os.path.islink(settings_path):
-            return "symlink 거부: %s" % settings_path
-        script = os.path.join(pack_dir(), "hooks", CAPGATE_HOOK)
-        cmd = ("bash " if os.name == "nt" else "sh ") + script
-        data = {}
-        if os.path.isfile(settings_path):
-            try:
-                data = json.load(open(settings_path, encoding="utf-8"))
-            except (OSError, ValueError) as e:
-                return "기존 settings.json 파싱 실패 — 거부: %s" % e
-            if not isinstance(data, dict):
-                return "settings.json 루트가 객체가 아님 — 거부"
-            backup = settings_path + ".bak-preflight"
-            if not os.path.exists(backup):
-                shutil.copy2(settings_path, backup)
-        else:
-            d = os.path.dirname(settings_path)
-            if d:
-                os.makedirs(d, exist_ok=True)
-        arr = data.setdefault("hooks", {}).setdefault("PreToolUse", [])
-        arr.append({"matcher": CAPGATE_HOOK_MATCHER,
                     "hooks": [{"type": "command", "command": cmd}]})
         tmp = settings_path + ".tmp"
         open(tmp, "w", encoding="utf-8").write(
@@ -2765,6 +2609,44 @@ class Preflight:
             return
         self.add(cid, PASS, "격리 config dir 라우터 설치됨 · 사용자 프로필 외부 체계 오염 없음")
 
+    # ── C54 god-file 회귀 방지 LOC-cap (cysd 코어 파일 줄수 ceiling 감시) ──
+    def c54_loc_cap(self):
+        cid = "C54.loc-cap"
+        if self.skipped(cid):
+            return
+        # cys-terminal 소스 경로 추정: CYS_REPO_DIR env 우선, 없으면 관용 경로 후보.
+        # 경로 부재면 SKIP(이 preflight는 pack 부트용 — repo 부재 환경에서 FAIL 금지).
+        repo = os.environ.get("CYS_REPO_DIR")
+        candidates = [repo] if repo else []
+        candidates += [os.path.join(os.path.expanduser("~"), "dev", "cys-terminal")]
+        root = next((c for c in candidates if c and os.path.isdir(
+            os.path.join(c, "src", "bin", "cysd"))), None)
+        if not root:
+            self.add(cid, SKIP, "cys-terminal 소스 경로 미발견(CYS_REPO_DIR 미설정·repo 부재) — pack 단독 부트 정상")
+            return
+        # 대상 파일별 ceiling — 회귀 경보용 초기 상한(현재값+여유). 순수화로 줄면 따라 낮춰
+        # god-file을 한 방향으로 압박(후행: ceiling 점진 강화). 형식: (모듈상대경로, ceiling).
+        caps = [
+            ("src/bin/cysd/handlers.rs", 5300),
+            ("src/bin/cysd/governance.rs", 2000),
+            ("src/bin/cysd/state.rs", 2700),
+        ]
+        over = []
+        for rel, cap in caps:
+            p = os.path.join(root, rel)
+            try:
+                with open(p, encoding="utf-8") as f:
+                    n = f.read().count("\n") + 1  # 마지막 줄 EOF 보정
+            except OSError:
+                continue  # 파일 부재(리네임 등)는 건너뜀 — 존재 검증은 별 체크 소관
+            if n > cap:
+                over.append("%s %d줄 > ceiling %d" % (rel, n, cap))
+        if over:
+            # 외부발행·삭제 없는 경보라 --fix 무관(자동수리 불가) — WARN로 보고.
+            self.add(cid, WARN, "god-file ceiling 초과(순수화로 분리 권장): " + "; ".join(over))
+        else:
+            self.add(cid, PASS, "cysd 코어 파일 LOC-cap 이내(%d개 감시)" % len(caps))
+
     def run(self):
         self.c01_pack_dir()
         self.c02_directives()
@@ -2808,36 +2690,57 @@ class Preflight:
         self.c38_silent_failure_catalog()
         self.c39_prereq_orphan_lint()
         self.c40_workflow_manifest()
-        self.c41_reference_integrity()
-        self.c42_cleanroom()
-        self.c43_verdict_literals()
-        self.c44_kind_enum_parity()
-        self.c45_statedb()
-        self.c46_session_ensure()
-        self.c47_capability_guard()
-        self.c48_governance_hardening()
-        self.c49_onboarding_catalog()
-        self.c50_skill_requirements()
-        self.c51_verdict_schema_sot()
+        self.c41_skillscan()
+        self.c42_mcpgate()
+        self.c43_serena()
+        self.c44_serena_eval()
+        self.c45_semver_selftest()
+        self.c46_bias_check()
+        self.c47_transcribe_channel()
+        self.c48_content_channel_deps()
+        self.c49_channel_health()
+        self.c50_channel_watch()
+        self.c51_cleanroom_vendor()
+        self.c52_license_gate()
+        self.c53_idempotency()
+        self.c54_loc_cap()
         return self.results
 
 
 def main():
     ap = argparse.ArgumentParser(description="CYSJavis 결정론 부트 프리플라이트")
     ap.add_argument("--fix", action="store_true", help="수리 가능한 항목 자동 수리")
+    # OPP-17: --fix 의 시스템 변경을 단일 Mutation 게이트로 수렴.
+    ap.add_argument("--dry-run", action="store_true",
+                    help="변경 없이 --fix 가 무엇을 할지 미리보기('[dry-run] Would …')")
+    ap.add_argument("--safe", action="store_true",
+                    help="시스템 무변경 — 무엇이 빠졌는지만(생산/공용 머신)")
+    ap.add_argument("--allow-irreversible", action="store_true",
+                    help="--fix 에서 전역 설치(npm -g·git clone) 집행 허용(기본=WARN-first 보류)")
     ap.add_argument("--json", action="store_true", help="JSON 출력")
     ap.add_argument("--skip", action="append", default=[], metavar="ID",
                     help="해당 검사 건너뜀 (예: --skip C12.daemon)")
     args = ap.parse_args()
 
-    pf = Preflight(fix=args.fix, skips=args.skip)
+    if args.safe and (args.dry_run or args.fix):
+        ap.error("--safe 는 --dry-run/--fix 와 동시 사용 불가")
+    if args.dry_run and args.fix:
+        ap.error("--dry-run 은 --fix 와 동시 사용 불가")
+    mode = ("safe" if args.safe else "dry" if args.dry_run
+            else "fix" if args.fix else "report")
+
+    pf = Preflight(fix=args.fix, skips=args.skip, mode=mode,
+                   allow_irreversible=args.allow_irreversible)
     results = pf.run()
     fails = sum(1 for r in results if r["status"] == FAIL)
     warns = sum(1 for r in results if r["status"] == WARN)
+    # dry/safe: "변경했나"가 아니라 "변경이 필요한가"를 보고 — planned 비어있지 않으면 변경 예정.
+    planned_change = any(p["cid"] for p in pf.planned)
 
     if args.json:
         print(json.dumps(
             {"ok": fails == 0, "fails": fails, "warns": warns,
+             "mode": mode, "planned": pf.planned,
              "pack_dir": pack_dir(), "checks": results},
             ensure_ascii=False, indent=2,
         ))
@@ -2845,11 +2748,25 @@ def main():
         for r in results:
             print("[%s] %s — %s" % (r["status"], r["id"], r["detail"]))
         print("─" * 60)
-        verdict = "READY (프로젝트 시작 준비 완료)" if fails == 0 else "NOT READY"
-        print("preflight: %s — FAIL %d · WARN %d · 검사 %d"
-              % (verdict, fails, warns, len(results)))
+        if mode in ("dry", "safe"):
+            tag = "DRY-RUN(미리보기)" if mode == "dry" else "SAFE(무변경 진단)"
+            print("preflight[%s]: 비가역 외부설치 예정 %d건 · FAIL %d · WARN %d · 검사 %d"
+                  % (tag, len(pf.planned), fails, warns, len(results)))
+            if pf.planned:
+                print("위 [DRYRUN]/[SAFE-GAP] 항목 = 비가역 external_install 변경 대상(--allow-irreversible 주의).")
+            print("※ 가역 로컬 변경(soul/hook/settings/todo 등)은 이 모드에서 self.fix=False 로 "
+                  "일괄 비집행 — 개별 미리보기는 비가역 외부설치 항목에 한정된다.")
+        else:
+            verdict = "READY (프로젝트 시작 준비 완료)" if fails == 0 else "NOT READY"
+            print("preflight: %s — FAIL %d · WARN %d · 검사 %d"
+                  % (verdict, fails, warns, len(results)))
+            if fails:
+                print("FAIL 항목을 수리하고 재실행하라. 이 출력 외의 추론으로 READY를 선언하지 마라.")
+    # 종료코드: dry/safe = 0(변경 불필요)·2(변경 예정)·1(진단 FAIL). report/fix = 기존 계약 불변.
+    if mode in ("dry", "safe"):
         if fails:
-            print("FAIL 항목을 수리하고 재실행하라. 이 출력 외의 추론으로 READY를 선언하지 마라.")
+            return 1
+        return 2 if planned_change else 0
     return 0 if fails == 0 else 1
 
 

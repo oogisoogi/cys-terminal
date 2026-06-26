@@ -75,10 +75,16 @@ HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
 FENCED_CODE_RE = re.compile(r"```.*?```", re.S)
 
 # 추가형 cys: 블록 — 전부 선택. 모르는 키는 통과(미래 내성)하되 점수류 키는 금지(아래 SCORE_KEY_RE).
-CYS_LIST_KEYS = ("requires_skills", "fallback_skills", "related_memory")
-CYS_SCALAR_KEYS = ("capability", "stability", "best_for", "cost_class")
+CYS_LIST_KEYS = ("requires_skills", "fallback_skills", "related_memory", "known_blocks")
+CYS_SCALAR_KEYS = ("capability", "stability", "best_for", "cost_class", "channel_tier")
 VALID_STABILITY = ("stable", "beta", "experimental", "deprecated")
 VALID_COST_CLASS = ("light", "wall-heavy", "context-heavy")  # 달러 없음(Max전용)
+# channel_tier = 인증부담(auth-burden) enum — cost_tier(달러)와 별 축. 정수(0/1/2) 금지:
+# L177-179 점수-우회 스캔이 한자리 정수를 걸러내므로 enum 문자열로 자연 회피한다(reward-hack 이중차단 불간섭).
+#   open = 무인증(공개 API·yt-dlp·정적 HTML) / tls = 자격증명 1회(쿠키·토큰·키) / auth = 상시 브라우저 세션
+VALID_CHANNEL_TIER = ("open", "tls", "auth")
+# known_blocks = 정직한 차단 실측 — platform:YYYY-MM-DD:symptom (날짜=실측일만·환각0). 리스트라 점수 스캔 자연 회피.
+KNOWN_BLOCK_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*:\d{4}-\d{2}-\d{2}:[a-z0-9][a-z0-9 ._-]*$")
 SCORE_KEY_RE = re.compile(r"score|grade|rating", re.I)
 
 
@@ -253,6 +259,12 @@ def build_catalog(pack_dir):
         cc = cys.get("cost_class")
         if cc is not None and cc not in VALID_COST_CLASS:
             problems.append("%s: cost_class 무효(%r) — %s" % (name, cc, "|".join(VALID_COST_CLASS)))
+        ct = cys.get("channel_tier")
+        if ct is not None and ct not in VALID_CHANNEL_TIER:
+            problems.append("%s: channel_tier 무효(%r) — %s" % (name, ct, "|".join(VALID_CHANNEL_TIER)))
+        for blk in _as_list(cys.get("known_blocks")):
+            if not KNOWN_BLOCK_RE.match(blk):
+                problems.append("%s: known_blocks 형식 불량(%r) — platform:YYYY-MM-DD:symptom" % (name, blk))
         # orphan lint — requires/fallback skill 실재? related_memory 색인 존재?
         for key in ("requires_skills", "fallback_skills"):
             for ref in _as_list(cys.get(key)):
@@ -488,6 +500,33 @@ def self_test():
         _write_skill(td, "bad-enum", cys_lines=["stability: awesome"])
         if not any("stability 무효" in p for p in build_catalog(td)[1]):
             failures.append("stability enum 위반 미검출")
+        # OPP-08 정상: channel_tier(enum) + known_blocks(실측) → problems 0 · rec에 두 필드 방출
+        with tempfile.TemporaryDirectory(prefix="javis-reg-opp08-") as td2:
+            os.makedirs(os.path.join(td2, "memory"))
+            open(os.path.join(td2, "memory", INDEX_FILE), "w", encoding="utf-8").write("# MEMORY.md\n")
+            _write_skill(td2, "ch-ok", cys_lines=[
+                "channel_tier: tls", "known_blocks: [reddit:2026-06-25:403-waf]"])
+            cat2, probs2 = build_catalog(td2)
+            if probs2:
+                failures.append("정상 channel_tier/known_blocks인데 problems 보고: %s" % probs2)
+            rec2 = next((r for r in cat2["capabilities"] if r["id"] == "skill:ch-ok"), {})
+            if rec2.get("channel_tier") != "tls":
+                failures.append("channel_tier 방출 누락/불일치: %r" % rec2.get("channel_tier"))
+            if rec2.get("known_blocks") != ["reddit:2026-06-25:403-waf"]:
+                failures.append("known_blocks 방출 누락/불일치: %r" % rec2.get("known_blocks"))
+            # 거짓양성 회귀(중요): channel_tier enum 값이 점수-우회 스캔에 안 걸려야(정수tier 폐기 근거)
+            fm_ok = parse_frontmatter(
+                "---\nname: x\ndescription: d\ncys:\n  channel_tier: open\n---\n본문\n")
+            if fm_ok["_score_violation"]:
+                failures.append("channel_tier enum이 점수-우회 스캔에 거짓양성(정수tier였다면 발생)")
+        # OPP-08 고장A: 무효 channel_tier
+        _write_skill(td, "ch-bad-tier", cys_lines=["channel_tier: paid"])
+        if not any("channel_tier 무효" in p for p in build_catalog(td)[1]):
+            failures.append("channel_tier enum 위반 미검출")
+        # OPP-08 고장B: known_blocks 형식 불량(날짜 없음)
+        _write_skill(td, "ch-bad-block", cys_lines=["known_blocks: [reddit-no-date]"])
+        if not any("known_blocks 형식 불량" in p for p in build_catalog(td)[1]):
+            failures.append("known_blocks 형식 위반 미검출")
         # 잠금 잔류 없어야
         if os.path.exists(os.path.join(td, CATALOG_REL) + ".lock"):
             failures.append("잠금파일 잔류")

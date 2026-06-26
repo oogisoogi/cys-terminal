@@ -44,7 +44,11 @@ import sys
 #       "fact_check": {"cross_checked": bool},
 #       "evidence":   {"quote": "...", "snapshot_path": "...", "context_entailment": "support"|"contradict"},
 #       "logic":      {"verdict_json": "{\"verdict\":\"PASS\",\"reason\":\"...\"}"},
-#       "quality":    {"eval_improved": bool}
+#       "quality":    {"eval_improved": bool},
+#       "efficiency": {"tokens_saved": num>=0, "baseline_tokens": num>0,    # 선택(부재/빈=SKIP)
+#                      "measured_by": "<실제 토크나이저 id>", "accuracy_retained": true}
+#                      # 정확도(quality.eval_improved) 통과 후에만 평가 · 선언 시 malformed=DENY(fail-CLOSED)
+#                      # · 크기 채점 안 함(무결성만; 채점=javis_rsi injected-only)
 #   },
 #   "verdicts": [ {"dimension":"fact_check","model_family":"gemini","verdict":"PASS"}, ... ]
 # }
@@ -185,6 +189,30 @@ def gate(inp):
     if not (dims.get("quality") or {}).get("eval_improved"):
         return "[내용우수성] benchmark 실측 우위 없음(측정 없는 '더 나음' = 환각)"
 
+    # 효율(토큰) — **정확도(quality.eval_improved) 통과 후에만** 평가(순서 load-bearing: 정확도
+    # 회귀 시 토큰 win 으로 절대 인정 안 됨). 차원 부재/빈=SKIP(효율 주장 없음, 하위호환).
+    # 선언 시 fail-CLOSED: 크기 채점이 아니라 주장 shape+accuracy_retained 무결성만 검증
+    # (작은 양의 절감도 인정; 크기 채점=javis_rsi injected-only). '내용 삭제로 효율 보이기' 차단.
+    eff = dims.get("efficiency")
+    if eff:                                  # None·빈 dict = SKIP
+        if not isinstance(eff, dict):
+            return "[효율] efficiency 차원이 dict 아님 — fail-CLOSED"
+        ts = eff.get("tokens_saved")
+        bl = eff.get("baseline_tokens")
+        mb = eff.get("measured_by")
+        ar = eff.get("accuracy_retained")
+        if not isinstance(ts, (int, float)) or isinstance(ts, bool) \
+                or not isinstance(bl, (int, float)) or isinstance(bl, bool) \
+                or not (isinstance(mb, str) and mb.strip()) or not isinstance(ar, bool):
+            return ("[효율] 필드 누락/형식오류(tokens_saved 수>=0·baseline_tokens 수>0·"
+                    "measured_by 비빈 str·accuracy_retained bool) — fail-CLOSED")
+        if bl <= 0:
+            return "[효율] baseline_tokens<=0 — 비율 산출 불가"
+        if ts < 0:
+            return "[효율] tokens_saved<0 — 음수 절감은 효율 학습 아님"
+        if ar is not True:
+            return "[효율] accuracy_retained=False — 정확도 미보존 절감은 reward-hack(내용 삭제) 차단"
+
     # ⑤ 의미·논리 독립 모델 패밀리 verdict 확인(공통모드 차단) — 결정론 통과 후에만.
     producer = str(inp.get("producer_model_family", "")).lower()
     verdicts = inp.get("verdicts") or []
@@ -294,6 +322,27 @@ def self_test():
     expect("confirmed snapshot 누락 DENY", d, False)
     d = cbase(); d["dimensions"]["evidence"]["snapshot_path"] = "/other-file"
     expect("confirmed snapshot_path≠snapshot.path DENY", d, False)
+
+    # ★U4 효율 차원 (정확도-우선 순서·fail-CLOSED·크기 미채점)
+    eff_ok = {"tokens_saved": 1500, "baseline_tokens": 5000,
+              "measured_by": "tiktoken/o200k_base", "accuracy_retained": True}
+    expect("efficiency 부재 allow(하위호환)", copy.deepcopy(base), True)
+    d = copy.deepcopy(base); d["dimensions"]["efficiency"] = dict(eff_ok)
+    expect("efficiency valid allow", d, True)
+    d = copy.deepcopy(base); d["dimensions"]["efficiency"] = dict(eff_ok, tokens_saved=1)
+    expect("efficiency 작은 양의 절감도 allow(크기 미채점)", d, True)
+    d = copy.deepcopy(base); d["dimensions"]["efficiency"] = dict(eff_ok, accuracy_retained=False)
+    expect("efficiency accuracy_retained=False DENY(reward-hack 차단)", d, False)
+    d = copy.deepcopy(base); d["dimensions"]["efficiency"] = dict(eff_ok, baseline_tokens=0)
+    expect("efficiency baseline_tokens=0 DENY", d, False)
+    d = copy.deepcopy(base); d["dimensions"]["efficiency"] = dict(eff_ok, tokens_saved=-5)
+    expect("efficiency tokens_saved<0 DENY", d, False)
+    d = copy.deepcopy(base); d["dimensions"]["efficiency"] = {"tokens_saved": 100, "baseline_tokens": 5000,
+                                                              "measured_by": "", "accuracy_retained": True}
+    expect("efficiency measured_by 빈 DENY(fail-CLOSED)", d, False)
+    d = copy.deepcopy(base); d["dimensions"]["quality"]["eval_improved"] = False
+    d["dimensions"]["efficiency"] = dict(eff_ok)
+    expect("quality 미충족 + efficiency present DENY(정확도-우선 순서)", d, False)
 
     return 1 if fails else 0
 

@@ -192,6 +192,14 @@ fn collect_for(
         return;
     };
 
+    // (4a) resume 핀: 발견한 transcript에서 session_id를 1회 stash (is_none 가드).
+    // 한번 잡으면 고정 — mtime 흔들림·동일 cwd 동시세션의 오핀을 방어한다.
+    if s.agent_session_id.lock().unwrap().is_none() {
+        if let Some(sid) = extract_session_id(agent, &path) {
+            *s.agent_session_id.lock().unwrap() = Some(sid);
+        }
+    }
+
     // tail 상태 초기화/전환: 경로가 바뀌었으면 파일 끝 창에서 새로 시작
     let need_reset = tails.get(&s.id).map(|t| t.path != path).unwrap_or(true);
     if need_reset {
@@ -285,6 +293,9 @@ fn collect_for(
         if !msgs.is_empty() {
             let today = chrono::Local::now().format("%Y-%m-%d").to_string();
             let sess = path.to_string_lossy().into_owned();
+            // D3: role(조직 단위 tier) 캐싱 — consumption/analytics 락 잡기 전에 1회(데드락 회피).
+            // s.role은 Option<String> — None(미부여 노드)은 ""로 환원, summarize가 "unattributed"로 정규화.
+            let role = s.role.lock().unwrap().clone().unwrap_or_default();
             let mut c = daemon.consumption.lock().unwrap();
             let alog = daemon.analytics.lock().unwrap(); // 일관 락 순서: consumption→analytics
             for m in msgs {
@@ -298,7 +309,7 @@ fn collect_for(
                 // T7 E1-3: 영속 — 재시작에도 보존(부트 시 리플레이). 실패는 무해.
                 if let Some(conn) = alog.as_ref() {
                     crate::analytics::record_usage(
-                        conn, &sess, agent, &m.model, m.input_tokens, m.output,
+                        conn, &sess, &role, agent, &m.model, m.input_tokens, m.output,
                         m.cache_creation, m.cache_read, cost, now,
                     );
                 }
@@ -497,6 +508,31 @@ fn rollout_first_line_cwd(path: &Path) -> Option<String> {
         .as_str()
         .or_else(|| v["cwd"].as_str())
         .map(|s| s.to_string())
+}
+
+/// (4a) 트랜스크립트 경로에서 agent transcript session_id 추출. claude=파일명 stem, codex=첫줄 payload.id.
+/// gemini/agy는 세션파일 포맷 미확인이라 None → boot에서 --continue fallback(회귀 없음).
+pub(crate) fn extract_session_id(agent: &str, path: &Path) -> Option<String> {
+    match agent {
+        "claude" => path.file_stem().and_then(|s| s.to_str()).map(String::from),
+        "codex" => {
+            let f = std::fs::File::open(path).ok()?;
+            let mut line = String::new();
+            std::io::BufReader::new(f).read_line(&mut line).ok()?;
+            let v: Value = serde_json::from_str(&line).ok()?;
+            v["payload"]["id"].as_str().map(String::from)
+        }
+        _ => None,
+    }
+}
+
+/// (4a) 세션 발견 + id 추출 묶음 진입점 — discover_session_file로 PathBuf를 얻어 extract_session_id.
+/// stash 경로(collect_for)는 이미 발견한 path에 extract_session_id를 직접 적용하므로 현재 미소비.
+/// 재발견 없이 id만 필요한 외부 호출(전용 RPC 등) 대비 진입점.
+#[allow(dead_code)]
+pub(crate) fn discover_session_id(s: &Arc<Surface>, agent: &str, bin: &str) -> Option<String> {
+    let path = discover_session_file(s, agent, bin)?;
+    extract_session_id(agent, &path)
 }
 
 fn mtime_epoch(p: &Path) -> f64 {

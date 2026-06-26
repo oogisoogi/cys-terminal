@@ -510,9 +510,10 @@ def resolve_manifest_phase(manifest, phase_id):
         return None, []
 
 
-def build_task_ticket(task, scope, success, to_role, rules, output_format=None, prereq_block="", dont=None):
+def build_task_ticket(task, scope, success, to_role, rules, output_format=None, prereq_block="", dont=None, tier_hint=None):
     """위임 티켓 본문 생성. rules는 필수 — 호출자가 추출 성패를 알고 명시 주입한다
-    (기본값 경유의 무경고 폴백 경로 제거 · self-test는 rules 주입으로 밀폐 검증)."""
+    (기본값 경유의 무경고 폴백 경로 제거 · self-test는 rules 주입으로 밀폐 검증).
+    tier_hint(R2 1단계): 권장 실행 등급 정보 1줄(강제 아님·None이면 라인 부재 → byte-identical)."""
     bullets = rules
     lines = []
     lines.append("[작업 위임 — 절대 강조 4규칙 포함 · work management 앵커]")
@@ -526,6 +527,8 @@ def build_task_ticket(task, scope, success, to_role, rules, output_format=None, 
         lines.append("성공 기준(완료 보고는 이 기준 대비 검증 결과를 포함하라): %s" % success)
     if output_format:
         lines.append("산출 형식(이 형식·구조로 산출하라 — W8 4-part output-format): %s" % output_format)
+    if tier_hint:
+        lines.append("권장 실행 등급(정보·강제 아님 — 작업 난이도 참고용): %s" % tier_hint)
     lines.append("")
     lines.append("절대 강조 4규칙 (WORKER_DIRECTIVE §3 — 모든 작업에 적용·위반 금지):")
     lines.extend("  " + b for b in bullets)
@@ -553,30 +556,34 @@ def cmd_task_prompt(args):
         return 2
     # 생존 게이트 (절대지침 5차-1): "워커가 정상 작동하는 것을 확인한 후 작업 지시를 내린다"
     # — 이 확인은 눈대중이 아니라 cys status의 agent_alive로만 확정한다.
-    status = cys_status()
-    if status is None:
-        print("[task-prompt] cys status 수집 실패(데몬 미가동?) — `cys ping` 확인 후 재실행. "
-              "대상 생존 미확인 상태로는 티켓을 내지 않는다.", file=sys.stderr)
-        return 2
-    if not live_roles(status).get(args.to):
-        print("[task-prompt] 대상 '%s' 미기동 — 티켓 미출력. `cys boot`(4종 의무 기동) 또는 "
-              "`cys launch-agent --role %s --agent claude`로 기동 후 재실행하라."
-              % (args.to, args.to), file=sys.stderr)
-        return 1
-    # '정상 작동' 보조 신호: 장기 idle(기본 5분 — CYS_IDLE_SECONDS와 동기)은 hang일 수
-    # 있다 — 차단은 아니고 경고만(지시 대기 중인 워커도 idle이므로 alive가 결정 기준,
-    # idle은 §5 능동 점검 트리거). 같은 role의 죽은 stale surface는 건너뛴다.
-    try:
-        idle_thr = int(os.environ.get("CYS_IDLE_SECONDS", "300"))
-    except ValueError:
-        idle_thr = 300
-    for s in status.get("surfaces", []):
-        if s.get("role") == args.to and s.get("agent_alive"):
-            idle = s.get("idle_secs")
-            if isinstance(idle, (int, float)) and idle >= idle_thr:
-                print("[task-prompt] 주의: '%s' idle %d초 — hang 여부를 read-screen으로 "
-                      "확인 후 전송하라(§5 능동 점검)." % (args.to, int(idle)), file=sys.stderr)
-            break
+    # ★일회용(fresh) 경로 예외(D5/B2): --no-survival-gate면 생략한다 — 워커 surface는 실행 시점에
+    #   schedule --fresh가 worker-fresh-*로 생성(+디렉티브 주입)하므로 지금 생존 확인은 의미가 없다.
+    #   (raw pane 주입이 아니라 디렉티브 주입 워커이므로 무계약·치명 결함 위험 없음.)
+    if not getattr(args, "no_survival_gate", False):
+        status = cys_status()
+        if status is None:
+            print("[task-prompt] cys status 수집 실패(데몬 미가동?) — `cys ping` 확인 후 재실행. "
+                  "대상 생존 미확인 상태로는 티켓을 내지 않는다.", file=sys.stderr)
+            return 2
+        if not live_roles(status).get(args.to):
+            print("[task-prompt] 대상 '%s' 미기동 — 티켓 미출력. `cys boot`(4종 의무 기동) 또는 "
+                  "`cys launch-agent --role %s --agent claude`로 기동 후 재실행하라."
+                  % (args.to, args.to), file=sys.stderr)
+            return 1
+        # '정상 작동' 보조 신호: 장기 idle(기본 5분 — CYS_IDLE_SECONDS와 동기)은 hang일 수
+        # 있다 — 차단은 아니고 경고만(지시 대기 중인 워커도 idle이므로 alive가 결정 기준,
+        # idle은 §5 능동 점검 트리거). 같은 role의 죽은 stale surface는 건너뛴다.
+        try:
+            idle_thr = int(os.environ.get("CYS_IDLE_SECONDS", "300"))
+        except ValueError:
+            idle_thr = 300
+        for s in status.get("surfaces", []):
+            if s.get("role") == args.to and s.get("agent_alive"):
+                idle = s.get("idle_secs")
+                if isinstance(idle, (int, float)) and idle >= idle_thr:
+                    print("[task-prompt] 주의: '%s' idle %d초 — hang 여부를 read-screen으로 "
+                          "확인 후 전송하라(§5 능동 점검)." % (args.to, int(idle)), file=sys.stderr)
+                break
     rules = extract_worker_rules()
     if rules is None:
         print("[task-prompt] 경고: WORKER_DIRECTIVE '절대 강조 4규칙' 추출 실패 또는 "
@@ -593,7 +600,8 @@ def cmd_task_prompt(args):
         os.path.join(pack_dir(), "memory"))
     print(build_task_ticket(args.task, args.scope, success, args.to, rules=rules,
                             output_format=getattr(args, "output_format", None),
-                            prereq_block=prereq, dont=getattr(args, "dont", None)))
+                            prereq_block=prereq, dont=getattr(args, "dont", None),
+                            tier_hint=getattr(args, "tier", None)))
     return 0
 
 
@@ -1110,6 +1118,20 @@ def cmd_silent_failure_catalog(args):
     return 0
 
 
+def cmd_channel_health(args):
+    """AGENTREACH OPP-02 — 콘텐츠 채널 per-channel 헬스(노드 헬스 check 의 짝).
+    javis_channels.py 를 subprocess 호출(사람판=silence-first·기계판=--json). check 가
+    부트 노드(cso/worker/agy/codex) 생존을, channel-health 가 콘텐츠 채널 도달성을 본다."""
+    tool = os.path.join(pack_dir(), "bin", "javis_channels.py")
+    if not os.path.isfile(tool):
+        print("[channel-health] javis_channels.py 부재 — `cys init-pack`", file=sys.stderr)
+        return 2
+    chans = list(getattr(args, "channels", []) or [])
+    flag = "--json" if getattr(args, "json", False) else "--silence-first"
+    r = subprocess.run([sys.executable, tool, flag] + chans)
+    return r.returncode
+
+
 def cmd_self_test(args):
     """순수 로직 자기검증 (cys 의존 없음) — preflight C19가 호출. assert 실패는 exit 1."""
     try:
@@ -1354,6 +1376,12 @@ def cmd_self_test(args):
         assert _td.index("무접촉(절대") > _td.index("범위(이 파일"), "무접촉 라인이 범위 앞에 옴"
         assert _td.index("무접촉(절대") < _td.index("절대 강조 4규칙 (WORKER"), \
             "무접촉 라인 위치 오류(범위 직후·4규칙 섹션 앞이어야 — do/don't 인접)"
+        # tier_hint 무접촉(R2 1단계) — tier_hint=None byte-identical 회귀 + 주입·비강제 실증
+        _tt = build_task_ticket("T", "S", "C", "worker", FALLBACK_RULES, tier_hint=None)
+        assert _tt == _t1, "tier_hint 기본값(None)이 기존 티켓을 변형(byte-identical 깨짐)"
+        assert "권장 실행 등급" not in _tt, "tier_hint 미지정 시 등급 라인 누출"
+        _th = build_task_ticket("T", "S", "C", "worker", FALLBACK_RULES, tier_hint="heavy")
+        assert "권장 실행 등급" in _th and "heavy" in _th, "--tier 등급 라인 미주입"
         # resolver 해소/미해소/주석제외 (격리 tempdir 색인)
         import tempfile as _tf2
         with _tf2.TemporaryDirectory(prefix="javis-orch-d6-") as _td2:
@@ -1448,6 +1476,12 @@ def main():
     tp.add_argument("--dont", default=None,
                     help="무접촉(do-not-touch) — 워커가 절대 수정·삭제·리팩터·포맷하지 말 "
                          "파일/영역(외과적 변경 음의 경계·4대 행동지침③). 미지정 시 티켓 byte-동일")
+    tp.add_argument("--tier", default=None,
+                    help="권장 실행 등급 정보 1줄 주입(trivial/standard/heavy — 강제 아님·R2 1단계·"
+                         "javis_route suggested_node와 정합). 미지정 시 티켓 byte-동일")
+    tp.add_argument("--no-survival-gate", action="store_true",
+                    help="생존 게이트 생략(D5 일회용 fresh 경로 — 워커 surface가 실행 시점에 생성될 때만). "
+                         "평시 위임엔 쓰지 마라(상시 워커 생존 확인이 안전).")
 
     pp = sub.add_parser("phase-plan",
                         help="Task를 자기완결 Phase 티켓으로 분해 (영상 N6 — Task/Phase 순차)")
@@ -1485,6 +1519,11 @@ def main():
     sfc.add_argument("--check", action="store_true",
                      help="재생성 없이 디스크 카탈로그가 SILENT_FAILURES와 정합인지 드리프트 검사(불일치=exit 1)")
 
+    ch = sub.add_parser("channel-health",
+                        help="콘텐츠 채널 per-channel 헬스(OPP-02) — 노드 check 의 짝(콘텐츠 채널 도달성)")
+    ch.add_argument("--json", action="store_true", help="기계판(verdict 배열) — 기본은 silence-first")
+    ch.add_argument("channels", nargs="*", help="부분집합(예: reddit x). 비우면 전체")
+
     args = ap.parse_args()
     return {
         "check": cmd_check,
@@ -1498,6 +1537,7 @@ def main():
         "gate-status": cmd_gate_status,
         "next-action": cmd_next_action,
         "silent-failure-catalog": cmd_silent_failure_catalog,
+        "channel-health": cmd_channel_health,
     }[args.cmd](args)
 
 

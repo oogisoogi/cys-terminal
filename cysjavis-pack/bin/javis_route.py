@@ -39,7 +39,8 @@
     python3 <이 파일> --resolve-manifest /path/to/workflow-folder
 
 출력 (stdout, JSON):
-    {"mode": "slow", "matched_token": "박사급으로", "group": "slow.quality"}
+    {"mode": "slow", "matched_token": "박사급으로", "group": "slow.quality",
+     "tier": "heavy", "tier_token": "박사급으로", "suggested_node": "master"}   # tier 3키는 slow일 때만
     {"mode": "deliberate", "matched_token": "교차검증해서", "group": "deliberate.quality"}
     {"mode": "fast", "matched_token": null, "group": null}
 
@@ -59,6 +60,7 @@ TRIGGER_FILENAMES = ("route_triggers.json", "_slow_triggers.json")
 
 MODES = ("slow", "deliberate")  # 검사 순서 = 우선순위
 GROUPS = ("path", "quality")
+TIER_GROUPS = ("trivial", "heavy")  # slow 작업 실행 등급. standard는 미매칭 기본값(토큰 없음)
 
 # 문장 경계: ASCII + 한국어 문서에 흔한 전각 부호
 SENTENCE_BOUNDARY = set(".,!?\n") | set("。，！？；：…")
@@ -97,6 +99,17 @@ def normalize_schema(raw) -> dict:
             g = {}
         out[mode] = {grp: _clean_tokens(g.get(grp, [])) for grp in GROUPS}
     return out
+
+
+def normalize_tier_schema(raw) -> dict:
+    """tier 키만 추출해 {grade: [tokens]}로 환원. tier 부재·오염도 크래시 없이 흡수.
+    mode 정규화(normalize_schema)와 독립 — tier는 세 번째 MODE가 아니라 별개 축이다."""
+    if not isinstance(raw, dict):
+        return {g: [] for g in TIER_GROUPS}
+    t = raw.get("tier")
+    if not isinstance(t, dict):
+        t = {}
+    return {g: _clean_tokens(t.get(g, [])) for g in TIER_GROUPS}
 
 
 def _is_at_sentence_start(text: str, idx: int) -> bool:
@@ -150,6 +163,43 @@ def route(request: str, triggers) -> dict:
                         "group": "%s.%s" % (mode, group),
                     }
     return {"mode": "fast", "matched_token": None, "group": None}
+
+
+def route_tier(request: str, triggers) -> dict:
+    """slow 작업의 실행 노드 등급 판정 (R1). mode와 직교(독립 축) — tier 추가는 mode 판정에 영향 0.
+    검사 순서 = heavy > trivial(고난도가 사소함을 이긴다 — 안전: 모호하면 무겁게).
+    미매칭 = standard(보수 기본). route()와 동일한 문장경계 매칭(_find_trigger 재사용)."""
+    norm = request.lower().strip()
+    tier_tokens = normalize_tier_schema(triggers)
+    for grade in ("heavy", "trivial"):     # heavy 우선(과소발화 안전)
+        for token in tier_tokens[grade]:
+            if _find_trigger(norm, token):
+                return {"tier": grade, "tier_token": token}
+    return {"tier": "standard", "tier_token": None}
+
+
+def suggested_node_for(tier: str, agents) -> "str | None":
+    """tier 등급 → 권장 노드(agents.json _tier_nodes 결정론 소비·P1).
+    부재/오염 시 None(힌트 없음·과소발화). heavy=master(Opus 상주)·강등 경로 없음."""
+    if not isinstance(agents, dict):
+        return None
+    tn = agents.get("_tier_nodes")
+    if not isinstance(tn, dict):
+        return None
+    entry = tn.get(tier)
+    if isinstance(entry, dict):
+        node = entry.get("node")
+        return node if isinstance(node, str) and node else None
+    return None
+
+
+def _load_agents() -> dict:
+    """agents.json 로드(best-effort) — bin/ 옆 ../agents.json. 부재·오염 시 {} (suggested_node None)."""
+    p = SCRIPT_DIR.parent / "agents.json"
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
 
 
 def validate_config(raw) -> list:
@@ -222,6 +272,35 @@ def self_test() -> int:
         except Exception as e:  # noqa: BLE001 — self-test는 모든 크래시를 결함으로 보고
             failures.append("logic: 오염 스키마 %r 크래시: %s" % (garbage, e))
 
+    # tier 판정(mode와 직교) — heavy 우선·미매칭 standard·slow 무관 독립 (R1 회귀배터리)
+    tier_synth = {"tier": {"trivial": ["간단히"], "heavy": ["박사급으로"]}}
+    if route_tier("박사급으로 해줘", tier_synth)["tier"] != "heavy":
+        failures.append("tier: heavy 매칭 실패")
+    if route_tier("간단히 정리", tier_synth)["tier"] != "trivial":
+        failures.append("tier: trivial 매칭 실패")
+    if route_tier("그냥 해줘", tier_synth)["tier"] != "standard":
+        failures.append("tier: 미매칭 standard 실패")
+    # heavy 우선 — heavy 토큰을 문장 경계에 둬야 _find_trigger가 인정(reviewer 교정)
+    if route_tier("박사급으로 간단히", tier_synth)["tier"] != "heavy":
+        failures.append("tier: heavy 우선 실패")
+    # tier 추가가 mode 판정을 오염시키지 않는다(직교 박제)
+    if route("박사급으로 분석", synth)["mode"] != "slow":
+        failures.append("tier: mode 회귀(tier 오염)")
+    # suggested_node: _tier_nodes 소비·부재 시 None(과소발화)
+    _an = {"_tier_nodes": {"heavy": {"node": "master"}, "trivial": {"node": "worker"}}}
+    if suggested_node_for("heavy", _an) != "master":
+        failures.append("tier: suggested_node heavy 실패")
+    if suggested_node_for("standard", _an) is not None:
+        failures.append("tier: 미정의 tier가 None이 아님")
+    if suggested_node_for("heavy", {}) is not None:
+        failures.append("tier: _tier_nodes 부재가 None이 아님")
+    # normalize_tier_schema 오염 흡수(크래시 금지) — tier 부재·비dict
+    for _g in (None, [], {"tier": 3}, {"tier": {"heavy": "str"}}):
+        try:
+            route_tier("아무 말", _g)
+        except Exception as e:  # noqa: BLE001
+            failures.append("tier: 오염 스키마 %r 크래시: %s" % (_g, e))
+
     # 배포 트리거 파일 구조 검증
     tp = default_triggers_path()
     config_checked = False
@@ -238,7 +317,7 @@ def self_test() -> int:
 
     print(json.dumps({
         "self_test": "ok" if not failures else "fail",
-        "logic_cases": len(cases) + 8,
+        "logic_cases": len(cases) + 8 + 12,  # 8 기존 비-cases + 12 tier 배터리(R1)
         "config_checked": str(tp) if config_checked else None,
         "failures": failures,
     }, ensure_ascii=False, indent=2))
@@ -305,6 +384,13 @@ def main() -> int:
         return 3
 
     result = route(args.request, triggers)
+    if result["mode"] == "slow":
+        # tier·suggested_node는 slow일 때만 의미(deliberate/fast엔 노드등급 개념 없음·P1).
+        # 새 키는 slow에만 추가 — mode만 읽던 소비자는 모르는 키 무시(단계적 배포 안전).
+        tinfo = route_tier(args.request, triggers)
+        result["tier"] = tinfo["tier"]
+        result["tier_token"] = tinfo["tier_token"]
+        result["suggested_node"] = suggested_node_for(tinfo["tier"], _load_agents())
     print(json.dumps(result, ensure_ascii=False))
     return 0
 

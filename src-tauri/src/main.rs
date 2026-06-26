@@ -166,6 +166,133 @@ async fn list_surfaces(socket: Option<String>) -> Result<Value, String> {
     rpc_on(&resolve_socket(&socket), "surface.list", json!({})).await
 }
 
+/// org.status 브리지 — 사이드바 라이브 신호(B3)·command palette(07) 공유 소스.
+#[tauri::command]
+async fn org_status(socket: Option<String>) -> Result<Value, String> {
+    rpc_on(&resolve_socket(&socket), "org.status", json!({})).await
+}
+
+/// 풀 비경유 일회성 RPC — org_fleet fan-out 전용. timeout 취소가 발생해도 이 연결만 드롭(폐기)되어
+/// 공유 풀(conn_cell)을 desync로 오염시키지 않는다(같은 부서로 가는 send_key/org_status 응답 귀속 보호).
+/// 적대검증 R-1 교정: rpc_on을 timeout으로 감싸면 취소 시 풀 연결이 미수신 응답을 남겨 후속 RPC가
+/// stale 응답을 잘못 읽는다 — 일회성 연결은 드롭이 곧 연결 종료라 공유 상태를 건드리지 않는다.
+async fn rpc_oneshot(socket: &std::path::Path, method: &str, params: Value) -> Result<Value, String> {
+    let req = json!({"id": 1, "method": method, "params": params});
+    let mut line = serde_json::to_vec(&req).map_err(|e| e.to_string())?;
+    line.push(b'\n');
+    let mut stream = connect_to(socket).await?;
+    stream.write_all(&line).await.map_err(|e| e.to_string())?;
+    stream.flush().await.map_err(|e| e.to_string())?;
+    let mut reader = BufReader::new(stream);
+    let mut resp = String::new();
+    let n = reader.read_line(&mut resp).await.map_err(|e| e.to_string())?;
+    if n == 0 {
+        return Err("connection closed".into());
+    }
+    let resp: Value = serde_json::from_str(resp.trim()).map_err(|e| e.to_string())?;
+    if resp["ok"].as_bool() == Some(true) {
+        Ok(resp["result"].clone())
+    } else {
+        Err(resp["error"]["message"]
+            .as_str()
+            .unwrap_or("unknown error")
+            .to_string())
+    }
+}
+
+/// Tasks Control Center — 모든 부서의 모든 노드를 한 콜로 집계한다("부서 다중소켓 보드").
+/// depts.json을 읽어 본부(기본 소켓)+각 부서 소켓에 org.status를 순회 호출하고, 부서 라벨을
+/// 호출자(여기)에서 주입한다(단일 데몬은 자기가 어느 부서인지 모름 — socket_slug 사상과 동일).
+/// 데몬은 outbound 클라이언트가 없어 집계는 이 Tauri 층(기존 rpc_on)에서 한다. 도달 실패 부서는
+/// 드롭하지 않고 error로 표기한다(박사님이 "부서가 죽었다"를 봐야 함). 부서 수가 적어(4~6) 순차
+/// 호출이며 부서별 2초 timeout으로 hung 부서가 전체 함대를 막지 않는다.
+#[tauri::command]
+async fn org_fleet() -> Result<Value, String> {
+    use std::time::Duration;
+    // (소켓, name, display_name) — 본부 먼저, 그다음 depts.json 등록순.
+    let mut targets: Vec<(std::path::PathBuf, String, String)> =
+        vec![(default_socket(), "_hq".to_string(), "본부 · CEO".to_string())];
+    if let Ok(reg) = list_depts() {
+        if let Some(depts) = reg.get("depts").and_then(|d| d.as_object()) {
+            for (name, meta) in depts {
+                let sock = meta
+                    .get("socket")
+                    .and_then(|s| s.as_str())
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| dept_socket_path(name));
+                let disp = meta
+                    .get("display_name")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or(name)
+                    .to_string();
+                targets.push((sock, name.clone(), disp));
+            }
+        }
+    }
+    let mut departments: Vec<Value> = Vec::new();
+    for (sock, name, display_name) in targets {
+        let slug = sock_slug(&sock);
+        let socket_str = sock.to_string_lossy().to_string();
+        // R-1 교정: 공유 풀(rpc_on) 대신 일회성 연결(rpc_oneshot) — timeout 취소가 풀을 오염시키지 않게.
+        let call =
+            tokio::time::timeout(Duration::from_secs(2), rpc_oneshot(&sock, "org.status", json!({})))
+                .await;
+        let base = json!({"name": name, "display_name": display_name,
+                          "socket": socket_str, "socket_slug": slug});
+        let entry = match call {
+            Ok(Ok(status)) => {
+                let mut o = base;
+                let m = o.as_object_mut().unwrap();
+                m.insert(
+                    "surfaces".into(),
+                    status.get("surfaces").cloned().unwrap_or_else(|| json!([])),
+                );
+                m.insert(
+                    "paused".into(),
+                    status.get("paused").cloned().unwrap_or(json!(false)),
+                );
+                o
+            }
+            Ok(Err(e)) => {
+                let mut o = base;
+                let m = o.as_object_mut().unwrap();
+                m.insert("error".into(), json!(e));
+                m.insert("surfaces".into(), json!([]));
+                o
+            }
+            Err(_) => {
+                let mut o = base;
+                let m = o.as_object_mut().unwrap();
+                m.insert("error".into(), json!("timeout"));
+                m.insert("surfaces".into(), json!([]));
+                o
+            }
+        };
+        departments.push(entry);
+    }
+    Ok(json!({ "departments": departments }))
+}
+
+/// Tasks Control Center 실시간성: depts.json의 모든 부서 소켓에 이벤트 forwarder를 보장한다
+/// (멱등 — 이미 도는 forwarder는 no-op). 앱 시작 시엔 기본 소켓 forwarder만 떠 있어(setup),
+/// 이미 가동 중인 부서 데몬의 task.changed/status.changed가 UI로 안 흐를 수 있다 — 작업 탭이
+/// 열릴 때 1회 호출해 전 부서 실시간 push를 보장한다.
+#[tauri::command]
+fn ensure_dept_forwarders(app: AppHandle) {
+    if let Ok(reg) = list_depts() {
+        if let Some(depts) = reg.get("depts").and_then(|d| d.as_object()) {
+            for (name, meta) in depts {
+                let sock = meta
+                    .get("socket")
+                    .and_then(|s| s.as_str())
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| dept_socket_path(name));
+                spawn_event_forwarder(app.clone(), sock);
+            }
+        }
+    }
+}
+
 #[tauri::command]
 async fn control_dashboard() -> Result<Value, String> {
     rpc("control.dashboard", json!({})).await
@@ -179,6 +306,11 @@ async fn control_analytics(window: Option<String>) -> Result<Value, String> {
 #[tauri::command]
 async fn control_skills(window: Option<String>) -> Result<Value, String> {
     rpc("control.skills", json!({ "window": window })).await
+}
+
+#[tauri::command]
+async fn control_cost_baseline(window: Option<String>) -> Result<Value, String> {
+    rpc("control.cost_baseline", json!({ "window": window })).await
 }
 
 #[tauri::command]
@@ -293,6 +425,129 @@ fn open_path(path: String) -> Result<(), String> {
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let r = std::process::Command::new("xdg-open").arg(&path).spawn();
     r.map(|_| ()).map_err(|e| e.to_string())
+}
+
+/// HUD-2: 외부 URL HARD 화이트리스트 — https만·도메인 allowlist(코드 봉인). 통과 시 Ok(spawn 없음·테스트 가능).
+/// url crate 부재 → 수동 host 파싱(https:// strip → 첫 '/' 전 host, userinfo(@)·port(:) 제거 = 위장 host 차단).
+fn url_host_allowed(url: &str) -> Result<(), String> {
+    const ALLOW: &[&str] = &["notebooklm.google.com", "github.com", "afhi.org"];
+    let rest = url.strip_prefix("https://").ok_or_else(|| "https only".to_string())?;
+    // authority는 첫 '/', '?'(query), '#'(fragment) 전까지(RFC 3986) — query/fragment 사칭 우회 차단.
+    let authority = rest.split(|c: char| c == '/' || c == '?' || c == '#').next().unwrap_or("");
+    let host = authority.rsplit('@').next().unwrap_or(authority); // userinfo(@) 제거 — 위장 host 차단
+    let host = host.split(':').next().unwrap_or(host); // port 제거
+    if ALLOW.iter().any(|d| host == *d || host.ends_with(&format!(".{d}"))) {
+        Ok(())
+    } else {
+        Err(format!("domain not allowed: {host}"))
+    }
+}
+
+/// HUD-2: SOT 근거 URL을 시스템 브라우저로 연다 — 화이트리스트 통과 https만(비가역 외부개방의 최후 게이트).
+#[tauri::command]
+fn open_url(url: String) -> Result<(), String> {
+    url_host_allowed(&url)?;
+    #[cfg(target_os = "macos")]
+    let r = std::process::Command::new("open").arg(&url).spawn();
+    #[cfg(target_os = "windows")]
+    let r = std::process::Command::new("explorer").arg(&url).spawn();
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let r = std::process::Command::new("xdg-open").arg(&url).spawn();
+    r.map(|_| ()).map_err(|e| e.to_string())
+}
+
+/// D5: cys 사이드카 바이너리 해소 — exe 옆(production 번들) 우선, 없으면 PATH 폴백(ensure_daemon 패턴).
+fn resolve_sidecar(name: &str) -> std::path::PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join(name)))
+        .filter(|p| p.exists())
+        .unwrap_or_else(|| std::path::PathBuf::from(name))
+}
+
+/// D5/P1: UI 발 키 전송 — surface.send_key RPC 래퍼. send_input(send_text)과 달리 Return 등 키 전송 가능.
+/// human 플래그 미사용(데몬 send_key 핸들러는 전부 프로그램 경로 — 읽지 않음).
+#[tauri::command]
+async fn send_key(socket: Option<String>, surface_id: u64, key: String) -> Result<(), String> {
+    rpc_on(&resolve_socket(&socket), "surface.send_key",
+        json!({"surface_id": surface_id, "key": key})).await.map(|_| ())
+}
+
+/// D5/SB-1: 스킬 버튼 보드 카탈로그 읽기(pack/board-catalog.json) — 정적 파일 read(데몬 무변경).
+#[tauri::command]
+fn read_board_catalog() -> Result<Value, String> {
+    let path = cys::pack::pack_dir().join("board-catalog.json");
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|e| format!("board-catalog.json 없음 ({}): {e}", path.display()))?;
+    serde_json::from_str(&raw).map_err(|e| format!("카탈로그 파싱 실패: {e}"))
+}
+
+/// D6: 청중 프로파일(~/.cys/profile.json·사용자 로컬·pack 밖) audience 읽기 — 없으면 "custom"(전체보기 폴백·안전).
+fn read_profile_audience() -> String {
+    let path = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cys/profile.json");
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|v| v.get("audience").and_then(|a| a.as_str()).map(String::from))
+        .filter(|a| !a.is_empty())
+        .unwrap_or_else(|| "custom".to_string())
+}
+
+/// D5: 무계약 차단의 결정론 강제점 — task-prompt 티켓(성공기준·4규칙)을 생성한다(UI가 직접 워커에 명령 못 함).
+/// --no-survival-gate(B2): fresh 경로는 surface를 실행 시점에 만들므로 지금 워커 생존 확인 불요.
+/// D6: 청중 프로파일 audience를 scope에 주입 — 스킬이 Implications Domain 질문을 건너뛴다(custom=전체보기).
+#[tauri::command]
+fn make_ticket(task: String, scope: String, success: String, to: String) -> Result<String, String> {
+    let script = cys::pack::pack_dir().join("bin").join("javis_orchestra.py");
+    let out_fmt = "산출물을 ~/.cys/_round/skill-out/<작업slug>/ (절대경로) 아래에 저장하라(결정론 회수 위치·SB-6). \
+                   산출물에 '🔒 AI 보조 생성 · 박사님 검수 전' 신뢰선 라벨을 부착하라(과대약속 금지).";
+    let audience = read_profile_audience();
+    let scope_full = if audience != "custom" {
+        format!("{scope} · 청중 프로파일: {audience}(이 청중 맞춤으로 산출·Implications Domain 질문 생략)")
+    } else {
+        scope.clone()
+    };
+    let output = std::process::Command::new("python3")
+        .arg(&script)
+        .arg("task-prompt")
+        .args(["--task", &task, "--scope", &scope_full, "--success", &success, "--to", &to])
+        .arg("--no-survival-gate")
+        .args(["--output-format", out_fmt])
+        .output()
+        .map_err(|e| format!("javis_orchestra 실행 실패: {e}"))?;
+    if !output.status.success() {
+        return Err(format!("task-prompt 실패: {}", String::from_utf8_lossy(&output.stderr)));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// D5/SB-2: 보이는 일회용 워커로 스킬 실행 — cys skill run(schedule --fresh) spawn(새 RPC 0·invisible -p 금지).
+#[tauri::command]
+fn run_skill(name: String, ticket: String, agent: Option<String>, close_after: Option<u64>) -> Result<Value, String> {
+    if ticket.trim().is_empty() {
+        return Err("ticket 비어 있음 — 무계약 실행 금지".into());
+    }
+    let cys = resolve_sidecar(if cfg!(windows) { "cys.exe" } else { "cys" });
+    let mut cmd = std::process::Command::new(&cys);
+    cmd.arg("skill").arg("run").arg(&name)
+        .args(["--ticket", &ticket])
+        .args(["--agent", agent.as_deref().unwrap_or("claude")]);
+    if let Some(ca) = close_after {
+        cmd.args(["--close-after", &ca.to_string()]);
+    }
+    cmd.stdin(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("cys skill run 실행 실패 ({}): {e}", cys.display()))?;
+    Ok(json!({"ok": true, "name": name}))
+}
+
+/// D5/SB-6: 산출물 회수 결정론 위치(~/.cys/_round/skill-out) — make_ticket output_format과 정합.
+#[tauri::command]
+fn skill_out_dir() -> String {
+    std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+        .join(".cys/_round/skill-out")
+        .to_string_lossy()
+        .to_string()
 }
 
 #[tauri::command]
@@ -872,12 +1127,17 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_notification::init())
         .manage(Attachments(Mutex::new(HashMap::new())))
         .invoke_handler(tauri::generate_handler![
             daemon_status,
             list_surfaces,
+            org_status,
+            org_fleet,
+            ensure_dept_forwarders,
             control_analytics,
             control_skills,
+            control_cost_baseline,
             control_alerts,
             control_weekly,
             control_sessions,
@@ -897,6 +1157,12 @@ fn main() {
             feed_reply,
             list_dir,
             open_path,
+            open_url,
+            send_key,
+            read_board_catalog,
+            make_ticket,
+            run_skill,
+            skill_out_dir,
             check_update,
             live_session_count,
             install_update,
@@ -942,6 +1208,21 @@ fn main() {
 mod tests {
     use super::*;
 
+    // HUD-2: open_url 화이트리스트 — https·허용 도메인만 통과, 위장 host(userinfo/서브도메인 사칭) 차단.
+    #[test]
+    fn open_url_whitelist_blocks_spoofed_and_nonhttps() {
+        assert!(url_host_allowed("https://notebooklm.google.com/notebook/abc").is_ok());
+        assert!(url_host_allowed("https://github.com/cys/repo").is_ok());
+        assert!(url_host_allowed("https://docs.afhi.org/x").is_ok(), "서브도메인 허용");
+        assert!(url_host_allowed("http://notebooklm.google.com/").is_err(), "http 차단");
+        assert!(url_host_allowed("https://evil.com/notebooklm.google.com").is_err(), "경로 사칭 차단");
+        assert!(url_host_allowed("https://notebooklm.google.com.evil.com/").is_err(), "서브도메인 사칭 차단");
+        assert!(url_host_allowed("https://notebooklm.google.com@evil.com/").is_err(), "userinfo 사칭 차단");
+        assert!(url_host_allowed("https://evil.com#.github.com/").is_err(), "fragment 사칭 차단");
+        assert!(url_host_allowed("https://evil.com?.github.com").is_err(), "query 사칭 차단");
+        assert!(url_host_allowed("https://evil.com?x=.github.com").is_err(), "query 파라미터 사칭 차단");
+    }
+
     // 회귀: windows 업데이트 핸드오프가 데몬을 taskkill /F로 하드킬하면 cysd의
     // shutdown_cleanup이 실행되지 않아 scoped 자식(cys CLI의 자식)이 영구 고아로
     // 남는다. 그 누수를 막으려면 데몬이 살아있을 때 UI가 ledger.list에서 scoped pid를
@@ -973,5 +1254,59 @@ mod tests {
         // scoped 키 누락 = false 취급, pid 누락 항목은 건너뛴다
         let resp = json!({"entries": [{"pid": 100}, {"scoped": true}]});
         assert!(scoped_pids_from_ledger_list(&resp).is_empty());
+    }
+
+    // 적대검증 R-1 회귀: org_fleet fan-out은 풀 비경유 rpc_oneshot을 쓴다. (a) 정상 소켓은 응답을
+    // 파싱해 반환하고, (b) 무응답(hung) 소켓은 timeout으로 깨끗이 Err를 준다 — 일회성 연결이라
+    // 취소가 공유 풀(conn_cell)을 오염시키지 않는다(같은 부서 send_key/org_status 응답 귀속 보호).
+    #[cfg(unix)]
+    #[test]
+    fn rpc_oneshot_parses_response_and_times_out_on_hung_socket() {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+        use tokio::net::UnixListener;
+        let dir = std::env::temp_dir().join(format!("cys-rpc-oneshot-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let ok_sock = dir.join("ok.sock");
+        let hang_sock = dir.join("hang.sock");
+        let _ = std::fs::remove_file(&ok_sock);
+        let _ = std::fs::remove_file(&hang_sock);
+
+        tauri::async_runtime::block_on(async {
+            // (a) 응답 소켓 — 요청 1줄 소비 후 valid 프레임 반환
+            let ok = UnixListener::bind(&ok_sock).unwrap();
+            tauri::async_runtime::spawn(async move {
+                if let Ok((mut s, _)) = ok.accept().await {
+                    let (r, mut w) = s.split();
+                    let mut br = BufReader::new(r);
+                    let mut l = String::new();
+                    let _ = br.read_line(&mut l).await;
+                    let _ = w.write_all(b"{\"ok\":true,\"result\":{\"surfaces\":[]}}\n").await;
+                    let _ = w.flush().await;
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+            });
+            // (b) hung 소켓 — accept만 하고 응답 없이 hold
+            let hang = UnixListener::bind(&hang_sock).unwrap();
+            tauri::async_runtime::spawn(async move {
+                if let Ok((_s, _)) = hang.accept().await {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await; // bind 안정화
+
+            // (a) 정상 응답 파싱
+            let ok_res = rpc_oneshot(&ok_sock, "org.status", json!({})).await;
+            assert!(ok_res.is_ok(), "정상 소켓 응답을 파싱해야 한다: {ok_res:?}");
+            assert!(ok_res.unwrap()["surfaces"].is_array());
+
+            // (b) hung 소켓은 timeout으로 Err — 취소가 깨끗이 일어난다(풀 비경유)
+            let hung = tokio::time::timeout(
+                std::time::Duration::from_millis(300),
+                rpc_oneshot(&hang_sock, "org.status", json!({})),
+            )
+            .await;
+            assert!(hung.is_err(), "무응답 소켓은 timeout(Elapsed)이어야 한다");
+        });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

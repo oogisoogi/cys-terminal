@@ -3,6 +3,7 @@
 
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
+import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 
 declare global {
   interface Window {
@@ -36,6 +37,19 @@ interface Workspace {
   // 부서 런칭 중 임시 placeholder 표식 — 무거운 launch await 동안 탭을 즉시 표시(체감 지연 0)하기 위함.
   // launch 완료 시 false로 내리고, 실패 시 ws 자체를 제거한다. 직렬화 제외(normalizeWorkspaces)로 디스크/복원 누수 차단.
   pending?: boolean;
+  // 06: 소속 그룹 id(undefined=ungrouped). 부서 ws도 그룹에 들어가면 set. 진실원=localStorage(cys-layout-v2).
+  groupId?: number;
+}
+
+// 06: 워크스페이스 그룹 메타데이터. 진실원=localStorage(cys-layout-v2). 데몬은 모름(그룹=UI/solution 층).
+// 부서(데몬)도 일반 그룹과 동일 구조로 표현 — anchorSocket이 있으면 부서 그룹(읽기전용 표식·teardown은 ws close가 담당).
+interface GroupMeta {
+  id: number;
+  name: string;
+  collapsed: boolean;
+  pinned: boolean;
+  color?: string; // hex(미지정 시 id 기반 WS_COLORS 폴백)
+  anchorSocket?: string; // 부서 그룹이면 부서 데몬 socket
 }
 
 const LAYOUT_KEY = "cys-layout-v2";
@@ -118,13 +132,23 @@ let ccTimer: number | null = null;
 let ccClockTimer: number | null = null;
 let ccUptimeBase = 0;
 let ccUptimeFetchedAt = 0;
-let ccTab: "live" | "eff" | "skills" | "sessions" | "weekly" | "learn" = "live";
+let ccTab: "live" | "eff" | "skills" | "sessions" | "weekly" | "learn" | "board" | "tasks" = "live";
 let ccEffWindow = "today";
 let ccSkillsWindow = "today";
 let ccSessionsWindow = "7d";
 let ccSessionsStarOnly = false;
 let ccSessionsRedact = false;
 let ccSessionSelected: string | null = null;
+
+// HUD-5: 밀도 모드 — 비기술자 Glance(오늘 큰 글씨) ↔ 엔지니어 Ops(6탭). body class 1개가 진실원.
+type CcDensity = "ops" | "glance";
+let ccDensity: CcDensity =
+  (localStorage.getItem("cys-cc-density") as CcDensity) === "glance" ? "glance" : "ops";
+// Tasks Control Center: Glance 모드 안에서 보여줄 면(Live=시스템부하 ↔ tasks=부서 업무) — 박사님 선택.
+let ccGlanceFace: "live" | "tasks" =
+  localStorage.getItem("cys-cc-glance-face") === "tasks" ? "tasks" : "live";
+// 마지막 org_fleet 스냅샷 — 실시간 이벤트(task.changed/status.changed)가 셀 단위로 패치한다.
+let lastFleet: any = null;
 
 const CC_ROLE_COLOR: Record<string, string> = {
   master: "#3b82f6", cso: "#8b5cf6", worker: "#00e676",
@@ -169,10 +193,31 @@ function ccAggRate(fleet: any[]): Record<string, { used: number; reset: number |
   return agg;
 }
 
+// HUD-5: 밀도 전환 — 순수 CSS(body class)가 진실원. JS는 class 토글 + 영속 + 버튼 라벨만.
+function applyCcDensity(mode: CcDensity) {
+  ccDensity = mode;
+  document.body.classList.toggle("cc-glance", mode === "glance");
+  localStorage.setItem("cys-cc-density", mode);
+  const b = document.getElementById("btn-cc-density");
+  if (b) b.textContent = mode === "glance" ? "🔍 상세보기" : "👁 한눈에";
+  // Glance는 단일 면 — 박사님 선택(Live=시스템부하 ↔ tasks=부서 업무)으로 전환. 분석 전용 탭이면 그 면으로.
+  if (mode === "glance") applyGlanceFace(ccGlanceFace);
+}
+
+// Glance 면 토글(박사님: Live↔작업, 선택된 면을 크게). 토글 버튼은 Glance에서만 보인다(CSS).
+function applyGlanceFace(face: "live" | "tasks") {
+  ccGlanceFace = face;
+  localStorage.setItem("cys-cc-glance-face", face);
+  const fb = document.getElementById("btn-cc-glance-face");
+  if (fb) fb.textContent = face === "tasks" ? "📊 Live" : "📋 작업";
+  if (ccDensity === "glance") setCcTab(face);
+}
+
 function setCcOpen(open: boolean) {
   ccOpen = open;
   document.getElementById("cc-panel")!.hidden = !open;
   if (open) {
+    applyCcDensity(ccDensity); // 저장된 밀도 모드 복원(class·버튼 라벨)
     refreshControlCenter();
     tickCc();
     if (ccTimer == null) ccTimer = setInterval(refreshControlCenter, 5000) as unknown as number;
@@ -211,6 +256,8 @@ async function refreshControlCenter() {
   if (ccTab === "eff") refreshEfficiency();
   if (ccTab === "skills") refreshSkills();
   if (ccTab === "learn") refreshLearn();
+  // Tasks 안전망 reconcile: 이벤트 누락·부서 신규 기동을 5초 폴링으로 보정(평시는 이벤트 드리븐).
+  if (ccTab === "tasks") refreshTasks();
 }
 
 // E6 경보 — 헤더 배지(개수) + Live 뷰 상단 스트립. severity: warn(주황)/crit(빨강).
@@ -261,7 +308,7 @@ async function refreshWeekly() {
   }
 }
 
-function setCcTab(view: "live" | "eff" | "skills" | "sessions" | "weekly" | "learn") {
+function setCcTab(view: "live" | "eff" | "skills" | "sessions" | "weekly" | "learn" | "board" | "tasks") {
   ccTab = view;
   document.getElementById("cc-view-live")!.hidden = view !== "live";
   document.getElementById("cc-view-eff")!.hidden = view !== "eff";
@@ -269,6 +316,8 @@ function setCcTab(view: "live" | "eff" | "skills" | "sessions" | "weekly" | "lea
   document.getElementById("cc-view-sessions")!.hidden = view !== "sessions";
   document.getElementById("cc-view-weekly")!.hidden = view !== "weekly";
   document.getElementById("cc-view-learn")!.hidden = view !== "learn";
+  document.getElementById("cc-view-board")!.hidden = view !== "board";
+  document.getElementById("cc-view-tasks")!.hidden = view !== "tasks";
   document.querySelectorAll("#cc-tabs .cc-tab").forEach((b) =>
     b.classList.toggle("active", (b as HTMLElement).dataset.view === view),
   );
@@ -277,6 +326,246 @@ function setCcTab(view: "live" | "eff" | "skills" | "sessions" | "weekly" | "lea
   if (view === "sessions") refreshSessions();
   if (view === "weekly") refreshWeekly();
   if (view === "learn") refreshLearn();
+  if (view === "board") refreshBoard();
+  if (view === "tasks") refreshTasks();
+}
+
+// D5: 스킬 버튼 보드 — 카탈로그 큐레이션 렌더 + 일회용 워커 실행 + 산출물 회수(터미널 입력 0회).
+async function refreshBoard() {
+  const cat = (await invoke("read_board_catalog").catch(() => ({ domains: [], actions: [] }))) as any;
+  const host = document.getElementById("cc-board-domains")!;
+  host.innerHTML = "";
+  for (const d of cat.domains ?? []) {
+    const sec = document.createElement("div");
+    sec.className = "cc-board-domain";
+    sec.innerHTML = `<div class="cc-board-domain-h">${ccEsc(d.label ?? d.id ?? "")}</div>`;
+    const wrap = document.createElement("div");
+    wrap.className = "cc-board-btns";
+    for (const s of d.skills ?? []) {
+      if ((s.acl ?? 1) > 1) continue; // 비기술자: acl≤1만 (민감/위험 스킬은 카탈로그 미포함=암묵 차단)
+      const b = document.createElement("button");
+      b.className = "cc-board-btn";
+      b.textContent = s.label ?? s.name;
+      b.title = `${s.scope ?? ""}${s.gate === "hitl" ? " · 미리보기 확인 필요" : ""}`;
+      b.onclick = () => runSkillButton(s);
+      wrap.appendChild(b);
+    }
+    sec.appendChild(wrap);
+    host.appendChild(sec);
+  }
+  // SB-4: actions(write-a-skill 등) 1급 노출 — 도메인과 동일 실행 경로(신규 인프라 0)
+  const actions = cat.actions ?? [];
+  if (actions.length) {
+    const sec = document.createElement("div");
+    sec.className = "cc-board-domain";
+    sec.innerHTML = `<div class="cc-board-domain-h">도구</div>`;
+    const wrap = document.createElement("div");
+    wrap.className = "cc-board-btns";
+    for (const a of actions) {
+      if ((a.acl ?? 1) > 1) continue;
+      const b = document.createElement("button");
+      b.className = "cc-board-btn";
+      b.textContent = a.label ?? a.name;
+      b.onclick = () =>
+        runSkillButton({
+          name: a.name,
+          label: a.label ?? a.name,
+          scope: "새 스킬 만들기 (write-a-skill — 일상 워크플로우를 스킬로 codify)",
+          success: "SKILL.md 4칸 본문 생성·트리거 명확",
+          gate: "hitl",
+        });
+      wrap.appendChild(b);
+    }
+    sec.appendChild(wrap);
+    host.appendChild(sec);
+  }
+  // 회수 패널 — list_dir 재사용(결정론 위치 skill_out_dir)
+  const outHost = document.getElementById("cc-board-out")!;
+  let dirs: any[] = [];
+  try {
+    const dir = (await invoke("skill_out_dir")) as string;
+    dirs = (await invoke("list_dir", { path: dir })) as any[];
+  } catch {
+    /* 아직 산출물 없음 */
+  }
+  outHost.innerHTML =
+    !dirs || dirs.length === 0
+      ? `<div class="cc-empty">산출물 없음 (~/.cys/_round/skill-out)</div>`
+      : dirs
+          .map((x: any) => {
+            const p = x.path ?? "";
+            const nm = x.name ?? p;
+            return `<button class="cc-board-out-item" data-path="${ccEsc(p)}">📄 ${ccEsc(nm)}</button>`;
+          })
+          .join("");
+  outHost.querySelectorAll<HTMLElement>(".cc-board-out-item").forEach((b) =>
+    b.addEventListener("click", () => invoke("open_path", { path: b.dataset.path }).catch(() => {})),
+  );
+}
+
+// ───────── Tasks Control Center — 모든 부서의 모든 노드가 지금 하는 업무(관측 전용) ─────────
+// 데이터원: org_fleet(본부+각 부서 소켓 org.status fan-out 집계). 신규 DB 없이 기존 set-status
+// 자기보고(task/state/context)를 부서 라벨과 함께 그린다. 평시 이벤트 드리븐, 5초 reconcile 폴링은 안전망.
+let tasksForwardersEnsured = false;
+const CC_TASK_STATE: Record<string, { cls: string; label: string }> = {
+  working: { cls: "working", label: "작업중" }, waiting: { cls: "idle", label: "대기" },
+  blocked: { cls: "error", label: "막힘" }, done: { cls: "offline", label: "완료" },
+};
+function ccAge(secs: number): string {
+  const s = Math.max(0, Math.round(secs));
+  if (s < 60) return `${s}초 전`;
+  if (s < 3600) return `${Math.floor(s / 60)}분 전`;
+  return `${Math.floor(s / 3600)}시간 전`;
+}
+
+async function refreshTasks() {
+  if (!tasksForwardersEnsured) {
+    tasksForwardersEnsured = true;
+    invoke("ensure_dept_forwarders").catch(() => {}); // 전 부서 실시간 push 보장(멱등)
+  }
+  try {
+    lastFleet = await invoke("org_fleet");
+  } catch {
+    /* 데몬 일시 부재 — 직전 스냅샷 유지, 다음 틱 재시도 */
+  }
+  renderTasks(lastFleet);
+}
+
+function renderTasks(fleet: any) {
+  const host = document.getElementById("cc-tasks-depts");
+  if (!host) return;
+  const depts: any[] = fleet?.departments ?? [];
+  if (!depts.length) {
+    host.innerHTML = `<div class="cc-empty">부서 정보 없음 — 데몬 응답 대기</div>`;
+    return;
+  }
+  host.innerHTML = depts
+    .map((d) => {
+      const surfaces: any[] = (d.surfaces ?? []).slice();
+      surfaces.sort((a, b) => (a.surface_id ?? 0) - (b.surface_id ?? 0));
+      const working = surfaces.filter(
+        (s) =>
+          s.status?.state === "working" ||
+          (!s.status && !s.exited && (s.idle_secs ?? 999) <= 60),
+      ).length;
+      const deadBadge = d.error
+        ? `<span class="cc-fail-badge crit">⚠ ${d.error === "timeout" ? "응답없음" : "도달불가"}</span>`
+        : "";
+      const head =
+        `<div class="cc-tasks-dept-h"><span class="cc-tasks-dept-name">${ccEsc(d.display_name ?? d.name ?? "")}</span>` +
+        `<span class="cc-tasks-dept-meta">노드 ${surfaces.length} · 작업중 ${working}</span>${deadBadge}</div>`;
+      const rows = d.error
+        ? `<div class="cc-empty">${d.error === "timeout" ? "부서 데몬 응답 없음(2초 초과)" : "부서 데몬 연결 실패 — 다운/기동 중"}</div>`
+        : surfaces.length === 0
+          ? `<div class="cc-empty">노드 없음</div>`
+          : surfaces.map((s) => taskRow(s)).join("");
+      return `<div class="cc-section cc-tasks-dept">${head}${rows}</div>`;
+    })
+    .join("");
+  // 행 클릭 → task 전문 펼치기(요약금지·읽기전용·PTY주입 0)
+  host.querySelectorAll<HTMLElement>(".cc-task-row").forEach((row) =>
+    row.addEventListener("click", () => row.classList.toggle("expanded")),
+  );
+}
+
+function taskRow(s: any): string {
+  const role = String(s.role ?? "?");
+  const color = CC_ROLE_COLOR[role] ?? "#64748b";
+  const st = s.status; // 자기보고 {state, context_pct, task, age_secs} | null
+  const selfReport = st != null;
+  let cls: string, label: string;
+  if (s.exited) {
+    cls = "offline";
+    label = "오프라인";
+  } else if (selfReport) {
+    const m = CC_TASK_STATE[st.state] ?? { cls: "idle", label: String(st.state) };
+    cls = m.cls;
+    label = m.label;
+  } else {
+    const idle = s.idle_secs ?? 999;
+    cls = idle > 60 ? "idle" : "working";
+    label = idle > 60 ? "대기" : "활동";
+  }
+  const trust = selfReport
+    ? `<span class="cc-trust-badge self">📍자기보고</span>`
+    : `<span class="cc-trust-badge derived">⚙파생</span>`;
+  const task = selfReport && st.task ? String(st.task) : "(업무 미보고)";
+  const ctx =
+    selfReport && st.context_pct != null
+      ? `<span class="cc-tbar" style="max-width:130px"><span class="cc-tbar-track"><span class="cc-tbar-fill ${st.context_pct >= 80 ? "crit" : st.context_pct >= 60 ? "warn" : ""}" style="width:${Math.min(100, st.context_pct)}%"></span></span><span class="cc-tbar-pct">${st.context_pct}%</span></span>`
+      : "";
+  const age = selfReport ? ccAge(st.age_secs ?? 0) : `idle ${s.idle_secs ?? 0}s`;
+  const stale = selfReport && (st.age_secs ?? 0) > 120 ? " stale" : "";
+  return (
+    `<div class="cc-task-row${stale}" title="${ccEsc(task)}">` +
+    `<span class="cc-dot ${cls}"></span>` +
+    `<span class="cc-task-role" style="color:${color}">${ccEsc(role)}</span>` +
+    `<span class="cc-task-text">${ccEsc(task)}</span>` +
+    ctx +
+    `<span class="cc-task-meta">${trust} · ${ccEsc(age)} · ${ccEsc(label)}</span>` +
+    `</div>`
+  );
+}
+
+// 실시간 이벤트(task.changed/status.changed)로 부서×노드 셀 패치 — socket_slug로 부서, surface_id로 노드 식별.
+function upsertTaskCell(slug: string, sid: number, payload: Record<string, unknown>) {
+  if (!lastFleet?.departments) return;
+  const dept = lastFleet.departments.find((d: any) => d.socket_slug === slug);
+  if (!dept) return; // 아직 스냅샷에 없는 부서 — 다음 reconcile 폴링이 채운다
+  dept.surfaces = dept.surfaces ?? [];
+  const status = {
+    state: String(payload.state ?? "working"),
+    context_pct: payload.context_pct ?? null,
+    task: payload.task ?? null,
+    age_secs: 0,
+  };
+  const node = dept.surfaces.find((s: any) => s.surface_id === sid);
+  if (node) {
+    node.status = status;
+    if (payload.role) node.role = payload.role;
+  } else {
+    dept.surfaces.push({
+      surface_id: sid,
+      surface_ref: `surface:${sid}`,
+      role: payload.role ?? "?",
+      status,
+      idle_secs: 0,
+    });
+  }
+  if (ccTab === "tasks") renderTasks(lastFleet);
+}
+
+let boardBusy = false;
+// D5: 버튼 클릭 → 무계약 차단(make_ticket 경유) → 보이는 일회용 워커 실행. gate:hitl은 미리보기 확인 강제.
+async function runSkillButton(s: any) {
+  if (boardBusy) return;
+  boardBusy = true;
+  setTimeout(() => (boardBusy = false), 2000); // 연타 디바운스(surface 누적 방지)
+  try {
+    let userInput = "";
+    if (s.gate === "hitl") {
+      // D6 제품 모드: 본문 원고/주제 입력 모달(HITL 보존·신뢰선 라벨·게이트 건너뛰기 금지)
+      const got = await inputModal(
+        s.label ?? s.name,
+        s.scope ?? "내용을 입력하세요",
+        "여기에 본문 원고나 주제를 붙여넣으세요…",
+      );
+      if (got === null) return; // 취소
+      userInput = got;
+    }
+    // ★무계약 차단: task-prompt 티켓을 먼저 생성(javis_orchestra 경유). UI는 ticket 텍스트만 받는다.
+    const scope = userInput ? `${s.scope ?? ""} · 입력 원고: ${userInput}` : s.scope ?? "";
+    const ticket = (await invoke("make_ticket", {
+      task: s.label ?? s.name,
+      scope,
+      success: s.success ?? "",
+      to: "worker",
+    })) as string;
+    await invoke("run_skill", { name: s.name, ticket, agent: "claude", closeAfter: null });
+    toast("system", "skill.launched", `${s.label ?? s.name} — 일회용 워커 실행(검수 전 라벨 부착)`);
+  } catch (e) {
+    toast("watchdog", "skill.failed", String(e));
+  }
 }
 
 // RSI 학습 탭 — learn.status(canonical state) 폴링 렌더 + 대기추천은 기존 feed 패널 재사용.
@@ -360,6 +649,7 @@ function renderEfficiency(a: any) {
     [
       ["총 비용", ccMoney(t.cost_usd ?? 0), winLab],
       ["🔥캐시 절감", ccMoney(s.cache_savings_usd ?? 0), "재사용 할인"],
+      ["캐시 ROI", `${(s.cache_roi_x ?? 0).toFixed(2)}×`, `재사용율 ${Math.round((s.cache_efficiency ?? 0) * 100)}%`],
       ["메시지", String(t.msgs ?? 0), `세션 ${t.sessions ?? 0}`],
       ["토큰", ccFmtTokens(t.tokens ?? 0), "4분해 합"],
     ] as [string, string, string][]
@@ -406,6 +696,19 @@ function renderEfficiency(a: any) {
           .map((x) => {
             const pct = Math.round(((x.tokens ?? 0) / agTotal) * 100);
             return `<div class="cc-mix-row"><span class="cc-mix-name">${ccEsc(x.agent ?? "?")}</span><span class="cc-tbar-track"><span class="cc-tbar-fill cc-mix-fill" style="width:${pct}%"></span></span><span class="cc-mix-pct">${pct}%</span></div>`;
+          })
+          .join("");
+
+  // D3 조직 단위(tier·역할) 비용 — 비용 점유율 바 (by_model 패턴 복제·producer≠evaluator baseline 가시화)
+  const tiers: any[] = s.by_tier ?? [];
+  const tierMax = Math.max(1e-9, ...tiers.map((x) => x.cost_usd ?? 0));
+  document.getElementById("cc-eff-tiers")!.innerHTML =
+    tiers.length === 0
+      ? `<div class="cc-empty">데이터 없음</div>`
+      : tiers
+          .map((x) => {
+            const pct = ((x.cost_usd ?? 0) / tierMax) * 100;
+            return `<div class="cc-mix-row"><span class="cc-mix-name" title="역할 ${ccEsc(x.tier ?? "")}">${ccEsc(x.tier ?? "?")}</span><span class="cc-tbar-track"><span class="cc-tbar-fill cc-mix-fill" style="width:${pct}%"></span></span><span class="cc-mix-pct">${ccMoney(x.cost_usd ?? 0)}</span></div>`;
           })
           .join("");
 
@@ -578,7 +881,7 @@ async function openSessionDetail(sid: string) {
   const t = d?.summary?.totals ?? {};
   const tl: any[] = d?.timeline ?? [];
   const head =
-    `<div class="cc-h">세션 상세 · ${ccEsc(sid.split("/").pop() || sid)}</div>` +
+    `<div class="cc-h">세션 상세 · ${ccEsc(sid.split("/").pop() || sid)} ${ccSourceBadge("control.session_detail")}</div>` +
     `<div class="cc-sess-detail-kpi">${ccFmtTokens(t.tokens ?? 0)} 토큰 · ${ccMoney(t.cost_usd ?? 0)} · ${t.msgs ?? 0}턴 · 이벤트 ${tl.length}</div>` +
     `<div class="cc-sess-note">전사 원문은 미수집(이벤트 타임라인으로 대체)</div>`;
   const rows =
@@ -589,10 +892,44 @@ async function openSessionDetail(sid: string) {
             const name = e.is_skill ? `Skill:${e.skill_name ?? "?"}` : e.is_agent ? `Task:${e.agent_type ?? "?"}` : e.tool_name ?? "?";
             const fail = e.exit_code != null && e.exit_code !== 0;
             const tag = e.event_type === "POST_TOOL" ? (fail ? "✗" : "✓") : "▸";
-            return `<div class="cc-tl-row ${fail ? "crit" : ""}"><span class="cc-tl-tag">${tag}</span><span class="cc-tl-name">${ccEsc(name)}</span><span class="cc-tl-role">${ccEsc(e.role ?? "")}</span></div>`;
+            // HUD-2 근거 추출(우선순위): result_path > evidence > sot_url > sha. 없으면 비점프(graceful·회귀0).
+            const ev = String(e.result_path ?? e.evidence ?? e.sot_url ?? e.sha ?? "");
+            const jump = ev ? ` cc-evidence" data-evidence="${ccEsc(ev)}` : "";
+            return `<div class="cc-tl-row ${fail ? "crit" : ""}${jump}"><span class="cc-tl-tag">${tag}</span>` +
+              `<span class="cc-tl-name">${ccEsc(name)}</span><span class="cc-tl-role">${ccEsc(e.role ?? "")}</span>` +
+              (ev ? `<span class="cc-tl-jump" title="근거로 이동">↗</span>` : "") +
+              `</div>`;
           })
           .join("");
   el.innerHTML = head + `<div class="cc-timeline">${rows}</div>`;
+  // HUD-2: 근거 행 클릭 위임 — innerHTML 재생성마다 재바인딩(producer≠evaluator UI)
+  el.querySelectorAll<HTMLElement>(".cc-tl-row.cc-evidence").forEach((row) =>
+    row.addEventListener("click", () => jumpEvidence(row.dataset.evidence!)),
+  );
+}
+
+// HUD-2: 근거 1개 문자열 → 종류 판별 후 점프(로컬경로/SHA/외부URL). open_url은 Rust측 HARD 화이트리스트 게이트.
+function jumpEvidence(ev: string) {
+  if (!ev) return;
+  if (/^https?:\/\//.test(ev)) {
+    invoke("open_url", { url: ev }).catch(() =>
+      toast("watchdog", "🔒 근거 링크 차단", `허용 목록 외 도메인: ${ev}`),
+    );
+  } else if (/^[0-9a-f]{7,40}$/i.test(ev)) {
+    toast("feed", "🔗 커밋 근거", ev); // SHA — 표시(점프 대상 없음)
+  } else {
+    invoke("open_path", { path: ev }).catch(() => toast("watchdog", "근거 파일 없음", ev));
+  }
+}
+
+// HUD-5: 출처+신선도 배지(화면 파싱 금지·환각0 UI). source=출처 라벨, ts=관측 epoch(없으면 신선도 생략).
+function ccSourceBadge(source: string, ts?: number): string {
+  let fresh = "";
+  if (ts) {
+    const age = Math.max(0, Math.round(Date.now() / 1000 - ts));
+    fresh = age > 120 ? ` · <span class="stale">${Math.round(age / 60)}분 전</span>` : "";
+  }
+  return `<span class="cc-source-badge">📍 ${ccEsc(source)}${fresh}</span>`;
 }
 
 // E5 추세·주간 — WoW 델타 KPI·일별 오버레이·효율 리더·스킬 자산
@@ -783,13 +1120,27 @@ function applyPanelZoom(delta: number | null) {
 let workspaces: Workspace[] = [];
 let activeWs = 0;
 let wsCounter = 1;
+let groups: GroupMeta[] = []; // 06: 그룹 메타 배열(진실원=localStorage)
+let groupCounter = 1; // 06: 그룹 id 발급(ws의 wsCounter와 분리)
 let focusedSid: number | null = null;
 const panes = new Map<string, PaneRuntime>(); // 키 = paneKey(sid, socket)
 // 부서 데몬 socket_slug(F3 백엔드 단일진실) → socket 경로. launch_dept_daemon 반환·daemon-event로 채운다.
 const socketForSlug = new Map<string, string>();
+// 사이드바 노드 신호 캐시(B3) — org.status 응답을 워크스페이스 행 집계용으로 보관.
+type NodeSig = { role: string | null; state: string; ctx_pct: number | null; idle_secs: number; agent_alive: boolean | null };
+const nodeSig = new Map<string, NodeSig>(); // 키 = `${socket}#${surface_id}`
+let pendingApprovals = 0; // org.status feed.pending 집계
 const root = document.getElementById("root")!;
 
 const current = (): Workspace => workspaces[activeWs];
+
+// 06: 그룹 헬퍼.
+const groupById = (gid: number | undefined): GroupMeta | undefined =>
+  gid == null ? undefined : groups.find((g) => g.id === gid);
+
+// 그룹의 anchor(부서) ws — anchorSocket이 일치하는 ws. 부서 그룹만 존재.
+const anchorWsOf = (g: GroupMeta): Workspace | undefined =>
+  g.anchorSocket ? workspaces.find((w) => w.socket === g.anchorSocket) : undefined;
 
 // 부서 workspace는 socket 단위로 유일해야 한다(한 부서 데몬 = 한 탭). 저장·복원 양쪽에서 이 게이트를
 // 통과시켜 중복(같은 socket 2탭)·id 중복이 저장→복원→재저장으로 증식하는 것을 차단한다.
@@ -816,13 +1167,31 @@ function normalizeWorkspaces(list: Workspace[]): Workspace[] {
   return out;
 }
 
+// 06: 그룹 무결성 게이트 — normalizeWorkspaces와 같은 불변식 철학(save·restore 양쪽 통과로 유령/중복 증식 차단).
+// 죽은 그룹 참조 청소(ws.groupId가 존재하지 않는 그룹을 가리키면 undefined화) + id중복 제거 + 멤버0 그룹 자동 해체(cmux ungroup 의미).
+function normalizeGroups(ws: Workspace[], gs: GroupMeta[]): GroupMeta[] {
+  const liveGids = new Set<number>();
+  for (const w of ws) {
+    if (w.groupId != null && !gs.some((g) => g.id === w.groupId)) w.groupId = undefined; // 죽은 그룹 참조 청소
+    else if (w.groupId != null) liveGids.add(w.groupId);
+  }
+  const seen = new Set<number>();
+  return gs.filter((g) => {
+    if (seen.has(g.id)) return false; // id 중복 제거
+    seen.add(g.id);
+    return liveGids.has(g.id); // 멤버 0인 그룹 = 자동 해체
+  });
+}
+
 function saveLayout() {
   const norm = normalizeWorkspaces(workspaces);
+  const normG = normalizeGroups(norm, groups); // 06: norm 기준으로 그룹 청소
+  groups = normG; // 06: 멤버0 그룹을 모듈 상태에서도 즉시 해체(유령 누적 방지 · 적대검증 교정)
   const activeId = workspaces[activeWs]?.id;
   const a = Math.max(0, norm.findIndex((w) => w.id === activeId));
   localStorage.setItem(
     LAYOUT_KEY,
-    JSON.stringify({ workspaces: norm, active: a, counter: wsCounter }),
+    JSON.stringify({ workspaces: norm, groups: normG, active: a, counter: wsCounter, groupCounter }),
   );
 }
 
@@ -1383,109 +1752,372 @@ async function actionEqualize() {
 
 // ---------- workspace tabs ----------
 
+// org.status를 워크스페이스별 socket마다 1콜 조회해 노드 신호 맵에 캐싱한다(B3).
+// 응답 키: 노드배열=surfaces, 대기수=중첩 feed.pending (top-level pending 아님).
+async function refreshSidebarStatus() {
+  const sockets = new Set(workspaces.map((w) => w.socket));
+  let pend = 0;
+  for (const sock of sockets) {
+    try {
+      const r = (await invoke("org_status", { socket: sock })) as {
+        surfaces?: any[];
+        feed?: { pending?: number };
+      };
+      pend += r.feed?.pending ?? 0;
+      for (const n of r.surfaces ?? [])
+        nodeSig.set(`${sock}#${n.surface_id}`, {
+          role: n.role,
+          state: n.status?.state ?? (n.idle_secs > 60 ? "idle" : "working"),
+          ctx_pct: n.status?.context_pct ?? n.usage?.ctx_pct ?? null,
+          idle_secs: n.idle_secs,
+          agent_alive: n.agent_alive,
+        });
+    } catch {
+      /* 부서 데몬 일시 부재 */
+    }
+  }
+  pendingApprovals = pend;
+  renderWsTabs(); // 신호 반영 재렌더
+}
+
 // ws별 고유색 (id 기반 — 세션 복원에도 같은 ws는 같은 색)
 const WS_COLORS = ["#2f81f7", "#3fb950", "#d29922", "#f85149", "#a371f7", "#db61a2", "#39c5cf", "#e3b341"];
 
 function renderWsTabs() {
   const bar = document.getElementById("ws-tabs")!;
   bar.innerHTML = "";
-  workspaces.forEach((ws, idx) => {
-    const color = WS_COLORS[ws.id % WS_COLORS.length];
-    const tab = document.createElement("div");
-    tab.className = "ws-tab" + (idx === activeWs ? " active" : "");
-    tab.style.borderLeftColor = color; // ws 고유색은 좌측 바 (사이드바 항목 식별)
-    const titleRow = document.createElement("div");
-    titleRow.className = "ws-title-row";
-    const label = document.createElement("span");
-    label.className = "ws-name";
-    label.textContent = ws.name;
-    const close = document.createElement("span");
-    close.className = "ws-close";
-    close.textContent = "×";
-    close.title = "워크스페이스 닫기 (surface 전부 종료)";
-    titleRow.append(label, close);
-    // 서브라인: pane 수 + 대표 pane 제목 (항목 가독성)
-    const sids = collectSids(ws.tree);
-    const firstTitle =
-      panes.get(paneKey(sids[0] ?? -1, ws.socket))?.titleEl.textContent ?? "";
-    const sub = document.createElement("span");
-    sub.className = "ws-sub";
-    if (ws.pending) {
-      sub.textContent = "부서 데몬 시작 중…";
-      sub.classList.add("ws-sub-pending");
-    } else {
-      sub.textContent = `${sids.length} pane${firstTitle ? ` · ${firstTitle}` : ""}`;
-    }
-    tab.append(titleRow, sub);
-    tab.addEventListener("mousedown", (e) => {
-      // 우클릭은 전환하지 않음 — render()가 탭 DOM을 재생성하면 컨텍스트 메뉴가 죽은 엘리먼트를 잡는다
-      if (e.button !== 0 || e.target === close) return;
-      if (idx !== activeWs) {
-        activeWs = idx;
-        render();
-        const first = collectSids(current().tree)[0];
-        if (first != null) setFocus(first);
-      }
-    });
-    const startRename = () => {
-      // WKWebView에서 prompt()는 무동작 — 인라인 편집
-      label.contentEditable = "true";
-      label.focus();
-      const sel = window.getSelection();
-      sel?.selectAllChildren(label);
-      const onKey = (ke: KeyboardEvent) => {
-        if (ke.key === "Enter") {
-          ke.preventDefault();
-          label.blur();
-        }
-      };
-      const commit = () => {
-        label.removeEventListener("keydown", onKey); // rename마다 리스너 누적 방지
-        label.contentEditable = "false";
-        const name = (label.textContent || "").trim();
-        ws.name = name || UNTITLED; // 이름을 지우면 미정 표시로 복귀
-        render();
-      };
-      label.addEventListener("blur", commit, { once: true });
-      label.addEventListener("keydown", onKey);
-    };
-    label.addEventListener("dblclick", startRename);
-    tab.addEventListener("contextmenu", (e) => {
-      e.preventDefault();
-      showCtxMenu(e.clientX, e.clientY, [{ label: "이름 변경", action: startRename }]);
-    });
-    close.addEventListener("click", async () => {
-      // WKWebView에서 confirm()은 무동작 — 2-click 확인 패턴 사용
-      if (close.dataset.arm !== "1") {
-        close.dataset.arm = "1";
-        close.textContent = "정말?";
-        setTimeout(() => {
-          close.dataset.arm = "";
-          close.textContent = "×";
-        }, 2500);
-        return;
-      }
-      for (const sid of collectSids(ws.tree)) {
-        await invoke("close_surface", { socket: ws.socket, surfaceId: sid }).catch(() => {});
-        destroyPaneRuntime(sid, ws.socket);
-      }
-      const i = workspaces.indexOf(ws); // 캡처된 idx는 stale일 수 있음 — 실시간 위치로 식별
-      if (i < 0) { render(); return; } // 이미 제거된 ws 재클릭 — no-op
-      workspaces.splice(i, 1);
-      // 부서 데몬 teardown은 '그 socket을 쓰는 마지막 탭'일 때만(중복 탭 잔존 시 다른 탭 보호)
-      const stillUsed = ws.socket && workspaces.some((w) => w.socket === ws.socket);
-      // socket 기준 teardown(order 8) — ws rename으로 name↔socket이 끊겨도 정확히 종료.
-      if (ws.socket && !stillUsed) await invoke("stop_dept_daemon_by_socket", { socket: ws.socket }).catch(() => {});
-      if (workspaces.length === 0) {
-        await addWorkspace(); // addWorkspace가 activeWs를 설정
-      } else {
-        if (i < activeWs) activeWs -= 1; // 활성보다 앞 탭을 닫으면 인덱스가 한 칸 당겨진다
-        activeWs = Math.min(activeWs, workspaces.length - 1);
-      }
+  // 06: 2계층 tier 정렬 — pinned 그룹 → unpinned 그룹 → ungrouped ws(배열 순서). 시각 순서≠배열 순서이므로
+  // 탭 핸들러는 캡처 idx 대신 workspaces.indexOf(ws)로 활성 비교/전환(stale idx 회피, close 핸들러 패턴 일치).
+  // 06: 멤버0 그룹은 렌더에서 제외(유령 헤더 차단 · 적대검증 교정 — saveLayout이 모듈 상태도 청소).
+  const hasMembers = (g: GroupMeta) => workspaces.some((w) => !w.pending && w.groupId === g.id);
+  const pinnedG = groups.filter((g) => g.pinned && hasMembers(g));
+  const unpinnedG = groups.filter((g) => !g.pinned && hasMembers(g));
+  for (const g of [...pinnedG, ...unpinnedG]) bar.appendChild(buildGroupSection(g));
+  for (const ws of workspaces.filter((w) => !w.pending && w.groupId == null)) bar.appendChild(buildTab(ws));
+}
+
+// 06: ws 1행 탭 DOM 생성(기존 renderWsTabs forEach 본문을 외과적으로 추출 — idx→workspaces.indexOf(ws)만 치환).
+function buildTab(ws: Workspace): HTMLElement {
+  const color = WS_COLORS[ws.id % WS_COLORS.length];
+  const tab = document.createElement("div");
+  tab.className = "ws-tab" + (workspaces.indexOf(ws) === activeWs ? " active" : "");
+  tab.style.borderLeftColor = color; // ws 고유색은 좌측 바 (사이드바 항목 식별)
+  const titleRow = document.createElement("div");
+  titleRow.className = "ws-title-row";
+  const label = document.createElement("span");
+  label.className = "ws-name";
+  label.textContent = ws.name;
+  const close = document.createElement("span");
+  close.className = "ws-close";
+  close.textContent = "×";
+  close.title = "워크스페이스 닫기 (surface 전부 종료)";
+  titleRow.append(label, close);
+  // 승인 대기 배지(B3): 중복 표시 방지 위해 활성 ws 행에만 1개 노출.
+  if (pendingApprovals > 0 && workspaces.indexOf(ws) === activeWs) {
+    const badge = document.createElement("span");
+    badge.className = "ws-approve-badge";
+    badge.textContent = `⚠${pendingApprovals}`;
+    titleRow.append(badge);
+  }
+  // 서브라인: pane 수 + 대표 pane 제목 (항목 가독성)
+  const sids = collectSids(ws.tree);
+  const firstTitle =
+    panes.get(paneKey(sids[0] ?? -1, ws.socket))?.titleEl.textContent ?? "";
+  const sub = document.createElement("span");
+  sub.className = "ws-sub";
+  if (ws.pending) {
+    sub.textContent = "부서 데몬 시작 중…";
+    sub.classList.add("ws-sub-pending");
+  } else {
+    // 노드 신호 집계(B3): 상태 dot + worst CTX% + idle + dead 카운트. pane 수·title 표시는 보존.
+    const sigs = sids
+      .map((id) => nodeSig.get(`${ws.socket}#${id}`))
+      .filter(Boolean) as NodeSig[];
+    const worst = sigs.reduce((acc, s) => Math.max(acc, s.ctx_pct ?? 0), 0);
+    const idleN = sigs.filter((s) => s.state === "idle" || s.idle_secs > 60).length;
+    const dead = sigs.filter((s) => s.agent_alive === false).length;
+    const dot = document.createElement("span");
+    dot.className = "ws-dot " + (dead ? "error" : idleN ? "idle" : "working");
+    sub.appendChild(dot);
+    const txt = document.createElement("span");
+    const bits = [`${sids.length} pane`];
+    if (firstTitle) bits.push(firstTitle);
+    if (worst >= 60) bits.push(`CTX ${worst}%`);
+    if (idleN) bits.push(`💤${idleN}`);
+    if (dead) bits.push(`❌${dead}`);
+    txt.textContent = bits.join(" · ");
+    if (worst >= 80) txt.className = "sev-crit";
+    else if (worst >= 60) txt.className = "sev-warn";
+    sub.appendChild(txt);
+  }
+  tab.append(titleRow, sub);
+  tab.addEventListener("mousedown", (e) => {
+    // 우클릭은 전환하지 않음 — render()가 탭 DOM을 재생성하면 컨텍스트 메뉴가 죽은 엘리먼트를 잡는다
+    if (e.button !== 0 || e.target === close) return;
+    const i = workspaces.indexOf(ws); // 그룹 재배열로 시각 순서≠배열 순서 — 실시간 위치로 전환
+    if (i !== activeWs) {
+      activeWs = i;
       render();
-    });
-    bar.appendChild(tab);
+      const first = collectSids(current().tree)[0];
+      if (first != null) setFocus(first);
+    }
   });
+  const startRename = () => {
+    // WKWebView에서 prompt()는 무동작 — 인라인 편집
+    label.contentEditable = "true";
+    label.focus();
+    const sel = window.getSelection();
+    sel?.selectAllChildren(label);
+    const onKey = (ke: KeyboardEvent) => {
+      if (ke.key === "Enter") {
+        ke.preventDefault();
+        label.blur();
+      }
+    };
+    const commit = () => {
+      label.removeEventListener("keydown", onKey); // rename마다 리스너 누적 방지
+      label.contentEditable = "false";
+      const name = (label.textContent || "").trim();
+      ws.name = name || UNTITLED; // 이름을 지우면 미정 표시로 복귀
+      render();
+    };
+    label.addEventListener("blur", commit, { once: true });
+    label.addEventListener("keydown", onKey);
+  };
+  label.addEventListener("dblclick", startRename);
+  tab.addEventListener("contextmenu", (e) => {
+    e.preventDefault();
+    showCtxMenu(e.clientX, e.clientY, [
+      { label: "이름 변경", action: startRename },
+      ...wsGroupCtxItems(ws), // 06: 그룹 만들기/넣기/빼기
+    ]);
+  });
+  close.addEventListener("click", async () => {
+    // WKWebView에서 confirm()은 무동작 — 2-click 확인 패턴 사용
+    if (close.dataset.arm !== "1") {
+      close.dataset.arm = "1";
+      close.textContent = "정말?";
+      setTimeout(() => {
+        close.dataset.arm = "";
+        close.textContent = "×";
+      }, 2500);
+      return;
+    }
+    for (const sid of collectSids(ws.tree)) {
+      await invoke("close_surface", { socket: ws.socket, surfaceId: sid }).catch(() => {});
+      destroyPaneRuntime(sid, ws.socket);
+    }
+    const i = workspaces.indexOf(ws); // 캡처된 idx는 stale일 수 있음 — 실시간 위치로 식별
+    if (i < 0) { render(); return; } // 이미 제거된 ws 재클릭 — no-op
+    workspaces.splice(i, 1);
+    // 부서 데몬 teardown은 '그 socket을 쓰는 마지막 탭'일 때만(중복 탭 잔존 시 다른 탭 보호)
+    const stillUsed = ws.socket && workspaces.some((w) => w.socket === ws.socket);
+    // socket 기준 teardown(order 8) — ws rename으로 name↔socket이 끊겨도 정확히 종료.
+    if (ws.socket && !stillUsed) await invoke("stop_dept_daemon_by_socket", { socket: ws.socket }).catch(() => {});
+    if (workspaces.length === 0) {
+      await addWorkspace(); // addWorkspace가 activeWs를 설정
+    } else {
+      if (i < activeWs) activeWs -= 1; // 활성보다 앞 탭을 닫으면 인덱스가 한 칸 당겨진다
+      activeWs = Math.min(activeWs, workspaces.length - 1);
+    }
+    render();
+  });
+  return tab;
+}
+
+// 06: 그룹 섹션 = 헤더(chevron collapse·name·count·hover add) + body(collapsed면 멤버 DOM 미생성=성능 가드).
+function buildGroupSection(g: GroupMeta): HTMLElement {
+  const sec = document.createElement("div");
+  sec.className = "ws-group" + (g.collapsed ? " collapsed" : "");
+
+  const head = document.createElement("div");
+  head.className = "ws-group-head" + (g.pinned ? " pinned" : "");
+  head.style.borderLeftColor = g.color || WS_COLORS[g.id % WS_COLORS.length];
+
+  const chevron = document.createElement("span");
+  chevron.className = "ws-group-chevron";
+  chevron.textContent = g.collapsed ? "▸" : "▾";
+  chevron.addEventListener("click", (e) => {
+    e.stopPropagation();
+    g.collapsed = !g.collapsed;
+    render();
+  });
+
+  const name = document.createElement("span");
+  name.className = "ws-group-name";
+  name.textContent = g.name;
+  // 헤더 이름 클릭 = anchor focus(부서 그룹) / 첫 멤버 focus(일반 그룹)
+  name.addEventListener("click", () => {
+    const anchor = anchorWsOf(g) ?? workspaces.find((w) => w.groupId === g.id);
+    if (anchor) {
+      activeWs = workspaces.indexOf(anchor);
+      render();
+      const first = collectSids(anchor.tree)[0];
+      if (first != null) setFocus(first);
+    }
+  });
+
+  const count = document.createElement("span");
+  count.className = "ws-group-count";
+  count.textContent = String(workspaces.filter((w) => !w.pending && w.groupId === g.id).length);
+
+  const add = document.createElement("span"); // hover '+' = 이 그룹에 새 ws
+  add.className = "ws-group-add";
+  add.textContent = "+";
+  add.title = "그룹에 워크스페이스 추가";
+  add.addEventListener("click", async (e) => {
+    e.stopPropagation();
+    const ws = await addWorkspace();
+    ws.groupId = g.id;
+    render();
+  });
+
+  head.append(chevron, name, count, add);
+  head.addEventListener("contextmenu", (e) => {
+    e.preventDefault();
+    showCtxMenu(e.clientX, e.clientY, groupCtxItems(g));
+  });
+  sec.appendChild(head);
+
+  if (!g.collapsed) {
+    const body = document.createElement("div");
+    body.className = "ws-group-body";
+    for (const ws of workspaces.filter((w) => !w.pending && w.groupId === g.id)) {
+      const tab = buildTab(ws);
+      tab.classList.add("in-group");
+      body.appendChild(tab);
+    }
+    sec.appendChild(body);
+  }
+  return sec;
+}
+
+// 06: ws 우클릭 — 그룹 만들기/넣기/빼기. 모두 끝에 render() 1회(saveLayout 직접호출 금지 — render가 부른다).
+function wsGroupCtxItems(ws: Workspace): { label: string; action: () => void }[] {
+  const items: { label: string; action: () => void }[] = [];
+  if (ws.groupId == null) {
+    items.push({
+      label: "새 그룹으로 묶기",
+      action: () => {
+        const g: GroupMeta = { id: groupCounter++, name: ws.name || "그룹", collapsed: false, pinned: false };
+        groups.push(g);
+        ws.groupId = g.id;
+        render();
+      },
+    });
+    for (const g of groups) {
+      items.push({
+        label: `“${g.name}” 그룹에 넣기`,
+        action: () => {
+          ws.groupId = g.id;
+          render();
+        },
+      });
+    }
+  } else {
+    items.push({
+      label: "그룹에서 빼기",
+      action: () => {
+        ws.groupId = undefined;
+        render(); // normalizeGroups가 멤버0 그룹 자동 제거
+      },
+    });
+  }
+  return items;
+}
+
+// 06: 그룹 헤더 우클릭 — 이름 변경/고정/해제(Ungroup)/삭제(Delete).
+function groupCtxItems(g: GroupMeta): { label: string; action: () => void }[] {
+  return [
+    { label: "그룹 이름 변경", action: () => startGroupRename(g) },
+    {
+      label: g.pinned ? "고정 해제" : "맨 위 고정",
+      action: () => {
+        g.pinned = !g.pinned;
+        render();
+      },
+    },
+    {
+      label: "그룹 해제(워크스페이스 보존)", // Ungroup — 멤버 ws는 ungrouped로 잔존
+      action: () => {
+        for (const w of workspaces) if (w.groupId === g.id) w.groupId = undefined;
+        render(); // normalizeGroups가 멤버0 그룹 자동 제거
+      },
+    },
+    { label: "그룹 삭제(워크스페이스 전부 닫기)", action: () => confirmDeleteGroup(g) }, // Delete(파괴적)
+  ];
+}
+
+// 06: 그룹 이름 인라인 변경 — ws startRename의 contentEditable 패턴 차용(WKWebView prompt() 무동작 우회).
+// 현재 렌더된 헤더의 .ws-group-name 엘리먼트를 그룹 색인으로 찾아 편집 진입.
+function startGroupRename(g: GroupMeta) {
+  const heads = Array.from(document.querySelectorAll<HTMLElement>("#ws-tabs .ws-group-head"));
+  const renderedG = [...groups.filter((x) => x.pinned), ...groups.filter((x) => !x.pinned)];
+  const idx = renderedG.indexOf(g);
+  const label = idx >= 0 ? heads[idx]?.querySelector<HTMLElement>(".ws-group-name") : null;
+  if (!label) return;
+  label.contentEditable = "true";
+  label.focus();
+  const sel = window.getSelection();
+  sel?.selectAllChildren(label);
+  const onKey = (ke: KeyboardEvent) => {
+    if (ke.key === "Enter") {
+      ke.preventDefault();
+      label.blur();
+    }
+  };
+  const commit = () => {
+    label.removeEventListener("keydown", onKey); // rename마다 리스너 누적 방지
+    label.contentEditable = "false";
+    const name = (label.textContent || "").trim();
+    g.name = name || "그룹"; // 이름을 지우면 기본명으로 복귀
+    render();
+  };
+  label.addEventListener("blur", commit, { once: true });
+  label.addEventListener("keydown", onKey);
+}
+
+// 06: 그룹 삭제(파괴적) — WKWebView confirm() 무동작이라 2-click 확인 패턴(ws close 차용).
+// 멤버 ws 각각에 기존 close 로직(close_surface + 부서면 stop_dept_daemon_by_socket) 재사용 → 부서 teardown 정합 유지.
+let groupDeleteArm: number | null = null;
+async function confirmDeleteGroup(g: GroupMeta) {
+  if (groupDeleteArm !== g.id) {
+    groupDeleteArm = g.id;
+    setTimeout(() => {
+      if (groupDeleteArm === g.id) groupDeleteArm = null;
+    }, 2500);
+    // 재실행 안내 — 그룹 메뉴를 다시 띄워 '정말 삭제' 항목을 노출.
+    const m = document.getElementById("ctx-menu");
+    const r = m?.getBoundingClientRect();
+    showCtxMenu(r?.left ?? 0, r?.top ?? 0, [
+      {
+        label: "정말 삭제(워크스페이스 전부 닫기)",
+        action: () => confirmDeleteGroup(g),
+      },
+    ]);
+    return;
+  }
+  groupDeleteArm = null;
+  const members = workspaces.filter((w) => w.groupId === g.id);
+  for (const ws of members) {
+    for (const sid of collectSids(ws.tree)) {
+      await invoke("close_surface", { socket: ws.socket, surfaceId: sid }).catch(() => {});
+      destroyPaneRuntime(sid, ws.socket);
+    }
+    const i = workspaces.indexOf(ws);
+    if (i < 0) continue;
+    workspaces.splice(i, 1);
+    // 부서 데몬 teardown은 '그 socket을 쓰는 마지막 탭'일 때만(close 핸들러와 동일 정합).
+    const stillUsed = ws.socket && workspaces.some((w) => w.socket === ws.socket);
+    if (ws.socket && !stillUsed) await invoke("stop_dept_daemon_by_socket", { socket: ws.socket }).catch(() => {});
+    if (i < activeWs) activeWs -= 1; // 활성보다 앞 탭을 닫으면 인덱스가 한 칸 당겨진다
+  }
+  if (workspaces.length === 0) {
+    await addWorkspace(); // addWorkspace가 activeWs를 설정
+  } else {
+    activeWs = Math.min(activeWs, workspaces.length - 1);
+  }
+  render(); // normalizeGroups가 멤버0이 된 그룹 g를 자동 제거
 }
 
 // ws는 번호가 아니라 이름으로 구분 — 이름이 정해지지 않으면 "non title" 표시.
@@ -1923,6 +2555,276 @@ async function promptInstall() {
 }
 
 /// 간단한 확인 모달 (WKWebView confirm 회피). resolve(true/false).
+// ───────── 07 Command Palette (⌘K) — 순수 DOM 오버레이 + fuzzy + 액션 큐레이션 ─────────
+// 흡수: 팔레트 메커니즘(모달·fuzzy·키 라우팅)=webview primitive. 액션 큐레이션(역할 점프·재기동·60% cycle·feed 승인)=cysjavis 처방 solution.
+// org_status Tauri 커맨드(src-tauri/main.rs:171)·기존 setFocus/confirmModal/send_input/feed_list/feed_reply 재사용. 데몬 무변경.
+
+// 팔레트 1개 행 — cmux 액션 스키마(title/subtitle/keywords/confirm) adapt.
+interface PaletteItem {
+  id: string; // 안정 키(중복 dedupe·테스트용). 예: "node:<socket>#<sid>", "act:restart-cso"
+  title: string; // 표시 라벨(역할/제목/액션명)
+  subtitle?: string; // 보조 설명(surface_ref·idle·context_pct 등)
+  keywords?: string; // 추가 검색어(role 별칭·한글/영문 동의어). title+subtitle+keywords가 매칭 대상
+  action: () => void | Promise<void>;
+  confirm?: { title: string; body: string }; // 있으면 실행 전 confirmModal 통과 요구(파괴적 액션)
+}
+
+// org.status surface 1개의 webview 타입(필요 필드만 — 데몬 핸들러 handlers.rs org.status arm와 일치)
+interface OrgSurface {
+  surface_id: number;
+  surface_ref: string; // "surface:N"
+  role: string | null;
+  title: string | null;
+  idle_secs: number;
+  agent: string | null;
+  agent_alive: boolean | null;
+  status: { state: string; context_pct: number | null; task: string | null; age_secs: number } | null;
+}
+
+// 쿼리 문자가 순서대로 부분 등장하면 매치. 점수 = 연속 매치 보너스 + 시작 보너스(낮을수록 우위는 -로 정렬).
+// 반환 null = 비매치. 공백 쿼리는 전부 매치(score 0). 의존성 0(서브시퀀스 매처 자체 구현).
+function fuzzyScore(query: string, text: string): number | null {
+  const q = query.toLowerCase().trim();
+  if (q === "") return 0;
+  const t = text.toLowerCase();
+  let qi = 0,
+    score = 0,
+    run = 0,
+    prevIdx = -1;
+  for (let ti = 0; ti < t.length && qi < q.length; ti++) {
+    if (t[ti] === q[qi]) {
+      run = prevIdx === ti - 1 ? run + 1 : 0;
+      score += 1 + run * 2 + (ti === 0 ? 3 : 0); // 연속·선두 가중
+      prevIdx = ti;
+      qi++;
+    }
+  }
+  return qi === q.length ? -score : null; // 전부 매치해야 통과, 음수=좋을수록 작음
+}
+
+function filterPalette(items: PaletteItem[], query: string): PaletteItem[] {
+  const scored: { it: PaletteItem; s: number }[] = [];
+  for (const it of items) {
+    const hay = `${it.title} ${it.subtitle ?? ""} ${it.keywords ?? ""}`;
+    const s = fuzzyScore(query, hay);
+    if (s !== null) scored.push({ it, s });
+  }
+  scored.sort((a, b) => a.s - b.s); // 음수 점수 오름차순 = 높은 매치 우선
+  return scored.map((x) => x.it);
+}
+
+// 점프: 다른 ws일 수 있으므로 ws 전환 2단계(ws-tab mousedown 레퍼런스 차용). setFocus(기존)는 활성 ws의 pane만 본다.
+function jumpToSurface(sid: number, socket?: string) {
+  const wsIdx = workspaces.findIndex(
+    (w) => (w.socket ?? undefined) === (socket ?? undefined) && collectSids(w.tree).includes(sid),
+  );
+  if (wsIdx >= 0 && wsIdx !== activeWs) {
+    activeWs = wsIdx;
+    render();
+  }
+  setFocus(sid); // 현재 활성 ws의 pane만 잡으므로 전환 후 호출
+}
+
+// 60% cycle: hot 노드를 순차 점프(모듈 전역 cursor로 라운드로빈).
+let hotCycleCursor = 0;
+function cycleHotNodes(hot: OrgSurface[], socket?: string) {
+  if (hot.length === 0) return;
+  const s = hot[hotCycleCursor % hot.length];
+  hotCycleCursor++;
+  jumpToSurface(s.surface_id, socket);
+  toast("feed", "60% cycle", `${s.role} · ctx ${s.status?.context_pct}% (${hotCycleCursor % hot.length || hot.length}/${hot.length})`);
+}
+
+// 재기동: role의 첫 surface로 명령+개행 주입(send_input human=true 재사용, data에 "\n"으로 원자 제출 — 계약 변경 금지).
+async function restartNode(role: string, cmd: string, surfaces: OrgSurface[], socket?: string) {
+  const target = surfaces.find((s) => s.role === role && !(s.status?.state === "offline"));
+  if (!target) {
+    toast("watchdog", "재기동 실패", `${role} 노드 없음`);
+    return;
+  }
+  jumpToSurface(target.surface_id, socket);
+  await invoke("send_input", { socket: socket ?? null, surfaceId: target.surface_id, data: cmd + "\n" });
+}
+
+// feed 승인: feed_list로 request_id 획득(org.status엔 count만) → 가장 오래된 pending Allow.
+async function approveOldestFeed() {
+  const r = (await invoke("feed_list", { status: "pending" }).catch(() => null)) as { items: FeedItem[] } | null;
+  const pending = (r?.items ?? []).filter((i) => i.status === "pending");
+  if (pending.length === 0) {
+    toast("feed", "feed 승인", "대기 요청 없음");
+    return;
+  }
+  const oldest = pending[0]; // feed.list는 삽입순(handlers.rs items.iter()) → [0]=가장 오래된
+  await invoke("feed_reply", { requestId: oldest.request_id, decision: "allow" });
+  refreshFeed();
+}
+
+// org.status로 노드 행 생성 + 빌트인 액션 행 추가. socket = 활성 ws socket(1차: 단일 소켓).
+async function buildPaletteItems(): Promise<PaletteItem[]> {
+  const items: PaletteItem[] = [];
+  const sock = current()?.socket; // undefined=기본 데몬
+  let org: { surfaces?: OrgSurface[]; feed?: { pending: number } } = {};
+  try {
+    org = (await invoke("org_status", { socket: sock ?? null })) as { surfaces?: OrgSurface[]; feed?: { pending: number } };
+  } catch {
+    /* 데몬 미응답시 노드행 생략 — 빌트인 액션은 항상 표시 */
+  }
+
+  // ── (1) 노드 점프 행 ──
+  for (const s of org.surfaces ?? []) {
+    const role = s.role ?? "";
+    const ctx = s.status?.context_pct;
+    const label = `${role || "(no role)"} · ${s.title ?? s.surface_ref}`;
+    const sub =
+      `${s.surface_ref} · idle ${s.idle_secs}s` +
+      (ctx != null ? ` · ctx ${ctx}%` : "") +
+      (s.status?.task ? ` · ${s.status.task}` : "");
+    items.push({
+      id: `node:${sock ?? ""}#${s.surface_id}`,
+      title: `점프 → ${label}`,
+      subtitle: sub,
+      keywords: `jump goto ${role} ${s.surface_ref} ${s.title ?? ""}`,
+      action: () => jumpToSurface(s.surface_id, sock),
+    });
+  }
+
+  // ── (2) 60% 노드 cycle ──
+  const hot = (org.surfaces ?? []).filter((s) => (s.status?.context_pct ?? 0) >= 60);
+  if (hot.length > 0) {
+    items.push({
+      id: "act:cycle-60",
+      title: `60% 노드 cycle (${hot.length})`,
+      subtitle: hot.map((s) => `${s.role}·${s.status?.context_pct}%`).join(", "),
+      keywords: "cycle context 60 hot 컨텍스트 순환",
+      action: () => cycleHotNodes(hot, sock),
+    });
+  }
+
+  // ── (3) 노드 재기동(명령 주입) — role별 처방. 파괴적이므로 confirm. ──
+  const RESTART: Record<string, string> = {
+    cso: "cys launch-agent --role cso --agent claude",
+    worker: "cys launch-agent --role worker --agent claude",
+    "reviewer-gemini": "agy --dangerously-skip-permissions",
+    "reviewer-codex": "codex --dangerously-bypass-approvals-and-sandbox",
+  };
+  for (const [role, cmd] of Object.entries(RESTART)) {
+    items.push({
+      id: `act:restart-${role}`,
+      title: `재기동 → ${role}`,
+      subtitle: cmd,
+      keywords: `restart relaunch reboot 재기동 ${role}`,
+      confirm: { title: `${role} 재기동`, body: `${role} 노드에 다음 명령을 주입합니다:\n${cmd}` },
+      action: () => restartNode(role, cmd, org.surfaces ?? [], sock),
+    });
+  }
+
+  // ── (4) feed 승인(가장 오래된 pending Allow) ──
+  if ((org.feed?.pending ?? 0) > 0) {
+    items.push({
+      id: "act:feed-approve",
+      title: `feed 승인 (대기 ${org.feed!.pending})`,
+      subtitle: "가장 오래된 pending 요청 Allow",
+      keywords: "feed approve allow 승인 피드 대기",
+      confirm: { title: "feed 승인", body: "가장 오래된 pending 요청을 Allow 합니다." },
+      action: () => approveOldestFeed(),
+    });
+  }
+
+  // ── (5) 빌트인 webview 액션(정적) ──
+  items.push(
+    { id: "act:new-tab", title: "새 탭", keywords: "new tab 탭", action: () => actionNew() },
+    { id: "act:split-row", title: "가로 분할", keywords: "split row 분할", action: () => actionSplit("row") },
+    { id: "act:split-col", title: "세로 분할", keywords: "split col 분할", action: () => actionSplit("col") },
+    { id: "act:close", title: "패널 닫기", keywords: "close 닫기", action: () => actionClose() },
+    { id: "act:equalize", title: "패널 균등화", keywords: "equalize 균등", action: () => actionEqualize() },
+    { id: "act:cc", title: "Control Center 토글", keywords: "control center dashboard 대시보드", action: () => setCcOpen(!ccOpen) },
+    { id: "act:feed-panel", title: "Feed 패널 토글", keywords: "feed panel 피드 패널", action: () => setFeedOpen(!feedOpen) },
+    { id: "act:dept", title: "부서 워크스페이스 추가", keywords: "dept workspace 부서", action: () => addDeptWorkspace() },
+  );
+  return items;
+}
+
+let paletteOpen = false;
+// 팔레트 모달 렌더 + 키보드. 패턴=showCtxMenu(window capture + 닫을 때 removeEventListener) + confirmModal 합성.
+async function openPalette() {
+  if (paletteOpen) return;
+  paletteOpen = true;
+  const all = await buildPaletteItems(); // 데몬 1콜
+  let filtered = filterPalette(all, "");
+  let sel = 0;
+
+  const ov = document.createElement("div");
+  ov.className = "palette-overlay";
+  ov.innerHTML = `<div class="palette"><input class="palette-input" placeholder="노드·역할·액션 검색…" /><div class="palette-list"></div></div>`;
+  const input = ov.querySelector(".palette-input") as HTMLInputElement;
+  const list = ov.querySelector(".palette-list") as HTMLElement;
+
+  const close = () => {
+    paletteOpen = false;
+    ov.remove();
+    window.removeEventListener("keydown", onKey, true);
+  };
+  const renderRows = () => {
+    list.innerHTML = "";
+    filtered.slice(0, 50).forEach((it, i) => {
+      const row = document.createElement("div");
+      row.className = "palette-item" + (i === sel ? " sel" : "");
+      const t = document.createElement("div");
+      t.className = "pi-title";
+      t.textContent = it.title; // textContent — XSS 가드(쿼리·노드 title)
+      row.appendChild(t);
+      if (it.subtitle) {
+        const s = document.createElement("div");
+        s.className = "pi-sub";
+        s.textContent = it.subtitle;
+        row.appendChild(s);
+      }
+      row.addEventListener("mousedown", (e) => {
+        e.preventDefault();
+        run(it);
+      });
+      list.appendChild(row);
+    });
+  };
+  const run = async (it: PaletteItem) => {
+    close(); // confirm 모달(z 1000)이 팔레트(z 1600) 아래로 가려지지 않게 먼저 닫음
+    if (it.confirm && !(await confirmModal(it.confirm.title, it.confirm.body))) return;
+    await it.action();
+  };
+  const onKey = (e: KeyboardEvent) => {
+    if (e.isComposing || e.keyCode === 229) return; // 07: IME 조합 중 Enter가 액션 오발화 방지(적대검증 교정)
+    if (e.key === "Escape") {
+      e.preventDefault();
+      close();
+    } else if (e.key === "ArrowDown") {
+      e.preventDefault();
+      sel = Math.min(sel + 1, filtered.length - 1);
+      renderRows();
+      list.children[sel]?.scrollIntoView({ block: "nearest" });
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      sel = Math.max(sel - 1, 0);
+      renderRows();
+      list.children[sel]?.scrollIntoView({ block: "nearest" });
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      if (filtered[sel]) run(filtered[sel]);
+    }
+  };
+  input.addEventListener("input", () => {
+    filtered = filterPalette(all, input.value);
+    sel = 0;
+    renderRows();
+  });
+  ov.addEventListener("mousedown", (e) => {
+    if (e.target === ov) close();
+  });
+  window.addEventListener("keydown", onKey, true); // capture — xterm/모달 위에서 화살표/Enter 가로채기
+  document.body.appendChild(ov);
+  renderRows();
+  input.focus();
+}
+
 function confirmModal(title: string, body: string): Promise<boolean> {
   return new Promise((resolve) => {
     const ov = document.createElement("div");
@@ -1946,6 +2848,36 @@ function confirmModal(title: string, body: string): Promise<boolean> {
   });
 }
 
+/// D6 제품 모드 입력 모달 (WKWebView prompt 회피·순수 DOM) — 본문 원고/주제 붙여넣기. resolve(text|null).
+/// HITL 미리보기·신뢰선 라벨 보존(게이트 건너뛰기 금지). 빈 입력·취소는 null.
+function inputModal(title: string, label: string, placeholder: string): Promise<string | null> {
+  return new Promise((resolve) => {
+    const ov = document.createElement("div");
+    ov.className = "modal-overlay";
+    ov.innerHTML =
+      `<div class="modal"><h3></h3><p class="modal-label"></p>` +
+      `<textarea class="modal-input" rows="8"></textarea>` +
+      `<div class="modal-trust">⚠ 산출물은 "AI 보조 생성 · 박사님 검수 전"입니다. 외부 공유 전 검수를 받으세요.</div>` +
+      `<div class="modal-btns"><button class="modal-no">취소</button>` +
+      `<button class="modal-yes">진행</button></div></div>`;
+    (ov.querySelector("h3") as HTMLElement).textContent = title;
+    (ov.querySelector(".modal-label") as HTMLElement).textContent = label;
+    const ta = ov.querySelector(".modal-input") as HTMLTextAreaElement;
+    ta.placeholder = placeholder;
+    const done = (v: string | null) => {
+      ov.remove();
+      resolve(v);
+    };
+    ov.querySelector(".modal-yes")!.addEventListener("click", () => done(ta.value.trim() || null));
+    ov.querySelector(".modal-no")!.addEventListener("click", () => done(null));
+    ov.addEventListener("click", (e) => {
+      if (e.target === ov) done(null);
+    });
+    document.body.appendChild(ov);
+    setTimeout(() => ta.focus(), 50);
+  });
+}
+
 // ---------- toasts (daemon push events) ----------
 
 function toast(category: string, name: string, detail: string) {
@@ -1959,11 +2891,68 @@ function toast(category: string, name: string, detail: string) {
   setTimeout(() => el.remove(), 8000);
 }
 
+// OS 네이티브 배너(B4): 채팅창 밖에서도 고우선 이벤트 포착. 권한 거부·미지원은 무해(try/catch).
+async function osBanner(title: string, body: string) {
+  try {
+    let granted = await isPermissionGranted();
+    if (!granted) granted = (await requestPermission()) === "granted";
+    if (granted) sendNotification({ title, body });
+  } catch {
+    /* 권한 거부·플러그인 미지원 — 무해 */
+  }
+}
+
 function onDaemonEvent(event: Record<string, unknown>) {
   const name = String(event.name ?? "");
   const category = String(event.category ?? "");
   const payload = (event.payload ?? {}) as Record<string, unknown>;
   const sid = event.surface_id;
+
+  // --- name-우선 전용 처리(B1) : name 매칭이 category 폴백보다 우선 ---
+  if (name === "approval.request") {
+    toast("approval", "⚠ 승인 대기", `${payload.role ?? ""} ${payload.surface_ref ?? ""} — ${String(payload.excerpt ?? "").slice(0, 100)}`);
+    osBanner("⚠ 승인 대기", `${payload.role ?? ""} ${payload.surface_ref ?? ""} — ${String(payload.excerpt ?? "").slice(0, 100)}`); // B4 OS 배너(고우선)
+    setFeedOpen(true); // 승인은 즉시 Feed 오픈 (feed.item.created의 wait 경로와 정합)
+    refreshFeed();
+    refreshSidebarStatus(); // 사이드바 ⚠ 배지 갱신 (B3)
+    return;
+  }
+  if (name === "context.threshold") {
+    toast("threshold", `🔋 컨텍스트 ${payload.context_pct}%`, `${payload.role ?? ""} ${payload.surface_ref ?? ""} ≥ ${payload.threshold}% — ${payload.action ?? ""}`);
+    if (Number(payload.context_pct ?? 0) >= 80)
+      osBanner(`🔋 컨텍스트 ${payload.context_pct}%`, `${payload.role ?? ""} ${payload.surface_ref ?? ""} ≥ ${payload.threshold}% — ${payload.action ?? ""}`); // B4 OS 배너(≥80만)
+    refreshSidebarStatus();
+    return;
+  }
+  if (name === "pane.idle") {
+    toast("idle", "💤 노드 유휴", `surface:${sid} — ${payload.idle_seconds}s 무출력`);
+    refreshSidebarStatus();
+    return;
+  }
+  if (name === "agent.exited") {
+    toast("alert", "❌ 에이전트 사망", `surface:${sid} ${payload.role ?? ""}`);
+    osBanner("❌ 에이전트 사망", `surface:${sid} ${payload.role ?? ""}`); // B4 OS 배너(고우선)
+    refreshSidebarStatus();
+    return;
+  }
+  if (name === "master.deadman") {
+    // 페이로드는 {reason,idle_secs}만 — role 키 없음(governance.rs). payload.role 폴백 안전.
+    toast("alert", "🚨 master 무응답(deadman)", `surface:${sid} ${payload.role ?? ""} ${payload.reason ?? ""}`);
+    osBanner("🚨 master 무응답(deadman)", `surface:${sid} ${payload.reason ?? ""}`); // B4 OS 배너(고우선)
+    return;
+  }
+  if (name === "status.changed" || name === "task.changed") {
+    if (name === "status.changed") refreshSidebarStatus(); // toast 없음(빈도 높음) — 사이드바만
+    // Tasks Control Center 실시간 갱신: 부서(socket_slug)×노드(surface_id) 셀 패치. 폴링 없이 즉시.
+    const slug = event.socket_slug ? String(event.socket_slug) : "";
+    if (slug && sid != null) upsertTaskCell(slug, Number(sid), payload);
+    return;
+  }
+  if (name === "osc.notify") {
+    toast("osc", `🔔 ${payload.title ?? "알림"}`, `surface:${sid} — ${String(payload.body ?? "").slice(0, 120)}`);
+    return;
+  }
+
   if (category === "health") {
     toast("health", `⚠ ${name}`, `surface:${sid} rule=${payload.rule} — ${String(payload.line ?? "").slice(0, 120)}`);
   } else if (category === "watchdog") {
@@ -2022,17 +3011,23 @@ async function start() {
     const saved = JSON.parse(localStorage.getItem(LAYOUT_KEY) ?? "null");
     if (saved && Array.isArray(saved.workspaces)) {
       workspaces = saved.workspaces;
+      groups = Array.isArray(saved.groups) ? saved.groups : []; // 06: 하위호환 — 옛 저장본엔 groups 없음
       activeWs = saved.active ?? 0;
       wsCounter = saved.counter ?? 1;
+      groupCounter = saved.groupCounter ?? 1; // 06
     }
   } catch {
     workspaces = [];
+    groups = []; // 06: 손상 저장본 폴백
   }
   for (const ws of workspaces) ws.socket = ws.socket ?? undefined; // 하위호환 마이그레이션(기본 데몬)
   // socket 1:1 수렴 + id 중복 제거(중복 탭 증식 차단) — 복원 적재 직후 단일 게이트.
   workspaces = normalizeWorkspaces(workspaces);
   // 카운터 보정: 신규 id/이름이 항상 기존 최댓값 초과하도록(중복·손상 저장본에도 강건)
   wsCounter = Math.max(wsCounter, 0, ...workspaces.map((w) => w.id)) + 1;
+  // 06: 고아 그룹 청소 + groupCounter를 기존 최대 id+1로 보정(중복·손상 저장본에도 강건).
+  groups = normalizeGroups(workspaces, groups);
+  groupCounter = Math.max(groupCounter, 0, ...groups.map((g) => g.id)) + 1;
 
   // (order 8) 레지스트리 진실원 대조 — 죽은 socket이면서 레지스트리 미등록인 부서 ws는 유령(옛 테스트
   // 잔재·삭제된 부서)이므로 재-launch 안 하고 드롭. 조회 실패 시엔 보수적으로 전부 보존(기존 동작).
@@ -2177,6 +3172,9 @@ async function start() {
   refreshFeed();
   started = true; // 복원 완료 — 이 시점부터 인터벌 자동 입양 허용
   refreshPaneTitles();
+  // 사이드바 노드 신호(B3): 시작 1회 + 10s idle 폴백(이벤트 구동은 onDaemonEvent에서). CC 5s 폴링보다 가벼움.
+  refreshSidebarStatus();
+  setInterval(refreshSidebarStatus, 10000);
 }
 
 // ---------- ui wiring ----------
@@ -2192,6 +3190,12 @@ document.getElementById("btn-files")!.addEventListener("click", () => setFtOpen(
 document.getElementById("btn-ft-close")!.addEventListener("click", () => setFtOpen(false));
 document.getElementById("btn-cc")!.addEventListener("click", () => setCcOpen(!ccOpen));
 document.getElementById("btn-cc-close")!.addEventListener("click", () => setCcOpen(false));
+document.getElementById("btn-cc-density")!.addEventListener("click", () =>
+  applyCcDensity(ccDensity === "glance" ? "ops" : "glance"),
+);
+document.getElementById("btn-cc-glance-face")!.addEventListener("click", () =>
+  applyGlanceFace(ccGlanceFace === "tasks" ? "live" : "tasks"),
+);
 document.querySelectorAll("#cc-tabs .cc-tab").forEach((b) =>
   b.addEventListener("click", () => setCcTab((b as HTMLElement).dataset.view as typeof ccTab)),
 );
@@ -2312,8 +3316,15 @@ deptBtn?.addEventListener("click", async () => {
 
 window.addEventListener("keydown", (e) => {
   if (e.isComposing || e.keyCode === 229) return; // IME 조합 중 무시
+  if (paletteOpen) return; // 07: 팔레트 열림 중 전역 단축키 누수 차단(검색 타이핑이 ⌘W/T/D/G 발화 방지 · 적대검증 교정)
   const mod = e.metaKey || e.ctrlKey;
   if (!mod) return;
+  if (e.key === "k") {
+    // 07: ⌘K — Command Palette 기동(미사용 키, 충돌 없음)
+    e.preventDefault();
+    openPalette();
+    return;
+  }
   if (e.key === "t") {
     e.preventDefault();
     actionNew();
@@ -2335,6 +3346,10 @@ window.addEventListener("keydown", (e) => {
   } else if (e.key === "0") {
     e.preventDefault();
     ccOpen ? applyPanelZoom(null) : applyZoom(null);
+  } else if (e.key === "g" && ccOpen) {
+    // HUD-5: ⌘G로 Glance↔Ops 전환(CC 열린 동안만 — 일반 ⌘G와 충돌 회피)
+    e.preventDefault();
+    applyCcDensity(ccDensity === "glance" ? "ops" : "glance");
   }
 });
 

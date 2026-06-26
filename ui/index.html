@@ -41,6 +41,8 @@
         <span class="cc-title">JARVIS Control Center</span>
         <span id="cc-livebadge" class="cc-badge idle">IDLE</span>
         <span id="cc-alertbadge" class="cc-alert-badge" hidden></span>
+        <button id="btn-cc-density" title="한눈에 보기 / 상세 보기 전환 (⌘G)">👁 한눈에</button>
+        <button id="btn-cc-glance-face" title="한눈에 면 전환: Live ↔ 작업">📋 작업</button>
         <span id="cc-clock"></span>
         <button id="btn-cc-close" title="닫기">×</button>
       </div>
@@ -51,6 +53,8 @@
         <button class="cc-tab" data-view="sessions">세션</button>
         <button class="cc-tab" data-view="weekly">추세·주간</button>
         <button class="cc-tab" data-view="learn">학습</button>
+        <button class="cc-tab" data-view="board">스킬 보드</button>
+        <button class="cc-tab" data-view="tasks">작업</button>
       </div>
       <div id="cc-body">
         <div id="cc-view-live">
@@ -86,6 +90,7 @@
           <div class="cc-section"><div class="cc-h">토큰 4분해</div><div id="cc-eff-tokens"></div></div>
           <div class="cc-section"><div class="cc-h">모델별 비용</div><div id="cc-eff-models"></div></div>
           <div class="cc-section"><div class="cc-h">에이전트 믹스</div><div id="cc-eff-agents"></div></div>
+          <div class="cc-section"><div class="cc-h">조직 단위 비용 (tier · 역할)</div><div id="cc-eff-tiers"></div></div>
           <div class="cc-section"><div class="cc-h">생산성</div><div class="cc-token-stats" id="cc-eff-prod"></div></div>
         </div>
         <div id="cc-view-skills" hidden>
@@ -123,6 +128,15 @@
           <div class="cc-section"><div class="cc-h">♻️ 채택 · 롤백 (retention)</div><div id="cc-learn-retention"></div></div>
           <div class="cc-section"><div class="cc-h">🧭 발견 누적 (Discovery)</div><div id="cc-learn-discovery"></div></div>
           <div class="cc-section"><div class="cc-h">⏳ 자율추천 대기 (승인은 Feed 패널)</div><div id="cc-learn-pending"></div></div>
+        </div>
+        <div id="cc-view-board" hidden>
+          <div class="cc-board-note">클릭 = 보이는 일회용 워커가 task-prompt 티켓(성공기준·4규칙) 경유로 실행합니다. 산출물은 "AI 보조 생성 · 박사님 검수 전"입니다.</div>
+          <div class="cc-section"><div class="cc-h">스킬 보드 (클릭 = 일회용 워커 실행)</div><div id="cc-board-domains"></div></div>
+          <div class="cc-section"><div class="cc-h">산출물 회수 (~/.cys/_round/skill-out)</div><div id="cc-board-out"></div></div>
+        </div>
+        <div id="cc-view-tasks" hidden>
+          <div class="cc-board-note">모든 부서의 모든 노드가 지금 무슨 업무를 하는지 실시간 표시(관측 전용·입력 주입 없음). 📍자기보고 = 노드가 보고한 업무 · ⚙파생 = 활동 추론.</div>
+          <div id="cc-tasks-depts"></div>
         </div>
         <div id="cc-footer"></div>
       </div>

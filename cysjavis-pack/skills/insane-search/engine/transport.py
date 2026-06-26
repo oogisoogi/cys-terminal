@@ -96,23 +96,32 @@ class SessionPool:
         ent = self.get(host, impersonate)
         if ent is None:
             return False
+        from .cred_guard import CredSink, sanitize  # OPP-15: cred sink guard
         ok = False
         for c in cookies or []:
-            name = c.get("name")
-            value = c.get("value")
-            if not name:
+            # OPP-15: adversarial cookies (CRLF / scope over-broad) are
+            # sanitized/dropped before the curl_cffi jar sink. fail-closed.
+            rn = sanitize(CredSink.COOKIE_NAME, c.get("name") or "")
+            if rn.verdict == "REJECTED":
                 continue
+            rv = sanitize(CredSink.COOKIE_VALUE, c.get("value") or "")
+            if rv.verdict == "REJECTED":
+                continue
+            rd = sanitize(CredSink.COOKIE_DOMAIN, c.get("domain") or host, host=host)
+            # Untrusted scope -> narrow to request host (conservative §4).
+            dom = rd.sanitized if rd.verdict != "REJECTED" else host
             try:
-                ent.session.cookies.set(name, value, domain=c.get("domain") or host)
+                ent.session.cookies.set(rn.sanitized, rv.sanitized, domain=dom)
                 ok = True
             except Exception:
                 try:
-                    ent.session.cookies.set(name, value)
+                    ent.session.cookies.set(rn.sanitized, rv.sanitized)
                     ok = True
                 except Exception:
                     continue
         if user_agent:
-            ent.injected_ua = user_agent
+            ru = sanitize(CredSink.HEADER_UA, user_agent)  # OPP-15: CRLF-strip UA
+            ent.injected_ua = ru.sanitized if ru.verdict != "REJECTED" else None
         return ok
 
     def request(self, url: str, *, impersonate: str, referer: str = "",
@@ -148,7 +157,14 @@ class SessionPool:
             try:
                 from curl_cffi import requests as cffi_requests
             except ImportError:
-                return None, "curl_cffi not installed"
+                # OPP-11: attach an install-source-aware re-install PRESCRIPTION
+                # (presented only — dep_doctor runs no install). Falls back to the
+                # plain string if diagnosis errors (best-effort, never breaks fetch).
+                try:
+                    from . import dep_doctor
+                    return None, dep_doctor.hint_for("curl_cffi", code_ref="transport.py:160")
+                except Exception:
+                    return None, "curl_cffi not installed"
             def _do_get(u):
                 return cffi_requests.get(u, impersonate=impersonate, headers=headers,
                                          timeout=timeout, allow_redirects=False)

@@ -16,6 +16,11 @@ It is intentionally network-live and dependency-light: curl_cffi for HTTP,
 yt-dlp for media. No site names are branched in engine/** — this is a *test*,
 so concrete targets are allowed here (same exemption as SKILL.md examples).
 
+Observe-only contract (AGENTREACH OPP-21): this battery never mutates remote
+state — GET + yt-dlp --skip-download only; no POST/PUT/DELETE, no --cookies /
+login session, no media download (-o/--output). bin/javis_idempotency.py
+--self-test statically asserts these forbidden tokens are absent (preflight C53).
+
 Run:  python3 tests/coverage_battery.py            # all platforms
       python3 tests/coverage_battery.py reddit x   # subset
       python3 tests/coverage_battery.py --json      # machine-readable

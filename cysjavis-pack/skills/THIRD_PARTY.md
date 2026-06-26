@@ -116,3 +116,34 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+## google-research/timesfm (Apache License 2.0, Copyright 2025 Google LLC)
+
+`timesfm-forecasting` 스킬은 cysjavis **원작 래퍼**이되, Google TimesFM 2.5(시계열 기반모델)를
+호출하며 그 SKILL.md 패키징·preflight 게이트 설계 DNA를 [google-research/timesfm](https://github.com/google-research/timesfm)
+(Apache License 2.0)에서 차용했다. 전수조사: 보고서 `_research/TimesFM_박사급_연구보고서.md`,
+구현설계서 `_research/TimesFM기반_cys_업그레이드_구현설계서.md`, 메모리 `timesfm-upgrade-research`.
+
+벤더링 범위: SKILL.md + scripts(timesfm_forecast.py·check_timesfm.py·holdout_eval.py·test_eval_gate.py)는
+cysjavis 규약으로 **재작성한 원작**이며 TimesFM 소스 코드를 직접 복사하지 않았다. TimesFM **코드 패키지**는
+런타임 의존(`pip install timesfm[torch]`)으로 사용자 환경에 설치되고, **모델 가중치(~800MB)는 PACK에
+임베드하지 않고**(include_str! 텍스트 전용) 첫 사용 시 HuggingFace에서 `~/.cache/huggingface`로 1회
+다운로드한다. Apache-2.0은 상업·임베드·재배포 친화이며 copyleft가 없어 본 PACK 코드사이닝과 마찰이 없다.
+
+★주의: HuggingFace 모델카드는 *"This open version is not an officially supported Google product"*로
+면책하며, TimesFM 사용·정확도 책임은 운영자에게 있다. TimesFM 소스 파일을 **직접 이식**하는 시점에는
+그 파일에 Apache-2.0 라이선스·NOTICE 고지를 동봉해야 한다(Apache-2.0 §4). 현재는 런타임 의존이라
+벤더링 대상이 아니다.
+
+### Apache License 2.0 (google-research/timesfm)
+
+Copyright 2025 Google LLC
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+this file except in compliance with the License. You may obtain a copy of the
+License at http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software distributed
+under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
+CONDITIONS OF ANY KIND, either express or implied. See the License for the
+specific language governing permissions and limitations under the License.

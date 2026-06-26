@@ -3,6 +3,13 @@
 > cys는 **AI 조직(자비스)이 거주하는 터미널**입니다. 코어 데몬(cysd) + CLI(cys) + GUI 앱(cys.app)으로
 > 구성되며, **받는 사람은 데몬을 따로 설치할 필요가 없습니다** — 앱·CLI가 자동으로 기동합니다.
 
+> **이 문서는 두 종류의 독자를 위해 명시 분리되어 있습니다.**
+> - 🧑 **[HUMAN]** 표시 = **사람이 직접** 해야 하는 단계(DMG 더블클릭·Gatekeeper·`sudo`). 에이전트는 자율 실행하지 말고 사람에게 위임합니다.
+> - 🤖 **[AGENT]** 표시 = 에이전트(워커)가 부트 시 **결정론으로 따르는** 실행 스텝(`cys boot`/`launch-agent` 등).
+> - 🚧 **[BOUNDARY]** 표시 = 설치 중 **무조건 정지·오너 보고** 대상인 위험 명령(아래 "설치 경계" 섹션 참조).
+>
+> 한 줄이 사람용 복붙인지 에이전트 실행 스텝인지가 헷갈리면, 이 표시를 우선합니다.
+
 ## 무엇이 자동인가 (0.2.0+)
 
 신규 머신에서 별도 설정 없이 동작합니다:
@@ -16,6 +23,23 @@
 
 → 따라서 GUI만 쓰는 사용자는 **앱을 더블클릭하면 끝**입니다.
 
+## 🚧 설치 경계 (Boundaries — 무조건 정지·오너 보고)
+
+> 이 섹션은 **에이전트(워커)용 1급 경계**입니다. 아래 명령들은 부트·설치 중에 워커가 자율로 밟지 말고,
+> 만나면 **무조건 중단하고 오너에게 보고**합니다. 거버넌스 일반 denylist(외부 발행·비가역 삭제는
+> 무조건 중단·보고)는 이미 워커 절대지침으로 주입되며(근거: `directives/WORKER_DIRECTIVE.md §7`),
+> 이 섹션은 **설치에 특화된 위험 명령**만 별도 열거해 보강합니다(directive가 담지 않는 부분).
+
+| ID | 위험 명령 | 왜 경계인가 | 워커 처리 |
+|---|---|---|---|
+| INST-DENY-01 | `cys daemon install --takeover` | **가동 중인 세션이 소멸**합니다(비가역 — 아래 "C. 상시 가동" line 참조). | 자율 실행 금지 → 정지·오너 보고 |
+| INST-DENY-02 | `sudo ln -sf …` (심링크 덮어쓰기) | `sudo` = 오너 권한 단계 + `-f`로 기존 파일을 묻지 않고 덮어씀. | 사람(🧑)이 직접 실행 → 워커는 위임 |
+| INST-DENY-03 | `rm -rf ~/.cys ~/.local/state/cys` | pack·트랜스크립트·상태 **완전 삭제**(비가역). | 자율 실행 금지 → 정지·오너 보고 |
+| INST-DENY-04 | DMG 우클릭·Gatekeeper "열기"·코드사이닝 | 사람 GUI/보안 결정 단계. | 사람(🧑)이 직접 → 워커는 위임 |
+
+> 위 경계는 거버넌스 denylist의 **install 특화 투영**입니다(새 denylist 생성 아님). 일반 경계는
+> `WORKER_DIRECTIVE.md §7`이 정본이며 여기서 재서술하지 않습니다 — 충돌·중복 표현형 방지.
+
 ## 선행조건 — git (기능별 필수)
 
 기본 사용(DMG/MSI 설치 → 앱 더블클릭)에는 git이 **필요 없습니다**. 다만 아래 기능을 쓰려면 git이 있어야 합니다:
@@ -27,57 +51,67 @@
 프리플라이트가 git 유무를 결정론으로 점검합니다(`C30.git` — 부재 시 WARN으로 안내). 설치:
 
 ```bash
-# macOS — Xcode Command Line Tools(권장) 또는 Homebrew
+# 🧑 [HUMAN] macOS — Xcode Command Line Tools(권장) 또는 Homebrew
 xcode-select --install        # 또는: brew install git
-# Linux
+# 🧑 [HUMAN] Linux
 sudo apt install git          # Debian/Ubuntu
 sudo dnf install git          # Fedora/RHEL
-# Windows — 공식 인스톨러
+# 🧑 [HUMAN] Windows — 공식 인스톨러
 #   https://git-scm.com/download/win  (설치 후 새 터미널에서 git --version)
-git --version                 # 설치 확인
+git --version                 # 설치 확인 (사람·에이전트 공통)
 ```
 
 ## macOS
 
-### A. 설치파일 (DMG) — 권장
+### 🧑 A. 설치파일 (DMG) — 권장 [HUMAN — 사람이 직접]
 1. `cys-0.2.0-macos-arm64.dmg`를 열고 `cys.app`을 `Applications`로 드래그.
-2. 첫 실행 시 Gatekeeper 경고가 나오면: 우클릭 → "열기"(미서명 빌드의 경우).
+2. 첫 실행 시 Gatekeeper 경고가 나오면: 우클릭 → "열기"(미서명 빌드의 경우). 🚧 [BOUNDARY INST-DENY-04 — 사람 보안 결정]
    서명·공증된 빌드라면 바로 열립니다.
 3. 끝. 앱이 데몬을 자동 기동합니다.
 
-### B. CLI도 터미널에서 쓰려면 (선택)
+#### 받는 분(비기술자)께 — 1페이지 (D6 제품 모드 패키징)
+> 터미널을 한 번도 안 열어도 박사님 대표 산출물(통찰보고서·문체 글)을 클릭으로 받을 수 있습니다.
+1. `cys.app`을 `Applications`로 드래그(설치 끝).
+2. 더블클릭 → 열림(공증 빌드면 경고 없음). "손상됨"이 뜨면 보낸 사람에게 **"공증 빌드"**를 요청하세요(미공증은 다른 맥에서 차단됩니다 — RELEASE.md §1 ★Apple 서명·공증).
+3. 우상단 **Control Center → "스킬 보드"** 탭 → "통찰보고서 만들기" 클릭 → 본문 붙여넣기 → 미리보기 확인 → PDF를 받습니다.
+4. ⚠ 산출물은 **"AI 보조 생성 · 박사님 검수 전"**입니다. 외부 공유 전 반드시 검수를 받으세요(과대약속 금지).
+5. **청중 맞춤**: `~/.cys/profile.json`의 `audience`를 바꾸면(예: `pastor`·`student`) 그 청중에 맞춰 산출됩니다(기본 `custom`=전체보기).
+
+### 🧑 B. CLI도 터미널에서 쓰려면 (선택) [HUMAN — sudo 단계]
 앱 번들 안의 바이너리를 PATH에 노출합니다:
 ```sh
+# 🧑 [HUMAN] 🚧 [BOUNDARY INST-DENY-02] sudo 심링크 — 사람이 직접, 워커 자율 실행 금지
 sudo ln -sf /Applications/cys.app/Contents/MacOS/cys  /usr/local/bin/cys
 sudo ln -sf /Applications/cys.app/Contents/MacOS/cysd /usr/local/bin/cysd
 ```
 (pane *안*에서는 PATH가 자동 주입되므로 이 단계는 오너이 **앱 밖 터미널**에서 `cys`를 칠 때만 필요)
 
-### C. 24/365 상시 가동 (선택 — 헤드리스/무인 운영)
+### 🧑 C. 24/365 상시 가동 (선택 — 헤드리스/무인 운영) [HUMAN]
 재부팅 후에도 데몬이 자동으로 살아 있게 launchd에 등록:
 ```sh
+# 🧑 [HUMAN] 상시 가동 등록 (가역)
 cys daemon install            # 로그인 시 자동 기동 + 사망 시 자동 재기동(KeepAlive)
 cys daemon status             # 등록·가동 상태 확인
 cys daemon uninstall          # 해제
 ```
 - 이미 데몬이 떠 있으면 `cys daemon install`은 안전을 위해 거부합니다(flock 충돌 방지).
   기존 세션을 정리하고 launchd로 소유권을 넘기려면 `cys daemon install --takeover`
-  (⚠ 가동 중인 세션이 소멸합니다 — `cys list`로 먼저 확인).
+  **🚧 [BOUNDARY INST-DENY-01] ⚠ 가동 중인 세션이 소멸합니다(비가역) — 워커 자율 실행 금지·정지·오너 보고. 사람은 `cys list`로 먼저 확인.**
 
 ## Windows
 
 > 코어(named pipe·ConPTY·DSR)는 검증 완료(docs/WINDOWS_VALIDATION.md). GUI 앱(Tauri)의 Windows
 > 빌드는 별도 트랙입니다. 현재 Windows 배포는 **CLI+데몬(MSI/ZIP)** 중심입니다.
 
-### A. MSI 설치파일
+### 🧑 A. MSI 설치파일 [HUMAN]
 1. 아키텍처에 맞는 파일 실행: `cys-0.2.0-windows-x64.msi` 또는 `...-arm64.msi`.
 2. 설치 시 `cys.exe`·`cysd.exe`가 PATH에 등록됩니다.
 3. `cys list` — 데몬이 없으면 자동 기동됩니다.
 
-### B. ZIP (수동)
+### 🧑 B. ZIP (수동) [HUMAN]
 `cys-0.2.0-windows-x64.zip`을 풀고 폴더를 PATH에 추가하거나, 그 폴더에서 직접 `cys.exe` 실행.
 
-### C. 상시 가동 (선택)
+### 🧑 C. 상시 가동 (선택) [HUMAN]
 ```
 cys daemon install     # 로그온 시 자동 기동 (작업 스케줄러 ONLOGON)
 cys daemon status
@@ -85,23 +119,41 @@ cys daemon uninstall
 ```
 ※ Windows는 작업 스케줄러에 사망-시-재기동이 없어, CLI 자동기동이 이를 보완합니다.
 
-## 빠른 시작 (설치 후 공통)
+## 🤖 빠른 시작 (설치 후 공통) [AGENT — 에이전트 실행 스텝]
+
+> 아래는 설치가 끝난 뒤 **에이전트(워커)가 결정론으로 따르는** 부트 스텝입니다. 각 스텝에
+> **Goal / verify**가 붙어 있어, "사람용 한 줄"과 달리 워커가 자율로 실행·검증합니다.
+> 위 🚧 설치 경계(INST-DENY-01~04)는 이 스텝에서도 그대로 유효합니다.
+
+**Goal(부트 완료의 단일 정의)**: 4종 의무 노드(worker·CSO·reviewer×2)가 생존하고, 프리플라이트가
+GREEN이며, 역할 주소가 등록된 상태.
 
 ```sh
+# 🤖 [AGENT] Step 1 — 관제 보드 (현재 노드 상태 확인)
 cys status                                   # 전 노드 1콜 관제 보드
+#   verify: 출력에 데몬 가동·노드 목록이 보이면 OK
+
+# 🤖 [AGENT] Step 2 — 역할 에이전트 기동 (디렉티브 자동 주입)
 cys launch-agent --role master --agent claude  # 역할 에이전트 기동 + 디렉티브 자동 주입
+#   verify: launch-agent가 ①surface 생성 ②CLI 기동 ③절대지침 stdin 주입 ④레지스트리 등록 완료
+
+# 🤖 [AGENT] Step 3 — 일괄 부트 (worker + reviewers)
 cys boot                                     # 설치된 CLI 자동 감지 → worker+reviewers 일괄 기동
+#   verify: python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_orchestra.py" check  → 4종 생존 GREEN
+#   on_fail: python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_preflight.py" --fix  (처방 내장 진단)
 ```
 
 `agents.json`(`~/.cys/pack/agents.json`)에서 각 에이전트의 기동 명령을 환경에 맞게 수정하세요
 (claude/gemini/codex/grok 어댑터 정의).
 
-## 제거
+## 🧑 제거 [HUMAN — 비가역 단계 포함]
 
 ```sh
+# 🧑 [HUMAN] 상시 가동 해제 (가역)
 cys daemon uninstall                         # 상시 가동 해제(설치했다면)
-# macOS: Applications에서 cys.app 삭제 + /usr/local/bin/cys{,d} 심링크 제거
-# Windows: 제어판에서 MSI 제거
+# 🧑 [HUMAN] macOS: Applications에서 cys.app 삭제 + /usr/local/bin/cys{,d} 심링크 제거
+# 🧑 [HUMAN] Windows: 제어판에서 MSI 제거
+# 🧑 [HUMAN] 🚧 [BOUNDARY INST-DENY-03] ⚠ 비가역 완전 삭제 — 워커 자율 실행 금지·정지·오너 보고
 rm -rf ~/.cys ~/.local/state/cys             # pack·트랜스크립트·상태 완전 삭제(선택)
 ```
 

@@ -1,6 +1,6 @@
 [package]
 name = "cys-app"
-version = "0.2.4"
+version = "0.3.0"
 edition = "2021"
 description = "cys UI shell (Tauri 2) — thin client over the cysd socket"
 license = "MIT"
@@ -12,6 +12,7 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = [] }
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
+tauri-plugin-notification = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["net", "io-util", "time"] }

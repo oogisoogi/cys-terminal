@@ -193,6 +193,7 @@ pub fn change_log_restore(socket_path: &Path, scope: &str, since_revn: u64) -> O
 pub fn record_usage(
     conn: &Connection,
     session: &str,
+    role: &str,
     agent: &str,
     model: &str,
     input: u64,
@@ -202,11 +203,13 @@ pub fn record_usage(
     cost: f64,
     ts: f64,
 ) {
+    // D3: role(조직 단위 tier) 적재 — schema(:21)엔 role TEXT가 있으나 INSERT에서 누락돼 있었다.
+    // 이것이 tier별 비용/재작업률 측정의 유일한 막힘이었다(by_tier eval baseline 전제).
     let _ = conn.execute(
-        "INSERT INTO usage_records(session_id, agent, model, input_tokens, output_tokens, cache_creation, cache_read, cost_usd, ts)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+        "INSERT INTO usage_records(session_id, role, agent, model, input_tokens, output_tokens, cache_creation, cache_read, cost_usd, ts)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
         rusqlite::params![
-            session, agent, model, input as i64, output as i64,
+            session, role, agent, model, input as i64, output as i64,
             cache_creation as i64, cache_read as i64, cost, ts
         ],
     );
@@ -328,8 +331,9 @@ pub fn seed_consumption(daemon: &Daemon) {
 
 // ───────────────────────── E2 비용·효율 집계 (control.analytics) ─────────────────────────
 
-/// (agent, model, input, output, cache_creation, cache_read, cost, session, ts)
-pub type SummaryRow = (String, String, u64, u64, u64, u64, f64, String, f64);
+/// (agent, role, model, input, output, cache_creation, cache_read, cost, session, ts)
+/// role(idx1)은 D3 by_tier 집계 키 — SELECT 컬럼 순서를 이 튜플 인덱스와 일치시킬 것.
+pub type SummaryRow = (String, String, String, u64, u64, u64, u64, f64, String, f64);
 
 /// window 문자열 → cutoff epoch. "today"(기본·로컬 자정)·"7d"·"all".
 pub fn window_since(now: f64, window: &str) -> f64 {
@@ -351,7 +355,7 @@ pub fn window_since(now: f64, window: &str) -> f64 {
 /// since 이후 usage_records 전 행(집계용 — agent·cache_read 포함). 실패는 빈 벡터.
 fn load_summary_rows(conn: &Connection, since: f64) -> Vec<SummaryRow> {
     let mut stmt = match conn.prepare(
-        "SELECT agent, model, input_tokens, output_tokens, cache_creation, cache_read, cost_usd, session_id, ts
+        "SELECT agent, role, model, input_tokens, output_tokens, cache_creation, cache_read, cost_usd, session_id, ts
          FROM usage_records WHERE ts >= ?1",
     ) {
         Ok(s) => s,
@@ -359,15 +363,16 @@ fn load_summary_rows(conn: &Connection, since: f64) -> Vec<SummaryRow> {
     };
     let rows = stmt.query_map(rusqlite::params![since], |r| {
         Ok((
-            r.get::<_, String>(0).unwrap_or_default(),
-            r.get::<_, String>(1).unwrap_or_default(),
-            r.get::<_, i64>(2)? as u64,
+            r.get::<_, String>(0).unwrap_or_default(),  // agent
+            r.get::<_, String>(1).unwrap_or_default(),  // role (idx1)
+            r.get::<_, String>(2).unwrap_or_default(),  // model
             r.get::<_, i64>(3)? as u64,
             r.get::<_, i64>(4)? as u64,
             r.get::<_, i64>(5)? as u64,
-            r.get::<_, f64>(6)?,
-            r.get::<_, String>(7).unwrap_or_default(),
-            r.get::<_, f64>(8)?,
+            r.get::<_, i64>(6)? as u64,
+            r.get::<_, f64>(7)?,
+            r.get::<_, String>(8).unwrap_or_default(),  // session
+            r.get::<_, f64>(9)?,
         ))
     });
     match rows {
@@ -383,10 +388,12 @@ pub fn summarize(rows: &[SummaryRow]) -> serde_json::Value {
     use std::collections::HashMap;
     let (mut t_in, mut t_out, mut t_cc, mut t_cr) = (0u64, 0u64, 0u64, 0u64);
     let (mut t_cost, mut savings) = (0.0f64, 0.0f64);
+    let mut full_input_cost = 0.0f64; // Σ cache_read × input단가 — 캐시 없었을 때 풀가격(cache_roi_x 분모)
     let mut models: HashMap<String, [f64; 6]> = HashMap::new(); // [in,out,cc,cr,cost,msgs]
     let mut agents: HashMap<String, [f64; 3]> = HashMap::new(); // [tokens,cost,msgs]
+    let mut tiers: HashMap<String, [f64; 3]> = HashMap::new(); // role(조직 tier)별 [tokens,cost,msgs] (D3)
     let mut sessions: HashMap<String, (f64, f64, u64, u64, f64)> = HashMap::new(); // (min_ts,max_ts,msgs,tokens,cost)
-    for (agent, model, input, output, cc, cr, cost, session, ts) in rows {
+    for (agent, role, model, input, output, cc, cr, cost, session, ts) in rows {
         t_in += input;
         t_out += output;
         t_cc += cc;
@@ -394,6 +401,7 @@ pub fn summarize(rows: &[SummaryRow]) -> serde_json::Value {
         t_cost += cost;
         let p = crate::cost::pricing_for(model);
         savings += (*cr as f64 / 1_000_000.0) * (p.input_per_m - p.cache_read_per_m);
+        full_input_cost += (*cr as f64 / 1_000_000.0) * p.input_per_m; // 풀가격(캐시 미사용 가정)
         let tokens = input + output + cc + cr;
         let m = models.entry(model.clone()).or_insert([0.0; 6]);
         m[0] += *input as f64;
@@ -407,6 +415,12 @@ pub fn summarize(rows: &[SummaryRow]) -> serde_json::Value {
         a[0] += tokens as f64;
         a[1] += *cost;
         a[2] += 1.0;
+        // D3 by_tier: role(조직 단위 tier)별 집계. 빈 role → "unattributed"(by_agent의 "unknown" 동형).
+        let tkey = if role.is_empty() { "unattributed".to_string() } else { role.clone() };
+        let tr = tiers.entry(tkey).or_insert([0.0; 3]);
+        tr[0] += tokens as f64;
+        tr[1] += *cost;
+        tr[2] += 1.0;
         let s = sessions.entry(session.clone()).or_insert((*ts, *ts, 0, 0, 0.0));
         s.0 = s.0.min(*ts);
         s.1 = s.1.max(*ts);
@@ -443,14 +457,31 @@ pub fn summarize(rows: &[SummaryRow]) -> serde_json::Value {
         b["tokens"].as_u64().unwrap_or(0).cmp(&a["tokens"].as_u64().unwrap_or(0))
             .then_with(|| a["agent"].as_str().unwrap_or("").cmp(b["agent"].as_str().unwrap_or("")))
     });
+    // D3 by_tier: cost desc, 동률은 tier asc (결정론 — by_model 패턴 동형)
+    let mut by_tier: Vec<Value> = tiers
+        .into_iter()
+        .map(|(tier, v)| json!({
+            "tier": tier, "tokens": v[0] as u64, "cost_usd": v[1], "msgs": v[2] as u64,
+            "cost_per_msg": div(v[1], v[2]),
+        }))
+        .collect();
+    by_tier.sort_by(|a, b| {
+        b["cost_usd"].as_f64().unwrap_or(0.0)
+            .partial_cmp(&a["cost_usd"].as_f64().unwrap_or(0.0))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a["tier"].as_str().unwrap_or("").cmp(b["tier"].as_str().unwrap_or("")))
+    });
     json!({
         "totals": {
             "input": t_in, "output": t_out, "cache_creation": t_cc, "cache_read": t_cr,
             "tokens": tokens_total as u64, "cost_usd": t_cost, "msgs": msgs as u64, "sessions": nsess as u64,
         },
         "cache_savings_usd": savings,
+        "cache_efficiency": div(t_cr as f64, (t_in + t_cc + t_cr) as f64),
+        "cache_roi_x": div(savings, full_input_cost),
         "by_model": by_model,
         "by_agent": by_agent,
+        "by_tier": by_tier,
         "productivity": {
             "turns_per_session": div(msgs, nsess),
             "tokens_per_turn": div(tokens_total, msgs),
@@ -856,7 +887,7 @@ pub fn session_detail(conn: &Connection, session_id: &str) -> serde_json::Value 
 /// 단일 세션의 usage_records를 summarize 입력 형태로 로드.
 fn load_summary_rows_for_session(conn: &Connection, session_id: &str) -> Vec<SummaryRow> {
     let mut stmt = match conn.prepare(
-        "SELECT agent, model, input_tokens, output_tokens, cache_creation, cache_read, cost_usd, session_id, ts
+        "SELECT agent, role, model, input_tokens, output_tokens, cache_creation, cache_read, cost_usd, session_id, ts
          FROM usage_records WHERE session_id = ?1",
     ) {
         Ok(s) => s,
@@ -864,15 +895,16 @@ fn load_summary_rows_for_session(conn: &Connection, session_id: &str) -> Vec<Sum
     };
     let rows = stmt.query_map(rusqlite::params![session_id], |r| {
         Ok((
-            r.get::<_, String>(0).unwrap_or_default(),
-            r.get::<_, String>(1).unwrap_or_default(),
-            r.get::<_, i64>(2)? as u64,
+            r.get::<_, String>(0).unwrap_or_default(),  // agent
+            r.get::<_, String>(1).unwrap_or_default(),  // role (idx1)
+            r.get::<_, String>(2).unwrap_or_default(),  // model
             r.get::<_, i64>(3)? as u64,
             r.get::<_, i64>(4)? as u64,
             r.get::<_, i64>(5)? as u64,
-            r.get::<_, f64>(6)?,
-            r.get::<_, String>(7).unwrap_or_default(),
-            r.get::<_, f64>(8)?,
+            r.get::<_, i64>(6)? as u64,
+            r.get::<_, f64>(7)?,
+            r.get::<_, String>(8).unwrap_or_default(),  // session
+            r.get::<_, f64>(9)?,
         ))
     });
     match rows {
@@ -1098,6 +1130,59 @@ pub fn redact_sessions(mut v: serde_json::Value) -> serde_json::Value {
     v
 }
 
+// ───────────────────────── D3 비용·효율 eval baseline (control.cost_baseline) ─────────────────────────
+
+/// D3 재작업률(rework) — events에서 role(tier)별 calls/fail 집계. fail 정의=POST exit≠0(summarize_skills 동형).
+/// rework_rate = fail/calls. producer≠evaluator 무결성: 검증된 fail_rate 정의를 baseline 분모로 재사용(새 정의 금지).
+pub fn summarize_rework(rows: &[EventRow]) -> serde_json::Value {
+    use serde_json::{json, Value};
+    use std::collections::HashMap;
+    let mut tiers: HashMap<String, [u64; 2]> = HashMap::new(); // role → [calls, fail]
+    let (mut total_calls, mut total_fail) = (0u64, 0u64);
+    for (etype, role, tool, _is_skill, _skill, _is_agent, _atype, exit, _ts) in rows {
+        let key = if role.is_empty() { "unattributed".to_string() } else { role.clone() };
+        if etype == "PRE_TOOL" && !tool.is_empty() {
+            tiers.entry(key).or_insert([0, 0])[0] += 1;
+            total_calls += 1;
+        } else if etype == "POST_TOOL" && matches!(exit, Some(c) if *c != 0) {
+            tiers.entry(key).or_insert([0, 0])[1] += 1;
+            total_fail += 1;
+        }
+    }
+    let rate = |fail: u64, calls: u64| if calls > 0 { fail as f64 / calls as f64 } else { 0.0 };
+    let mut by_tier_rework: Vec<Value> = tiers
+        .into_iter()
+        .map(|(tier, v)| json!({"tier": tier, "calls": v[0], "fail": v[1], "rework_rate": rate(v[1], v[0])}))
+        .collect();
+    // calls desc, 동률은 tier asc (결정론)
+    by_tier_rework.sort_by(|a, b| {
+        b["calls"].as_u64().unwrap_or(0).cmp(&a["calls"].as_u64().unwrap_or(0))
+            .then_with(|| a["tier"].as_str().unwrap_or("").cmp(b["tier"].as_str().unwrap_or("")))
+    });
+    json!({
+        "by_tier_rework": by_tier_rework,
+        "global_rework_rate": rate(total_fail, total_calls),
+        "total_calls": total_calls,
+        "total_fail": total_fail,
+    })
+}
+
+/// D3 LOCKED baseline 합본 — by_tier(비용)+rework+cache_roi_x를 한 객체로(producer≠evaluator diff 단위).
+/// tier 라우팅(R1) 도입 '전'에 cys cost-baseline lock으로 박제 → 도입 후 동일 eval 재실행·diff로 회귀 판정.
+pub fn cost_baseline(conn: &Connection, since: f64) -> serde_json::Value {
+    use serde_json::json;
+    let cost = summarize(&load_summary_rows(conn, since)); // by_tier·cache_roi_x·productivity·totals
+    let rework = summarize_rework(&load_event_rows(conn, since)); // by_tier_rework·global_rework_rate
+    json!({
+        "by_tier": cost["by_tier"],
+        "cost_per_session": cost["productivity"]["cost_per_session"],
+        "cache_roi_x": cost["cache_roi_x"],
+        "cache_efficiency": cost["cache_efficiency"],
+        "rework": rework,
+        "totals": cost["totals"],
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1114,10 +1199,10 @@ mod tests {
         )
         .unwrap();
         let now = 2_000_000.0;
-        record_usage(&conn, "/s/a.jsonl", "claude", "claude-opus-4-8", 1000, 300, 2000, 50000, 0.42, now - 100.0);
-        record_usage(&conn, "/s/a.jsonl", "claude", "claude-opus-4-8", 500, 200, 0, 0, 0.01, now);
+        record_usage(&conn, "/s/a.jsonl", "master", "claude", "claude-opus-4-8", 1000, 300, 2000, 50000, 0.42, now - 100.0);
+        record_usage(&conn, "/s/a.jsonl", "master", "claude", "claude-opus-4-8", 500, 200, 0, 0, 0.01, now);
         // 12h 밖 — 제외돼야
-        record_usage(&conn, "/s/old.jsonl", "claude", "claude-haiku-4-5", 10, 10, 0, 0, 0.5, now - 50_000.0);
+        record_usage(&conn, "/s/old.jsonl", "worker", "claude", "claude-haiku-4-5", 10, 10, 0, 0, 0.5, now - 50_000.0);
 
         let rows = load_recent(&conn, now - SPARK_SPAN_SECS);
         assert_eq!(rows.len(), 2, "12h 안쪽 2건만(오래된 1건 제외)");
@@ -1166,9 +1251,9 @@ mod tests {
     fn summarize_costs_and_productivity() {
         // 세션 A: opus 2메시지(캐시 read 50000), 세션 B: haiku 1메시지. agent=claude/codex.
         let rows: Vec<SummaryRow> = vec![
-            ("claude".into(), "claude-opus-4-8".into(), 1000, 300, 2000, 50000, 0.05, "/s/a".into(), 1000.0),
-            ("claude".into(), "claude-opus-4-8".into(), 500, 200, 0, 0, 0.01, "/s/a".into(), 1100.0),
-            ("codex".into(), "claude-haiku-4-5".into(), 100, 50, 0, 0, 0.00035, "/s/b".into(), 1050.0),
+            ("claude".into(), "master".into(), "claude-opus-4-8".into(), 1000, 300, 2000, 50000, 0.05, "/s/a".into(), 1000.0),
+            ("claude".into(), "master".into(), "claude-opus-4-8".into(), 500, 200, 0, 0, 0.01, "/s/a".into(), 1100.0),
+            ("codex".into(), "reviewer".into(), "claude-haiku-4-5".into(), 100, 50, 0, 0, 0.00035, "/s/b".into(), 1050.0),
         ];
         let s = summarize(&rows);
         let t = &s["totals"];
@@ -1192,6 +1277,83 @@ mod tests {
         let empty = summarize(&[]);
         assert_eq!(empty["totals"]["msgs"], 0);
         assert_eq!(empty["productivity"]["tokens_per_turn"], 0.0);
+    }
+
+    #[test]
+    fn record_usage_writes_role() {
+        // D3: role 적재 — by_tier 집계의 유일한 전제(과거 INSERT 누락 회귀 방지).
+        let dir = std::env::temp_dir().join(format!("cys-role-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = Connection::open(dir.join(format!("r-{}.db", line!()))).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE usage_records(id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, agent TEXT,
+             model TEXT, input_tokens INTEGER, output_tokens INTEGER, cache_creation INTEGER,
+             cache_read INTEGER, cost_usd REAL, ts REAL);",
+        )
+        .unwrap();
+        record_usage(&conn, "/s/x", "cso", "claude", "claude-opus-4-8", 10, 5, 0, 0, 0.01, 1000.0);
+        let role: String = conn
+            .query_row("SELECT role FROM usage_records LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(role, "cso", "record_usage가 role을 적재해야 by_tier 집계 성립");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn summarize_by_tier_and_cache_roi() {
+        // master(opus) 2건·worker(haiku) 1건. cache_read 50000(opus)로 cache_roi_x>0.
+        let rows: Vec<SummaryRow> = vec![
+            ("claude".into(), "master".into(), "claude-opus-4-8".into(), 1000, 300, 2000, 50000, 0.05, "/s/a".into(), 1000.0),
+            ("claude".into(), "master".into(), "claude-opus-4-8".into(), 500, 200, 0, 0, 0.01, "/s/a".into(), 1100.0),
+            ("claude".into(), "worker".into(), "claude-haiku-4-5".into(), 100, 50, 0, 0, 0.001, "/s/b".into(), 1050.0),
+        ];
+        let s = summarize(&rows);
+        let bt = s["by_tier"].as_array().unwrap();
+        // cost desc → master(0.06) 먼저, worker(0.001) 뒤
+        assert_eq!(bt[0]["tier"], "master");
+        assert_eq!(bt[0]["msgs"], 2);
+        assert!((bt[0]["cost_usd"].as_f64().unwrap() - 0.06).abs() < 1e-9);
+        assert_eq!(bt[1]["tier"], "worker");
+        // cache_roi_x = savings/full_input_cost. opus: savings=0.225, full=50000/1e6*5=0.25 → 0.9
+        assert!((s["cache_roi_x"].as_f64().unwrap() - 0.9).abs() < 1e-6, "{}", s["cache_roi_x"]);
+        // cache_efficiency = cr/(in+cc+cr) = 50000/(1600+2000+50000)
+        let exp_eff = 50000.0 / (1600.0 + 2000.0 + 50000.0);
+        assert!((s["cache_efficiency"].as_f64().unwrap() - exp_eff).abs() < 1e-9);
+        // 빈 role → unattributed
+        let r2: Vec<SummaryRow> = vec![
+            ("claude".into(), "".into(), "claude-opus-4-8".into(), 10, 5, 0, 0, 0.01, "/s/c".into(), 1.0),
+        ];
+        assert_eq!(summarize(&r2)["by_tier"][0]["tier"], "unattributed");
+        // 빈 입력 0-division 안전
+        assert_eq!(summarize(&[])["cache_roi_x"], 0.0);
+    }
+
+    #[test]
+    fn summarize_rework_failrate() {
+        // fail 정의=POST exit≠0 / calls=PRE(!tool.is_empty) — summarize_skills 동형(producer≠evaluator).
+        let ev = |t: &str, role: &str, tool: &str, ex: Option<i64>| -> EventRow {
+            (t.into(), role.into(), tool.into(), false, String::new(), false, String::new(), ex, 0.0)
+        };
+        let rows: Vec<EventRow> = vec![
+            ev("PRE_TOOL", "worker", "Bash", None),
+            ev("POST_TOOL", "worker", "Bash", Some(1)), // worker 1 fail
+            ev("PRE_TOOL", "worker", "Edit", None),
+            ev("POST_TOOL", "worker", "Edit", Some(0)), // 성공
+            ev("PRE_TOOL", "master", "Read", None),
+            ev("POST_TOOL", "master", "Read", Some(0)),
+        ];
+        let r = summarize_rework(&rows);
+        // global: calls=3(PRE) fail=1(POST exit≠0) → 1/3
+        assert!((r["global_rework_rate"].as_f64().unwrap() - 1.0 / 3.0).abs() < 1e-9);
+        assert_eq!(r["total_calls"], 3);
+        assert_eq!(r["total_fail"], 1);
+        let bt = r["by_tier_rework"].as_array().unwrap();
+        // worker calls=2(>master 1) → 먼저. rework_rate worker=1/2
+        assert_eq!(bt[0]["tier"], "worker");
+        assert_eq!(bt[0]["calls"], 2);
+        assert!((bt[0]["rework_rate"].as_f64().unwrap() - 0.5).abs() < 1e-9);
+        // 빈 입력 0-division 안전
+        assert_eq!(summarize_rework(&[])["global_rework_rate"], 0.0);
     }
 
     #[test]

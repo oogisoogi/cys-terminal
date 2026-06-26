@@ -120,6 +120,11 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Tasks Control Center(CLI): 모든 부서의 모든 노드가 지금 하는 업무를 1콜로 (부서 다중소켓 집계)
+    Fleet {
+        #[arg(long)]
+        json: bool,
+    },
     /// T4-15 kill-switch: 큐 배달·스케줄 발화 동결 (직접 send는 통과 — '신경 차단'이지 행동 정지가 아님)
     Pause {
         #[arg(long, default_value = "")]
@@ -249,6 +254,9 @@ enum Command {
         /// Auto-reconnect on connection loss
         #[arg(long)]
         reconnect: bool,
+        /// 시작 커서를 이 파일에서 읽고(있으면), 매 이벤트마다 seq를 원자적으로 기록
+        #[arg(long = "cursor-file")]
+        cursor_file: Option<String>,
     },
     /// Mirror a surface's raw output to stdout (read-only tail)
     Attach { surface: String },
@@ -337,6 +345,12 @@ enum Command {
         #[command(subcommand)]
         action: ScheduleAction,
     },
+    /// D3: 비용·효율 eval baseline — tier 라우팅 도입 전후 '비용↓·품질불변' 검증(producer≠evaluator)
+    #[command(name = "cost-baseline")]
+    CostBaseline {
+        #[command(subcommand)]
+        action: CostBaselineAction,
+    },
     /// Register the current (or given) surface under a role — for sessions started without launch-agent
     ClaimRole {
         /// Role: master / worker / cso / reviewer
@@ -366,6 +380,11 @@ enum Command {
     /// Print this surface's cysd-authoritative role (one word) — PreToolUse capability-gate hook용.
     /// CYS_SURFACE_ID로 자기 surface를 찾아 데몬 roles 맵의 role을 출력(미등록 시 빈 줄·exit 0).
     SurfaceRole,
+    /// HMAC signed-prefix 승인 — 위험명령 prefix를 1회 서명하면 이후 자동 통과(guard.sh 연동)
+    Approval {
+        #[command(subcommand)]
+        action: ApprovalAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -414,6 +433,28 @@ enum AttestAction {
 }
 
 #[derive(Subcommand)]
+enum ApprovalAction {
+    /// 명령이 서명된 prefix에 매칭하는지 확인 (exit 0=서명됨/통과, 비0=미서명/차단). guard.sh가 호출.
+    Check {
+        /// 검사할 전체 명령 문자열
+        #[arg(long)]
+        command: String,
+        /// 명령 실행 cwd (생략 시 미지정 — 레코드가 cwd 무관이면 매칭)
+        #[arg(long)]
+        cwd: Option<String>,
+    },
+    /// 위험명령 prefix를 서명·영속 (master role surface에서만 허용 — 위조 서명 차단)
+    Sign {
+        /// 승인할 명령 prefix (공백 구분 토큰, 예: "git push")
+        #[arg(long)]
+        prefix: String,
+        /// 승인 범위를 고정할 cwd (생략 시 cwd 무관 승인)
+        #[arg(long)]
+        cwd: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum SkillAction {
     /// Create a new skill from experience (SKILL.md, 4-칸 본문 템플릿)
     New {
@@ -426,6 +467,28 @@ enum SkillAction {
     List,
     /// Print a skill's full SKILL.md
     Show { name: String },
+    /// D5: 보이는 일회용 워커로 스킬 1회 실행 (schedule --fresh 얇은 래퍼·invisible -p 금지)
+    Run {
+        /// 카탈로그의 skill name
+        name: String,
+        /// task-prompt 티켓 본문(javis_orchestra가 생성). 빈 값이면 거부(무계약 차단)
+        #[arg(long)]
+        ticket: String,
+        /// 실행 워커 에이전트(agents.json 키)
+        #[arg(long, default_value = "claude")]
+        agent: String,
+        /// fresh surface TTL(초). 미지정=schedule.rs 기본 TTL
+        #[arg(long)]
+        close_after: Option<u64>,
+    },
+}
+
+#[derive(Subcommand)]
+enum CostBaselineAction {
+    /// 현재 7d 분포를 ~/.cys/_round/cost_baseline.json에 박제(sha256 핀·locked_at)
+    Lock,
+    /// 현재 vs 박제본 비교 → IMPROVED/REGRESSED/FLAT 판정(rework 초과는 reward-hack 차단)
+    Diff,
 }
 
 #[derive(Subcommand)]
@@ -1033,6 +1096,7 @@ fn run(command: Command) -> i32 {
         Command::UsageEventStdin { surface } => return run_usage_event_stdin(&surface),
 
         Command::Status { json: as_json } => return run_status(as_json),
+        Command::Fleet { json: as_json } => return run_fleet(as_json),
 
         Command::Pause { reason } => request("system.pause", json!({"reason": reason}))
             .map(|_| println!("PAUSED — 큐 배달·스케줄 발화 동결 (이미 실행 중인 에이전트 행동은 계속된다; cys resume로 해제)")),
@@ -1200,6 +1264,58 @@ fn run(command: Command) -> i32 {
             };
         }
 
+        Command::Approval { action } => {
+            return match action {
+                // exit 0 = 서명됨(통과) / 비0 = 미서명·차단. cysd 미가용 시 fail-closed(비0).
+                ApprovalAction::Check { command, cwd } => {
+                    let cwd = cwd.or_else(|| {
+                        std::env::current_dir().ok().map(|p| p.to_string_lossy().to_string())
+                    });
+                    match request(
+                        "approval.check",
+                        json!({"command": command, "cwd": cwd}),
+                    ) {
+                        Ok(r) => {
+                            if r["approved"].as_bool() == Some(true) {
+                                0 // 서명된 prefix — guard.sh가 우회 통과
+                            } else {
+                                2 // 미서명 — 차단 유지
+                            }
+                        }
+                        // cysd 미가용·RPC 실패 = fail-closed(미서명 취급, 자동 통과 금지)
+                        Err(e) => {
+                            eprintln!("[approval] check failed (fail-closed): {e}");
+                            2
+                        }
+                    }
+                }
+                ApprovalAction::Sign { prefix, cwd } => {
+                    let tokens: Vec<String> =
+                        prefix.split_whitespace().map(|s| s.to_string()).collect();
+                    if tokens.is_empty() {
+                        eprintln!("error: --prefix must be a non-empty command prefix");
+                        return 1;
+                    }
+                    let cwd = cwd.or_else(|| {
+                        std::env::current_dir().ok().map(|p| p.to_string_lossy().to_string())
+                    });
+                    match request(
+                        "approval.sign",
+                        json!({"command_prefix": tokens, "cwd": cwd}),
+                    ) {
+                        Ok(r) => {
+                            println!("signed: {}", r["id"].as_str().unwrap_or("?"));
+                            0
+                        }
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            1
+                        }
+                    }
+                }
+            };
+        }
+
         Command::ReadScreen { surface, to, lines, since, max_lines } => {
             target_surface(&surface, &to).and_then(|sid| {
                 if let Some(s) = since {
@@ -1252,8 +1368,8 @@ fn run(command: Command) -> i32 {
                 })
             }),
 
-        Command::Events { after_seq, names, categories, reconnect } => {
-            stream_events(after_seq, names, categories, reconnect)
+        Command::Events { after_seq, names, categories, reconnect, cursor_file } => {
+            stream_events(after_seq, names, categories, reconnect, cursor_file)
         }
 
         Command::Attach { surface } => parse_surface_ref(&surface)
@@ -1326,6 +1442,7 @@ fn run(command: Command) -> i32 {
         }
 
         Command::Schedule { action } => return run_schedule(action),
+        Command::CostBaseline { action } => return run_cost_baseline(action),
 
         Command::Recall { query, role, surface, days, limit } => {
             parse_explicit_surface(&surface)
@@ -1429,14 +1546,45 @@ fn run_feed(action: FeedAction) -> i32 {
     }
 }
 
+/// (2c) 재연결해도 되는 일시적 오류인가? cmux isTransientEventStreamError(Events.swift:105-134) 포팅.
+/// ★실측 정렬: cys connect()는 `cannot connect to cysd at {path}: {e}`를 반환하고 {e}는 OS 에러
+/// Display라 누락 소켓="No such file or directory (os error 2)"·거부="Connection refused (os error 61)",
+/// read half-open="Broken pipe (os error 32)"/"Connection reset by peer (os error 54)"로 나온다.
+/// 서버가 (2a) slow_consumer로 스트림을 종료한 케이스도 재연결 대상. 그 외(invalid_params 등)는 비-transient.
+fn is_transient_event_error(msg: &str) -> bool {
+    let m = msg.to_lowercase();
+    const MARKERS: &[&str] = &[
+        "no such file or directory", // cys connect_raw: 누락 소켓(ENOENT) — 데몬 재기동 중
+        "connection refused",        // 데몬 부팅 직전(ECONNREFUSED)
+        "connection reset",          // half-open read(ECONNRESET)
+        "broken pipe",               // write/read 단절(EPIPE)
+        "event stream closed",       // 정상 EOF — 재연결로 이어붙임
+        "slow_consumer",             // 서버가 (2a)로 종료한 케이스
+        "cannot connect to cysd",    // connect_raw 래퍼 문구(autostart 실패 포함)
+        "os error 32",
+        "os error 35",
+        "os error 54",
+        "os error 57",
+        "os error 60",
+        "os error 61",
+    ];
+    MARKERS.iter().any(|k| m.contains(k))
+}
+
 /// Subscribe to the push event stream and print NDJSON lines.
 fn stream_events(
     after_seq: Option<u64>,
     names: Vec<String>,
     categories: Vec<String>,
     reconnect: bool,
+    cursor_file: Option<String>,
 ) -> Result<(), String> {
-    let mut last_seq = after_seq;
+    // (3) 시드: --after_seq 미지정이면 cursor-file에서 읽는다(cmux Events.swift:25-27).
+    let mut last_seq = after_seq.or_else(|| {
+        cursor_file
+            .as_ref()
+            .and_then(|p| read_event_cursor(p).ok().flatten())
+    });
     loop {
         let attempt = (|| -> Result<(), String> {
             let mut stream = connect()?;
@@ -1452,28 +1600,74 @@ fn stream_events(
             let reader = BufReader::new(stream);
             for read in reader.lines() {
                 let l = read.map_err(|e| e.to_string())?;
+                // (2c) 에러 프레임을 행동으로 연결: slow_consumer/replay_gap을 Err로 격상해
+                // 재시도 게이트가 transient 판정을 거치게 한다. 출력 중복을 막으려 should_return
+                // 플래그를 세우고 println은 루프 말미 한 곳에서만 한다.
+                let mut should_return: Option<String> = None;
                 if let Ok(v) = serde_json::from_str::<Value>(&l) {
-                    if v["type"] == "event" {
-                        if let Some(seq) = v["seq"].as_u64() {
-                            last_seq = Some(seq);
+                    match v["type"].as_str() {
+                        Some("event") => {
+                            if let Some(seq) = v["seq"].as_u64() {
+                                last_seq = Some(seq);
+                                if let Some(cf) = &cursor_file {
+                                    write_event_cursor(cf, seq)?; // (3) 매 이벤트 원자적 갱신
+                                }
+                            }
                         }
-                    } else if v["type"] == "ack" && last_seq.is_none() {
-                        // 첫 이벤트 수신 전 끊겨도 재접속이 구체적 커서로 replay 경로를 타게 시드
-                        last_seq = v["latest_seq"].as_u64();
+                        Some("ack") if last_seq.is_none() => {
+                            // 첫 이벤트 수신 전 끊겨도 재접속이 구체적 커서로 replay 경로를 타게 시드
+                            last_seq = v["latest_seq"].as_u64();
+                        }
+                        Some("heartbeat") => { /* keepalive — 출력만, 커서 영향 없음 */ }
+                        Some("error") if v["ok"] == false => {
+                            let code = v["error"]["code"].as_str().unwrap_or("stream_error");
+                            should_return = Some(code.to_string());
+                        }
+                        _ => {}
                     }
                 }
                 println!("{l}");
+                if let Some(c) = should_return {
+                    return Err(c);
+                }
             }
             Err("event stream closed".into())
         })();
         match attempt {
-            Err(e) if reconnect => {
+            // (2c) transient만 재연결 — 비-transient는 즉시 반환(무한루프 차단)
+            Err(e) if reconnect && is_transient_event_error(&e) => {
                 eprintln!("[events] {e}; reconnecting in 1s...");
                 std::thread::sleep(std::time::Duration::from_secs(1));
             }
             other => return other,
         }
     }
+}
+
+/// (3) cmux readEventCursor(Events.swift:206-222): 없으면 None, 비숫자면 Err.
+fn read_event_cursor(path: &str) -> Result<Option<u64>, String> {
+    let p = expand_tilde(path);
+    match std::fs::read_to_string(&p) {
+        Ok(s) => s
+            .trim()
+            .parse::<u64>()
+            .map(Some)
+            .map_err(|_| format!("bad cursor in {path}")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// (3) cmux writeEventCursor(Events.swift:224-231): 디렉터리 생성 + 원자적 쓰기(tmp+rename).
+/// std::fs::write 직접보다 tmp+rename으로 쓰기 도중 프로세스가 죽어도 커서가 절반 상태로 남지 않게 한다.
+fn write_event_cursor(path: &str, seq: u64) -> Result<(), String> {
+    let p = expand_tilde(path);
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let tmp = p.with_extension("tmp");
+    std::fs::write(&tmp, format!("{seq}\n")).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &p).map_err(|e| e.to_string())
 }
 
 /// Mirror raw PTY output to stdout.
@@ -1522,6 +1716,117 @@ fn chrono_fmt(epoch: i64) -> String {
 }
 
 /// 스킬 라이브러리: jarvis/skills/<name>/SKILL.md (frontmatter 표지 + 4칸 본문).
+/// D3 비용·효율 eval baseline (producer≠evaluator) — lock=박제·diff=회귀 판정.
+/// 채점은 master(LOCKED ref launcher)가 직접 — producer(워커)가 자기채점 못 함(eval-driven 무결성).
+fn run_cost_baseline(action: CostBaselineAction) -> i32 {
+    // baseline 박제 위치 — pack 밖·로컬·gitignore(~/.cys는 repo 밖). _round 컨벤션.
+    let path = match dirs::home_dir() {
+        Some(h) => h.join(".cys/_round/cost_baseline.json"),
+        None => {
+            eprintln!("home_dir 해소 실패 — baseline 경로 불가");
+            return 2;
+        }
+    };
+    // baseline canonical json → sha256 핀(사후 변조 차단).
+    let sha_of = |v: &Value| -> String {
+        use sha2::{Digest, Sha256};
+        let canon = serde_json::to_string(v).unwrap_or_default();
+        let mut h = Sha256::new();
+        h.update(canon.as_bytes());
+        h.finalize().iter().map(|x| format!("{x:02x}")).collect()
+    };
+    match action {
+        CostBaselineAction::Lock => {
+            let resp = match request("control.cost_baseline", json!({"window": "7d"})) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("control.cost_baseline 실패: {e}");
+                    return 1;
+                }
+            };
+            let baseline = resp["baseline"].clone();
+            let sha = sha_of(&baseline);
+            let locked = json!({
+                "baseline": baseline,
+                "sha256": sha,
+                "locked_at": resp["now"].clone(),
+                "window": resp["window"].clone(),
+            });
+            if let Some(parent) = path.parent() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    eprintln!("디렉터리 생성 실패 {}: {e}", parent.display());
+                    return 2;
+                }
+            }
+            match std::fs::write(&path, serde_json::to_string_pretty(&locked).unwrap_or_default()) {
+                Ok(_) => {
+                    println!("baseline locked: {} (sha256 {}…)", path.display(), &sha[..12.min(sha.len())]);
+                    0
+                }
+                Err(e) => {
+                    eprintln!("baseline 쓰기 실패: {e}");
+                    2
+                }
+            }
+        }
+        CostBaselineAction::Diff => {
+            let locked_raw = match std::fs::read_to_string(&path) {
+                Ok(s) => s,
+                Err(_) => {
+                    eprintln!("박제본 없음 — 먼저 `cys cost-baseline lock` 실행: {}", path.display());
+                    return 2;
+                }
+            };
+            let locked: Value = match serde_json::from_str(&locked_raw) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("박제본 파싱 실패: {e}");
+                    return 2;
+                }
+            };
+            // 변조 검증(retention gate): 저장된 sha256 vs baseline 재계산 대조.
+            let lb = locked["baseline"].clone();
+            if locked["sha256"].as_str() != Some(sha_of(&lb).as_str()) {
+                eprintln!("⚠ 박제본 sha256 불일치 — 사후 변조 의심. 판정 중단(retention gate).");
+                return 1;
+            }
+            let cur = match request("control.cost_baseline", json!({"window": "7d"})) {
+                Ok(r) => r["baseline"].clone(),
+                Err(e) => {
+                    eprintln!("control.cost_baseline 실패: {e}");
+                    return 1;
+                }
+            };
+            let f = |v: &Value| v.as_f64().unwrap_or(0.0);
+            let cps_old = f(&lb["cost_per_session"]);
+            let cps_new = f(&cur["cost_per_session"]);
+            let rw_old = f(&lb["rework"]["global_rework_rate"]);
+            let rw_new = f(&cur["rework"]["global_rework_rate"]);
+            let band = 0.05; // ±5% noise band (설계 §8.6 — 1차 보수값)
+            let verdict = if rw_new > rw_old + 1e-9 {
+                "REGRESSED" // 비용↓라도 재작업률 상승 = 품질저하(reward-hack 차단·품질절대우선)
+            } else if cps_old > 0.0 && cps_new < cps_old * (1.0 - band) {
+                "IMPROVED"
+            } else if cps_old > 0.0 && cps_new > cps_old * (1.0 + band) {
+                "REGRESSED"
+            } else {
+                "FLAT"
+            };
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "verdict": verdict,
+                    "cost_per_session": {"locked": cps_old, "current": cps_new},
+                    "global_rework_rate": {"locked": rw_old, "current": rw_new},
+                    "note": "REGRESSED=비용↑ 또는 재작업률↑(reward-hack 차단). 판정=master LOCKED ref 직접(producer≠evaluator).",
+                }))
+                .unwrap_or_default()
+            );
+            0
+        }
+    }
+}
+
 fn run_skill(action: SkillAction) -> i32 {
     let skills_dir = cys::pack::pack_dir().join("skills");
     let result: Result<(), String> = match action {
@@ -1588,6 +1893,41 @@ fn run_skill(action: SkillAction) -> i32 {
                 .map_err(|_| format!("no skill '{name}' ({})", path.display()))?;
             println!("{content}");
             Ok(())
+        })(),
+        SkillAction::Run { name, ticket, agent, close_after } => (|| {
+            if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+                return Err("name must be kebab-case ascii (a-z0-9-)".into());
+            }
+            if ticket.trim().is_empty() {
+                return Err("ticket 비어 있음 — 무계약 실행 금지(task-prompt 경유 필수)".into());
+            }
+            // 일회용 격리 실행 = schedule add --fresh 잡(즉발 원샷 + fresh + worker 디렉티브 주입 + 자동 close).
+            // invisible `claude -p` 맹목복제 금지(PROMPT_RUNNER_ABSENT) — 보이는 surface + 원장 강제종료.
+            // B1 교정: now_epoch()는 cysd 전용 → cys.rs는 chrono로 epoch 취득.
+            let job_id = format!("skill-{}-{}", name, chrono::Local::now().timestamp());
+            // ★누수 차단(설계 §1 성공기준1·§6 불변식2): 원샷+fresh는 schedule.rs effective_close_ttl이
+            // close_after_secs=None이면 None을 반환(반복 fresh만 기본 TTL) → 명시 안 하면 surface 영구 누수.
+            // 따라서 미지정 시 보수적 기본 600초를 부여해 worker-fresh-* 가 반드시 자동 close되게 한다.
+            let rc = run_schedule(ScheduleAction::Add {
+                id: job_id,
+                time: None,
+                every: None,
+                in_dur: Some("0s".into()),   // 즉발 원샷(once:true)
+                close_after: Some(close_after.unwrap_or(600)), // fresh 전용 TTL(누수 차단·미지정 600초)
+                days: None,
+                text: Some(ticket),          // task-prompt 티켓 본문
+                to: Some("worker".into()),   // ★raw pane 금지 — worker 디렉티브 주입(compose_directive 폴백)
+                command: None,
+                if_absent_launch: false,
+                fresh: true,                 // 보이는 일회용 surface
+                agent: Some(agent),
+                cwd: None,                   // 호출 폴더 = 워크플로우 폴더(launch_opts 규칙)
+            });
+            if rc == 0 {
+                Ok(())
+            } else {
+                Err(format!("schedule add 실패 (rc={rc})"))
+            }
         })(),
     };
     match result {
@@ -2268,13 +2608,27 @@ fn boot_agent_on_surface(
     agent: &str,
     spec: &Value,
     resume: bool,
+    session_id: Option<&str>,
 ) -> Result<(), String> {
     let mut cmd = spec["cmd"].as_str().ok_or("agent cmd missing")?.to_string();
     if resume {
         if let Some(arg) = spec["resume_arg"].as_str() {
-            // T2-6 resume 어댑터: 대화 기억 복원 플래그 (예: claude --continue)
+            // T2-6 resume 어댑터: 대화 기억 복원 플래그 (예: claude --continue).
+            // (4b) {session_id} placeholder 치환: id가 있으면 정확한 세션 핀, 없으면 fallback arg
+            // (claude=--continue, codex=resume --last). placeholder 없는 arg는 그대로(하위호환).
+            let resolved = if arg.contains("{session_id}") {
+                match session_id {
+                    Some(id) => arg.replace("{session_id}", id),
+                    None => spec["resume_arg_fallback"]
+                        .as_str()
+                        .unwrap_or("--continue")
+                        .to_string(),
+                }
+            } else {
+                arg.to_string()
+            };
             cmd.push(' ');
-            cmd.push_str(arg);
+            cmd.push_str(&resolved);
         }
     }
     let delay = spec["inject_delay_secs"].as_u64().unwrap_or(12);
@@ -2472,7 +2826,7 @@ fn run_todo_path() -> i32 {
 }
 
 fn run_launch_agent(role: &str, agent: &str, cwd: Option<String>) -> i32 {
-    run_launch_agent_opts(role, agent, cwd, false)
+    run_launch_agent_opts(role, agent, cwd, false, None)
 }
 
 /// 절대지침(앵커1-b): 탭(타이틀) = 워크플로우 폴더명 — "{role}-{agent} · {폴더}".
@@ -2491,7 +2845,13 @@ fn workflow_title(role: &str, agent: &str, cwd: &Option<String>) -> String {
         .unwrap_or_else(|| format!("{role}-{agent}"))
 }
 
-fn run_launch_agent_opts(role: &str, agent: &str, cwd: Option<String>, resume: bool) -> i32 {
+fn run_launch_agent_opts(
+    role: &str,
+    agent: &str,
+    cwd: Option<String>,
+    resume: bool,
+    session_id: Option<String>,
+) -> i32 {
     // 절대지침(앵커1-b): 워커는 워크플로우 폴더에서 산다 — cwd 미지정이면 호출 폴더가
     // 워크플로우 폴더다 (데몬 기본값 home에 맡기지 않는다. 명시 --cwd는 그대로 우선).
     // 빈 문자열은 None으로 정규화 — 구버전 topology의 "cwd": "" 가 PTY 생성을 깨거나
@@ -2505,15 +2865,28 @@ fn run_launch_agent_opts(role: &str, agent: &str, cwd: Option<String>, resume: b
     let mut created: Option<u64> = None;
     let result = (|| -> Result<(), String> {
         let spec = load_agent_spec(agent)?;
+        // (E-f) 멱등 기동 키 — 같은 role+agent+cwd 재시도가 중복 surface를 만들지 않게
+        // 데몬이 단기 캐시(create_idem)로 기존 surface를 재반환하도록. 단일 머신·단일
+        // 사용자라 단순 해시로 충분(설계 §4.1.5).
+        let idem = format!(
+            "la-{}-{}-{}",
+            role,
+            agent,
+            cwd.as_deref()
+                .unwrap_or("")
+                .chars()
+                .map(|c| c as u32)
+                .fold(0u64, |a, c| a.wrapping_mul(31).wrapping_add(c as u64))
+        );
         let r = request(
             "surface.create",
             json!({"cwd": cwd, "title": workflow_title(role, agent, &cwd), "role": role,
-                   "rows": 40, "cols": 140}),
+                   "rows": 40, "cols": 140, "idempotency_key": idem}),
         )?;
         let sid = r["surface_id"].as_u64().ok_or("create returned no id")?;
         created = Some(sid);
         eprintln!("[launch-agent] {} created (role={role})", surface_ref(sid));
-        boot_agent_on_surface(sid, role, agent, &spec, resume)?;
+        boot_agent_on_surface(sid, role, agent, &spec, resume, session_id.as_deref())?;
         println!("{}", surface_ref(sid));
         Ok(())
     })();
@@ -2858,14 +3231,20 @@ fn run_usage_report_stdin(surface: &Option<String>, quiet: bool) -> i32 {
 /// PreToolUse/PostToolUse/Stop/SubagentStop만 매핑, 그 외 hook은 None(무시).
 /// PostToolUse는 tool_response.is_error로 exit_code(실패 신호)를 best-effort 추출(E3 반복실패).
 fn hook_to_event_params(v: &Value) -> Option<Value> {
-    let event_type = match v.get("hook_event_name").and_then(|x| x.as_str())? {
+    let raw = v.get("hook_event_name").and_then(|x| x.as_str())?;
+    let event_type = match raw {
         "PreToolUse" => "PRE_TOOL",
         "PostToolUse" => "POST_TOOL",
         "Stop" => "STOP",
         "SubagentStop" => "SUBAGENT_STOP",
+        // E-b: actionable 이벤트(PermissionRequest/ExitPlanMode/AskUserQuestion)를 버리지 않고
+        //   raw 그대로 event_type에 싣는다. 데몬은 raw_hook_event(아래 동봉)로 분류한다.
+        "PermissionRequest" | "ExitPlanMode" | "AskUserQuestion" => raw,
         _ => return None,
     };
-    let mut p = json!({ "event_type": event_type });
+    // E-b: raw hook_event_name을 그대로 동봉 → 데몬 분류기가 CLI 변환명이 아닌 raw로 분류.
+    //   event_type(PRE_TOOL 등)은 SQLite 적재용으로 유지(record_event 무손상).
+    let mut p = json!({ "event_type": event_type, "raw_hook_event": raw });
     if let Some(t) = v.get("tool_name").and_then(|x| x.as_str()) {
         p["tool_name"] = json!(t);
     }
@@ -2905,6 +3284,125 @@ fn run_usage_event_stdin(surface: &Option<String>) -> i32 {
     if let Ok(sid) = target_surface(surface, &None) {
         params["surface_id"] = json!(sid);
         let _ = request("usage.event", params);
+    }
+    0
+}
+
+/// 지정 스트림에 단발 RPC(부서 fan-out 집계용 와이어 로직). request()와 동일 프로토콜.
+fn rpc_over<S: std::io::Read + std::io::Write>(
+    mut stream: S,
+    method: &str,
+    params: Value,
+) -> Result<Value, String> {
+    let req = json!({"id": 1, "method": method, "params": params});
+    let mut line = serde_json::to_string(&req).unwrap();
+    line.push('\n');
+    stream.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
+    stream.flush().map_err(|e| e.to_string())?;
+    let mut reader = BufReader::new(stream);
+    let mut resp = String::new();
+    reader.read_line(&mut resp).map_err(|e| e.to_string())?;
+    let v: Value = serde_json::from_str(resp.trim()).map_err(|e| e.to_string())?;
+    if v["ok"].as_bool() == Some(true) {
+        Ok(v["result"].clone())
+    } else {
+        Err(v["error"]["message"].as_str().unwrap_or("error").to_string())
+    }
+}
+
+/// 지정 소켓에 단발 RPC — fan-out 집계용(부서 소켓 순회). autostart 안 함(부서 다운=정상 정보·도달불가 표기).
+#[cfg(unix)]
+fn request_on(socket: &std::path::Path, method: &str, params: Value) -> Result<Value, String> {
+    let stream = std::os::unix::net::UnixStream::connect(socket)
+        .map_err(|e| format!("connect {}: {e}", socket.display()))?;
+    rpc_over(stream, method, params)
+}
+#[cfg(windows)]
+fn request_on(socket: &std::path::Path, method: &str, params: Value) -> Result<Value, String> {
+    let stream = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(socket)
+        .map_err(|e| format!("open {}: {e}", socket.display()))?;
+    rpc_over(stream, method, params)
+}
+
+/// Tasks Control Center(CLI) — depts.json을 읽어 본부+각 부서 소켓에 org.status를 순회 집계한다.
+/// master 능동 모니터링: 모든 부서의 모든 노드가 지금 하는 업무를 1콜로 본다. 도달불가 부서는 표기.
+fn run_fleet(as_json: bool) -> i32 {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let mut targets: Vec<(std::path::PathBuf, String)> =
+        vec![(socket_path(), "본부 · CEO".to_string())];
+    let reg = std::env::var("CYS_DEPTS_JSON")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from(&home).join(".cys/depts.json"));
+    if let Ok(s) = std::fs::read_to_string(&reg) {
+        if let Ok(v) = serde_json::from_str::<Value>(&s) {
+            if let Some(depts) = v["depts"].as_object() {
+                for (name, meta) in depts {
+                    let sock = meta["socket"]
+                        .as_str()
+                        .map(std::path::PathBuf::from)
+                        .unwrap_or_else(|| {
+                            std::path::PathBuf::from(&home)
+                                .join(format!(".local/state/cys-dept-{name}/cys.sock"))
+                        });
+                    let disp = meta["display_name"].as_str().unwrap_or(name).to_string();
+                    targets.push((sock, disp));
+                }
+            }
+        }
+    }
+    let mut out: Vec<Value> = Vec::new();
+    for (sock, disp) in &targets {
+        match request_on(sock, "org.status", json!({})) {
+            Ok(r) => out.push(json!({"department": disp, "surfaces": r["surfaces"].clone()})),
+            Err(e) => out.push(json!({"department": disp, "error": e, "surfaces": []})),
+        }
+    }
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({ "departments": out })).unwrap()
+        );
+        return 0;
+    }
+    for d in &out {
+        let disp = d["department"].as_str().unwrap_or("");
+        if let Some(e) = d["error"].as_str() {
+            println!("\n■ {disp}  ⚠ 도달불가: {e}");
+            continue;
+        }
+        let surfaces = d["surfaces"].as_array().cloned().unwrap_or_default();
+        let working = surfaces
+            .iter()
+            .filter(|s| s["status"]["state"].as_str() == Some("working"))
+            .count();
+        println!("\n■ {disp}  (노드 {} · 작업중 {working})", surfaces.len());
+        for s in surfaces {
+            let role = s["role"].as_str().unwrap_or("-");
+            let state = if s["exited"].as_bool() == Some(true) {
+                "오프라인"
+            } else {
+                s["status"]["state"].as_str().unwrap_or("·파생")
+            };
+            let ctx = s["status"]["context_pct"]
+                .as_u64()
+                .map(|v| format!("{v}%"))
+                .unwrap_or_else(|| "-".into());
+            let task = s["status"]["task"]
+                .as_str()
+                .filter(|t| !t.is_empty())
+                .or_else(|| s["title"].as_str())
+                .unwrap_or("(업무 미보고)");
+            println!(
+                "   {:<14} {:<9} {:>4}  {}",
+                role,
+                state,
+                ctx,
+                task.chars().take(60).collect::<String>()
+            );
+        }
     }
     0
 }
@@ -3262,7 +3760,9 @@ fn run_node_recover(surface: Option<String>, role: Option<String>) -> i32 {
         // 셸 입력 잔재 정리 후 기동 (resume 플래그로 대화 기억 복원 시도)
         request("surface.send_key", json!({"surface_id": sid, "key": "C-u"}))?;
         std::thread::sleep(std::time::Duration::from_millis(200));
-        boot_agent_on_surface(sid, &role_name, &agent, &spec, true)?;
+        // (4b) topology에 영속된 session_id가 있으면 정확한 세션 재개(없으면 fallback)
+        let sess = entry["session_id"].as_str().map(String::from);
+        boot_agent_on_surface(sid, &role_name, &agent, &spec, true, sess.as_deref())?;
         inject_text(sid, "[RECOVER] 너는 방금 재기동되었다. _round/SESSION_STATE.md와 자기 TODO 파일을 읽어 작업 기억을 복원한 뒤 master에게 복귀를 1줄 push로 보고하라. 작업 재개는 master 지시를 따른다.")?;
         println!("recovered surface:{sid} ({agent})");
         Ok(())
@@ -3313,7 +3813,9 @@ fn run_restore(cwd: Option<String>, include_master: bool, no_resume: bool) -> i3
                 .clone()
                 .or_else(|| entry["cwd"].as_str().map(String::from));
             println!("· {role}: {agent} 재기동…");
-            if run_launch_agent_opts(role, agent, target_cwd, !no_resume) == 0 {
+            // (4b) saved entry의 session_id를 꺼내 정확한 세션 재개(없으면 fallback)
+            let sess = entry["session_id"].as_str().map(String::from);
+            if run_launch_agent_opts(role, agent, target_cwd, !no_resume, sess) == 0 {
                 ok += 1;
                 if let Ok(r) = request("system.resolve_role", json!({"role": role})) {
                     if let Some(sid) = r["surface_id"].as_u64() {
@@ -3503,6 +4005,53 @@ extern "C" fn scoped_cleanup_handler(sig: libc::c_int) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (2c) 회귀 박제: transient 화이트리스트가 cys connect()의 실제 에러 문자열과 정렬돼야
+    /// (2a) slow_consumer return 후 재연결이 작동한다. cys connect_raw는 누락 소켓에
+    /// "No such file or directory (os error 2)", 거부에 "Connection refused (os error 61)",
+    /// half-open read에 "Broken pipe/Connection reset by peer"를 낸다. 그 외(invalid_params 등)는
+    /// 비-transient라 즉시 반환돼야(무한루프 차단) 한다.
+    #[test]
+    fn transient_event_error_matches_real_connect_strings() {
+        // cys connect_raw가 실제로 내는 형태
+        assert!(is_transient_event_error(
+            "cannot connect to cysd at /tmp/x.sock: No such file or directory (os error 2)"
+        ));
+        assert!(is_transient_event_error(
+            "cannot connect to cysd at /tmp/x.sock: Connection refused (os error 61)"
+        ));
+        // half-open read 단절
+        assert!(is_transient_event_error("Broken pipe (os error 32)"));
+        assert!(is_transient_event_error("Connection reset by peer (os error 54)"));
+        // 정상 EOF·서버 (2a) 종료
+        assert!(is_transient_event_error("event stream closed"));
+        assert!(is_transient_event_error("slow_consumer"));
+        // 비-transient는 재연결 금지(즉시 반환)
+        assert!(!is_transient_event_error("invalid_params"));
+        assert!(!is_transient_event_error("bad cursor in /tmp/cur"));
+    }
+
+    /// (3) 회귀 박제: cursor 파일은 write→read 라운드트립으로 seq를 정확히 보존하고,
+    /// 부재 파일은 None(에러 아님)·비숫자는 Err로 구분돼야 한다.
+    #[test]
+    fn event_cursor_roundtrip_and_missing() {
+        let dir = std::env::temp_dir().join(format!("cys-cursor-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("cursor");
+        let p = path.to_str().unwrap();
+        // 부재 파일 = None
+        assert_eq!(read_event_cursor(p).unwrap(), None);
+        // write→read 라운드트립
+        write_event_cursor(p, 4242).unwrap();
+        assert_eq!(read_event_cursor(p).unwrap(), Some(4242));
+        // 갱신
+        write_event_cursor(p, 9999).unwrap();
+        assert_eq!(read_event_cursor(p).unwrap(), Some(9999));
+        // 비숫자 = Err
+        std::fs::write(&path, "garbage\n").unwrap();
+        assert!(read_event_cursor(p).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// 회귀 박제: boot의 설치 판정이 경로형 cmd(틸드 절대경로 — agy)를 which로 넘기면
     /// 틸드 비확장으로 '미설치' 오판 → 4종 의무 부트가 조용히 3종이 된다.
@@ -3910,14 +4459,25 @@ mod tests {
         let pre = json!({"hook_event_name":"PreToolUse","session_id":"s1","tool_name":"Skill","tool_input":{"skill":"commit"}});
         let p = hook_to_event_params(&pre).unwrap();
         assert_eq!(p["event_type"], json!("PRE_TOOL"));
+        assert_eq!(p["raw_hook_event"], json!("PreToolUse"), "E-b: raw 동봉");
         assert_eq!(p["tool_name"], json!("Skill"));
         assert_eq!(p["tool_input"]["skill"], json!("commit"));
         assert_eq!(p["session_id"], json!("s1"));
         let post = json!({"hook_event_name":"PostToolUse","tool_name":"Bash","tool_response":{"is_error":true}});
         let pp = hook_to_event_params(&post).unwrap();
         assert_eq!(pp["event_type"], json!("POST_TOOL"));
+        assert_eq!(pp["raw_hook_event"], json!("PostToolUse"), "E-b: raw 동봉");
         assert_eq!(pp["exit_code"], json!(1), "is_error→exit 1");
         assert!(hook_to_event_params(&json!({"hook_event_name":"Notification"})).is_none(), "관심 없는 hook 무시");
+        // E-b: actionable 이벤트는 None으로 버려지지 않고 raw가 보존된다.
+        let perm = json!({"hook_event_name":"PermissionRequest","tool_name":"Bash"});
+        let pr = hook_to_event_params(&perm).unwrap();
+        assert_eq!(pr["event_type"], json!("PermissionRequest"), "raw event_type 보존");
+        assert_eq!(pr["raw_hook_event"], json!("PermissionRequest"));
+        let epm = hook_to_event_params(&json!({"hook_event_name":"ExitPlanMode"})).unwrap();
+        assert_eq!(epm["raw_hook_event"], json!("ExitPlanMode"));
+        let auq = hook_to_event_params(&json!({"hook_event_name":"AskUserQuestion"})).unwrap();
+        assert_eq!(auq["raw_hook_event"], json!("AskUserQuestion"));
     }
 
     #[test]

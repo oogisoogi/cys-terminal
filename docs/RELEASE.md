@@ -73,6 +73,14 @@ sh scripts/build-macos-signed.sh    # env 검증 → tauri build(자동 공증) 
 > **다른 맥 전송 시 "손상됨"**이 뜨므로, 받은 맥에서 `xattr -dr com.apple.quarantine
 > /Applications/cys.app` 로만 우회 가능(배포용 아님).
 
+### ★비기술자(청중) 배포 전 게이트 체크리스트 (D6 제품 모드)
+박사님 대표 산출물을 제3자에게 패키징해 내보내기 전, 아래를 **모두** 확인한다.
+- [ ] **공증 빌드**(`spctl -a -vv cys.app` = accepted) — 미공증은 비기술자 배포 금지(다른 맥에서 "손상됨" 차단).
+- [ ] **신뢰선 라벨 활성** — 스킬 보드 산출물에 "🔒 AI 보조 생성 · 박사님 검수 전"이 부착되는지(과대약속 "80~90%" 금지).
+- [ ] **외부발행은 master 승인 경유** — 제3자 공유/전송은 자율주행 denylist의 "외부발행(비가역)"에 해당. `cys feed push --wait`(master 승인)를 거친다. 임의 전송 금지(§4 외부발행 원칙 계승).
+- [ ] **HITL 미리보기 보존** — 제품 모드도 입력 모달·validate_ir 게이트·미리보기 확인을 우회하지 않는다("1클릭"이라도 게이트 제거는 REJECT).
+- [ ] **청중 프로파일 확인** — `~/.cys/profile.json` audience가 대상 청중과 일치(민감 스킬은 카탈로그 미포함=암묵 차단).
+
 ## 2. Windows 빌드 (MSI + ZIP)
 
 > Windows 머신(또는 Parallels Win11 ARM64)에서 수행. 코어는 검증 완료.

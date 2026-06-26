@@ -37,6 +37,8 @@ javis_select rank --catalog "${CYS_PACK_DIR:-$HOME/.cys/pack}/round/video_provid
 
 - **입력**: `transcript.json`의 `segments[].words[]`(start/end) — `transcription` 산출물. 단어
   타임스탬프가 없으면 정렬 불가 → 먼저 `transcription`을 단어 단위로 재실행(garbage-in 차단).
+  URL 소스는 `transcription/bin/transcribe_channel.py`를 `--want-words`로 호출하면 자막(단어
+  타임스탬프 없음)을 자동 건너뛰고 `transcriber_whisperx` ASR로 격상해 단어 단위를 보장한다(OPP-09).
 - **산출**: `captions.json`(작업 폴더):
 
 ```json

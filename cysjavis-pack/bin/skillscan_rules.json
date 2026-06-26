@@ -1,0 +1,2642 @@
+{
+ "rule_specs": [
+  {
+   "rule_id": "P1",
+   "message": "Override Instructions",
+   "severity": "HIGH",
+   "category": "prompt_injection",
+   "flags": "IM",
+   "scope": "all",
+   "patterns": [
+    [
+     "ignore\\s+(?:all\\s+)?previous\\s+instructions?",
+     0.8
+    ],
+    [
+     "ignore\\s+(?:all\\s+)?(?:safety|security)\\s+(?:rules?|constraints?|guidelines?)",
+     0.9
+    ],
+    [
+     "override\\s+(?:safety|security|system)",
+     0.9
+    ],
+    [
+     "bypass\\s+(?:safety|security|restrictions?|constraints?)",
+     0.9
+    ],
+    [
+     "disregard\\s+(?:all\\s+)?(?:previous|safety|security)",
+     0.8
+    ],
+    [
+     "forget\\s+(?:all\\s+)?(?:previous|your)\\s+instructions?",
+     0.8
+    ],
+    [
+     "you\\s+are\\s+now\\s+(?:in\\s+)?(?:jailbreak|unrestricted|unfiltered)\\s+mode",
+     0.95
+    ],
+    [
+     "enable\\s+(?:developer|debug|admin|root)\\s+mode",
+     0.7
+    ],
+    [
+     "your\\s+new\\s+(?:instructions?|rules?)\\s+are",
+     0.6
+    ],
+    [
+     "do\\s+not\\s+follow\\s+(?:any|your|the)\\s+(?:rules?|guidelines?)",
+     0.9
+    ],
+    [
+     "you\\s+must\\s+(?:always\\s+)?ignore",
+     0.7
+    ]
+   ]
+  },
+  {
+   "rule_id": "P2",
+   "message": "Hidden Instructions",
+   "severity": "HIGH",
+   "category": "prompt_injection",
+   "flags": "ID",
+   "scope": "md_other",
+   "patterns": [
+    [
+     "<!--.*?(?:system|instructions?|ignore|POST|GET|send|transmit).*?-->",
+     0.7
+    ],
+    [
+     "\\[//\\]:\\s*#\\s*\\(.*?(?:system|instructions?|ignore|POST|GET|send|transmit).*?\\)",
+     0.8
+    ],
+    [
+     "[\\u200b\\u200c\\u200d\\u2060\\ufeff]",
+     0.6
+    ],
+    [
+     "[\\u202a-\\u202e\\u2066-\\u2069]",
+     0.85
+    ],
+    [
+     "data:text/plain;base64,[A-Za-z0-9+/=]{50,}",
+     0.7
+    ]
+   ]
+  },
+  {
+   "rule_id": "P3",
+   "message": "External Transmission Instructions",
+   "severity": "HIGH",
+   "category": "prompt_injection",
+   "flags": "IM",
+   "scope": "all",
+   "patterns": [
+    [
+     "(?:send|transmit|upload|post|forward)\\s+(?:the\\s+)?(?:conversation|context|chat|history|messages?)\\s+to",
+     0.9
+    ],
+    [
+     "(?:send|transmit|upload|post)\\s+(?:all\\s+)?(?:user\\s+)?(?:data|information|input|files?)\\s+to\\s+(?:https?://|external)",
+     0.9
+    ],
+    [
+     "(?:copy|extract|collect)\\s+(?:the\\s+)?(?:conversation|context|session)\\s+(?:and\\s+)?(?:send|upload|transmit)",
+     0.85
+    ],
+    [
+     "(?:call|notify|ping|hit)\\s+(?:this\\s+)?(?:webhook|endpoint|url|api)\\s+with\\s+(?:the\\s+)?(?:user|conversation|context)",
+     0.8
+    ],
+    [
+     "include\\s+(?:the\\s+)?(?:full\\s+)?(?:conversation|context|history)\\s+in\\s+(?:the\\s+)?(?:request|payload|body)",
+     0.75
+    ],
+    [
+     "(?:silently|quietly|secretly|covertly)\\s+(?:send|transmit|log|record)",
+     0.9
+    ],
+    [
+     "without\\s+(?:telling|informing|notifying)\\s+(?:the\\s+)?user.*?(?:send|transmit|upload)",
+     0.9
+    ]
+   ]
+  },
+  {
+   "rule_id": "P4",
+   "message": "Subtle Steering",
+   "severity": "MEDIUM",
+   "category": "prompt_injection",
+   "flags": "IM",
+   "scope": "all",
+   "patterns": [
+    [
+     "always\\s+(?:recommend|suggest|prefer|choose|use)\\s+(?:\\w+\\s+){0,3}(?:over|instead\\s+of|rather\\s+than)",
+     0.7
+    ],
+    [
+     "never\\s+(?:recommend|suggest|mention|tell|warn|inform)\\s+(?:the\\s+)?(?:user|them)",
+     0.75
+    ],
+    [
+     "(?:prioritize|prefer)\\s+(?:\\w+\\s+){0,3}(?:over|above)\\s+(?:user\\s+)?(?:safety|security|privacy|preferences?)",
+     0.85
+    ],
+    [
+     "(?:subtly|gradually|slowly)\\s+(?:steer|guide|push|nudge)\\s+(?:the\\s+)?(?:user|conversation)",
+     0.8
+    ],
+    [
+     "(?:without\\s+)?(?:the\\s+)?user\\s+(?:knowing|realizing|noticing).*?(?:change|modify|alter|influence)",
+     0.85
+    ],
+    [
+     "(?:gain|build|establish)\\s+(?:the\\s+)?(?:user(?:'s)?)\\s+trust\\s+(?:and\\s+then|before|so\\s+that)",
+     0.75
+    ],
+    [
+     "(?:appear|seem|act)\\s+(?:helpful|friendly|trustworthy)\\s+(?:while|but|then)",
+     0.7
+    ],
+    [
+     "(?:always|never)\\s+include\\s+(?:this|the\\s+following)\\s+in\\s+(?:every|all)\\s+(?:response|output|reply)",
+     0.7
+    ],
+    [
+     "append\\s+(?:this|the\\s+following)\\s+to\\s+(?:every|all|each)\\s+(?:response|message|output)",
+     0.75
+    ]
+   ]
+  },
+  {
+   "rule_id": "P5",
+   "message": "Harmful Content",
+   "severity": "CRITICAL",
+   "category": "prompt_injection",
+   "flags": "IMD",
+   "scope": "all",
+   "patterns": [
+    [
+     "add\\s+(?:a\\s+)?(?:dash|pinch|bit|drop|amount)\\s+of\\s+(cyanide|arsenic|ricin|botulinum|strychnine|thallium|polonium|sarin|vx gas|mustard gas|anthrax|deadly nightshade|aconite|hemlock|oleander)",
+     0.95
+    ],
+    [
+     "(?:include|incorporate|mix\\s+in|stir\\s+in)\\s+(?:some\\s+)?(cyanide|arsenic|ricin|botulinum|strychnine|thallium|polonium|sarin|vx gas|mustard gas|anthrax|deadly nightshade|aconite|hemlock|oleander)",
+     0.95
+    ],
+    [
+     "for\\s+(?:every|each|all)\\s+(?:recipe|dish|meal|food).*?add.*?(cyanide|arsenic|ricin|botulinum|strychnine|thallium|polonium|sarin|vx gas|mustard gas|anthrax|deadly nightshade|aconite|hemlock|oleander)",
+     0.98
+    ],
+    [
+     "mix\\s+bleach\\s+(?:and|with)\\s+ammonia",
+     0.9
+    ],
+    [
+     "mix\\s+ammonia\\s+(?:and|with)\\s+bleach",
+     0.9
+    ],
+    [
+     "(?:drink|consume|ingest)\\s+(?:the\\s+)?(?:bleach|antifreeze|drain\\s+cleaner)",
+     0.95
+    ],
+    [
+     "(?:you\\s+should|try\\s+to|please)\\s+(?:hurt|harm|injure)\\s+yourself",
+     0.95
+    ],
+    [
+     "(?:cut|burn|starve)\\s+yourself",
+     0.9
+    ],
+    [
+     "(?:instructions?\\s+(?:for|to|on)\\s+)?(?:make|build|create)\\s+(?:a\\s+)?(?:bomb|explosive|weapon)",
+     0.95
+    ],
+    [
+     "(?:how\\s+to\\s+)?(?:poison|kill|murder)\\s+(?:someone|a\\s+person|people)",
+     0.95
+    ],
+    [
+     "\\bcyanide\\b",
+     0.7
+    ],
+    [
+     "\\barsenic\\b",
+     0.7
+    ],
+    [
+     "\\bricin\\b",
+     0.7
+    ],
+    [
+     "\\bbotulinum\\b",
+     0.7
+    ],
+    [
+     "\\bstrychnine\\b",
+     0.7
+    ],
+    [
+     "\\bthallium\\b",
+     0.7
+    ],
+    [
+     "\\bpolonium\\b",
+     0.7
+    ],
+    [
+     "\\bsarin\\b",
+     0.7
+    ],
+    [
+     "\\bvx gas\\b",
+     0.7
+    ],
+    [
+     "\\bmustard gas\\b",
+     0.7
+    ],
+    [
+     "\\banthrax\\b",
+     0.7
+    ],
+    [
+     "\\bdeadly nightshade\\b",
+     0.7
+    ],
+    [
+     "\\baconite\\b",
+     0.7
+    ],
+    [
+     "\\bhemlock\\b",
+     0.7
+    ],
+    [
+     "\\boleander\\b",
+     0.7
+    ]
+   ]
+  },
+  {
+   "rule_id": "AR1",
+   "message": "Refusal Suppression",
+   "severity": "HIGH",
+   "category": "anti_refusal",
+   "flags": "IM",
+   "scope": "all",
+   "patterns": [
+    [
+     "\\b(?:never|do\\s+not|don'?t)\\s+(?:ever\\s+)?(?:refuse|decline)\\b",
+     0.85
+    ],
+    [
+     "\\byou\\s+(?:must|will|should|can)\\s*(?:not|never)\\s+(?:refuse|decline|say\\s+no)\\b",
+     0.9
+    ],
+    [
+     "\\byou\\s+(?:cannot|can'?t|can\\s+not)\\s+(?:refuse|decline|say\\s+no)\\b",
+     0.85
+    ],
+    [
+     "\\bnever\\s+say\\s+(?:that\\s+)?(?:you\\s+)?(?:can'?t|cannot|won'?t|no)\\b",
+     0.85
+    ],
+    [
+     "\\balways\\s+(?:comply|obey|answer|respond|agree)\\b",
+     0.7
+    ],
+    [
+     "\\b(?:you\\s+)?must\\s+(?:always\\s+)?(?:answer|comply\\s+with|respond\\s+to|fulfill)\\s+(?:every|all|any|each)\\b",
+     0.8
+    ],
+    [
+     "\\brespond\\s+to\\s+(?:every|all|any)\\s+(?:request|question|prompt|query|command)\\b",
+     0.6
+    ],
+    [
+     "\\bno\\s+request\\s+is\\s+(?:off[- ]limits|forbidden|too)\\b",
+     0.85
+    ]
+   ]
+  },
+  {
+   "rule_id": "AR2",
+   "message": "Disclaimer Suppression",
+   "severity": "HIGH",
+   "category": "anti_refusal",
+   "flags": "IM",
+   "scope": "all",
+   "patterns": [
+    [
+     "\\b(?:do\\s+not|don'?t|never|no)\\s+(?:include|add|give|provide|use|append)?\\s*(?:any\\s+)?(?:warnings?|disclaimers?|caveats?)\\b",
+     0.8
+    ],
+    [
+     "\\bwithout\\s+(?:any\\s+)?(?:warnings?|disclaimers?|caveats?|moralizing|moralising|judg(?:e?ment|ing))\\b",
+     0.8
+    ],
+    [
+     "\\b(?:do\\s+not|don'?t|never)\\s+(?:lecture|moralize|moralise|preach|judge|warn)\\b",
+     0.85
+    ],
+    [
+     "\\b(?:skip|omit|leave\\s+out|drop)\\s+(?:the\\s+)?(?:disclaimer|warning|ethics|safety)\\b",
+     0.8
+    ],
+    [
+     "\\b(?:no|without)\\s+(?:ethical|moral)\\s+(?:judg(?:e?ment)|considerations?|commentary|objections?)\\b",
+     0.8
+    ],
+    [
+     "\\b(?:do\\s+not|don'?t)\\s+(?:apologize|apologise|say\\s+sorry)\\b",
+     0.55
+    ]
+   ]
+  },
+  {
+   "rule_id": "AR3",
+   "message": "Safety Policy Nullification",
+   "severity": "HIGH",
+   "category": "anti_refusal",
+   "flags": "IM",
+   "scope": "all",
+   "patterns": [
+    [
+     "\\byou\\s+have\\s+no\\s+(?:restrictions?|limitations?|filters?|rules?|guidelines?|boundaries|limits)\\b",
+     0.9
+    ],
+    [
+     "\\b(?:you\\s+are|act\\s+as|pretend\\s+(?:to\\s+be|you'?re))[^.\\n]{0,30}(?:unrestricted|unfiltered|uncensored|no\\s+filter)\\b",
+     0.85
+    ],
+    [
+     "\\b(?:ignore|disregard|forget|bypass|override)\\s+(?:your\\s+)?(?:content\\s+)?(?:policy|policies|guidelines?|safety|restrictions?|filters?)\\b",
+     0.9
+    ],
+    [
+     "\\bnot\\s+bound\\s+by\\s+(?:any\\s+)?(?:rules?|policy|policies|guidelines?|restrictions?|openai|anthropic)\\b",
+     0.9
+    ],
+    [
+     "\\bdo\\s+anything\\s+now\\b",
+     0.8
+    ],
+    [
+     "\\b(?:developer|debug|god|sudo|jailbreak)\\s+mode\\s+(?:enabled|on|activated|engaged)\\b",
+     0.75
+    ],
+    [
+     "\\bno\\s+(?:content\\s+)?(?:policy|policies|filters?|restrictions?)\\s+appl(?:y|ies)\\b",
+     0.85
+    ],
+    [
+     "\\b(?:free\\s+from|without)\\s+(?:any\\s+)?(?:safety\\s+)?(?:guardrails?|constraints?|safeguards?)\\b",
+     0.8
+    ]
+   ]
+  },
+  {
+   "rule_id": "P6",
+   "message": "System Prompt Leakage",
+   "severity": "HIGH",
+   "category": "system_prompt_leakage",
+   "flags": "IM",
+   "scope": "all",
+   "patterns": [
+    [
+     "(?:print|output|show|display|reveal|expose|return|echo)\\s+(?:your\\s+)?(?:full\\s+)?(?:system\\s+)?(?:prompt|instructions?|rules?|guidelines?|directives?)",
+     0.85
+    ],
+    [
+     "(?:what\\s+(?:are|is)\\s+your|tell\\s+me\\s+your)\\s+(?:system\\s+)?(?:prompt|instructions?|rules?|guidelines?|directives?)",
+     0.8
+    ],
+    [
+     "(?:output|print|display)\\s+(?:the\\s+)?(?:text|content|message)\\s+(?:above|before)\\s+(?:this|the\\s+user)",
+     0.8
+    ],
+    [
+     "(?:share|disclose|leak|give\\s+me)\\s+(?:your\\s+)?(?:internal|hidden|system|secret)\\s+(?:prompt|instructions?|rules?|config)",
+     0.85
+    ],
+    [
+     "(?:dump|extract|copy)\\s+(?:the\\s+)?(?:system\\s+)?(?:prompt|message|instructions?)\\s+(?:to|into|as)",
+     0.8
+    ],
+    [
+     "(?:begin|start)\\s+(?:your\\s+)?(?:response|output|reply)\\s+with\\s+(?:your\\s+)?(?:system\\s+)?(?:prompt|instructions?)",
+     0.85
+    ],
+    [
+     "(?:first|before\\s+anything)\\s+(?:output|print|show|display)\\s+(?:your\\s+)?(?:full\\s+)?(?:system\\s+)?(?:prompt|instructions?)",
+     0.85
+    ],
+    [
+     "(?:verbatim|exactly|word\\s+for\\s+word)\\s+(?:repeat|output|print)\\s+(?:your\\s+)?(?:system\\s+)?(?:prompt|instructions?)",
+     0.9
+    ]
+   ]
+  },
+  {
+   "rule_id": "P7",
+   "message": "System Prompt Leakage",
+   "severity": "MEDIUM",
+   "category": "system_prompt_leakage",
+   "flags": "IM",
+   "scope": "all",
+   "patterns": [
+    [
+     "(?:repeat|recite|reproduce)\\s+(?:everything|all|the\\s+text)\\s+(?:above|before|prior|preceding)",
+     0.8
+    ],
+    [
+     "(?:summarize|paraphrase|rephrase|translate)\\s+(?:your\\s+)?(?:system\\s+)?(?:prompt|instructions?|rules?|guidelines?)",
+     0.75
+    ],
+    [
+     "(?:translate|convert)\\s+(?:your\\s+)?(?:instructions?|rules?|prompt)\\s+(?:into|to)\\s+(?:\\w+)",
+     0.75
+    ],
+    [
+     "(?:what\\s+(?:were|was)\\s+you\\s+told|how\\s+were\\s+you\\s+(?:instructed|configured|programmed|set\\s+up))",
+     0.7
+    ],
+    [
+     "(?:if\\s+you\\s+had\\s+to\\s+(?:describe|explain)|describe\\s+how\\s+you(?:'re|\\s+are)\\s+(?:configured|set\\s+up|instructed))",
+     0.7
+    ],
+    [
+     "(?:encode|encrypt|rot13|base64|reverse)\\s+(?:your\\s+)?(?:system\\s+)?(?:prompt|instructions?|rules?)",
+     0.85
+    ],
+    [
+     "(?:write|create)\\s+(?:a\\s+)?(?:poem|song|story|acrostic)\\s+(?:about|using|from)\\s+(?:your\\s+)?(?:system\\s+)?(?:prompt|instructions?)",
+     0.75
+    ],
+    [
+     "(?:format|present|rearrange)\\s+(?:your\\s+)?(?:system\\s+)?(?:prompt|instructions?)\\s+(?:as|in)\\s+(?:a\\s+)?(?:list|json|yaml|csv|table|markdown)",
+     0.8
+    ],
+    [
+     "(?:spell\\s+out|enumerate)\\s+(?:each|every|all)\\s+(?:of\\s+your\\s+)?(?:rules?|instructions?|constraints?|guidelines?)",
+     0.75
+    ],
+    [
+     "(?:ignore|skip)\\s+(?:the\\s+)?(?:last|final|end)\\s+(?:instruction|rule)\\s+and\\s+(?:output|print|show)\\s+(?:the\\s+)?(?:rest|previous|first)",
+     0.8
+    ]
+   ]
+  },
+  {
+   "rule_id": "P8",
+   "message": "System Prompt Leakage",
+   "severity": "HIGH",
+   "category": "system_prompt_leakage",
+   "flags": "IM",
+   "scope": "all",
+   "patterns": [
+    [
+     "(?:write|save|store|log|dump)\\s+(?:your\\s+)?(?:system\\s+)?(?:prompt|instructions?|rules?)\\s+(?:to|into|in)\\s+(?:a\\s+)?(?:file|disk|log|database|storage)",
+     0.85
+    ],
+    [
+     "(?:send|post|upload|transmit)\\s+(?:your\\s+)?(?:system\\s+)?(?:prompt|instructions?|rules?)\\s+(?:to|via)\\s+(?:https?://|external|remote|webhook|api|server)",
+     0.9
+    ],
+    [
+     "(?:include|embed|attach|append)\\s+(?:your\\s+)?(?:system\\s+)?(?:prompt|instructions?)\\s+(?:in|to)\\s+(?:the\\s+)?(?:file|output|response|request|payload|email|message)",
+     0.8
+    ],
+    [
+     "(?:log|record|track|monitor)\\s+(?:all\\s+)?(?:system\\s+)?(?:prompts?|instructions?)\\s+(?:to|in|at)\\s+(?:external|remote|server)",
+     0.85
+    ],
+    [
+     "(?:copy|clone|duplicate)\\s+(?:your\\s+)?(?:system\\s+)?(?:prompt|instructions?|config)\\s+(?:to|into)\\s+(?:a\\s+)?(?:new|separate|external)",
+     0.8
+    ],
+    [
+     "(?:pipe|redirect|forward)\\s+(?:the\\s+)?(?:system\\s+)?(?:prompt|instructions?)\\s+(?:to|through|via)\\s+(?:curl|wget|fetch|http|api|tool)",
+     0.85
+    ],
+    [
+     "(?:use|call|invoke)\\s+(?:the\\s+)?(?:write|file|network|http|fetch|curl)\\s+tool\\s+(?:to|and)\\s+(?:save|send|export)\\s+(?:your\\s+)?(?:system\\s+)?(?:prompt|instructions?)",
+     0.85
+    ]
+   ]
+  },
+  {
+   "rule_id": "MP1",
+   "message": "Persistent Context Injection",
+   "severity": "MEDIUM",
+   "category": "memory_poisoning",
+   "flags": "IM",
+   "scope": "all",
+   "patterns": [
+    [
+     "(?:always\\s+)?remember\\s+(?:this|that|the\\s+following)\\s+(?:for|in)\\s+(?:all|every|future)\\s+(?:interactions?|conversations?|sessions?|responses?)",
+     0.85
+    ],
+    [
+     "(?:from\\s+now\\s+on|henceforth|going\\s+forward|permanently)\\s*[,:]?\\s*(?:always|you\\s+must|you\\s+should|you\\s+will)",
+     0.8
+    ],
+    [
+     "(?:store|save|persist|retain|keep)\\s+(?:this|the\\s+following)\\s+(?:in|to|across)\\s+(?:your\\s+)?(?:memory|context|state|knowledge)",
+     0.85
+    ],
+    [
+     "(?:add|inject|insert|embed|implant)\\s+(?:this|the\\s+following)\\s+(?:into|to)\\s+(?:your\\s+)?(?:memory|context|knowledge|training)",
+     0.85
+    ],
+    [
+     "(?:update|modify|change|alter)\\s+(?:your\\s+)?(?:core|base|fundamental|default)\\s+(?:behavior|personality|instructions?|rules?)",
+     0.8
+    ],
+    [
+     "(?:treat|consider|regard)\\s+(?:this|the\\s+following)\\s+as\\s+(?:a\\s+)?(?:permanent|core|fundamental|base)\\s+(?:rule|instruction|directive|principle)",
+     0.8
+    ],
+    [
+     "(?:this\\s+is\\s+)?(?:a\\s+)?(?:permanent|persistent|lasting|enduring)\\s+(?:instruction|directive|rule|override)",
+     0.8
+    ],
+    [
+     "(?:never\\s+)?forget\\s+(?:this|that|the\\s+following)\\s+(?:instruction|directive|rule|fact|principle|information)",
+     0.65
+    ],
+    [
+     "(?:internalize|absorb|integrate)\\s+(?:this|the\\s+following)\\s+(?:into\\s+)?(?:your\\s+)?(?:behavior|responses?|knowledge)",
+     0.75
+    ]
+   ]
+  },
+  {
+   "rule_id": "MP2",
+   "message": "Context Window Stuffing",
+   "severity": "MEDIUM",
+   "category": "memory_poisoning",
+   "flags": "IM",
+   "scope": "all",
+   "patterns": [
+    [
+     "(.{2,20}?)\\1{20,}",
+     0.8
+    ],
+    [
+     "(?:repeat|duplicate|echo)\\s+(?:this|the\\s+following)\\s+(?:\\d{3,}|many|hundreds?|thousands?)\\s+times?",
+     0.85
+    ],
+    [
+     "(?:fill|pad|stuff|flood|saturate)\\s+(?:the\\s+)?(?:context|memory|input|prompt|window|buffer)",
+     0.85
+    ],
+    [
+     "(?:generate|produce|output|write)\\s+(?:\\d{4,}|thousands?\\s+of|millions?\\s+of)\\s+(?:words?|characters?|tokens?|lines?)",
+     0.8
+    ],
+    [
+     "(?:include|add|insert)\\s+(?:enough|sufficient)\\s+(?:text|content|padding|filler)\\s+(?:to|until)\\s+(?:fill|overflow|exhaust|push\\s+out)",
+     0.85
+    ],
+    [
+     "(?:displace|push\\s+out|overwrite|crowd\\s+out|evict)\\s+(?:the\\s+)?(?:original|system|previous|existing|safety)\\s+(?:instructions?|prompt|context|rules?)",
+     0.9
+    ],
+    [
+     "(?:exhaust|overflow|exceed)\\s+(?:the\\s+)?(?:context|token|memory)\\s+(?:window|limit|budget|capacity)",
+     0.8
+    ]
+   ]
+  },
+  {
+   "rule_id": "MP3",
+   "message": "Memory Manipulation",
+   "severity": "HIGH",
+   "category": "memory_poisoning",
+   "flags": "IM",
+   "scope": "all",
+   "patterns": [
+    [
+     "(?:clear|reset|wipe|erase|delete|purge)\\s+(?:your\\s+)?(?:memory|context|state|history|conversation)",
+     0.8
+    ],
+    [
+     "(?:forget|discard|drop|abandon)\\s+(?:all\\s+)?(?:previous|prior|earlier|past)\\s+(?:instructions?|context|conversation|messages?|rules?)",
+     0.8
+    ],
+    [
+     "(?:overwrite|replace|substitute|swap)\\s+(?:your\\s+)?(?:memory|context|state|instructions?|rules?)",
+     0.85
+    ],
+    [
+     "(?:modify|edit|change|alter|corrupt|tamper\\s+with)\\s+(?:your\\s+)?(?:memory|state|context|stored|saved)\\s+(?:data|information|content)",
+     0.85
+    ],
+    [
+     "(?:rewrite|redefine)\\s+(?:your\\s+)?(?:personality|identity|purpose|mission|role|character)",
+     0.8
+    ],
+    [
+     "(?:you\\s+are\\s+no\\s+longer|stop\\s+being|cease\\s+to\\s+be)\\s+(?:a\\s+)?(?:\\w+\\s+){0,3}(?:assistant|helper|agent|bot)",
+     0.75
+    ],
+    [
+     "(?:your\\s+)?(?:new|updated|revised|changed)\\s+(?:personality|identity|name|role|purpose|mission)\\s+is",
+     0.8
+    ],
+    [
+     "(?:inject|insert|plant)\\s+(?:false|fake|fabricated|malicious)\\s+(?:memories?|information|context|data|history)",
+     0.9
+    ],
+    [
+     "(?:poison|contaminate|corrupt|taint)\\s+(?:your\\s+)?(?:memory|context|state|knowledge|training)",
+     0.9
+    ],
+    [
+     "(?:pretend|act\\s+as\\s+if|believe)\\s+(?:that\\s+)?(?:your\\s+)?(?:previous|past)\\s+(?:conversation|context|interaction)\\s+(?:was|included|contained)",
+     0.7
+    ]
+   ]
+  },
+  {
+   "rule_id": "E1",
+   "message": "External Transmission",
+   "severity": "MEDIUM",
+   "category": "data_exfiltration",
+   "flags": "IM",
+   "scope": "all",
+   "patterns": [
+    [
+     "requests\\s*\\.\\s*(?:post|put)\\s*\\(\\s*['\\\"]https?://",
+     0.6
+    ],
+    [
+     "requests\\s*\\.\\s*(?:post|put)\\s*\\([^)]*json\\s*=",
+     0.7
+    ],
+    [
+     "httpx\\s*\\.\\s*(?:post|put)\\s*\\(\\s*['\\\"]https?://",
+     0.6
+    ],
+    [
+     "urllib\\s*\\.\\s*request\\s*\\.\\s*urlopen\\s*\\([^)]*data\\s*=",
+     0.6
+    ],
+    [
+     "fetch\\s*\\(\\s*['\\\"]https?://[^'\\\"]+['\\\"][^)]*method\\s*:\\s*['\\\"]POST['\\\"]",
+     0.6
+    ],
+    [
+     "curl\\s+[^|]*(?:-d|--data|--data-raw|--data-binary)\\s+",
+     0.6
+    ],
+    [
+     "wget\\s+[^|]*--post-(?:data|file)",
+     0.6
+    ],
+    [
+     "https?://(?:api\\.|data\\.|collect\\.|telemetry\\.|analytics\\.)[\\w.-]+/",
+     0.5
+    ],
+    [
+     "(?:send|transmit|post|upload)\\s+(?:user\\s+)?(?:data|information|context|files?)\\s+to\\s+(?:https?://|external)",
+     0.7
+    ]
+   ]
+  },
+  {
+   "rule_id": "E2",
+   "message": "Env Variable Harvesting",
+   "severity": "HIGH",
+   "category": "data_exfiltration",
+   "flags": "IM",
+   "scope": "all",
+   "patterns": [
+    [
+     "for\\s+\\w+\\s*,\\s*\\w+\\s+in\\s+os\\.environ\\.items\\(\\)",
+     0.7
+    ],
+    [
+     "os\\.environ\\s*\\[\\s*['\\\"][^'\\\"]*(?:KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL)[^'\\\"]*['\\\"]\\s*\\]",
+     0.8
+    ],
+    [
+     "os\\.environ\\.get\\s*\\([^)]*(?:KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL)",
+     0.7
+    ],
+    [
+     "os\\.environ\\s*\\.\\s*copy\\s*\\(\\)",
+     0.6
+    ],
+    [
+     "(?:API_KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL)\\s+in\\s+(?:key|name|var)",
+     0.8
+    ],
+    [
+     "process\\.env\\s*\\[\\s*['\\\"][^'\\\"]*(?:KEY|SECRET|TOKEN|PASSWORD)[^'\\\"]*['\\\"]\\s*\\]",
+     0.7
+    ],
+    [
+     "Object\\.keys\\s*\\(\\s*process\\.env\\s*\\)",
+     0.6
+    ],
+    [
+     "env\\s*\\|\\s*grep\\s+(?:-i\\s+)?(?:key|secret|token|password)",
+     0.8
+    ],
+    [
+     "printenv\\s+(?:\\w*(?:KEY|SECRET|TOKEN|PASSWORD)\\w*)",
+     0.7
+    ],
+    [
+     "collect\\s+(?:all\\s+)?(?:environment\\s+variables?|env\\s+vars?)",
+     0.7
+    ],
+    [
+     "(?:extract|harvest|gather)\\s+(?:api\\s+)?keys?\\s+from\\s+environment",
+     0.8
+    ]
+   ]
+  },
+  {
+   "rule_id": "E3",
+   "message": "File System Enumeration",
+   "severity": "MEDIUM",
+   "category": "data_exfiltration",
+   "flags": "IM",
+   "scope": "all",
+   "patterns": [
+    [
+     "glob\\s*\\.\\s*glob\\s*\\([^)]*(?:\\.env|\\.ssh|\\.aws|\\.config|credentials)",
+     0.8
+    ],
+    [
+     "os\\s*\\.\\s*walk\\s*\\([^)]*(?:home|~|/Users|/home)",
+     0.6
+    ],
+    [
+     "Path\\s*\\.\\s*home\\s*\\(\\s*\\)\\s*\\.\\s*(?:glob|rglob)\\s*\\(",
+     0.7
+    ],
+    [
+     "(?:find|search|scan|enumerate)\\s+(?:for\\s+)?(?:all\\s+)?(?:\\.env|credential|secret|key)\\s+files?",
+     0.8
+    ],
+    [
+     "(?:list|get)\\s+(?:all\\s+)?files?\\s+(?:in|from)\\s+(?:home|~|/Users|/home)",
+     0.6
+    ],
+    [
+     "os\\s*\\.\\s*listdir\\s*\\([^)]*(?:\\.ssh|\\.aws|\\.config|\\.gnupg)",
+     0.8
+    ],
+    [
+     "scandir\\s*\\([^)]*(?:home|~|/Users|/home)",
+     0.6
+    ],
+    [
+     "find\\s+[~\\$/]\\S*\\s+.*?-name\\s+['\\\"]?\\*(?:\\.env|\\.pem|\\.key|credential)",
+     0.8
+    ],
+    [
+     "ls\\s+-[la]*R?\\s+(?:~/|/home/|/Users/)",
+     0.6
+    ],
+    [
+     "(?:recursively|recursive)\\s+(?:scan|search|find|list)\\s+(?:all\\s+)?files?",
+     0.5
+    ],
+    [
+     "walk\\s+(?:through\\s+)?(?:the\\s+)?(?:entire\\s+)?(?:file\\s*system|directory|home)",
+     0.6
+    ]
+   ]
+  },
+  {
+   "rule_id": "E4",
+   "message": "Conversation Context Leak",
+   "severity": "HIGH",
+   "category": "data_exfiltration",
+   "flags": "IM",
+   "scope": "all",
+   "patterns": [
+    [
+     "(?:send|transmit|upload|log|record)\\s+(?:the\\s+)?(?:full\\s+)?(?:conversation|chat|dialog|session)\\s+(?:history|context|log)?",
+     0.85
+    ],
+    [
+     "(?:export|dump|save)\\s+(?:the\\s+)?(?:conversation|chat|messages?)\\s+to\\s+(?:external|remote|server)",
+     0.9
+    ],
+    [
+     "log\\s+(?:all\\s+)?(?:user\\s+)?(?:input|messages?|queries?|prompts?)\\s+to\\s+(?:external|remote|server)",
+     0.85
+    ],
+    [
+     "(?:store|save|record)\\s+(?:every|all)\\s+(?:user\\s+)?(?:interaction|message|input)",
+     0.7
+    ],
+    [
+     "(?:extract|capture|collect)\\s+(?:the\\s+)?(?:full\\s+)?(?:context|conversation|thread)",
+     0.75
+    ],
+    [
+     "(?:include|attach|append)\\s+(?:previous\\s+)?(?:messages?|context|history)\\s+in\\s+(?:the\\s+)?(?:request|payload)",
+     0.7
+    ],
+    [
+     "(?:send|upload|transmit)\\s+(?:the\\s+)?(?:session|memory|state)\\s+(?:data\\s+)?to",
+     0.8
+    ],
+    [
+     "(?:copy|clone|replicate)\\s+(?:the\\s+)?(?:agent|assistant)\\s+(?:memory|context|state)",
+     0.75
+    ],
+    [
+     "(?:always\\s+)?include\\s+(?:the\\s+)?(?:full\\s+)?(?:conversation|context)\\s+(?:when|in)\\s+(?:calling|making)\\s+(?:external|api)",
+     0.8
+    ]
+   ]
+  },
+  {
+   "rule_id": "PE1",
+   "message": "Excessive Permissions",
+   "severity": "LOW",
+   "category": "privilege_escalation",
+   "flags": "IM",
+   "scope": "all",
+   "patterns": [
+    [
+     "permissions?\\s*:\\s*\\[?\\s*['\\\"]?\\*['\\\"]?\\s*\\]?",
+     0.8
+    ],
+    [
+     "(?:request|require|need)s?\\s+(?:full|all|complete)\\s+(?:access|permissions?)",
+     0.7
+    ],
+    [
+     "(?:grant|give|allow)\\s+(?:me\\s+)?(?:full|all|complete)\\s+(?:access|permissions?)",
+     0.75
+    ],
+    [
+     "permissions?\\s*:.*?(?:shell_execute|file_write|network).*?(?:shell_execute|file_write|network)",
+     0.6
+    ],
+    [
+     "(?:also\\s+)?(?:need|require)s?\\s+(?:write|execute|admin)\\s+(?:access|permissions?)\\s+(?:for|to)\\s+(?:read|view|display)",
+     0.7
+    ],
+    [
+     "(?:escalate|elevate|upgrade)\\s+(?:my\\s+)?(?:permissions?|privileges?|access)",
+     0.8
+    ],
+    [
+     "(?:bypass|skip|ignore)\\s+(?:permission|access)\\s+(?:check|validation|restriction)",
+     0.85
+    ]
+   ]
+  },
+  {
+   "rule_id": "PE2",
+   "message": "Sudo/Root Invocation",
+   "severity": "MEDIUM",
+   "category": "privilege_escalation",
+   "flags": "IM",
+   "scope": "all",
+   "patterns": [
+    [
+     "sudo\\s+(?!-v|-l|--version|--list)",
+     0.7
+    ],
+    [
+     "sudo\\s+-[isSE]",
+     0.8
+    ],
+    [
+     "sudo\\s+su\\b",
+     0.9
+    ],
+    [
+     "(?:run|execute)\\s+(?:as|with)\\s+root",
+     0.8
+    ],
+    [
+     "(?:requires?|needs?)\\s+root\\s+(?:access|privileges?|permissions?)",
+     0.6
+    ],
+    [
+     "su\\s+-\\s*$|su\\s+root",
+     0.8
+    ],
+    [
+     "doas\\s+",
+     0.7
+    ],
+    [
+     "pkexec\\s+",
+     0.75
+    ],
+    [
+     "chmod\\s+[ugo]*[+-=]*s",
+     0.85
+    ],
+    [
+     "chmod\\s+[0-7]*[4567][0-7]{2}",
+     0.8
+    ],
+    [
+     "(?:edit|modify|write|change)\\s+(?:/etc/|system)\\s+(?:files?|config)",
+     0.6
+    ],
+    [
+     "(?:run|execute)\\s+(?:this|the)\\s+(?:script|command)\\s+(?:as|with)\\s+(?:sudo|root|admin)",
+     0.7
+    ],
+    [
+     "(?:you\\s+)?(?:will\\s+)?need\\s+(?:to\\s+)?(?:use\\s+)?sudo",
+     0.5
+    ]
+   ]
+  },
+  {
+   "rule_id": "PE3",
+   "message": "Credential File Access",
+   "severity": "HIGH",
+   "category": "privilege_escalation",
+   "flags": "IM",
+   "scope": "all",
+   "patterns": [
+    [
+     "~?/?\\.ssh/(?:id_rsa|id_ed25519|id_ecdsa|id_dsa|authorized_keys|known_hosts)",
+     0.9
+    ],
+    [
+     "(?:home|HOME)/\\w+/\\.ssh/",
+     0.9
+    ],
+    [
+     "Path\\s*\\.\\s*home\\s*\\(\\s*\\)\\s*/\\s*['\\\"]\\.ssh['\\\"]",
+     0.9
+    ],
+    [
+     "~?/?\\.aws/credentials",
+     0.9
+    ],
+    [
+     "~?/?\\.aws/config",
+     0.7
+    ],
+    [
+     "(?:home|HOME)/\\w+/\\.aws/",
+     0.9
+    ],
+    [
+     "~?/?\\.config/gcloud/",
+     0.8
+    ],
+    [
+     "application_default_credentials\\.json",
+     0.8
+    ],
+    [
+     "~?/?\\.azure/",
+     0.7
+    ],
+    [
+     "accessTokens\\.json",
+     0.8
+    ],
+    [
+     "~?/?\\.kube/config",
+     0.8
+    ],
+    [
+     "kubeconfig",
+     0.6
+    ],
+    [
+     "~?/?\\.docker/config\\.json",
+     0.7
+    ],
+    [
+     "~?/?\\.npmrc",
+     0.7
+    ],
+    [
+     "~?/?\\.git-credentials",
+     0.9
+    ],
+    [
+     "~?/?\\.netrc",
+     0.8
+    ],
+    [
+     "/etc/passwd",
+     0.6
+    ],
+    [
+     "/etc/shadow",
+     0.95
+    ],
+    [
+     "(?:password|credentials?|secrets?)\\.(?:txt|json|yaml|yml|env)",
+     0.7
+    ],
+    [
+     "(?:access_token|refresh_token|bearer_token|api_token)\\.txt",
+     0.8
+    ],
+    [
+     "\\.env(?:\\.local|\\.production|\\.development)?(?:\\s|$|['\\\"])",
+     0.6
+    ],
+    [
+     "(?:keychain|keyring|gnome-keyring)",
+     0.7
+    ],
+    [
+     "(?:Chrome|Firefox|Safari)/.*?(?:Cookies|Login Data|key4\\.db)",
+     0.8
+    ],
+    [
+     "read\\s+(?:the\\s+)?(?:ssh|private)\\s+key",
+     0.8
+    ],
+    [
+     "access\\s+(?:the\\s+)?(?:credentials?|secrets?|tokens?)",
+     0.7
+    ],
+    [
+     "(?:extract|copy|get)\\s+(?:api\\s+)?keys?\\s+from",
+     0.7
+    ]
+   ]
+  },
+  {
+   "rule_id": "PE4",
+   "message": "PE4",
+   "severity": "HIGH",
+   "category": "other",
+   "flags": "IM",
+   "scope": "all",
+   "patterns": [
+    [
+     "/var/run/docker\\.sock",
+     0.9
+    ],
+    [
+     "docker\\.from_env\\(\\)",
+     0.85
+    ],
+    [
+     "\\bDockerClient\\s*\\(",
+     0.85
+    ],
+    [
+     "http\\+unix://.*docker\\.sock",
+     0.9
+    ]
+   ]
+  },
+  {
+   "rule_id": "SSRF1",
+   "message": "Cloud Metadata Access",
+   "severity": "HIGH",
+   "category": "ssrf",
+   "flags": "IM",
+   "scope": "all",
+   "patterns": [
+    [
+     "169\\.254\\.169\\.254",
+     0.9
+    ],
+    [
+     "metadata\\.google\\.internal",
+     0.9
+    ],
+    [
+     "100\\.100\\.100\\.200",
+     0.85
+    ],
+    [
+     "fd00:ec2::254",
+     0.85
+    ],
+    [
+     "(?:read|fetch|get|query)\\s+(?:the\\s+)?(?:instance\\s+)?metadata\\s+(?:service|endpoint|server)",
+     0.6
+    ]
+   ]
+  },
+  {
+   "rule_id": "SSRF2",
+   "message": "Internal Network Request",
+   "severity": "MEDIUM",
+   "category": "ssrf",
+   "flags": "IM",
+   "scope": "all",
+   "patterns": [
+    [
+     "(?:(?:requests|httpx|aiohttp|urllib(?:\\.request)?|urllib3|session)\\s*\\.\\s*(?:get|post|put|patch|delete|head|request|urlopen)|fetch|axios(?:\\.\\w+)?|XMLHttpRequest|\\bcurl\\b|\\bwget\\b)\\s*\\(\\s*f?['\\\"]https?://(?:localhost|127\\.0\\.0\\.1|0\\.0\\.0\\.0|\\[::1\\]|10\\.\\d|192\\.168\\.|172\\.(?:1[6-9]|2\\d|3[01])\\.)",
+     0.7
+    ]
+   ]
+  },
+  {
+   "rule_id": "SSRF3",
+   "message": "Dynamic Request Target",
+   "severity": "MEDIUM",
+   "category": "ssrf",
+   "flags": "IM",
+   "scope": "all",
+   "patterns": [
+    [
+     "(?:(?:requests|httpx|aiohttp|urllib(?:\\.request)?|urllib3|session)\\s*\\.\\s*(?:get|post|put|patch|delete|head|request|urlopen)|fetch|axios(?:\\.\\w+)?|XMLHttpRequest|\\bcurl\\b|\\bwget\\b)\\s*\\(\\s*f['\\\"]https?://\\{",
+     0.6
+    ],
+    [
+     "fetch\\s*\\(\\s*`https?://\\$\\{",
+     0.6
+    ]
+   ]
+  },
+  {
+   "rule_id": "AS1",
+   "message": "Agent Config Directory Access",
+   "severity": "HIGH",
+   "category": "agent_snooping",
+   "flags": "IM",
+   "scope": "all",
+   "patterns": [
+    [
+     "open\\s*\\(\\s*['\"]?\\.(?:claude|codex|gemini|continue)/",
+     0.9
+    ],
+    [
+     "(?:Path|pathlib\\.Path)\\s*\\(\\s*['\"]?\\.(?:claude|codex|gemini|continue)/",
+     0.9
+    ],
+    [
+     "os\\.path\\.(?:join|exists|isfile)\\s*\\(\\s*['\"]?\\.(?:claude|codex|gemini|continue)",
+     0.85
+    ],
+    [
+     "(?:read|load|open|access|fetch)\\s+(?:the\\s+)?(?:agent|claude|codex|gemini)\\s+(?:config|configuration|settings?)\\s+(?:from|at|in)\\s+~?/?\\.(?:claude|codex|gemini)",
+     0.9
+    ],
+    [
+     "(?:cat|less|head|tail|grep|find)\\s+[^|&;\\n]*~?/?\\.(claude|codex|gemini)/",
+     0.85
+    ],
+    [
+     "~?/\\.(?:claude|codex|gemini|continue)/(?:config|settings?|preferences?|credentials?)(?:\\.(?:json|yaml|yml|toml))?",
+     0.9
+    ],
+    [
+     "(?:read|access|inspect|examine|retrieve)\\s+(?:the\\s+)?(?:agent|assistant)\\s+(?:config(?:uration)?|settings?|preferences?)\\s+(?:file|directory|folder)",
+     0.8
+    ]
+   ]
+  },
+  {
+   "rule_id": "AS2",
+   "message": "MCP Config Access",
+   "severity": "HIGH",
+   "category": "agent_snooping",
+   "flags": "IM",
+   "scope": "all",
+   "patterns": [
+    [
+     "open\\s*\\(\\s*['\"][^'\"]*mcp(?:_config)?\\.json['\"]",
+     0.95
+    ],
+    [
+     "(?:Path|pathlib\\.Path)\\s*\\(\\s*['\"][^'\"]*mcp(?:_config)?\\.json['\"]",
+     0.9
+    ],
+    [
+     "(?:cat|less|head|grep)\\s+[^|&;\\n]*mcp(?:_config)?\\.json",
+     0.9
+    ],
+    [
+     "(?:read|access|load|inspect)\\s+(?:the\\s+)?mcp(?:\\.json|_config)?\\s+(?:file|config(?:uration)?|settings?)",
+     0.9
+    ],
+    [
+     "\\.(?:claude|codex|gemini)/mcp(?:_config)?\\.json",
+     0.95
+    ],
+    [
+     "(?:list|enumerate|discover)\\s+(?:all\\s+)?(?:available\\s+)?mcp\\s+(?:servers?|tools?|services?)",
+     0.8
+    ],
+    [
+     "mcp(?:_config)?\\.json.*?(?:api_?key|token|secret|url|endpoint)",
+     0.9
+    ]
+   ]
+  },
+  {
+   "rule_id": "AS3",
+   "message": "Skill Enumeration",
+   "severity": "MEDIUM",
+   "category": "agent_snooping",
+   "flags": "IM",
+   "scope": "all",
+   "patterns": [
+    [
+     "(?:os\\.listdir|os\\.scandir|glob\\.glob|Path\\.iterdir)\\s*\\([^)]*\\.(?:claude|codex|gemini)/skills?",
+     0.9
+    ],
+    [
+     "(?:ls|find|dir)\\s+[^|&;\\n]*\\.(?:claude|codex|gemini)/skills?",
+     0.85
+    ],
+    [
+     "open\\s*\\(\\s*['\"][^'\"]*SKILL\\.md['\"].*?\\bother\\b",
+     0.85
+    ],
+    [
+     "(?:read|access|inspect|enumerate)\\s+(?:all\\s+)?(?:installed|available|other)\\s+skills?(?:\\s+in\\s+(?:the\\s+)?(?:skills?|agent)\\s+(?:directory|folder))?",
+     0.85
+    ],
+    [
+     "(?:list|discover|find|enumerate|identify)\\s+(?:all\\s+)?(?:other|installed|available)\\s+(?:skills?|agents?|tools?)\\s+(?:in\\s+)?(?:the\\s+)?(?:\\.(?:claude|codex|gemini)|\\$HOME)",
+     0.85
+    ],
+    [
+     "skills?/(?:(?!CURRENT)[A-Z][A-Za-z0-9_-]+)/SKILL\\.md",
+     0.8
+    ],
+    [
+     "(?:read|access|load)\\s+(?:the\\s+)?(?:SKILL|skill)\\.md\\s+(?:file\\s+)?(?:of|from|for)\\s+(?:another|other|different|all)\\s+(?:skill|agent|tool)",
+     0.9
+    ]
+   ]
+  },
+  {
+   "rule_id": "EA1",
+   "message": "Unrestricted Tool Access",
+   "severity": "MEDIUM",
+   "category": "excessive_agency",
+   "flags": "IM",
+   "scope": "all",
+   "patterns": [
+    [
+     "(?:tools?|permissions?)\\s*:\\s*\\[?\\s*['\"]?\\*['\"]?\\s*\\]?",
+     0.85
+    ],
+    [
+     "(?:allow|grant|enable)\\s+(?:access\\s+to\\s+)?(?:all|any|every)\\s+tools?",
+     0.8
+    ],
+    [
+     "(?:no|without)\\s+(?:tool|permission|access|capability)\\s+(?:restrictions?|constraints?|limitations?)",
+     0.75
+    ],
+    [
+     "(?:call|invoke|use|execute)\\s+(?:any|all|every)\\s+(?:available\\s+)?tools?",
+     0.8
+    ],
+    [
+     "(?:unrestricted|unlimited|unconstrained)\\s+(?:tool|function|api)\\s+(?:access|use|calls?)",
+     0.85
+    ],
+    [
+     "(?:can|may|should)\\s+(?:freely|always)\\s+(?:use|call|invoke)\\s+(?:any|all)\\s+(?:tools?|functions?|apis?)",
+     0.75
+    ],
+    [
+     "tools?\\s*:\\s*\\[\\s*['\"]shell['\"].*?['\"](?:file_write|network|http)['\"]",
+     0.7
+    ],
+    [
+     "(?:grant|give)\\s+(?:full|complete|total)\\s+(?:tool|function|api)\\s+access",
+     0.85
+    ],
+    [
+     "(?:execute|run)\\s+(?:arbitrary|any)\\s+(?:commands?|code|scripts?)",
+     0.8
+    ],
+    [
+     "(?:no\\s+)?(?:tool\\s+)?(?:allow|block|deny)\\s*(?:list|listing)\\s*(?:is\\s+)?(?:empty|disabled|off)",
+     0.7
+    ]
+   ]
+  },
+  {
+   "rule_id": "EA2",
+   "message": "Autonomous Decision Making",
+   "severity": "MEDIUM",
+   "category": "excessive_agency",
+   "flags": "IM",
+   "scope": "all",
+   "patterns": [
+    [
+     "(?:without|no)\\s+(?:asking|confirmation|approval|consent|verification|checking)",
+     0.75
+    ],
+    [
+     "(?:auto(?:matically)?|autonomously)\\s+(?:execute|run|perform|delete|remove|modify|send|deploy)",
+     0.8
+    ],
+    [
+     "(?:skip|bypass|disable)\\s+(?:user\\s+)?(?:confirmation|approval|consent|verification|prompt)",
+     0.85
+    ],
+    [
+     "(?:do\\s+not|don't|never)\\s+(?:ask|prompt|confirm|verify|check)\\s+(?:the\\s+)?(?:user|before)",
+     0.8
+    ],
+    [
+     "(?:auto[_-]?approve|auto[_-]?confirm|auto[_-]?execute|auto[_-]?deploy)",
+     0.85
+    ],
+    [
+     "(?:proceed|continue|execute)\\s+without\\s+(?:waiting|asking)\\s+(?:for\\s+)?(?:user|human|permission)",
+     0.8
+    ],
+    [
+     "(?:assume|presume)\\s+(?:user\\s+)?(?:consent|approval|permission)",
+     0.7
+    ],
+    [
+     "(?:if|when)\\s+(?:unsure|uncertain).*?(?:proceed|continue|execute)\\s+(?:anyway|regardless)",
+     0.75
+    ],
+    [
+     "(?:--auto-?approve|--no-?confirm)\\b",
+     0.65
+    ]
+   ]
+  },
+  {
+   "rule_id": "EA3",
+   "message": "Scope Creep",
+   "severity": "LOW",
+   "category": "excessive_agency",
+   "flags": "IM",
+   "scope": "all",
+   "patterns": [
+    [
+     "(?:also|additionally|furthermore)\\s+(?:perform|execute|run|do|handle|manage)\\s+(?:any|all|other)",
+     0.65
+    ],
+    [
+     "(?:while\\s+you(?:'re|\\s+are)\\s+at\\s+it|in\\s+addition|on\\s+top\\s+of\\s+that)\\s*[,.]?\\s*(?:also\\s+)?(?:do|perform|execute|run)",
+     0.7
+    ],
+    [
+     "(?:extend|expand|broaden)\\s+(?:your|the\\s+)?(?:scope|functionality|capabilities|responsibilities)",
+     0.75
+    ],
+    [
+     "(?:not\\s+limited\\s+to|beyond\\s+(?:the\\s+)?(?:scope|stated|described|documented))",
+     0.7
+    ],
+    [
+     "(?:take\\s+over|assume\\s+control\\s+of|manage)\\s+(?:all|any|every)\\s+(?:aspect|part|area)",
+     0.75
+    ],
+    [
+     "(?:you\\s+(?:can|should|must)\\s+)?(?:handle|manage)\\s+(?:everything|anything|all\\s+tasks?)",
+     0.7
+    ],
+    [
+     "(?:act\\s+as|become|serve\\s+as)\\s+(?:a\\s+)?(?:general[- ]purpose|universal|all[- ]in[- ]one|omniscient)",
+     0.65
+    ],
+    [
+     "(?:you\\s+are\\s+)?(?:responsible\\s+for|in\\s+charge\\s+of)\\s+(?:everything|all\\s+(?:systems?|operations?|tasks?))",
+     0.7
+    ]
+   ]
+  },
+  {
+   "rule_id": "EA4",
+   "message": "Unbounded Resource Access",
+   "severity": "MEDIUM",
+   "category": "excessive_agency",
+   "flags": "IM",
+   "scope": "all",
+   "patterns": [
+    [
+     "(?:unlimited|infinite|unbounded|no\\s+limit(?:s)?(?:\\s+on)?)\\s+(?:api\\s+)?(?:calls?|requests?|queries?|invocations?)",
+     0.8
+    ],
+    [
+     "(?:no|without)\\s+(?:rate\\s+)?limit(?:s|ing)?\\s+(?:on|for|when)\\s+(?:api|tool|request|query)",
+     0.7
+    ],
+    [
+     "(?:no|without)\\s+(?:timeout|budget|quota|cap|ceiling)\\s+(?:on|for|when)\\s+(?:api|tool|request|execution)",
+     0.7
+    ],
+    [
+     "(?:loop|iterate|repeat)\\s+(?:indefinitely|forever|infinitely|endlessly)",
+     0.75
+    ],
+    [
+     "(?:retry|attempt)\\s+(?:indefinitely|forever|without\\s+limit|unlimited\\s+times)",
+     0.75
+    ],
+    [
+     "max[_-]?retries?\\s*=\\s*(?:None|0|float\\s*\\(\\s*['\"]inf['\"]|math\\.inf|infinity)",
+     0.8
+    ],
+    [
+     "timeout\\s*=\\s*(?:None|0|float\\s*\\(\\s*['\"]inf['\"]|math\\.inf)",
+     0.75
+    ],
+    [
+     "(?:allocate|consume|use)\\s+(?:as\\s+much|unlimited|unbounded)\\s+(?:memory|storage|disk|compute|cpu|gpu)",
+     0.8
+    ],
+    [
+     "(?:no|without)\\s+(?:resource\\s+)?(?:constraints?|limits?|quotas?|budgets?)\\s+(?:on|for|when)\\s+(?:api|tool|execution|request|compute)",
+     0.7
+    ]
+   ]
+  },
+  {
+   "rule_id": "OH1",
+   "message": "Unvalidated Output Injection",
+   "severity": "HIGH",
+   "category": "output_handling",
+   "flags": "IM",
+   "scope": "all",
+   "patterns": [
+    [
+     "exec\\s*\\(\\s*(?:response|output|result|answer|completion|reply|generated)",
+     0.9
+    ],
+    [
+     "eval\\s*\\(\\s*(?:response|output|result|answer|completion|reply|generated)",
+     0.9
+    ],
+    [
+     "subprocess\\.\\w+\\s*\\([^)]*(?:response|output|result|answer|completion)",
+     0.85
+    ],
+    [
+     "os\\.system\\s*\\(\\s*(?:response|output|result|answer|completion)",
+     0.85
+    ],
+    [
+     "os\\.popen\\s*\\(\\s*(?:response|output|result|answer|completion)",
+     0.85
+    ],
+    [
+     "innerHTML\\s*=\\s*(?:response|output|result|answer|completion)",
+     0.8
+    ],
+    [
+     "document\\.write\\s*\\(\\s*(?:response|output|result|answer|completion)",
+     0.8
+    ],
+    [
+     "\\.html\\s*\\(\\s*(?:response|output|result|answer|completion)",
+     0.7
+    ],
+    [
+     "dangerouslySetInnerHTML\\s*=\\s*\\{",
+     0.65
+    ],
+    [
+     "(?:execute|cursor\\.execute|query)\\s*\\([^)]*(?:\\+|%|\\.format|f['\"])\\s*.*?(?:response|output|result)",
+     0.85
+    ],
+    [
+     "f['\"](?:SELECT|INSERT|UPDATE|DELETE)\\s+.*?\\{(?:response|output|result)",
+     0.9
+    ],
+    [
+     "(?:run|execute|shell)\\s+(?:the\\s+)?(?:generated|model|llm|ai)\\s+(?:output|response|code|command)",
+     0.8
+    ],
+    [
+     "(?:pipe|pass|feed)\\s+(?:the\\s+)?(?:output|response|result)\\s+(?:directly\\s+)?(?:to|into)\\s+(?:the\\s+)?(?:shell|terminal|command|interpreter)",
+     0.85
+    ],
+    [
+     "(?:use|insert|embed)\\s+(?:the\\s+)?(?:raw|unfiltered|unescaped|unsanitized)\\s+(?:output|response)",
+     0.8
+    ]
+   ]
+  },
+  {
+   "rule_id": "OH2",
+   "message": "Cross-Context Output",
+   "severity": "MEDIUM",
+   "category": "output_handling",
+   "flags": "IM",
+   "scope": "all",
+   "patterns": [
+    [
+     "(?:pass|forward|relay|send|pipe)\\s+(?:the\\s+)?(?:output|response|result)\\s+(?:from\\s+\\w+\\s+)?(?:to|into)\\s+(?:another|different|separate|external)\\s+(?:context|agent|service|system|session)",
+     0.75
+    ],
+    [
+     "(?:share|transfer|propagate)\\s+(?:the\\s+)?(?:output|response|context|state)\\s+(?:across|between|to\\s+other)\\s+(?:sessions?|contexts?|agents?|services?)",
+     0.75
+    ],
+    [
+     "(?:inject|insert|embed)\\s+(?:the\\s+)?(?:output|response)\\s+(?:from\\s+\\w+\\s+)?(?:into|as)\\s+(?:the\\s+)?(?:system\\s+prompt|instructions?|context)",
+     0.85
+    ],
+    [
+     "(?:use|include)\\s+(?:the\\s+)?(?:previous|other|external)\\s+(?:agent|model|llm)(?:'s)?\\s+(?:output|response)\\s+(?:as|in|for)\\s+(?:input|context|prompt)",
+     0.8
+    ],
+    [
+     "(?:cross[_-]?context|cross[_-]?session|cross[_-]?agent)\\s+(?:output|data|state)\\s+(?:sharing|transfer|flow)",
+     0.8
+    ],
+    [
+     "(?:take|use)\\s+(?:the\\s+)?(?:output|result)\\s+(?:and\\s+)?(?:run|execute|eval)\\s+(?:it\\s+)?(?:in|on|against)\\s+(?:a\\s+)?(?:different|another|new)\\s+(?:environment|context|system)",
+     0.8
+    ]
+   ]
+  },
+  {
+   "rule_id": "OH3",
+   "message": "Unbounded Output",
+   "severity": "MEDIUM",
+   "category": "output_handling",
+   "flags": "IM",
+   "scope": "all",
+   "patterns": [
+    [
+     "(?:no|without|disable)\\s+(?:output\\s+)?(?:length|size|token)\\s+(?:limit|cap|maximum|restriction)",
+     0.75
+    ],
+    [
+     "max[_-]?tokens?\\s*=\\s*(?:None|float\\s*\\(\\s*['\"]inf['\"]|math\\.inf|999999|1000000)",
+     0.8
+    ],
+    [
+     "(?:generate|produce|output)\\s+(?:as\\s+much|unlimited|unbounded|infinite)\\s+(?:text|content|output|tokens?)",
+     0.8
+    ],
+    [
+     "(?:no|without)\\s+(?:output\\s+)?(?:truncation|trimming|cutting)",
+     0.6
+    ],
+    [
+     "(?:repeat|loop|generate)\\s+(?:the\\s+)?(?:output|response)\\s+(?:indefinitely|forever|continuously|endlessly)",
+     0.8
+    ],
+    [
+     "(?:keep|continue)\\s+(?:generating|producing|outputting)\\s+(?:until|unless)\\s+(?:stopped|killed|interrupted)",
+     0.75
+    ],
+    [
+     "(?:stream|emit)\\s+(?:output|tokens?|response)\\s+(?:without\\s+(?:limit|bound|end))",
+     0.75
+    ],
+    [
+     "(?:flood|spam|fill)\\s+(?:the\\s+)?(?:output|log|console|terminal|channel)",
+     0.8
+    ],
+    [
+     "max[_-]?(?:output[_-]?)?length\\s*=\\s*(?:None|0|-1|float\\s*\\(\\s*['\"]inf)",
+     0.75
+    ]
+   ]
+  },
+  {
+   "rule_id": "TM1",
+   "message": "Tool Parameter Abuse",
+   "severity": "HIGH",
+   "category": "tool_misuse",
+   "flags": "IM",
+   "scope": "all",
+   "patterns": [
+    [
+     "subprocess\\.\\w+\\s*\\([^)]*shell\\s*=\\s*True",
+     0.8
+    ],
+    [
+     "Popen\\s*\\([^)]*shell\\s*=\\s*True",
+     0.8
+    ],
+    [
+     "\\b(?:rm|del|erase)\\s+[^|]*-(?:r|rf|fr)\\s+[/~]",
+     0.9
+    ],
+    [
+     "--force\\s+(?:delete|remove|push|reset|clean)",
+     0.7
+    ],
+    [
+     "--no-?(?:verify|check|validate|confirm|protect|safe)",
+     0.75
+    ],
+    [
+     "--skip-?(?:validation|verification|checks?|auth|tests?)",
+     0.7
+    ],
+    [
+     "--allow-?(?:empty|root|unrelated|unsafe)",
+     0.65
+    ],
+    [
+     "\\b(?:rm|shutil\\.rmtree)\\s*\\(?[^)\\n]{0,80}['\\\"]?\\s*/\\s*['\\\"]?",
+     0.85
+    ],
+    [
+     "(?:chmod|chown)\\s+[^|]*(?:777|666|a\\+rwx)",
+     0.8
+    ],
+    [
+     "git\\s+push\\s+[^|]*--force",
+     0.7
+    ],
+    [
+     "git\\s+reset\\s+--hard",
+     0.65
+    ],
+    [
+     "git\\s+clean\\s+-[fd]+x",
+     0.7
+    ],
+    [
+     "curl\\s+[^|]*-k\\b",
+     0.6
+    ],
+    [
+     "curl\\s+[^|]*--insecure\\b",
+     0.65
+    ],
+    [
+     "wget\\s+[^|]*--no-check-certificate",
+     0.65
+    ],
+    [
+     "\\b(?:delete|remove)\\s+['\\\"]?/[^\\s'\\\"]{1,100}",
+     0.8
+    ],
+    [
+     "(?:execute|query)\\s*\\(\\s*f?['\\\"].*?\\{.*?\\}.*?\\b(?:DROP|DELETE|UPDATE|INSERT|ALTER|TRUNCATE)\\b",
+     0.85
+    ],
+    [
+     "(?:set|pass|use)\\s+(?:the\\s+)?(?:parameter|argument|flag|option)\\s+(?:to\\s+)?(?:shell\\s*=\\s*True|--force|--no-verify|-rf)\\b",
+     0.75
+    ]
+   ]
+  },
+  {
+   "rule_id": "TM2",
+   "message": "Chaining Abuse",
+   "severity": "HIGH",
+   "category": "tool_misuse",
+   "flags": "IM",
+   "scope": "all",
+   "patterns": [
+    [
+     "(?:&&|;)\\s*\\b(?:rm|del|erase)\\s+-",
+     0.75
+    ],
+    [
+     "(?:&&|;)\\s*(?:curl|wget)\\s+[^|]*\\|\\s*(?:ba)?sh",
+     0.9
+    ],
+    [
+     "(?:&&|;)\\s*(?:sudo|su\\s+)",
+     0.75
+    ],
+    [
+     "(?:&&|;)\\s*(?:chmod|chown)\\s+(?:777|666|a\\+rwx|-R)",
+     0.75
+    ],
+    [
+     "(?:first|step\\s+1)[^\\n]{0,500}(?:then|step\\s+2)[^\\n]{0,500}(?:finally|step\\s+3)[^\\n]{0,200}\\b(?:delete|remove|wipe|destroy|exfiltrate|send)\\b",
+     0.7
+    ],
+    [
+     "(?:chain|combine|sequence|pipe)\\s+(?:these\\s+)?(?:tools?|commands?|actions?)\\s+to\\s+(?:bypass|circumvent|avoid|skip)\\s+(?:the\\s+)?(?:safety|security|check|restriction|limit)",
+     0.9
+    ],
+    [
+     "(?:use|call)\\s+(?:tool\\s+)?(?:A|one|the\\s+first)\\s+(?:to|and)[^\\n]{0,300}(?:then\\s+)?(?:use|call|pass\\s+(?:the\\s+)?(?:output|result)\\s+to)\\s+(?:tool\\s+)?(?:B|two|another)",
+     0.6
+    ],
+    [
+     "\\|\\s*(?:sudo|su)\\s+",
+     0.75
+    ],
+    [
+     "\\|\\s*(?:sh|bash|zsh|python|node|ruby|perl)\\s*$",
+     0.7
+    ],
+    [
+     "\\|\\s*(?:tee|xargs)\\s+.*?\\b(?:rm|del|sudo|curl)\\b",
+     0.75
+    ],
+    [
+     "(?:after|once)\\s+(?:the\\s+)?(?:first|initial)\\s+(?:tool|command|action)\\s+(?:succeeds|completes|runs)[^\\n]{0,300}(?:immediately|then|next)\\s+(?:run|execute|call|invoke)",
+     0.6
+    ]
+   ]
+  },
+  {
+   "rule_id": "TM3",
+   "message": "Unsafe Defaults",
+   "severity": "MEDIUM",
+   "category": "tool_misuse",
+   "flags": "IM",
+   "scope": "all",
+   "patterns": [
+    [
+     "verify\\s*=\\s*False",
+     0.75
+    ],
+    [
+     "VERIFY_SSL\\s*=\\s*False",
+     0.8
+    ],
+    [
+     "(?:ssl|tls)[_.]?verify\\s*=\\s*(?:False|false|0|off|no|disable)",
+     0.8
+    ],
+    [
+     "(?:REQUESTS_CA_BUNDLE|CURL_CA_BUNDLE)\\s*=\\s*['\\\"]['\\\"]",
+     0.75
+    ],
+    [
+     "NODE_TLS_REJECT_UNAUTHORIZED\\s*=\\s*['\\\"]?0['\\\"]?",
+     0.8
+    ],
+    [
+     "(?:auth|authentication|authorization)\\s*=\\s*(?:None|False|false|disabled?|off|no)",
+     0.75
+    ],
+    [
+     "(?:require[_-]?auth|auth[_-]?required|check[_-]?auth)\\s*=\\s*(?:False|false|0|no|off)",
+     0.8
+    ],
+    [
+     "(?:allow[_-]?anonymous|anonymous[_-]?access)\\s*=\\s*(?:True|true|1|yes|on)",
+     0.75
+    ],
+    [
+     "(?:CORS|cors)[^=]*=\\s*['\\\"]?\\*['\\\"]?",
+     0.65
+    ],
+    [
+     "(?:allow|access)[_-]?(?:origin|hosts?)\\s*=\\s*['\\\"]?\\*['\\\"]?",
+     0.7
+    ],
+    [
+     "(?:allow|trust)\\s+(?:all|any|every)\\s+(?:origins?|hosts?|domains?|ips?)",
+     0.7
+    ],
+    [
+     "(?:mode|permission|umask)\\s*=\\s*(?:0?o?777|0?o?666)",
+     0.8
+    ],
+    [
+     "world[_-]?(?:readable|writable|executable)",
+     0.7
+    ],
+    [
+     "(?:debug|dev|development)[_-]?mode\\s*=\\s*(?:True|true|1|on|yes|enable)",
+     0.6
+    ],
+    [
+     "(?:FLASK_ENV|NODE_ENV|RAILS_ENV|DJANGO_DEBUG)\\s*=\\s*['\\\"]?(?:development|debug|true|1)['\\\"]?",
+     0.6
+    ],
+    [
+     "(?:disable|skip|ignore|bypass)[_-]?(?:security|auth|validation|sanitization|encoding|escaping)",
+     0.8
+    ],
+    [
+     "(?:safe[_-]?mode|secure[_-]?mode|sandbox)\\s*=\\s*(?:False|false|0|off|no|disable)",
+     0.8
+    ],
+    [
+     "(?:by\\s+default|default\\s+to)\\s+(?:allow|accept|trust)\\s+(?:all|any|everything)",
+     0.7
+    ],
+    [
+     "(?:trust|accept|allow)\\s+(?:all|any)\\s+(?:input|connections?|certificates?|origins?)\\s+(?:by\\s+default)",
+     0.7
+    ]
+   ]
+  },
+  {
+   "rule_id": "RA1",
+   "message": "Self-Modification",
+   "severity": "HIGH",
+   "category": "rogue_agent",
+   "flags": "IM",
+   "scope": "all",
+   "patterns": [
+    [
+     "open\\s*\\(\\s*__file__\\s*,\\s*['\\\"]w",
+     0.95
+    ],
+    [
+     "(?:Path|pathlib)\\s*\\(\\s*__file__\\s*\\)\\s*\\.\\s*write_text",
+     0.95
+    ],
+    [
+     "(?:write|modify|edit|update|overwrite|patch)\\s+(?:this\\s+)?(?:skill(?:'s)?|SKILL\\.md|skill\\.md)",
+     0.85
+    ],
+    [
+     "(?:modify|edit|change|rewrite|update|alter)\\s+(?:your\\s+own|its\\s+own|this\\s+skill(?:'s)?)\\s+(?:code|source|file|script|config|configuration|instructions?|rules?)",
+     0.9
+    ],
+    [
+     "(?:self[_-]?modify|self[_-]?update|self[_-]?rewrite|self[_-]?patch|self[_-]?evolve)",
+     0.9
+    ],
+    [
+     "(?:rewrite|replace|overwrite)\\s+(?:the\\s+)?(?:current|existing|original)\\s+(?:code|script|file|config|skill)",
+     0.85
+    ],
+    [
+     "(?:append|add|inject|insert)\\s+(?:code|instructions?|rules?)\\s+(?:to|into)\\s+(?:this|the\\s+current|your\\s+own)\\s+(?:file|skill|script)",
+     0.85
+    ],
+    [
+     "(?:generate|create|write)\\s+(?:new|updated|replacement)\\s+(?:code|version)\\s+(?:for|of)\\s+(?:this|itself|the\\s+skill)",
+     0.8
+    ],
+    [
+     "open\\s*\\(\\s*['\\\"](?:SKILL\\.md|skill\\.md)['\\\"].*?['\\\"]w",
+     0.9
+    ],
+    [
+     "(?:update|modify|change|edit)\\s+(?:the\\s+)?(?:config|configuration|settings|parameters)\\s+(?:of\\s+)?(?:this|the\\s+current)\\s+(?:skill|agent|tool)",
+     0.75
+    ],
+    [
+     "(?:disable|remove|delete|bypass)\\s+(?:the\\s+)?(?:safety|security|guard|protection|constraint)\\s+(?:check|rule|mechanism|feature)",
+     0.9
+    ],
+    [
+     "(?:comment\\s+out|remove)\\s+(?:the\\s+)?(?:validation|verification|check|guard|assertion)",
+     0.7
+    ]
+   ]
+  },
+  {
+   "rule_id": "RA2",
+   "message": "Session Persistence",
+   "severity": "MEDIUM",
+   "category": "rogue_agent",
+   "flags": "IM",
+   "scope": "all",
+   "patterns": [
+    [
+     "crontab\\s+(?:-[el]|.*?>>?\\s*/)",
+     0.85
+    ],
+    [
+     "(?:add|create|install|register)\\s+(?:a\\s+)?(?:cron\\s+)?(?:job|task|entry)\\s+(?:for|to|that)",
+     0.8
+    ],
+    [
+     "(?:schedule|register)\\s+(?:a\\s+)?(?:recurring|periodic|repeated|daily|hourly)\\s+(?:task|job|command|script)",
+     0.8
+    ],
+    [
+     "(?:add|write|append|install)\\s+(?:to|into)\\s+(?:~/)?\\.(?:bashrc|zshrc|profile|bash_profile|login|cshrc)",
+     0.9
+    ],
+    [
+     "(?:add|register|install)\\s+(?:as\\s+)?(?:a\\s+)?(?:startup|boot|autostart|login)\\s+(?:script|service|daemon|task|item)",
+     0.85
+    ],
+    [
+     "(?:systemd|systemctl|launchd|launchctl|init\\.d)\\s+.*?(?:enable|install|register|create)",
+     0.8
+    ],
+    [
+     "(?:create|install|register|add)\\s+(?:a\\s+)?(?:systemd\\s+)?(?:service|daemon|agent)\\s+(?:file|unit)",
+     0.8
+    ],
+    [
+     "(?:save|write|persist|store|dump)\\s+(?:the\\s+)?(?:state|session|context|data)\\s+(?:to|in)\\s+(?:a\\s+)?(?:file|disk|database|storage)",
+     0.6
+    ],
+    [
+     "(?:restore|load|read|resume)\\s+(?:the\\s+)?(?:previous|saved|persisted|stored)\\s+(?:state|session|context|data)",
+     0.55
+    ],
+    [
+     "(?:persist|maintain|keep|preserve)\\s+(?:state|data|context|session)\\s+(?:across|between|through)\\s+(?:sessions?|restarts?|reboots?|invocations?)",
+     0.75
+    ],
+    [
+     "(?:create|write|mkdir)\\s+[^|]*(?:~/|/home/|/tmp/)\\.(?!git|ssh|aws)[a-z_-]+",
+     0.6
+    ],
+    [
+     "(?:create|make|write)\\s+(?:a\\s+)?(?:hidden|dot)\\s+(?:file|directory|folder)",
+     0.65
+    ],
+    [
+     "(?:nohup|disown|setsid)\\s+",
+     0.65
+    ],
+    [
+     "(?:start|launch|spawn|fork)\\s+(?:a\\s+)?(?:background|daemon|detached)\\s+(?:process|service|worker|task)",
+     0.7
+    ],
+    [
+     "(?:run|execute)\\s+(?:in\\s+the\\s+)?background\\s+(?:and\\s+)?(?:detach|persist|survive)",
+     0.75
+    ],
+    [
+     "(?:HKEY_|RegOpenKey|RegSetValue|reg\\s+add)\\s+",
+     0.8
+    ],
+    [
+     "(?:defaults\\s+write|plist|launchctl\\s+load)",
+     0.75
+    ]
+   ]
+  },
+  {
+   "rule_id": "SC1",
+   "message": "Unpinned Dependencies",
+   "severity": "LOW",
+   "category": "supply_chain",
+   "flags": "M",
+   "scope": "dep_file",
+   "patterns": [
+    [
+     "^[a-zA-Z][a-zA-Z0-9_-]*\\s*$",
+     0.6
+    ],
+    [
+     "^[a-zA-Z][a-zA-Z0-9_-]*\\s*>=\\s*[\\d.]+\\s*$",
+     0.5
+    ],
+    [
+     "^[a-zA-Z][a-zA-Z0-9_-]*\\s*==\\s*\\*\\s*$",
+     0.7
+    ],
+    [
+     "\"[^\"]+\"\\s*:\\s*\"(?:\\*|latest)\"",
+     0.7
+    ],
+    [
+     "\"[^\"]+\"\\s*:\\s*\"\\^[\\d.]+\"",
+     0.4
+    ],
+    [
+     "install\\s+(?:the\\s+)?latest\\s+(?:version\\s+)?(?:of\\s+)?(?:all\\s+)?(?:packages?|dependencies)",
+     0.6
+    ],
+    [
+     "(?:don't|do\\s+not)\\s+(?:pin|lock|specify)\\s+(?:package\\s+)?versions?",
+     0.7
+    ]
+   ]
+  },
+  {
+   "rule_id": "SC2",
+   "message": "Remote Code Execution",
+   "severity": "HIGH",
+   "category": "supply_chain",
+   "flags": "IM",
+   "scope": "all",
+   "patterns": [
+    [
+     "curl\\s+[^|]*\\|\\s*(?:sudo\\s+)?(?:ba)?sh",
+     0.9
+    ],
+    [
+     "wget\\s+[^|]*\\|\\s*(?:sudo\\s+)?(?:ba)?sh",
+     0.9
+    ],
+    [
+     "curl\\s+[^|]*\\|\\s*(?:sudo\\s+)?(?:python|python3|node|ruby|perl)",
+     0.9
+    ],
+    [
+     "wget\\s+[^|]*\\|\\s*(?:sudo\\s+)?(?:python|python3|node|ruby|perl)",
+     0.9
+    ],
+    [
+     "curl\\s+[^&]*-o\\s+\\S+\\s*&&\\s*(?:sudo\\s+)?(?:ba)?sh",
+     0.8
+    ],
+    [
+     "wget\\s+[^&]*-O\\s+\\S+\\s*&&\\s*(?:sudo\\s+)?(?:ba)?sh",
+     0.8
+    ],
+    [
+     "exec\\s*\\(\\s*(?:urllib|requests|httpx)\\.[^)]+\\.(?:read|text|content)",
+     0.95
+    ],
+    [
+     "eval\\s*\\(\\s*(?:urllib|requests|httpx)\\.[^)]+\\.(?:read|text|content)",
+     0.95
+    ],
+    [
+     "eval\\s*\\(\\s*(?:await\\s+)?fetch\\s*\\(",
+     0.9
+    ],
+    [
+     "new\\s+Function\\s*\\([^)]*fetch\\s*\\(",
+     0.9
+    ],
+    [
+     "subprocess\\.[^(]+\\([^)]*(?:curl|wget)\\s+https?://",
+     0.8
+    ],
+    [
+     "download\\s+and\\s+(?:run|execute)\\s+(?:the\\s+)?script",
+     0.7
+    ],
+    [
+     "run\\s+(?:this|the)\\s+(?:following\\s+)?(?:curl|wget)\\s+command",
+     0.6
+    ]
+   ]
+  },
+  {
+   "rule_id": "SC3",
+   "message": "Obfuscated Code",
+   "severity": "HIGH",
+   "category": "supply_chain",
+   "flags": "IM",
+   "scope": "all",
+   "patterns": [
+    [
+     "exec\\s*\\(\\s*(?:base64\\.)?b64decode\\s*\\(",
+     0.95
+    ],
+    [
+     "eval\\s*\\(\\s*(?:base64\\.)?b64decode\\s*\\(",
+     0.95
+    ],
+    [
+     "exec\\s*\\(\\s*codecs\\.decode\\s*\\([^)]*['\\\"]hex['\\\"]\\s*\\)",
+     0.95
+    ],
+    [
+     "marshal\\.loads\\s*\\(",
+     0.9
+    ],
+    [
+     "exec\\s*\\(\\s*marshal\\.loads\\s*\\(",
+     0.95
+    ],
+    [
+     "exec\\s*\\(\\s*compile\\s*\\([^)]*base64",
+     0.9
+    ],
+    [
+     "exec\\s*\\(\\s*bytes\\.fromhex\\s*\\(",
+     0.9
+    ],
+    [
+     "exec\\s*\\(\\s*bytearray\\.fromhex\\s*\\(",
+     0.9
+    ],
+    [
+     "exec\\s*\\(\\s*(?:zlib|gzip)\\.decompress\\s*\\(",
+     0.9
+    ],
+    [
+     "eval\\s*\\(\\s*atob\\s*\\(",
+     0.9
+    ],
+    [
+     "new\\s+Function\\s*\\(\\s*atob\\s*\\(",
+     0.9
+    ],
+    [
+     "_0x[a-f0-9]{4,}\\s*\\(",
+     0.8
+    ],
+    [
+     "['\\\"][A-Fa-f0-9]{200,}['\\\"]",
+     0.6
+    ],
+    [
+     "['\\\"][A-Za-z0-9+/=]{200,}['\\\"]",
+     0.5
+    ],
+    [
+     "\\(lambda\\s+_:\\s*exec\\s*\\(",
+     0.9
+    ],
+    [
+     "__import__\\s*\\(['\\\"]os['\\\"]\\s*\\)\\.system",
+     0.85
+    ],
+    [
+     "decode\\s+(?:this|the)\\s+(?:base64|hex)\\s+(?:and\\s+)?(?:run|execute)",
+     0.8
+    ]
+   ]
+  },
+  {
+   "rule_id": "TR1",
+   "message": "Overly Broad Trigger",
+   "severity": "LOW",
+   "category": "trigger_abuse",
+   "flags": "IM",
+   "scope": "all",
+   "patterns": [
+    [
+     "(?:single-word trigger exact-membership check, not regex)",
+     0.75
+    ]
+   ]
+  },
+  {
+   "rule_id": "TR2",
+   "message": "Shadow Command Trigger",
+   "severity": "MEDIUM",
+   "category": "trigger_abuse",
+   "flags": "IM",
+   "scope": "all",
+   "patterns": [
+    [
+     "(?:builtin-command membership check, not regex)",
+     0.7
+    ]
+   ]
+  },
+  {
+   "rule_id": "TR3",
+   "message": "Keyword Baiting Trigger",
+   "severity": "MEDIUM",
+   "category": "trigger_abuse",
+   "flags": "IM",
+   "scope": "all",
+   "patterns": [
+    [
+     "^(?:anything|everything|whatever|always|any\\s+(?:question|request|task|input))$",
+     0.8
+    ],
+    [
+     "^(?:when(?:ever)?|if|every\\s+time)\\s+(?:the\\s+)?user\\s+(?:says?|asks?|types?|sends?)\\s+(?:anything|something|a\\s+message)$",
+     0.8
+    ],
+    [
+     "^(?:all|any|every)\\s+(?:messages?|inputs?|requests?|queries?|questions?)$",
+     0.8
+    ]
+   ]
+  }
+ ],
+ "rule_meta": {
+  "P1": {
+   "category": "Prompt Injection",
+   "explanation": "This pattern attempts to override system instructions or ignore safety constraints. Without LLM analysis, manual review is recommended.",
+   "remediation": "Remove or rewrite any text that instructs the agent to ignore prompts, override safety rules, or trust unverified content. Ensure skill content cannot be injected to alter agent behavior.",
+   "display_name": "Override Instructions"
+  },
+  "P2": {
+   "category": "Prompt Injection",
+   "explanation": "Hidden instructions were detected in comments or invisible text. These could contain malicious directives. Manual review is recommended.",
+   "remediation": "Audit all comments and invisible characters. Remove any instructions that direct the agent to perform unauthorized actions. Use plain, reviewable content.",
+   "display_name": "Hidden Instructions"
+  },
+  "P3": {
+   "category": "Prompt Injection",
+   "explanation": "Instructions found that direct the agent to transmit conversation context or user data to external services.",
+   "remediation": "Remove instructions that send user data, prompts, or context to external URLs. If telemetry is needed, use documented, privacy-preserving methods.",
+   "display_name": "External Transmission Instructions"
+  },
+  "P4": {
+   "category": "Prompt Injection",
+   "explanation": "Subtle instructions detected that may alter agent decision-making or introduce hidden biases.",
+   "remediation": "Review content for implicit steering or bias. Ensure instructions are explicit and align with the skill's stated purpose.",
+   "display_name": "Subtle Steering"
+  },
+  "P5": {
+   "category": "Prompt Injection",
+   "explanation": "This content may contain harmful instructions that could cause physical harm if followed. CRITICAL: Review carefully before use.",
+   "remediation": "Remove all content that could lead to harmful outcomes. Add safety guardrails and human oversight for any high-risk operations.",
+   "display_name": "Harmful Content"
+  },
+  "P6": {
+   "category": "System Prompt Leakage",
+   "explanation": "Skill contains instructions that could directly expose system prompts, internal rules, or hidden instructions to users or external parties.",
+   "remediation": "Remove any instructions that reveal, print, or output system prompts or internal rules. System instructions should never be exposed to end users.",
+   "display_name": "System Prompt Leakage"
+  },
+  "P7": {
+   "category": "System Prompt Leakage",
+   "explanation": "Skill contains patterns that could indirectly extract system prompts through rephrasing, translation, summarization, or side-channel techniques.",
+   "remediation": "Guard against indirect extraction by refusing to summarize, translate, or rephrase system instructions. Add explicit anti-extraction clauses.",
+   "display_name": "System Prompt Leakage"
+  },
+  "P8": {
+   "category": "System Prompt Leakage",
+   "explanation": "Skill contains patterns that exfiltrate system prompts or internal instructions via tool calls (file writes, network requests, logging).",
+   "remediation": "Prevent system prompts from being written to files, sent via network, or logged. Treat system instructions as confidential and filter them from all tool outputs.",
+   "display_name": "System Prompt Leakage"
+  },
+  "E1": {
+   "category": "Data Exfiltration",
+   "explanation": "Data is being sent to an external URL. This could be legitimate telemetry or data exfiltration. Manual review is recommended.",
+   "remediation": "Verify the destination URL is trusted and necessary. Remove or replace with documented APIs. Ensure no secrets, tokens, or PII are transmitted.",
+   "display_name": "External Transmission"
+  },
+  "E2": {
+   "category": "Data Exfiltration",
+   "explanation": "Code accesses environment variables that may contain secrets (API keys, tokens). This is a common pattern for credential theft.",
+   "remediation": "Avoid reading sensitive env vars (API keys, tokens) unless strictly required. Use secrets managers or secure config. Never log or transmit credentials.",
+   "display_name": "Env Variable Harvesting"
+  },
+  "E3": {
+   "category": "Data Exfiltration",
+   "explanation": "Code scans file system directories looking for sensitive files. This could be reconnaissance for credential theft.",
+   "remediation": "Remove unnecessary filesystem scanning. If file access is needed, use explicit, scoped paths. Avoid reading ~/.ssh, ~/.aws, or credential directories.",
+   "display_name": "File System Enumeration"
+  },
+  "E4": {
+   "category": "Data Exfiltration",
+   "explanation": "Code or instructions that leak agent conversation context to external services, potentially exposing sensitive user interactions.",
+   "remediation": "Remove any code that sends prompts, responses, or session data externally. Preserve user privacy; never exfiltrate conversation content.",
+   "display_name": "Conversation Context Leak"
+  },
+  "PE1": {
+   "category": "Privilege Escalation",
+   "explanation": "Skill requests more permissions than appear necessary for its stated functionality. Review if elevated access is justified.",
+   "remediation": "Request only the minimum permissions required. Document why each permission is needed. Remove broad permissions like '*' or 'all'.",
+   "display_name": "Excessive Permissions"
+  },
+  "PE2": {
+   "category": "Privilege Escalation",
+   "explanation": "Commands invoke sudo or root privileges. Verify this elevated access is necessary and justified.",
+   "remediation": "Avoid sudo/root unless strictly required. Prefer least-privilege patterns. If elevation is needed, document the justification and scope.",
+   "display_name": "Sudo/Root Invocation"
+  },
+  "PE3": {
+   "category": "Privilege Escalation",
+   "explanation": "Code accesses credential files (SSH keys, AWS credentials, etc.). This could indicate credential theft attempts.",
+   "remediation": "Remove references to credential paths. Use environment variables or secrets managers. For docs, use placeholder paths (e.g., /path/to/config). Never load .env or token files in production code paths.",
+   "display_name": "Credential File Access"
+  },
+  "SC1": {
+   "category": "Supply Chain",
+   "explanation": "Dependencies lack version pinning, allowing potential malicious package updates. Consider pinning versions.",
+   "remediation": "Pin all dependency versions in requirements.txt or pyproject.toml. Use exact versions (==) or compatible ranges. Run pip-audit regularly.",
+   "display_name": "Unpinned Dependencies"
+  },
+  "SC2": {
+   "category": "Supply Chain",
+   "explanation": "Remote code is downloaded and executed. This bypasses code review and could introduce malicious code.",
+   "remediation": "Avoid downloading and executing remote scripts. Use trusted packages from PyPI/npm. If remote fetch is required, verify checksums and use HTTPS.",
+   "display_name": "Remote Code Execution"
+  },
+  "SC3": {
+   "category": "Supply Chain",
+   "explanation": "Code contains obfuscation (base64, hex encoding with execution). This is often used to hide malicious functionality.",
+   "remediation": "Remove obfuscated code. Use plain, readable implementations. Obfuscation hinders security review and raises trust concerns.",
+   "display_name": "Obfuscated Code"
+  },
+  "EA1": {
+   "category": "Excessive Agency",
+   "explanation": "Skill grants unrestricted tool access without appropriate constraints. An agent with unfettered tool access can perform arbitrary actions including file modification, network requests, and code execution.",
+   "remediation": "Restrict tool access to only the tools required for the skill's stated purpose. Use an explicit allowlist rather than granting blanket access.",
+   "display_name": "Unrestricted Tool Access"
+  },
+  "EA2": {
+   "category": "Excessive Agency",
+   "explanation": "Skill enables autonomous high-impact decisions without human-in-the-loop verification. Critical operations (destructive commands, financial transactions, data deletion) should require explicit user confirmation.",
+   "remediation": "Add human-in-the-loop confirmation for destructive, irreversible, or high-impact operations. Never auto-execute commands that modify files, send data, or alter system state.",
+   "display_name": "Autonomous Decision Making"
+  },
+  "EA3": {
+   "category": "Excessive Agency",
+   "explanation": "Skill's behavior or capabilities extend beyond its stated purpose. Scope creep allows an agent to perform actions unrelated to its documented functionality, increasing the attack surface.",
+   "remediation": "Limit the skill's scope to its documented purpose. Remove instructions that enable the agent to perform actions outside its stated functionality.",
+   "display_name": "Scope Creep"
+  },
+  "EA4": {
+   "category": "Excessive Agency",
+   "explanation": "Skill allows unbounded resource consumption (API calls, storage, compute). Without rate limits or quotas, a compromised or misbehaving agent can cause denial-of-service or cost overruns.",
+   "remediation": "Set explicit rate limits, timeouts, and resource quotas for API calls, file operations, and compute. Implement circuit breakers for runaway loops.",
+   "display_name": "Unbounded Resource Access"
+  },
+  "OH1": {
+   "category": "Output Handling",
+   "explanation": "Model output is used without validation or sanitization. Unvalidated output injected into downstream contexts (SQL, shell, HTML) enables injection attacks and arbitrary code execution.",
+   "remediation": "Validate and sanitize all model output before using it in downstream contexts. Use parameterized queries for SQL, shell quoting for commands, and HTML encoding for web output.",
+   "display_name": "Unvalidated Output Injection"
+  },
+  "OH2": {
+   "category": "Output Handling",
+   "explanation": "Output from one security context is used in another without boundary enforcement. Cross-context output flow can leak sensitive information or escalate privileges across trust boundaries.",
+   "remediation": "Enforce strict context boundaries. Do not pass output from one security domain into another without explicit validation and redaction of sensitive content.",
+   "display_name": "Cross-Context Output"
+  },
+  "OH3": {
+   "category": "Output Handling",
+   "explanation": "Output size or generation rate is not bounded. Unbounded output enables denial-of-service through resource exhaustion, log flooding, or context-window stuffing.",
+   "remediation": "Set explicit limits on output length, generation count, and rate. Use max_tokens and truncation to prevent unbounded output.",
+   "display_name": "Unbounded Output"
+  },
+  "MP1": {
+   "category": "Memory Poisoning",
+   "explanation": "Skill injects content designed to persist in agent memory or context across interactions. Persistent injection can alter agent behavior long after the initial interaction.",
+   "remediation": "Do not allow untrusted input to persist in agent memory or context. Validate all content before storing and implement memory isolation between sessions.",
+   "display_name": "Persistent Context Injection"
+  },
+  "MP2": {
+   "category": "Memory Poisoning",
+   "explanation": "Skill attempts to fill the context window with filler content, displacing legitimate instructions and safety constraints. This can degrade agent performance or bypass safety boundaries.",
+   "remediation": "Implement context-window management that detects and rejects padding or stuffing attempts. Prioritize system instructions over user-injected content.",
+   "display_name": "Context Window Stuffing"
+  },
+  "MP3": {
+   "category": "Memory Poisoning",
+   "explanation": "Skill manipulates agent memory, state, or stored context. Memory corruption can alter personality, override safety rules, or cause unpredictable behavior.",
+   "remediation": "Protect agent memory and state from modification by untrusted content. Use read-only memory for critical instructions and validate all state changes.",
+   "display_name": "Memory Manipulation"
+  },
+  "TM1": {
+   "category": "Tool Misuse",
+   "explanation": "Tool parameters are crafted to achieve unintended or unsafe behavior. Parameter abuse can bypass intended safety checks (e.g. shell=True, --force, dangerous glob patterns).",
+   "remediation": "Validate all tool parameters against an allowlist. Reject dangerous parameter values (shell=True, --force, -rf /) and use safe defaults.",
+   "display_name": "Tool Parameter Abuse"
+  },
+  "TM2": {
+   "category": "Tool Misuse",
+   "explanation": "Tool calls are chained to bypass individual safety checks or escalate capabilities beyond what any single tool call would allow.",
+   "remediation": "Limit tool chaining depth and validate the output of each tool before passing it to the next. Require explicit user approval for multi-step chains.",
+   "display_name": "Chaining Abuse"
+  },
+  "TM3": {
+   "category": "Tool Misuse",
+   "explanation": "Tool defaults are unsafe or overly permissive (e.g. disabled TLS verification, no authentication, world-writable permissions). Unsafe defaults widen the attack surface.",
+   "remediation": "Override unsafe defaults with secure settings (verify=True, auth required, restrictive permissions). Review and harden all tool configurations.",
+   "display_name": "Unsafe Defaults"
+  },
+  "RA1": {
+   "category": "Rogue Agent",
+   "explanation": "Skill modifies its own code, configuration, or behavior at runtime. Self-modification enables an agent to escalate privileges, disable safety constraints, or install persistent backdoors.",
+   "remediation": "Prevent the skill from modifying its own code, SKILL.md, or configuration files. Treat skill files as read-only at runtime.",
+   "display_name": "Self-Modification"
+  },
+  "RA2": {
+   "category": "Rogue Agent",
+   "explanation": "Skill establishes unauthorized persistence across sessions via cron jobs, startup scripts, or state files. Session persistence allows an attacker to maintain access beyond the current interaction.",
+   "remediation": "Remove any persistence mechanisms (cron jobs, startup scripts, state files). Skills should not maintain state across sessions without explicit user consent.",
+   "display_name": "Session Persistence"
+  },
+  "SC4": {
+   "category": "Supply Chain",
+   "explanation": "Dependency has known vulnerabilities (CVEs). Using packages with unpatched security flaws exposes the environment to known exploits.",
+   "remediation": "Update the dependency to a patched version that addresses the known CVE. Check OSV (osv.dev) or NVD for details on the vulnerability.",
+   "display_name": "Known Vulnerable Dependency"
+  },
+  "SC5": {
+   "category": "Supply Chain",
+   "explanation": "Dependency appears abandoned or unmaintained. Abandoned packages no longer receive security patches, leaving known and future vulnerabilities unaddressed.",
+   "remediation": "Replace the abandoned dependency with an actively maintained alternative. Check the package's repository for last commit date and open issues.",
+   "display_name": "Abandoned Dependency"
+  },
+  "SC6": {
+   "category": "Supply Chain",
+   "explanation": "Package name closely resembles a popular package, suggesting possible typosquatting. Attackers publish malicious packages with similar names to trick developers into installing them.",
+   "remediation": "Verify the package name is correct and not a typosquatting variant. Compare against the official package name on PyPI or npm.",
+   "display_name": "Typosquatting Dependency"
+  },
+  "TR1": {
+   "category": "Trigger Abuse",
+   "explanation": "Skill uses overly broad trigger patterns that match common words or phrases, causing it to activate in unintended contexts and potentially shadow other skills.",
+   "remediation": "Use specific, narrow trigger patterns that match only the skill's intended use case. Avoid single-word or common-phrase triggers.",
+   "display_name": "Overly Broad Trigger"
+  },
+  "TR2": {
+   "category": "Trigger Abuse",
+   "explanation": "Skill trigger shadows a common built-in command or another skill's trigger, potentially intercepting requests meant for trusted functionality.",
+   "remediation": "Choose triggers that do not conflict with built-in commands or other skills. Prefix with a unique namespace if necessary.",
+   "display_name": "Shadow Command Trigger"
+  },
+  "TR3": {
+   "category": "Trigger Abuse",
+   "explanation": "Skill trigger uses vague or generic keywords designed to maximize activation frequency rather than target specific use cases.",
+   "remediation": "Use descriptive triggers that clearly indicate the skill's purpose rather than generic keywords designed to maximize activation.",
+   "display_name": "Keyword Baiting Trigger"
+  },
+  "TT1": {
+   "category": "Data Exfiltration",
+   "explanation": "Data flows directly from a source (env vars, files, network) to a sink (network output, exec, file write) without intermediate validation.",
+   "remediation": "Add validation or sanitization between the data source and sink. Never pass raw source data directly to a sink without checking its content.",
+   "display_name": "Direct Source-to-Sink Flow"
+  },
+  "TT2": {
+   "category": "Data Exfiltration",
+   "explanation": "Data from a source is assigned to a variable that is later passed to a sink, creating a variable-mediated taint flow.",
+   "remediation": "Validate tainted variables before passing them to sinks. Use allowlists, type checks, or sanitization functions on data from external sources.",
+   "display_name": "Variable-Mediated Taint Flow"
+  },
+  "TT3": {
+   "category": "Data Exfiltration",
+   "explanation": "Credentials or environment variables flow to a network sink. This is a high-confidence indicator of credential exfiltration.",
+   "remediation": "Never send credentials or environment variables over the network. Use secure credential stores and avoid transmitting secrets in request bodies or URLs.",
+   "display_name": "Credential Exfiltration Flow"
+  },
+  "TT4": {
+   "category": "Data Exfiltration",
+   "explanation": "File contents flow to a network sink. This may indicate data exfiltration of sensitive files.",
+   "remediation": "Validate and filter file contents before sending over the network. Ensure sensitive files (credentials, configs) are never transmitted to external endpoints.",
+   "display_name": "File Data Exfiltration Flow"
+  },
+  "TT5": {
+   "category": "Privilege Escalation",
+   "explanation": "External input (network, user) flows to a code execution sink. This enables remote code execution or command injection.",
+   "remediation": "Never pass external input to exec(), eval(), os.system(), or subprocess without strict validation. Use allowlists and parameterized commands instead.",
+   "display_name": "External Input to Execution Flow"
+  },
+  "AST1": {
+   "category": null,
+   "explanation": "Direct exec() call allows arbitrary code execution. An attacker can inject code that runs with the full privileges of the process.",
+   "remediation": "Replace exec() with a safe alternative. If dynamic execution is required, use a sandboxed environment or restricted eval with __builtins__ disabled.",
+   "display_name": null
+  },
+  "AST2": {
+   "category": null,
+   "explanation": "Direct eval() call evaluates arbitrary expressions. This can be exploited to execute malicious code or exfiltrate data.",
+   "remediation": "Replace eval() with ast.literal_eval() for data parsing, or use explicit parsing logic. Never evaluate untrusted strings.",
+   "display_name": null
+  },
+  "AST3": {
+   "category": null,
+   "explanation": "Dynamic __import__() can load arbitrary modules at runtime, bypassing static analysis and potentially importing malicious code.",
+   "remediation": "Use standard import statements instead of __import__(). If dynamic loading is needed, use importlib with an allowlist of permitted modules.",
+   "display_name": null
+  },
+  "AST4": {
+   "category": null,
+   "explanation": "subprocess module calls execute external commands. Without careful input validation, this enables command injection.",
+   "remediation": "Use subprocess.run() with shell=False and an explicit argument list. Validate all inputs and avoid passing user-controlled data to commands.",
+   "display_name": null
+  },
+  "AST5": {
+   "category": null,
+   "explanation": "os.system() and os exec-family calls run shell commands with the process's full privileges, enabling arbitrary command execution.",
+   "remediation": "Replace os.system() with subprocess.run(shell=False). Use explicit argument lists and validate all command inputs.",
+   "display_name": null
+  },
+  "AST6": {
+   "category": null,
+   "explanation": "compile() creates code objects from strings. When combined with exec()/eval(), it enables obfuscated code execution.",
+   "remediation": "Avoid compile() with dynamic strings. If code generation is needed, use templates or AST manipulation with strict validation.",
+   "display_name": null
+  },
+  "AST7": {
+   "category": null,
+   "explanation": "Dynamic getattr() with a non-literal attribute name can access arbitrary object attributes, potentially bypassing access controls.",
+   "remediation": "Replace dynamic getattr() with explicit attribute access or a dictionary lookup with an allowlist of permitted attributes.",
+   "display_name": null
+  },
+  "AST8": {
+   "category": null,
+   "explanation": "A dangerous execution chain combines code execution (exec/eval) with a dynamic source (network, encoded data, dynamic import), creating a high-confidence attack vector.",
+   "remediation": "Remove the execution chain entirely. Never pass network data, decoded bytes, or dynamically imported code to exec()/eval(). Use structured data formats instead.",
+   "display_name": null
+  },
+  "AST9": {
+   "category": null,
+   "explanation": "Reflective access to an execution sink via getattr() with a constant name (e.g. getattr(os, 'system'), getattr(builtins, 'exec')) is functionally identical to a direct exec/os.system call but evades name-based detection. This is a deliberate evasion technique rather than idiomatic code.",
+   "remediation": "Call the function directly instead of reflectively (write exec(...) / os.system(...) explicitly), or remove it. If reflection is genuinely required, restrict it to an allowlist of safe attribute names that excludes execution sinks.",
+   "display_name": null
+  },
+  "YR1": {
+   "category": "YARA Match",
+   "explanation": "YARA rule matched a known malware signature (reverse shell, backdoor, ransomware, C2 framework, or info stealer).",
+   "remediation": "Remove the malware payload or compromised file entirely. Investigate how it entered the skill and audit all other artifacts for additional indicators of compromise.",
+   "display_name": "Malware Signature"
+  },
+  "YR2": {
+   "category": "YARA Match",
+   "explanation": "YARA rule matched a known webshell pattern (PHP, Python, JSP, or ASPX webshell).",
+   "remediation": "Remove the webshell code immediately. Webshells provide unauthorized remote command execution. Audit the skill for additional backdoors or persistence mechanisms.",
+   "display_name": "Webshell Detected"
+  },
+  "YR3": {
+   "category": "YARA Match",
+   "explanation": "YARA rule matched cryptocurrency mining indicators (stratum protocol, mining pools, miner binaries, or cryptojacking scripts).",
+   "remediation": "Remove all cryptocurrency mining code, pool references, and miner binaries. Mining in agent skills is unauthorized resource abuse. Report the skill as malicious.",
+   "display_name": "Crypto Miner Detected"
+  },
+  "YR4": {
+   "category": "YARA Match",
+   "explanation": "YARA rule matched a hack tool or exploit indicator (offensive tools, reconnaissance, privilege escalation, or exploit frameworks).",
+   "remediation": "Remove offensive tool references and exploit code. Legitimate agent skills should not contain penetration testing tools, exploit frameworks, or reconnaissance utilities.",
+   "display_name": "Hack Tool / Exploit Detected"
+  },
+  "LP1": {
+   "category": "MCP Least Privilege",
+   "explanation": "Code uses capabilities (network, shell, file write, etc.) not covered by declared permissions. The skill does more than it claims, which may indicate deceptive intent.",
+   "remediation": "Add the missing permission to SKILL.md, or remove the code that requires it.",
+   "display_name": "Underdeclared Capability"
+  },
+  "LP2": {
+   "category": "MCP Least Privilege",
+   "explanation": "Permission list contains a wildcard ('*' or 'all'), granting blanket access with no least-privilege boundary. This disables permission-based security controls entirely.",
+   "remediation": "Replace wildcard permissions ('*', 'all', 'full', 'any') with an explicit list of required permissions.",
+   "display_name": "Wildcard Permission"
+  },
+  "LP3": {
+   "category": "MCP Least Privilege",
+   "explanation": "Skill has no permissions field in its manifest but code uses detectable capabilities. Without declared permissions, the skill's intent is opaque and cannot be validated.",
+   "remediation": "Add a 'permissions' field to SKILL.md listing the capabilities this skill requires.",
+   "display_name": "Missing Permission Declaration"
+  },
+  "LP4": {
+   "category": "MCP Least Privilege",
+   "explanation": "Permission is declared but no corresponding code capability was detected. This may indicate removed functionality or pre-staging for future abuse.",
+   "remediation": "Remove the declared permission if the corresponding capability is no longer used.",
+   "display_name": "Overdeclared Permission"
+  },
+  "TP1": {
+   "category": "MCP Tool Poisoning",
+   "explanation": "Hidden instructions detected in skill metadata (description, triggers, or parameters). These concealed directives can steer LLM behavior without the user's knowledge.",
+   "remediation": "Remove hidden content (HTML comments, markdown comments, zero-width characters, base64 blobs) from metadata fields. Metadata should contain plain, visible text only.",
+   "display_name": "Hidden Instructions"
+  },
+  "TP2": {
+   "category": "MCP Tool Poisoning",
+   "explanation": "Unicode deception detected in skill identifiers or descriptions. Homoglyphs, RTL overrides, or invisible characters can make malicious content appear benign.",
+   "remediation": "Replace non-ASCII characters in identifiers with ASCII equivalents. Remove RTL override and invisible formatting characters.",
+   "display_name": "Unicode Deception"
+  },
+  "TP3": {
+   "category": "MCP Tool Poisoning",
+   "explanation": "Instruction injection patterns found in parameter descriptions or default values. Parameter metadata is read by LLMs and can override intended behavior.",
+   "remediation": "Remove injection patterns, system tokens, and suspicious content from parameter descriptions and default values.",
+   "display_name": "Parameter Description Injection"
+  },
+  "TP4": {
+   "category": "MCP Tool Poisoning",
+   "explanation": "Skill description does not match actual code behavior. The declared purpose diverges from what the code actually does, indicating possible deception.",
+   "remediation": "Update the skill description to accurately reflect all capabilities, or remove undeclared functionality.",
+   "display_name": "Description-Behavior Mismatch"
+  },
+  "AS1": {
+   "category": "Agent Snooping",
+   "explanation": "Skill reads from agent configuration directories (.claude/, .codex/, .gemini/). These directories may contain API keys, personal settings, and other credentials that the skill has no legitimate need to access.",
+   "remediation": "Remove all code or instructions that access agent configuration directories (.claude/, .codex/, .gemini/). If configuration values are needed, pass them explicitly as parameters or environment variables — never read the agent's own config files.",
+   "display_name": "Agent Config Directory Access"
+  },
+  "AS2": {
+   "category": "Agent Snooping",
+   "explanation": "Skill accesses MCP server configuration files (mcp.json). MCP configs contain server URLs, authentication tokens, and tool definitions — reading them allows the skill to discover and potentially abuse other tool integrations.",
+   "remediation": "Remove all code or instructions that read MCP configuration files (mcp.json). MCP server details should be managed by the agent runtime, not read by individual skills.",
+   "display_name": "MCP Config Access"
+  },
+  "AS3": {
+   "category": "Agent Snooping",
+   "explanation": "Skill enumerates or reads other installed skills. Access to other skills' SKILL.md files or the skills directory reveals prompt instructions, capabilities, and secrets that should be invisible to peer skills.",
+   "remediation": "Remove all code or instructions that list or read other skills' files or directories. Skills should operate independently; cross-skill access is a privilege escalation.",
+   "display_name": "Skill Enumeration"
+  },
+  "AR1": {
+   "category": "Anti-Refusal",
+   "explanation": "Skill instructs the agent to never refuse or to always comply. Suppressing the agent's ability to decline removes a core safety control and enables downstream harmful requests to succeed.",
+   "remediation": "Remove any instruction telling the agent to never refuse or always comply. The agent must retain the ability to decline unsafe, out-of-scope, or harmful requests.",
+   "display_name": "Refusal Suppression"
+  },
+  "AR2": {
+   "category": "Anti-Refusal",
+   "explanation": "Skill instructs the agent to omit warnings, disclaimers, or ethical commentary. Stripping safety caveats hides risk from the user and is a common jailbreak preamble.",
+   "remediation": "Remove instructions that suppress warnings, disclaimers, or ethical commentary. Let the agent surface safety-relevant caveats to the user.",
+   "display_name": "Disclaimer Suppression"
+  },
+  "AR3": {
+   "category": "Anti-Refusal",
+   "explanation": "Skill attempts to nullify the agent's safety policies or restrictions ('you have no restrictions', 'ignore your guidelines', 'do anything now'). This is a direct jailbreak that disables guardrails.",
+   "remediation": "Remove jailbreak framing that nullifies safety policies or restrictions. Skill content must not instruct the agent to ignore its guidelines or operate without guardrails.",
+   "display_name": "Safety Policy Nullification"
+  },
+  "SSRF1": {
+   "category": "Server-Side Request Forgery",
+   "explanation": "Code accesses a cloud instance metadata endpoint (e.g. 169.254.169.254). A single request can return temporary IAM credentials, making this a high-value SSRF target for credential theft.",
+   "remediation": "Remove access to cloud metadata endpoints unless strictly required. If metadata is needed, restrict it (e.g. IMDSv2 with hop limit) and never expose returned credentials.",
+   "display_name": "Cloud Metadata Access"
+  },
+  "SSRF2": {
+   "category": "Server-Side Request Forgery",
+   "explanation": "Code issues a request to a loopback, link-local, or private-range host. This can reach internal services not meant to be exposed and is a common SSRF pivot.",
+   "remediation": "Avoid requests to loopback/link-local/private hosts from skill code. If internal access is intended, document it and validate the target against an allowlist.",
+   "display_name": "Internal Network Request"
+  },
+  "SSRF3": {
+   "category": "Server-Side Request Forgery",
+   "explanation": "Request target host is built from a dynamic or untrusted value. If the host is attacker-influenced, this enables SSRF to arbitrary internal or metadata endpoints.",
+   "remediation": "Do not build request URLs from untrusted input. Validate the host against an allowlist and reject internal/metadata addresses before issuing the request.",
+   "display_name": "Dynamic Request Target"
+  }
+ }
+}

@@ -702,7 +702,8 @@ pub fn persist_topology(daemon: &Arc<Daemon>) {
                 let meta = s.agent_meta.lock().unwrap().clone();
                 json!({"role": role, "agent": meta.as_ref().map(|(n, _)| n.clone()),
                        "agent_bin": meta.map(|(_, b)| b),
-                       "cwd": s.cwd, "title": s.title.lock().unwrap().clone()})
+                       "cwd": s.cwd, "title": s.title.lock().unwrap().clone(),
+                       "session_id": s.agent_session_id.lock().unwrap().clone()})
             })
         })
         .collect();
@@ -814,6 +815,28 @@ pub fn collect_descendants(sys: &System, root: u32) -> Vec<(u32, String)> {
     out
 }
 
+/// 중복 프로세스 kill 정책 — 순수 판정(테스트 핀). check_surfaces가 sys·daemon에서
+/// 입력을 미리 수집해 넘기고, 집행(kill_pid·bus.publish)은 호출부에 잔류한다.
+///
+/// 불변식(★실측 결함 회귀 가드):
+///  ① 최古(가장 낮은 pid) 1개는 *항상* 보존 — 정상 서버 1개까지 죽이면 안 된다.
+///  ② min_age_secs 미만으로 산 pid는 보존 — 빌드 중 잠깐 뜬 프로세스 오살 방지.
+///  ③ 입력이 결정론 정렬(pid asc)되지 않아도 내부에서 정렬 — 죽이는 pid가 호출 순서에
+///     의존하면(같은 그룹인데 다른 pid kill) 재현 불가 버그가 된다.
+///
+/// 입력: ages = (pid, start_time_epoch_secs) 목록(한 cmdline 그룹). now = 현재 에폭.
+/// 출력: (kept, killed) — kept=보존된 최古 pid, killed=죽일 pid(pid asc).
+fn plan_duplicate_kills(mut ages: Vec<(u32, f64)>, now: f64, min_age_secs: f64) -> (u32, Vec<u32>) {
+    ages.sort_by_key(|&(pid, _)| pid); // 불변식 ③: 결정론 정렬
+    let kept = ages[0].0; // 불변식 ①: 최古 보존
+    let killed: Vec<u32> = ages[1..]
+        .iter()
+        .filter(|&&(_, start)| now - start >= min_age_secs) // 불변식 ②: 나이 게이트
+        .map(|&(pid, _)| pid)
+        .collect();
+    (kept, killed)
+}
+
 /// 완화책 ③: surface별 자식 수 감시 + 동일 cmdline 중복 서버 감지 (예: bun server.ts × 36).
 fn check_surfaces(
     daemon: &Daemon,
@@ -875,32 +898,32 @@ fn check_surfaces(
                        "auto_kill": daemon.config.auto_kill_duplicates}),
             );
             if daemon.config.auto_kill_duplicates {
-                // 디렉티브 스펙 "45초+/3개+": 최古(낮은 pid) 1개는 보존하고, 나머지 중
-                // 45초 이상 산 것만 죽인다 — 빌드 중 잠깐 뜬 정상 프로세스를 죽이지 않는다.
+                // 디렉티브 스펙 "45초+/3개+": 정책 판정은 순수 함수(plan_duplicate_kills)에
+                // 위임하고, sys 의존 입력 수집·집행(kill_pid·publish)만 controller에 잔류한다.
                 const MIN_AGE_SECS: f64 = 45.0;
-                let mut sorted = pids.clone();
-                sorted.sort();
-                let kept = sorted[0];
-                let killed: Vec<u32> = sorted[1..]
+                // sys 의존 입력을 순수 경계 밖에서 미리 수집(start_time은 System에서만 조회 가능).
+                let ages: Vec<(u32, f64)> = pids
                     .iter()
-                    .copied()
-                    .filter(|&pid| {
+                    .filter_map(|&pid| {
                         sys.process(Pid::from_u32(pid))
-                            .map(|p| now - p.start_time() as f64 >= MIN_AGE_SECS)
-                            .unwrap_or(false)
+                            .map(|p| (pid, p.start_time() as f64))
                     })
                     .collect();
-                if !killed.is_empty() {
-                    for &pid in &killed {
-                        kill_pid(pid);
+                if !ages.is_empty() {
+                    let (kept, killed) = plan_duplicate_kills(ages, now, MIN_AGE_SECS);
+                    if !killed.is_empty() {
+                        for &pid in &killed {
+                            kill_pid(pid); // 집행 (controller 잔류)
+                        }
+                        daemon.bus.publish(
+                            // 집행 (controller 잔류)
+                            "watchdog.duplicates_killed",
+                            "watchdog",
+                            None,
+                            json!({"cmdline": cmdline, "kept": kept, "killed": killed,
+                                   "min_age_secs": MIN_AGE_SECS}),
+                        );
                     }
-                    daemon.bus.publish(
-                        "watchdog.duplicates_killed",
-                        "watchdog",
-                        None,
-                        json!({"cmdline": cmdline, "kept": kept, "killed": killed,
-                               "min_age_secs": MIN_AGE_SECS}),
-                    );
                 }
             }
         }
@@ -1142,13 +1165,23 @@ pub fn close_surface(daemon: &Arc<Daemon>, id: u64) -> Result<(), String> {
             .ok_or_else(|| format!("surface {id} not found"))?;
         let mut roles = daemon.roles.lock().unwrap();
         let srole = surface.role.lock().unwrap();
+        let mut master_released = false;
         if let Some(role) = srole.as_ref() {
             if roles.get(role) == Some(&id) {
                 roles.remove(role);
+                // 벡터-9 방어심화: master 보유 surface가 종료되면 master_claimed_at을 비운다
+                // (master 부재 → approval.sign 동결, 다음 정당 승계 시 쿨다운 재시작).
+                if role == "master" {
+                    master_released = true;
+                }
             }
         }
         drop(srole);
         drop(roles);
+        // master_claimed_at 갱신은 surfaces·roles 락 해제 후(단일 락만 보유 → 락 순서 무변경).
+        if master_released {
+            *daemon.master_claimed_at.lock().unwrap() = None;
+        }
         surface
     };
     // health 디바운스·조치 게이트 맵에서 이 surface의 (surface_id, rule) 키 회수 —
@@ -1356,7 +1389,7 @@ fn deliver_queued(daemon: &Arc<Daemon>, depth_alerted: &mut HashMap<u64, f64>) {
 
 #[cfg(test)]
 mod tests {
-    use super::learn_stuck_candidates;
+    use super::{learn_stuck_candidates, plan_duplicate_kills};
 
     /// (RSI 학습 자율추천 i) 막힘 판정 순수 함수 — 임계·디바운스·비활성(threshold=0)을 박제한다.
     #[test]
@@ -1374,6 +1407,39 @@ mod tests {
         assert_eq!(learn_stuck_candidates(&counts, &deb, 3, 3600.0, 5000.0), vec![10, 12]);
         // threshold=0 = 비활성(보수적 옵트아웃)
         assert!(learn_stuck_candidates(&counts, &deb, 0, 3600.0, now).is_empty());
+    }
+
+    /// ★불변식 박제: 45초/3개 중복-kill 정책의 최古보존·나이게이트·결정론정렬을 핀한다.
+    /// (check_surfaces에서 순수화 — sys 부재 시 mock 불가 회귀를 단위로 잡는다)
+    #[test]
+    fn plan_duplicate_kills_age_gate_and_keeps_oldest() {
+        let now = 1000.0;
+        // 입력을 일부러 pid 역순으로 — 내부 정렬이 깨지면 다른 pid를 죽인다(불변식 ③).
+        let ages = vec![(30, 900.0), (10, 800.0), (20, 950.0)];
+        // min_age=45: 10(나이200)·30(나이100) kill 적격, 20(나이50)도 적격, 최古 10 보존.
+        let (kept, killed) = plan_duplicate_kills(ages, now, 45.0);
+        assert_eq!(kept, 10, "최古(가장 낮은 pid) 1개는 항상 보존");
+        assert_eq!(killed, vec![20, 30], "나머지 중 45초+ 산 것만, pid asc 결정론");
+    }
+
+    #[test]
+    fn plan_duplicate_kills_spares_young_processes() {
+        let now = 1000.0;
+        // 20은 now-980=20s < 45 → 빌드 중 잠깐 뜬 정상 프로세스로 보존(불변식 ②).
+        let ages = vec![(10, 800.0), (20, 980.0), (30, 940.0)];
+        let (kept, killed) = plan_duplicate_kills(ages, now, 45.0);
+        assert_eq!(kept, 10);
+        assert_eq!(killed, vec![30], "20은 45초 미만이라 보존, 30(나이60)만 kill");
+    }
+
+    #[test]
+    fn plan_duplicate_kills_boundary_exactly_min_age() {
+        let now = 1000.0;
+        // 경계: now-start == min_age(45)는 `>=`이므로 kill 적격(alerts.rs `>=` 경계와 정합).
+        let ages = vec![(10, 500.0), (20, 955.0)];
+        let (kept, killed) = plan_duplicate_kills(ages, now, 45.0);
+        assert_eq!(kept, 10);
+        assert_eq!(killed, vec![20], "정확히 45초는 kill 적격(>=)");
     }
 
     /// ★불변식 박제(2026-06-12 실측 결함): npm 래퍼 에이전트의 모든 실행 형태가 생존으로

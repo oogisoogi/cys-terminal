@@ -57,6 +57,17 @@ SOFT_CHALLENGE_MARKERS: list[str] = [
     "checking your browser",
     "datadome",
     "captcha",
+    # --- Korean block containers (measured negative knowledge) ---
+    # Verbatim from LIVE block bodies, not invented. Each traces to
+    # references/blocked-ko.md (platform + confirmation date). SOFT, not HARD:
+    # a tech / security / scraping article can quote these phrases verbatim, so
+    # they are NOT "impossible in legitimate content" — they defer to caller
+    # positive proof (success_selectors) and only decide a CHALLENGE when no
+    # proof is present (i.e. a real block page). Can go stale if a platform
+    # changes its block HTML — update this list and blocked-ko.md together.
+    # Korean has no case so the `m in body_lower` match is verbatim.
+    "사용자 활동 검토 요청 및 안내",                   # measured 2026-06-25 gmarket/auction bot-check interstitial
+    "고객님의 사이트 내 활동이 봇의 동작과 유사해 보입니다",  # measured 2026-06-25 gmarket/auction bot-check body
 ]
 
 # Backward-compatible export (some callers import CHALLENGE_MARKERS).

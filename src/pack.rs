@@ -56,6 +56,11 @@ pub const PACK: &[(&str, &str)] = &[
     ),
     ("agents.json", include_str!("../cysjavis-pack/agents.json")),
     ("acl.json", include_str!("../cysjavis-pack/acl.json")),
+    // D5 스킬 버튼 보드 큐레이션 — read_board_catalog가 pack/board-catalog.json을 읽는다.
+    (
+        "board-catalog.json",
+        include_str!("../cysjavis-pack/board-catalog.json"),
+    ),
     (
         "alerts-config.json",
         include_str!("../cysjavis-pack/alerts-config.json"),
@@ -98,6 +103,10 @@ pub const PACK: &[(&str, &str)] = &[
         include_str!("../cysjavis-pack/bin/javis_report.py"),
     ),
     (
+        "bin/javis_fleet_report.py",
+        include_str!("../cysjavis-pack/bin/javis_fleet_report.py"),
+    ),
+    (
         "bin/javis_route.py",
         include_str!("../cysjavis-pack/bin/javis_route.py"),
     ),
@@ -108,6 +117,62 @@ pub const PACK: &[(&str, &str)] = &[
     (
         "bin/javis_memory.py",
         include_str!("../cysjavis-pack/bin/javis_memory.py"),
+    ),
+    // 스킬 보안·품질 결정론 게이트 (SkillSpector 규칙 stdlib 포트) + 규칙 사이드카.
+    // javis_memory가 P0.2 포이즌 WARN에 optional import 하므로 함께 배포된다(없으면 graceful).
+    (
+        "bin/javis_skillscan.py",
+        include_str!("../cysjavis-pack/bin/javis_skillscan.py"),
+    ),
+    (
+        "bin/skillscan_rules.json",
+        include_str!("../cysjavis-pack/bin/skillscan_rules.json"),
+    ),
+    (
+        "bin/javis_mcpgate.py",
+        include_str!("../cysjavis-pack/bin/javis_mcpgate.py"),
+    ),
+    // ── AgentReach 22 OPP 콘텐츠/거버넌스 채널 도구 — preflight C45/C49/C50/C53(위 javis_preflight.py)가
+    // 존재·self-test 를 결정론 게이트한다. semver=strictly-newer 버전비교 advisory(C45)·channels=콘텐츠
+    // 채널 per-channel 헬스 doctor(C49)·channel_watch=silence-first 채널 감시(C50)·idempotency=관찰
+    // 명령 부작용 금지 멱등성 봉인(C53). engine 신규(proc·cred_guard·disk_signal·dep_doctor)·
+    // skills/_VENDOR_MANIFEST.json 은 build.rs 가 skills/ 자동 walk 임베드하므로 PACK 수동 등재 불요 —
+    // bin 4종만 여기 수동 등재한다. exec 비트는 shebang 으로 자동.
+    (
+        "bin/javis_semver.py",
+        include_str!("../cysjavis-pack/bin/javis_semver.py"),
+    ),
+    (
+        "bin/javis_channels.py",
+        include_str!("../cysjavis-pack/bin/javis_channels.py"),
+    ),
+    (
+        "bin/javis_channel_watch.py",
+        include_str!("../cysjavis-pack/bin/javis_channel_watch.py"),
+    ),
+    (
+        "bin/javis_idempotency.py",
+        include_str!("../cysjavis-pack/bin/javis_idempotency.py"),
+    ),
+    // ── Serena 코드-의미 인덱스 MCP 채택 (S0~S8) — preflight C43/C44(위 javis_preflight.py)가
+    // 등록·도달성·거버넌스를 게이트한다. probe=생명주기 heartbeat(S4)·eval=crossover 측정
+    // 하베스터(S7)·nudge=PreToolUse 심볼-tool steering(S5, never updatedInput/exit2)·
+    // cys-codex-readonly.yml=codex 리뷰어 구조적 read-only context(S6). exec 비트는 shebang으로 자동.
+    (
+        "bin/javis_serena_probe.py",
+        include_str!("../cysjavis-pack/bin/javis_serena_probe.py"),
+    ),
+    (
+        "bin/javis_serena_eval.py",
+        include_str!("../cysjavis-pack/bin/javis_serena_eval.py"),
+    ),
+    (
+        "hooks/serena-nudge.sh",
+        include_str!("../cysjavis-pack/hooks/serena-nudge.sh"),
+    ),
+    (
+        "resources/contexts/cys-codex-readonly.yml",
+        include_str!("../cysjavis-pack/resources/contexts/cys-codex-readonly.yml"),
     ),
     (
         "bin/javis_orchestra.py",

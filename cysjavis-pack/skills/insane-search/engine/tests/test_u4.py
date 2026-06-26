@@ -53,6 +53,75 @@ def t_inject_cookies_then_present():
     print(f"  ✓ injected cookies present on session: {sorted(names)}")
 
 
+def t_cred_roundtrip_adversarial():
+    """OPP-15: push adversarial cookies/UA through the REAL inject_cookies sink,
+    then assert (A) normal-value fidelity preserved + (B) zero side effect
+    (no header splitting, no cross-host scope, no second cookie, no NUL)."""
+    from engine.cred_guard import sanitize, CredSink
+
+    host = "www.x.com"
+    p = SessionPool()
+    # Mixed corpus: one legit cookie + four adversarial payloads + adversarial UA.
+    cookies = [
+        {"name": "cf_clearance", "value": "正常값-base64+v/=", "domain": "www.x.com"},  # legit
+        {"name": "sess", "value": "v\r\nSet-Cookie: evil=1", "domain": "www.x.com"},     # CRLF value
+        {"name": "wide", "value": "1", "domain": ".com"},                                  # scope over-broad
+        {"name": "cross", "value": "1", "domain": "evil.example"},                          # host mismatch
+        {"name": "n\x00ame", "value": "1", "domain": "www.x.com"},                          # NUL name
+        {"name": "sep", "value": "v\u2028Set-Cookie: lsep=1", "domain": "www.x.com"},        # U+2028 LINE SEP
+    ]
+    adversarial_ua = "UA/1.0\r\nX-Injected: pwn"
+    ok = p.inject_cookies(host, "chrome", cookies, user_agent=adversarial_ua)
+    ent = p.get(host, "chrome")
+    if ent is None:
+        print("  ⚠ curl_cffi unavailable — skipped cred round-trip check")
+        return
+    assert ok, "inject should report success for the legit cookie"
+
+    jar = list(ent.session.cookies.jar)
+    by_name = {c.name: c for c in jar}
+
+    # (A) round-trip fidelity: legit value survives byte-equal (CLEAN, no mangling).
+    assert "cf_clearance" in by_name, sorted(by_name)
+    assert by_name["cf_clearance"].value == "正常값-base64+v/=", by_name["cf_clearance"].value
+
+    # (B) zero side effect — CRLF value: no second cookie named "evil" leaked in.
+    assert "evil" not in by_name, f"CRLF must not inject a 2nd cookie: {sorted(by_name)}"
+    # The CRLF-bearing cookie either dropped or stored with CR/LF stripped.
+    if "sess" in by_name:
+        v = by_name["sess"].value
+        assert "\r" not in v and "\n" not in v, f"CR/LF must be stripped: {v!r}"
+    # (B) U+2028/U+2029 (newline-class) must not survive in any stored value.
+    assert all("\u2028" not in c.value and "\u2029" not in c.value for c in jar), \
+        f"U+2028/U+2029 must be stripped: {[c.value for c in jar]}"
+    assert "lsep" not in by_name, f"U+2028 must not inject a 2nd cookie: {sorted(by_name)}"
+
+    # (B) cross-host scope: any cookie that survived must be scoped to host range.
+    for c in jar:
+        dom = (c.domain or "").lstrip(".").lower()
+        assert dom == host or host.endswith("." + dom) or dom == "" , \
+            f"cookie {c.name!r} domain {c.domain!r} escaped host scope {host!r}"
+    # .com / evil.example domains were rejected -> narrowed to host (not broadened).
+    if "wide" in by_name:
+        assert (by_name["wide"].domain or "").lstrip(".").lower() in (host, ""), by_name["wide"].domain
+    if "cross" in by_name:
+        assert (by_name["cross"].domain or "").lstrip(".").lower() in (host, ""), by_name["cross"].domain
+
+    # (B) NUL name: no jar key carries a NUL byte.
+    assert all("\x00" not in c.name for c in jar), [c.name for c in jar]
+
+    # (B) UA sink: stored injected_ua has no CR/LF (cannot split the request line).
+    assert ent.injected_ua is None or ("\r" not in ent.injected_ua and "\n" not in ent.injected_ua), \
+        repr(ent.injected_ua)
+
+    # (C) positive control — direct sanitizer false-positive pin (no over-block).
+    assert sanitize(CredSink.COOKIE_NAME, "cf_clearance").verdict == "CLEAN"
+    assert sanitize(CredSink.COOKIE_VALUE, "正常값-한글-OK").verdict == "CLEAN"
+    assert sanitize(CredSink.COOKIE_VALUE, "base64+val/ue=").verdict == "CLEAN"
+    assert sanitize(CredSink.COOKIE_DOMAIN, "www.x.com", host=host).verdict == "CLEAN"
+    print(f"  ✓ cred round-trip: fidelity preserved, side effects 0 (jar={sorted(by_name)})")
+
+
 def t_parse_envelope_json():
     env = '{"html":"<h1>hi</h1>","finalUrl":"https://x/p","status":200,' \
           '"cookies":[{"name":"a","value":"b"}],"userAgent":"UA"}'
@@ -103,6 +172,7 @@ ALL = [
     ("host_and_root_helpers", t_host_and_root_helpers),
     ("session_reuse_same_key", t_session_reuse_same_key),
     ("inject_cookies_then_present", t_inject_cookies_then_present),
+    ("cred_roundtrip_adversarial", t_cred_roundtrip_adversarial),
     ("parse_envelope_json", t_parse_envelope_json),
     ("parse_envelope_raw_html_fallback", t_parse_envelope_raw_html_fallback),
     ("warmup_once_guard_online", t_warmup_once_guard_online),

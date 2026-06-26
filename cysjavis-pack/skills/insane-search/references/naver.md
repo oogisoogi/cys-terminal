@@ -1,5 +1,9 @@
 # 네이버 계열 접근 전략
 
+> ▶ phase0.py로 코드 승격됨 (OPP-03, 2026-06-25): blog(m.blog→rss)·finance(siseJson)는
+> 1급 결정론 핸들러(`engine/phase0.py:_naver`), cafe는 auth-required 자기선언. news(Jina)·tv(yt-dlp)는
+> 미승격(아래 산문 절차 유지). 무인증 엔드포인트라 stale 가능 → 실패 시 generic grid 폴백.
+
 > 네이버 서비스별로 접근 방법이 다르다. 블로그는 모바일 URL, 뉴스/증권은 Jina Reader.
 
 ## 네이버 블로그

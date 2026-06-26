@@ -6,7 +6,10 @@
     "notes": "Claude Code. cys 전용 CLAUDE_CONFIG_DIR(~/.cys/claude)로 기동 — 사용자 ~/.claude(외부 터미널 체계·구 지침 오염 가능)와 격리(읽지도 지우지도 않음). macOS 인증은 계정 단위 Keychain이라 격리해도 로그인 유지. ready_marker(❯) 감지 후 주입. 폴더 신뢰 프롬프트는 launch-agent가 자동 확인한다.",
     "ready_marker": "❯",
     "clear_cmd": "/clear",
-    "resume_arg": "--continue",
+    "resume_arg": "--resume {session_id}",
+    "resume_arg_fallback": "--continue",
+    "cost_tier": "heavy",
+    "strengths": ["orchestration", "deep-reasoning", "coding", "writing"],
     "approval_patterns": [
       {
         "name": "tool-permission",
@@ -31,6 +34,8 @@
       "deep-research"
     ],
     "capability_notes": "앵커4-6: deep research는 gemini(agy) 담당. image 생성은 ChatGPT Image 2.0 사용. 코딩 협업 가능.",
+    "cost_tier": "standard",
+    "strengths": ["deep-research", "review", "coding"],
     "approval_patterns": [
       {
         "name": "approve",
@@ -43,11 +48,15 @@
     "inject_delay_secs": 12,
     "notes": "OpenAI Codex CLI (YOLO 모드 — cys 터미널 소켓 push 무프롬프트). 첫 실행 update 프롬프트는 Skip. 홈 기반 경로(~)인 이유: brew 본 /opt/homebrew/bin/codex가 dangling symlink(Caskroom 0.76.0 타깃 소멸)라 PATH 순서·로그인셸 차이에 따라 끊긴 본을 잡을 수 있다 → npm 설치본(~/.npm-global/bin/codex)으로 고정해 회피. ~ 는 로그인셸이 전개(gemini agy 어댑터와 동일 방식). 설치 위치가 다르면 이 경로를 수정.",
     "clear_cmd": "/new",
+    "resume_arg": "resume {session_id}",
+    "resume_arg_fallback": "resume --last",
     "capabilities": [
       "review",
       "coding"
     ],
     "capability_notes": "앵커4-6: 코딩 협업·코드 리뷰 담당.",
+    "cost_tier": "standard",
+    "strengths": ["review", "coding"],
     "approval_patterns": [
       {
         "name": "approve-command",
@@ -71,5 +80,11 @@
     "worker": "directives/WORKER_DIRECTIVE.md",
     "cso": "directives/CSO_DIRECTIVE.md",
     "reviewer": "directives/REVIEWER_DIRECTIVE.md"
+  },
+  "_tier_nodes": {
+    "_comment": "tier 등급 → slow 작업 권장 노드/사고규약. P1 suggested_node 결정론 소스. cost_tier 값은 D3 cost.rs 사후 실측이 진실 — 이건 라우팅 힌트일 뿐 강제 아님. heavy=항상 Opus 불변(강등 경로 없음).",
+    "trivial":  { "node": "worker",  "rsi": "min",  "note": "워커 위임·라운드 최소(단순 작업)" },
+    "standard": { "node": "worker",  "rsi": "std",  "note": "워커 위임 + 외부 리뷰 라운드(기본)" },
+    "heavy":    { "node": "master",  "rsi": "full", "note": "master 직접 주도 + full RSI 라운드(고난도·heavy=항상 Opus 불변)" }
   }
 }

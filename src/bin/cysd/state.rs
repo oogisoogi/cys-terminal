@@ -82,10 +82,16 @@ pub struct Surface {
     pub observed_usage: Mutex<Option<crate::usage::ObservedUsage>>,
     /// T5 세션 트랜스크립트 등록 (`usage.register` — SessionStart hook의 결정론 매핑)
     pub registered_transcript: Mutex<Option<String>>,
+    /// (4) resume 핀용 agent transcript session_id — analytics.rs의 회계 session_id와 무관(별개 개념).
+    /// usage 수집기가 transcript 발견 시 1회 stash(is_none 가드)·topology에 영속해 정확한 세션 재개.
+    pub agent_session_id: Mutex<Option<String>>,
     /// context.threshold 에지 게이트 — 자기보고(status.set)·관측(usage.rs) **공유**.
     /// true=발화 가능(임계 미만 관측됨). 분리하면 같은 교차에 두 경로가 각각 발화해
     /// master/CSO가 cycle-agent를 이중 집행한다. swap(false)가 원자적 1회 발화를 보장.
     pub ctx_threshold_armed: AtomicBool,
+    /// (B2) OSC 9/99/777 알림 스캐너 carry — reader 스레드 전용(단일 스레드 접근이라 Mutex면 충분).
+    /// strip 전 raw chunk를 누적해 완성 OSC 시퀀스만 추출한다(화면 렌더/strip 경로와 독립).
+    pub osc_carry: Mutex<Vec<u8>>,
     /// T4-4/T6-P3 능력 가드: 이 surface의 정규화된 권한 집합(write⊇read·deny-by-default).
     /// 역할 변경(claim_role)과 동기 갱신 — cysd-매개 변형 경로(send/scoped run)의 게이트 키.
     /// role과 함께 도출하되 self-declared role을 신뢰하지 않고 cysd-인증 발신 surface를 키로 쓴다.
@@ -180,6 +186,8 @@ pub struct Config {
     pub duplicate_threshold: usize,
     pub auto_kill_duplicates: bool,
     pub idle_seconds: u64,
+    /// (E-a) 동시 살아있는 worker-* 한도. 0=무제한(하위호환 escape hatch).
+    pub max_active_workers: usize,
 }
 
 impl Config {
@@ -196,6 +204,7 @@ impl Config {
                 .map(|v| v == "1")
                 .unwrap_or(false),
             idle_seconds: env_f64("CYS_IDLE_SECONDS", 300.0) as u64,
+            max_active_workers: env_f64("CYS_MAX_ACTIVE_WORKERS", 8.0) as usize,
         }
     }
 }
@@ -266,9 +275,19 @@ pub fn dedup_worker_role(
     }
 }
 
+/// (E-b) 살아있는 worker-* 역할 개수. 호출자는 surfaces·roles 락을 surfaces→roles 순서로
+/// 보유한 상태여야 한다(데드락 회피 — dedup_worker_role과 동일 계약). 순수 함수(락 비보유).
+pub fn live_worker_count(roles: &HashMap<String, u64>, is_alive: impl Fn(u64) -> bool) -> usize {
+    roles
+        .iter()
+        .filter(|(name, _)| *name == "worker" || name.starts_with("worker-"))
+        .filter(|(_, &h)| is_alive(h))
+        .count()
+}
+
 #[cfg(test)]
 mod dedup_tests {
-    use super::dedup_worker_role;
+    use super::{dedup_worker_role, live_worker_count};
     use std::collections::HashMap;
 
     fn roles(pairs: &[(&str, u64)]) -> HashMap<String, u64> {
@@ -310,6 +329,35 @@ mod dedup_tests {
         let r = roles(&[("worker", 7)]);
         assert_eq!(dedup_worker_role("worker", &r, |_| true, 7), "worker");
     }
+
+    // ---- (E-b) live_worker_count ----
+
+    #[test]
+    fn live_worker_count_empty_is_zero() {
+        let r = roles(&[]);
+        assert_eq!(live_worker_count(&r, |_| true), 0);
+    }
+
+    #[test]
+    fn live_worker_count_counts_all_alive_workers() {
+        // worker + worker-2 둘 다 alive = 2
+        let r = roles(&[("worker", 1), ("worker-2", 2)]);
+        assert_eq!(live_worker_count(&r, |_| true), 2);
+    }
+
+    #[test]
+    fn live_worker_count_excludes_dead() {
+        // worker(id=1) 죽음, worker-2(id=2) 생존 = 1
+        let r = roles(&[("worker", 1), ("worker-2", 2)]);
+        assert_eq!(live_worker_count(&r, |h| h == 2), 1);
+    }
+
+    #[test]
+    fn live_worker_count_ignores_non_worker_roles() {
+        // master/cso/reviewer-*는 worker 한도에서 제외
+        let r = roles(&[("master", 1), ("cso", 2), ("reviewer-gemini", 3), ("worker", 4)]);
+        assert_eq!(live_worker_count(&r, |_| true), 1);
+    }
 }
 
 pub struct Daemon {
@@ -329,9 +377,19 @@ pub struct Daemon {
     pub todo_progress: Mutex<HashMap<String, (u64, u64, f64)>>,
     /// T1-3 발신자 해석 캐시: caller pid → 항목 — 60초 TTL (항목 정의는 CallerCacheEntry).
     pub caller_cache: Mutex<HashMap<u32, CallerCacheEntry>>,
+    /// (E-c) idempotencyKey → (surface_id, epoch초). 클라이언트 재시도가 같은 key면 기존 surface
+    /// 재반환(추가 spawn 0). TTL(CREATE_IDEM_TTL_SECS) 만료 엔트리는 조회 시 lazy 제거.
+    pub create_idem: Mutex<HashMap<String, (u64, f64)>>,
     pub ledger: Mutex<HashMap<u32, LedgerEntry>>,
     /// 역할 레지스트리: role → surface_id (launch-agent가 등록, --to <role> 주소 해석에 사용)
     pub roles: Mutex<HashMap<String, u64>>,
+    /// 적대검증 벡터-9 방어심화: master role이 현재 보유 surface로 (재)claim된 epoch초.
+    /// master surface가 죽는 윈도우에 다른 노드가 claim_role("master")로 합법 승계 → 즉시
+    /// approval.sign으로 위험명령을 정당 서명할 수 있다. 이 값으로 갓 승계한 master의 서명을
+    /// 쿨다운(SIGN_COOLDOWN_SECS) 동안 동결해 승계-윈도우 남용을 차단한다. master가 부재/해제되면
+    /// None. ★단일UID·신뢰노드 모델에선 claim_role 자체가 권한 메커니즘이라 legit/usurper를
+    /// 암호학적으로 완전 구분 불가 — 이건 윈도우 축소·탐지(방어심화)이지 암호보증이 아니다.
+    pub master_claimed_at: Mutex<Option<f64>>,
     pub feed_items: Mutex<Vec<FeedItem>>,
     pub feed_waiters: Mutex<HashMap<String, tokio::sync::oneshot::Sender<String>>>,
     /// feed.jsonl append 직렬화 락 — write_all이 짧은 write로 쪼개져도 한 줄 전체가
@@ -433,6 +491,9 @@ impl Consumption {
         out
     }
 }
+
+/// (E-c) create_idem 캐시 엔트리 TTL — 클라이언트 재시도 창. 만료분은 조회 시 lazy GC.
+pub const CREATE_IDEM_TTL_SECS: f64 = 120.0;
 
 pub fn now_epoch() -> f64 {
     std::time::SystemTime::now()
@@ -555,8 +616,11 @@ impl Daemon {
             pause_info: Mutex::new(pause_restored),
             todo_progress: Mutex::new(HashMap::new()),
             caller_cache: Mutex::new(HashMap::new()),
+            create_idem: Mutex::new(HashMap::new()),
             ledger: Mutex::new(HashMap::new()),
             roles: Mutex::new(HashMap::new()),
+            // 벡터-9 방어심화: 기동 시 master 미승계 → None (첫 claim_role("master")에서 기록).
+            master_claimed_at: Mutex::new(None),
             feed_items: Mutex::new(restored),
             feed_waiters: Mutex::new(HashMap::new()),
             feed_persist_lock: Mutex::new(()),
@@ -783,10 +847,12 @@ impl Daemon {
             last_injected: Mutex::new(None),
             observed_usage: Mutex::new(None),
             registered_transcript: Mutex::new(None),
+            agent_session_id: Mutex::new(None),
             ctx_threshold_armed: AtomicBool::new(true),
             // 능력 가드: 생성 시 역할에서 도출(reviewer-*=read/search, full=worker/master/cso,
             // 그 외 deny-by-default none). claim_role이 역할 전이 시 동기 재도출한다.
             caps: Mutex::new(crate::caps::Caps::for_role(role.as_deref())),
+            osc_carry: Mutex::new(Vec::new()),
         });
 
         {
@@ -909,6 +975,39 @@ impl Daemon {
                         dsr_tail = probe[probe.len().saturating_sub(3)..].to_vec();
                         *surf.last_output.lock().unwrap() = Instant::now();
                         surf.idle_notified.store(false, Ordering::Relaxed);
+                        // (B2-c) OSC 9/99/777 알림 스캔 — strip 전 raw chunk 사용. parser 락
+                        // 임계영역(위 :876-902) 밖이라 attach 중복배달 불변식과 직교한다.
+                        {
+                            let mut carry = surf.osc_carry.lock().unwrap();
+                            carry.extend_from_slice(chunk);
+                            // 미완성 OSC가 무한 성장하는 경로 차단(128KiB 초과 폐기)
+                            if carry.len() > 128 * 1024 {
+                                carry.clear();
+                            }
+                            let extracted = drain_complete_osc(&mut carry);
+                            drop(carry);
+                            for (mut title, body) in extracted {
+                                if title.is_empty() {
+                                    title = surf.title.lock().unwrap().clone(); // cmux 폴백
+                                }
+                                // 억제 게이트: 직전 1.5s 내 주입(에코)이 있으면 폐기(cmux suppressesRaw 대응)
+                                let recently_injected = surf
+                                    .last_injected
+                                    .lock()
+                                    .unwrap()
+                                    .map(|t| t.elapsed().as_millis() < 1500)
+                                    .unwrap_or(false);
+                                if recently_injected {
+                                    continue;
+                                }
+                                daemon.bus.publish(
+                                    "osc.notify",
+                                    "notify",
+                                    Some(surf.id),
+                                    json!({"surface_ref": cys::surface_ref(surf.id), "title": title, "body": body}),
+                                );
+                            }
+                        }
                         daemon.ingest_output(&surf, chunk);
                     }
                 }
@@ -1213,6 +1312,107 @@ fn ansi_incomplete(tail: &[u8]) -> bool {
         // 그 외 2바이트 ESC 시퀀스 — 완결로 간주
         _ => false,
     }
+}
+
+/// (B2-a) OSC 9/99/777 데스크톱 알림을 (title, body)로 추출한다. 시퀀스 경계는 BEL(0x07)
+/// 또는 ST(ESC \)로, 호출처가 ESC]와 종결자를 포함한 완성 시퀀스를 넘긴다(여기서 벗긴다).
+/// 추출 못 한 (미완성·진행률·기타) 시퀀스는 None. 1차 범위: 단일-청크 평문 payload
+/// (멀티청크 OSC 99·base64는 미지원). 순수 함수 — 슬라이스 연산만(panic-free).
+fn parse_osc_notification(seq: &[u8]) -> Option<(String, String)> {
+    let s = std::str::from_utf8(seq).ok()?;
+    let s = s.strip_prefix("\x1b]").unwrap_or(s);
+    // 종결자 BEL/ST 제거 (ST = ESC \)
+    let s = s
+        .trim_end_matches('\x07')
+        .trim_end_matches('\\')
+        .trim_end_matches('\x1b');
+    let mut it = s.splitn(2, ';');
+    let code = it.next()?;
+    let rest = it.next().unwrap_or("");
+    match code {
+        "9" => {
+            // OSC 9;4;... = ConEmu 진행률 → 알림 아님
+            if rest.starts_with("4;") || rest == "4" {
+                return None;
+            }
+            (!rest.is_empty()).then(|| (String::new(), rest.to_string()))
+        }
+        "777" => {
+            // 777;notify;<title>;<body>
+            let mut p = rest.splitn(3, ';');
+            if p.next()? != "notify" {
+                return None;
+            }
+            let title = p.next().unwrap_or("").to_string();
+            let body = p.next().unwrap_or("").to_string();
+            (!title.is_empty() || !body.is_empty()).then(|| (title, body))
+        }
+        "99" => {
+            // 99;<metadata>;<payload> — 1차 범위: metadata 무시, 평문 payload만
+            let payload = rest.rsplitn(2, ';').next().unwrap_or(rest).to_string();
+            (!payload.is_empty()).then(|| (String::new(), payload))
+        }
+        _ => None,
+    }
+}
+
+/// (B2-a) carry에서 `ESC](=0x1b 0x5d)`로 시작해 BEL(0x07) 또는 ST(ESC \)로 끝나는 완성
+/// OSC 시퀀스를 앞에서부터 추출해 parse_osc_notification에 넘기고 소비한다. ESC] 앞의
+/// 비-OSC 바이트와 추출 실패 시퀀스는 버린다(추출 전용 — 화면 렌더/strip 경로와 독립).
+/// 미완성 꼬리(ESC] 시작 후 종결자 미도착)는 carry에 남겨 다음 청크와 이어붙인다.
+/// 종결 판정은 ansi_incomplete의 OSC 규칙(BEL 또는 ESC\)과 동일하다.
+fn drain_complete_osc(carry: &mut Vec<u8>) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    // keep_from = carry에서 보존을 시작할 위치. 미완성 OSC 시작을 만나면 거기로 고정,
+    // 아니면 스캔이 끝난 곳까지(앞쪽은 전부 버림 — 추출 전용).
+    let mut keep_from = carry.len();
+    let mut i = 0;
+    while i < carry.len() {
+        // 다음 OSC 시작(ESC])을 찾는다
+        if i + 1 >= carry.len() {
+            // ESC 단독 꼬리 — 다음 청크와 이어붙이게 보존
+            if carry[i] == 0x1b {
+                keep_from = i;
+            } else {
+                keep_from = carry.len();
+            }
+            break;
+        }
+        if carry[i] != 0x1b || carry[i + 1] != 0x5d {
+            i += 1;
+            continue;
+        }
+        // ESC] 이후에서 종결자(BEL 또는 ST=ESC\)를 찾는다
+        let mut end: Option<usize> = None;
+        let mut j = i + 2;
+        while j < carry.len() {
+            if carry[j] == 0x07 {
+                end = Some(j + 1); // BEL 1바이트 포함
+                break;
+            }
+            if carry[j] == 0x1b && j + 1 < carry.len() && carry[j + 1] == 0x5c {
+                end = Some(j + 2); // ST 2바이트 포함
+                break;
+            }
+            j += 1;
+        }
+        match end {
+            Some(e) => {
+                if let Some(pair) = parse_osc_notification(&carry[i..e]) {
+                    out.push(pair);
+                }
+                i = e;
+                keep_from = e; // 여기까지 확정 소비
+            }
+            None => {
+                // 미완성 OSC — 이 ESC]부터 다음 청크와 이어붙이게 남긴다
+                keep_from = i;
+                break;
+            }
+        }
+    }
+    carry.drain(..keep_from);
+    out
 }
 
 /// Windows에서 셸에 인라인 명령을 넘길 때 쓰는 플래그를 셸명으로 선택한다.
@@ -1595,6 +1795,77 @@ mod tests {
         assert!(!ansi_incomplete(b"\x1b]52;c;data\x07"));
         // ST도 BEL도 없는 긴 OSC는 미완성 (다음 청크 대기)
         assert!(ansi_incomplete(b"\x1b]8;;https://example.com"));
+    }
+
+    // ---- (B2) OSC 9/99/777 데스크톱 알림 파서 ----
+
+    /// OSC 9 = 단순 알림. title 없음(빈 문자열), body=payload 전체.
+    #[test]
+    fn osc_9_notify() {
+        assert_eq!(
+            parse_osc_notification(b"\x1b]9;build done\x07"),
+            Some((String::new(), "build done".to_string()))
+        );
+        // ST 종결도 동일
+        assert_eq!(
+            parse_osc_notification(b"\x1b]9;build done\x1b\\"),
+            Some((String::new(), "build done".to_string()))
+        );
+    }
+
+    /// OSC 9;4;... = ConEmu 진행률 → 알림 아님(None). 회귀 박제: 진행률을 알림으로 오발화 금지.
+    #[test]
+    fn osc_9_progress_ignored() {
+        assert_eq!(parse_osc_notification(b"\x1b]9;4;50\x07"), None);
+        assert_eq!(parse_osc_notification(b"\x1b]9;4\x07"), None);
+        // 빈 payload도 None
+        assert_eq!(parse_osc_notification(b"\x1b]9;\x07"), None);
+    }
+
+    /// OSC 777;notify;title;body — iTerm2/kitty 계열. notify가 아니면 None.
+    #[test]
+    fn osc_777() {
+        assert_eq!(
+            parse_osc_notification(b"\x1b]777;notify;\xed\x85\x8c\xec\x8a\xa4\xed\x8a\xb8;\xeb\xb3\xb8\xeb\xac\xb8\x07"),
+            Some(("테스트".to_string(), "본문".to_string()))
+        );
+        // notify 아닌 서브커맨드는 알림 아님
+        assert_eq!(parse_osc_notification(b"\x1b]777;precmd\x07"), None);
+    }
+
+    /// OSC 99 = kitty desktop notification. 1차 범위: metadata 무시, 평문 payload만.
+    #[test]
+    fn osc_99_plain() {
+        // 99;<metadata>;<payload> — 마지막 ';' 뒤를 payload로
+        assert_eq!(
+            parse_osc_notification(b"\x1b]99;i=1;hello\x07"),
+            Some((String::new(), "hello".to_string()))
+        );
+        // metadata 없는 단순형
+        assert_eq!(
+            parse_osc_notification(b"\x1b]99;hello\x07"),
+            Some((String::new(), "hello".to_string()))
+        );
+    }
+
+    /// drain_complete_osc: 완성 시퀀스만 추출·소비, 미완성 꼬리는 carry에 보존(청크 경계 박제).
+    #[test]
+    fn drain_osc_keeps_incomplete_tail() {
+        // 완성 1개 + 미완성 1개 → 1개 추출, 미완성은 carry에 남음
+        let mut carry: Vec<u8> = b"\x1b]9;done\x07\x1b]777;notify;t".to_vec();
+        let out = drain_complete_osc(&mut carry);
+        assert_eq!(out, vec![(String::new(), "done".to_string())]);
+        assert_eq!(carry, b"\x1b]777;notify;t".to_vec()); // 미완성 꼬리 보존
+        // 다음 청크로 종결자 도착 → 추출 완료, carry 비움
+        carry.extend_from_slice(b";b\x07");
+        let out2 = drain_complete_osc(&mut carry);
+        assert_eq!(out2, vec![("t".to_string(), "b".to_string())]);
+        assert!(carry.is_empty());
+        // OSC 사이 비-OSC 노이즈는 버려진다(추출 전용)
+        let mut noisy: Vec<u8> = b"plain\x1b]9;x\x07more".to_vec();
+        let out3 = drain_complete_osc(&mut noisy);
+        assert_eq!(out3, vec![(String::new(), "x".to_string())]);
+        assert!(noisy.is_empty()); // 미완성 OSC 없음 → 전부 소비
     }
 
     // ---- ingest_output 라인분할 상태기계 (state.rs:627) ----

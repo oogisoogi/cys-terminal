@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""No-Site-Name Rule checker.
+"""No-Site-Name + UTF-8-subprocess static lints.
 
-Run in CI / pre-commit. Scans engine/** for hard-coded site names or
-domains that would bias the generic fetch chain toward one site.
+Run in CI / pre-commit. Two engine/** invariants:
+  1) No hard-coded site names / domains that bias the generic fetch chain
+     toward one site (the original No-Site-Name Rule).
+  2) Every subprocess.run/Popen/check_output call in engine/**.py passes an
+     explicit `env=` (OPP-16: forces utf8_env() so child text I/O is UTF-8
+     regardless of host locale code page — Windows cp949/cp936 mojibake).
 
-Exit code 0 if clean, 1 if violations found.
+Exit code 0 if clean, 1 if any violation found.
 
     python3 engine/bias_check.py
     python3 engine/bias_check.py --strict    # also check references/*.md (usually off)
@@ -12,6 +16,7 @@ Exit code 0 if clean, 1 if violations found.
 from __future__ import annotations
 
 import argparse
+import ast
 import os
 import re
 import sys
@@ -134,6 +139,57 @@ def _scan_file(path: Path, root: Path) -> list[str]:
     return violations
 
 
+# --- Rule 2: subprocess calls must pass an explicit env= (OPP-16) -----------
+# Names that spawn a child process whose text I/O inherits the host locale
+# unless env= forces utf8_env(). Matched as `subprocess.<name>(`.
+SUBPROCESS_CALL_NAMES = {"run", "Popen", "check_output"}
+
+# engine/**.py files explicitly exempted from the env= rule (full match against
+# relative path from scan root, same convention as EXPLICIT_ALLOW_FILES). Empty
+# by design — every engine subprocess call site currently passes env=utf8_env().
+EXPLICIT_ALLOW_SUBPROCESS_FILES: set[str] = set()
+
+
+def _call_attr_name(func: ast.AST) -> str | None:
+    """Return the attribute name for a `subprocess.<name>(...)` call, else None."""
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    return None
+
+
+def _scan_file_subprocess(path: Path, root: Path) -> list[str]:
+    """Return env= violations for one .py file (Rule 2)."""
+    rel = path.relative_to(root.parent)
+    if str(rel) in EXPLICIT_ALLOW_SUBPROCESS_FILES:
+        return []
+    try:
+        src = path.read_text(encoding="utf-8", errors="strict")
+    except Exception as e:
+        return [f"{rel}:0 — read error: {e}"]
+    try:
+        tree = ast.parse(src, filename=str(rel))
+    except SyntaxError as e:
+        return [f"{rel}:{e.lineno or 0} — parse error: {e.msg}"]
+
+    violations: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = _call_attr_name(node.func)
+        if name not in SUBPROCESS_CALL_NAMES:
+            continue
+        # keyword arg names; ast.keyword.arg is None for a **kwargs spread, which
+        # may carry env= dynamically — treat as satisfied (no false positive).
+        kw_args = {kw.arg for kw in node.keywords}
+        if None in kw_args or "env" in kw_args:
+            continue
+        violations.append(
+            f"{rel}:{node.lineno} — subprocess.{name}(...) missing env= "
+            f"(OPP-16: pass env=utf8_env())"
+        )
+    return violations
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Scan engine for site-name bias")
     parser.add_argument("--strict", action="store_true",
@@ -162,6 +218,9 @@ def main(argv: list[str] | None = None) -> int:
                     continue  # self-exempt (this file lists the brands)
                 scanned += 1
                 total_violations.extend(_scan_file(p, skill_root))
+                # Rule 2 (env=) applies only to engine/**.py, not references.
+                if name == "engine" and p.suffix.lower() == ".py":
+                    total_violations.extend(_scan_file_subprocess(p, skill_root))
 
     print(f"[bias-check] scanned {scanned} files under {skill_root}")
     if total_violations:
@@ -173,6 +232,7 @@ def main(argv: list[str] | None = None) -> int:
         print("  1) Remove the brand name (preferred)")
         print("  2) If genuinely explanatory, add '# NOTE-BIAS-OK' on the same line")
         print("  3) If this is a Phase 0 official API reference, move it to references/*.md and rerun without --strict")
+        print("  4) For 'missing env=' add env=utf8_env() to the subprocess call (OPP-16)")
         return 1
 
     print("[bias-check] ✅ clean")

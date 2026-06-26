@@ -182,10 +182,13 @@ def cmd_progress(a):
         print("error: 기준 score 없음 — checkpoint에 --score 주거나 직전 progress 필요", file=sys.stderr)
         return 2
     delta = a.score - prev
-    v = verdict(delta)
+    v = verdict(delta)               # ★verdict는 순수 delta 산술 — tokens_saved 절대 미접촉(injected-only)
     ts = time.time()
     rec = {"score": a.score, "prev": prev, "delta": round(delta, 6), "verdict": v,
            "ts": ts, "note": a.note or ""}
+    # U4 rider: tokens_saved는 score 옆 공동기록만(verdict/delta/flat_streak 불변). 미지정=키 생략.
+    if getattr(a, "tokens_saved", None) is not None:
+        rec["tokens_saved"] = a.tokens_saved
     r["progress"].append(rec)
     # (RSI 자율추천 iii) ceiling — flat N연속 = 점수 정체 → 학습 추천(추천만·사람 승인).
     r["flat_streak"] = (r.get("flat_streak", 0) + 1) if v == "flat" else 0
@@ -281,6 +284,7 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     c = sub.add_parser("checkpoint"); c.add_argument("--round", required=True); c.add_argument("--score", type=float); c.add_argument("--note")
     p = sub.add_parser("progress"); p.add_argument("--round", required=True); p.add_argument("--score", type=float, required=True); p.add_argument("--note")
+    p.add_argument("--tokens-saved", type=float, default=None, help="U4 비-verdict rider — 원장에 공동기록만, verdict()/delta 미접촉(injected-only 불변)")
     m = sub.add_parser("markers"); m.add_argument("--json", action="store_true")
     rb = sub.add_parser("rollback"); rb.add_argument("--round", required=True); rb.add_argument("--execute", action="store_true"); rb.add_argument("--force", action="store_true")
     s = sub.add_parser("status"); s.add_argument("--json", action="store_true")

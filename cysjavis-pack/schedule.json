@@ -16,6 +16,22 @@
       "to": "master",
       "text_command": "printf '[heartbeat] 5분 보고 — 아래 진행%%는 결정론 산출값이다. 그대로(수치 불변) 주인님에게 보고하라.\\n'; python3 \"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_report.py\"",
       "if_absent": "skip"
+    },
+    {
+      "id": "fleet-adoption-cost-digest",
+      "every_minutes": 1440,
+      "action": "push",
+      "to": "master",
+      "text_command": "printf '[heartbeat] 일일 fleet 채택/비용 digest — 결정론 read-only 집계. 수치 불변으로 보고하고 COVERAGE DRIFT 경고가 있으면 javis_preflight.py --fix 하라.\\n'; python3 \"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_fleet_report.py\" --days 7",
+      "if_absent": "skip"
+    },
+    {
+      "id": "content-channel-health-watch",
+      "every_minutes": 360,
+      "action": "push",
+      "to": "master",
+      "text_command": "python3 \"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_channel_watch.py\" --no-push",
+      "if_absent": "skip"
     }
   ]
 }
