@@ -81,15 +81,17 @@ def ensure_dirs(dept):
     os.makedirs(cwd, exist_ok=True)
     return cwd
 
-def backfill_mission_key(depts_path, key, mission_key):
-    """레거시 부서에 mission_key 소급(F6). cys-dept와 같은 .lock으로 직렬화, 다른 필드 무접촉."""
+def backfill_mission_key(depts_path, key, mission_key, display=None):
+    """레거시 부서에 mission_key 소급(F6). cys-dept와 같은 .lock으로 직렬화, 다른 필드 무접촉.
+    매처: cwd 마지막 세그먼트가 display(한글 규약·1차) 또는 key(영문 레거시·2차)와 정확일치(R3-1).
+    정확일치라 suffix-bleed(R1 BLOCK-1) 회귀 없음. expand()로 $HOME 토큰 정규화."""
     lock = depts_path + ".lock"
     with open(lock, "w") as lf:
         fcntl.flock(lf, fcntl.LOCK_EX)
         reg = load_json(depts_path, {"depts":{}})
         for name, e in reg.get("depts", {}).items():
-            cwd_base = os.path.basename(e.get("cwd","").rstrip("/"))  # 경로 마지막 세그먼트 정확일치(R1 BLOCK-1)
-            if cwd_base == key or e.get("mission_key")==mission_key:
+            cwd_base = os.path.basename(expand(e.get("cwd","")).rstrip("/"))
+            if cwd_base == display or cwd_base == key:  # 한글 display 1차·영문 key 레거시 2차
                 if not e.get("mission_key"):
                     e["mission_key"] = mission_key
         _atomic_write(depts_path, reg)
@@ -308,7 +310,7 @@ def apply_plan(m):
         plan.append(("write_mission", d))
         plan.append(("ensure_dirs", d))
         plan.append(("create_dept", d["key"]))
-        plan.append(("backfill_mission_key", d["key"]))
+        plan.append(("backfill_mission_key", d))  # dept dict 보존(display까지 전달·R3-1)
     for t in m["tasks"]:
         plan.append(("dispatch_task", t))
     return plan
@@ -338,7 +340,7 @@ def apply_manifest(m):
         elif action == "ensure_dirs": ensure_dirs(arg); results.append((action, arg["key"], 0))
         elif action == "create_dept":
             rc, out = create_dept(arg); results.append((action, arg, rc))
-        elif action == "backfill_mission_key": backfill_mission_key(DEPTS, arg, arg); results.append((action, arg, 0))
+        elif action == "backfill_mission_key": backfill_mission_key(DEPTS, arg["key"], arg["key"], arg["display"]); results.append((action, arg["key"], 0))
         elif action == "dispatch_task":
             rc, out = dispatch_task(arg); results.append((action, arg["dept"], rc))
     return results
@@ -454,6 +456,19 @@ def self_test():
     r2 = json.load(open(dpath))
     chk("backfill-exact-match", r2["depts"]["dept-2"].get("mission_key") == "research",
         "정확 basename 일치인데 backfill 안 됨")
+    # --- R3-1: 한글-display 레거시 cwd backfill 소급 성공 (라이브 규약 커버 — over-correction 해소) ---
+    # 라이브 cwd 전건이 한글 display로 끝남(.../미래연구부) → 영문 key(future-research)와 영영 불일치였음
+    json.dump({"depts":{"d3":{"cwd":"$HOME/Desktop/CYSjavis/미래연구부","socket":"s3"}}}, open(dpath,"w"))
+    backfill_mission_key(dpath, "future-research", "future-research", "미래연구부")
+    r3 = json.load(open(dpath))
+    chk("backfill-hangul-display", r3["depts"]["d3"].get("mission_key") == "future-research",
+        "한글 display 레거시 cwd backfill 소급 실패(over-correction)")
+    # 한글 display여도 부분문자열 오탐은 여전 차단(정확일치라 suffix-bleed 회귀 없음)
+    json.dump({"depts":{"d4":{"cwd":"$HOME/Desktop/CYSjavis/구미래연구부","socket":"s4"}}}, open(dpath,"w"))
+    backfill_mission_key(dpath, "future-research", "future-research", "미래연구부")
+    r4 = json.load(open(dpath))
+    chk("backfill-hangul-no-bleed", r4["depts"]["d4"].get("mission_key") != "future-research",
+        "한글 display 부분문자열(구미래연구부) 오탐")
     # --- Task6: apply 분해(부수효과 없는 plan 생성) ---
     plan = apply_plan(m_ok)  # [(action, key/args), ...]
     chk("apply-order", plan[0][0]=="catalog_upsert" and "create_dept" in [p[0] for p in plan], "apply 순서/구성 오류")
