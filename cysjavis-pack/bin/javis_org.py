@@ -227,16 +227,27 @@ def tar_snapshot(key, workdir, dest_dir=None):
         tar.add(workdir, arcname=os.path.basename(workdir.rstrip("/")))
     return out if os.path.exists(out) else None
 
+def _snapshot_gate(name, workdir):
+    """--purge-workdir 선행 결정 (R1 REVISE-2): (proceed, action).
+    workdir 부재=백업·삭제 둘 다 no-op → skip 후 진행(영구 락인 해소) /
+    workdir 존재+스냅샷 실패=진짜 위험 → fail-closed abort."""
+    if not (workdir and os.path.isdir(workdir)):
+        return True, ("workdir_absent_skip", workdir)
+    snap = tar_snapshot(name, workdir)
+    if not snap:
+        return False, ("abort_no_snapshot", workdir)
+    return True, ("snapshot", snap)
+
 def destroy_dept(name, mission_key, purge=False, purge_workdir=False):
     actions = []
-    # 1) 작업물 삭제는 의무 스냅샷 뒤에만 (fail-closed)
+    # 1) 작업물 삭제는 의무 스냅샷 뒤에만 — 단 workdir 부재면 skip(no-op·abort 금지)
     if purge_workdir:
         reg = load_json(DEPTS, {"depts":{}}); e = reg["depts"].get(name, {})
         workdir = expand(e.get("cwd",""))
-        snap = tar_snapshot(name, workdir)
-        if not snap:
-            return [("abort_no_snapshot", workdir)]  # hard abort
-        actions.append(("snapshot", snap))
+        proceed, action = _snapshot_gate(name, workdir)
+        actions.append(action)
+        if not proceed:
+            return actions  # abort_no_snapshot (workdir 존재+스냅샷 실패만)
     # 2) cys-dept down 위임(CSO 상속)
     r = subprocess.run(["cys-dept", "down", name], capture_output=True, text=True,
                        env={**os.environ, "CYS_ROLE": "cso"})
@@ -463,6 +474,11 @@ def self_test():
     snap = tar_snapshot("authoring", src, dest_dir=td)
     chk("snap-made", snap and os.path.exists(snap), "스냅샷 미생성")
     chk("snap-missing-src", tar_snapshot("x", os.path.join(td,"nope"), dest_dir=td) is None, "없는 소스에 스냅샷 성공(위험)")
+    # --- R1 REVISE-2: workdir 부재=skip(no abort 영구락인), 존재=의무스냅샷 ---
+    proceed_abs, act_abs = _snapshot_gate("x", os.path.join(td,"nope-wd"))
+    chk("snapgate-absent-skip", proceed_abs and act_abs[0]=="workdir_absent_skip", "workdir 부재인데 abort(영구 락인)")
+    proceed_pre, act_pre = _snapshot_gate("authoring", src)  # src는 위에서 생성된 실재 workdir
+    chk("snapgate-present-snap", proceed_pre and act_pre[0]=="snapshot", "workdir 존재인데 스냅샷 안 됨")
     print(json.dumps({"self_test": "ok" if not failures else "fail",
                       "failures": failures}, ensure_ascii=False))
     return 1 if failures else 0

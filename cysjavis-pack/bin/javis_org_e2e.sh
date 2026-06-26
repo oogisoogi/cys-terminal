@@ -35,4 +35,16 @@ python3 -c "import json;m=json.load(open('$T/m.json'));m['departments'][0]['key'
 if python3 "$BIN" validate "$T/bad.json"; then echo "E2E FAIL: 풀익스플로잇 오귀속이 통과됨"; exit 1; else echo "  → 기대대로 FAIL"; fi
 echo "== apply CSO 게이트 (exit3 기대·CYS_ROLE 없음) =="
 if CYS_ROLE= python3 "$BIN" apply "$T/m.json"; then echo "E2E FAIL: 비-CSO apply 통과"; exit 1; else echo "  → 기대대로 차단"; fi
+
+echo "== destroy workdir 부재 (rc0·skip 기대·R1 REVISE-2) =="
+# ★cys-dept 스텁: 실제 down은 격리 reg_count==0 시 라이브 ceo_demote(MASTER_DIRECTIVE.md.pre-ceo)를
+#   건드림 → 무접촉 보장 위해 스텁으로 대체(라이브 cys-dept 무호출).
+mkdir -p "$T/bin"; printf '#!/bin/bash\necho "[stub cys-dept] $*"\nexit 0\n' > "$T/bin/cys-dept"; chmod +x "$T/bin/cys-dept"
+echo '{"depts":{"e2e-dept":{"cwd":"'"$T"'/Desktop/CYSjavis/없는부서","socket":"'"$T"'/fake.sock","mission_key":"e2e-dept"}}}' > "$CYS_DEPTS_JSON"
+OUT=$(PATH="$T/bin:$PATH" CYS_ROLE=cso python3 "$BIN" destroy --dept e2e-dept --purge-workdir); RC=$?
+echo "$OUT"
+if [ "$RC" != "0" ]; then echo "E2E FAIL: workdir 부재 destroy rc=$RC (영구 락인)"; exit 1; fi
+echo "$OUT" | grep -q workdir_absent_skip || { echo "E2E FAIL: workdir_absent_skip 미포함"; exit 1; }
+echo "  → 기대대로 rc0·skip"
+
 echo "ALL E2E PASS (라이브 무접촉)"; rm -rf "$T"
