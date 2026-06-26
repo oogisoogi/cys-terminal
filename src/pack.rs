@@ -179,6 +179,14 @@ pub const PACK: &[(&str, &str)] = &[
         include_str!("../cysjavis-pack/bin/javis_orchestra.py"),
     ),
     (
+        "bin/javis_org.py",
+        include_str!("../cysjavis-pack/bin/javis_org.py"),
+    ),
+    (
+        "bin/javis_org_e2e.sh",
+        include_str!("../cysjavis-pack/bin/javis_org_e2e.sh"),
+    ),
+    (
         "bin/javis_boot_node.py",
         include_str!("../cysjavis-pack/bin/javis_boot_node.py"),
     ),
