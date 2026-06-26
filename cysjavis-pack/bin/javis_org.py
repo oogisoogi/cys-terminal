@@ -53,6 +53,47 @@ def v_schema(m):
             errs.append(f"tasks[{i}].to enum 위반: {t.get('to')}")
     return errs
 
+def _norm(s): return " ".join((s or "").split())
+
+def v_quote_binding(depts, doc_text, catalog):
+    """F1: quote 존재+정체결속+key↔account+cwd패턴+span유일+길이/고유성."""
+    errs = []
+    ndoc = _norm(doc_text)
+    accounts = (catalog.get("accounts") or {}).keys()
+    cat_depts = catalog.get("departments") or {}
+    seen_quotes = {}
+    for i, d in enumerate(depts):
+        key, disp, acct = d.get("key",""), d.get("display",""), d.get("account","")
+        q = _norm(d.get("source_quote", ""))
+        tag = f"departments[{i}]({key})"
+        # 길이(F3) → 존재 → 고유성(F3) 순 (존재성을 고유성보다 먼저 — 부재 분기 도달 보장)
+        if len(q) < MIN_QUOTE:
+            errs.append(f"{tag}: source_quote 길이<{MIN_QUOTE}")
+        elif q not in ndoc:
+            errs.append(f"{tag}: source_quote 부재(doc에 없음)")
+        elif ndoc.count(q) != 1:
+            errs.append(f"{tag}: source_quote 고유성 위반(doc 내 {ndoc.count(q)}회)")
+        else:
+            # 정체 결속: quote가 display 또는 key 변별토큰 포함
+            if disp not in q and key not in q:
+                errs.append(f"{tag}: quote가 부서 정체(display/key) 미포함 — 결속 실패")
+            # span 유일성
+            if q in seen_quotes:
+                errs.append(f"{tag}: source_quote가 {seen_quotes[q]}와 동일 span 재사용")
+            seen_quotes[q] = tag
+        # key↔account 일관성
+        if key in cat_depts:
+            want = cat_depts[key].get("account")
+            if want and acct != want:
+                errs.append(f"{tag}: account 오배정({acct}≠catalog {want})")
+        elif acct not in accounts:
+            errs.append(f"{tag}: 신규 key의 account '{acct}'가 승인 accounts에 없음(박사님 승인 필요)")
+        # cwd 규약 경로
+        cwd = d.get("cwd", "")
+        if disp and not cwd.replace("\\", "/").endswith(f"Desktop/CYSjavis/{disp}"):
+            errs.append(f"{tag}: cwd가 규약 경로($HOME/Desktop/CYSjavis/{disp}) 불일치")
+    return errs
+
 def self_test():
     failures = []
     def chk(name, cond, msg=""):
@@ -71,6 +112,39 @@ def self_test():
         "to enum 위반 미검출")
     chk("schema-miss-field", any("departments" in e for e in v_schema({k:v for k,v in m_ok.items() if k!="departments"})),
         "필수키 누락 미검출")
+    # --- Task3: v_quote_binding (F1) ---
+    doc = ("미래연구부는 모든 통찰의 원천 엔진이다. "
+           "저술콘텐츠부는 통찰을 칼럼과 책으로 대중에 전파한다. "
+           "이 문장은 부서 정체 토큰을 포함하지 않는 충분히 긴 고유 문장이다.")
+    cat = {"accounts":{"cysinsight":"x","ysfuture":"y"},
+           "departments":{
+             "future-research":{"display":"미래연구부","account":"cysinsight"},
+             "authoring":{"display":"저술콘텐츠부","account":"ysfuture"}}}
+    d_ok = {"key":"future-research","display":"미래연구부","account":"cysinsight",
+            "cwd":"$HOME/Desktop/CYSjavis/미래연구부",
+            "source_quote":"미래연구부는 모든 통찰의 원천 엔진이다."}
+    chk("f1-ok", v_quote_binding([d_ok], doc, cat) == [], f"errs={v_quote_binding([d_ok],doc,cat)}")
+    # 오귀속: 실재(미래연구부) 문장을 엉뚱한 key/account(authoring/cysinsight)에 붙임 → FAIL
+    d_mis = {**d_ok, "key":"authoring", "display":"미래연구부", "account":"cysinsight"}
+    chk("f1-misattr", v_quote_binding([d_mis], doc, cat) != [], "오귀속 미검출")
+    # key↔account 불일치 (authoring은 ysfuture여야)
+    d_acct = {"key":"authoring","display":"저술콘텐츠부","account":"cysinsight",
+              "cwd":"$HOME/Desktop/CYSjavis/저술콘텐츠부",
+              "source_quote":"저술콘텐츠부는 통찰을 칼럼과 책으로 대중에 전파한다."}
+    chk("f1-account", any("account" in e for e in v_quote_binding([d_acct], doc, cat)), "계정 오배정 미검출")
+    # quote가 부서정체 토큰 미포함
+    d_noid = {**d_ok, "source_quote":"이 문장은 부서 정체 토큰을 포함하지 않는 충분히 긴 고유 문장이다."}
+    chk("f1-noident", any("정체" in e for e in v_quote_binding([d_noid], doc, cat)), "정체 결속 미검출")
+    # quote가 doc에 없음
+    d_fab = {**d_ok, "source_quote":"존재하지 않는 긴 문장 어쩌고저쩌고 일이삼사오육칠팔."}
+    chk("f1-absent", any("부재" in e for e in v_quote_binding([d_fab], doc, cat)), "부재 quote 미검출")
+    # span 재사용: 두 부서가 같은 quote
+    d_dup1 = {**d_ok}
+    d_dup2 = {**d_ok, "key":"authoring", "display":"미래연구부"}
+    chk("f1-span", any("재사용" in e for e in v_quote_binding([d_dup1,d_dup2], doc, cat)), "span 재사용 미검출")
+    # 짧은 quote
+    d_short = {**d_ok, "source_quote":"미래연구부"}
+    chk("f1-short", any("길이" in e or "고유" in e for e in v_quote_binding([d_short], doc, cat)), "짧은 quote 미검출")
     print(json.dumps({"self_test": "ok" if not failures else "fail",
                       "failures": failures}, ensure_ascii=False))
     return 1 if failures else 0
