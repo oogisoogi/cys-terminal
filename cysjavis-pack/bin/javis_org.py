@@ -31,11 +31,46 @@ def require_cso():
         sys.stderr.write("[javis_org] ★CSO 전용: apply/destroy는 CYS_ROLE=cso에서만(부서 mutation 단일소유). CSO에 위임하라.\n")
         sys.exit(3)
 
+def v_schema(m):
+    errs = []
+    if not isinstance(m, dict): return ["매니페스트가 객체 아님"]
+    if m.get("kind") != "org-manifest": errs.append("kind != 'org-manifest'")
+    if m.get("manifest_version") != 1: errs.append("manifest_version != 1")
+    if m.get("reconcile_mode", "additive") != "additive":
+        errs.append("MVP reconcile_mode는 additive만(exact는 후속)")
+    src = m.get("source") or {}
+    if not src.get("design_doc"): errs.append("source.design_doc 누락")
+    if not src.get("design_doc_sha256"): errs.append("source.design_doc_sha256 누락")
+    for key in ("departments", "tasks"):
+        if not isinstance(m.get(key), list): errs.append(f"필수 키 누락/배열아님: {key}")
+    for i, d in enumerate(m.get("departments") or []):
+        for f in ("key", "display", "account", "cwd", "mission_md", "source_quote"):
+            if not d.get(f): errs.append(f"departments[{i}].{f} 누락")
+    for i, t in enumerate(m.get("tasks") or []):
+        for f in ("dept", "task", "scope", "source_quote"):
+            if not t.get(f): errs.append(f"tasks[{i}].{f} 누락")
+        if t.get("to", "worker") not in ALLOWED_ROLES:
+            errs.append(f"tasks[{i}].to enum 위반: {t.get('to')}")
+    return errs
+
 def self_test():
     failures = []
     def chk(name, cond, msg=""):
         if not cond: failures.append(f"{name}: {msg}")
     # Task별로 케이스가 여기 누적된다.
+    # --- Task2: v_schema ---
+    good_dept = {"key":"future-research","display":"미래연구부","account":"cysinsight",
+                 "cwd":"$HOME/Desktop/CYSjavis/미래연구부","mission_md":"# m","source_quote":"x"}
+    m_ok = {"manifest_version":1,"kind":"org-manifest","reconcile_mode":"additive",
+            "source":{"design_doc":"/d","design_doc_sha256":"a"},
+            "departments":[good_dept],"tasks":[]}
+    chk("schema-ok", v_schema(m_ok) == [], f"errs={v_schema(m_ok)}")
+    chk("schema-bad-kind", any("kind" in e for e in v_schema({**m_ok,"kind":"x"})), "kind 위반 미검출")
+    chk("schema-bad-to", any("to" in e for e in v_schema({**m_ok,
+        "tasks":[{"dept":"future-research","to":"ceo","task":"t","scope":"s","source_quote":"q"}]})),
+        "to enum 위반 미검출")
+    chk("schema-miss-field", any("departments" in e for e in v_schema({k:v for k,v in m_ok.items() if k!="departments"})),
+        "필수키 누락 미검출")
     print(json.dumps({"self_test": "ok" if not failures else "fail",
                       "failures": failures}, ensure_ascii=False))
     return 1 if failures else 0
