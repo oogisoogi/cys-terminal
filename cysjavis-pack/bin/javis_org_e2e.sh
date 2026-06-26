@@ -15,7 +15,8 @@ cat > "$DOC" <<'MD'
 첫 작업: 미래연구부는 종교·교회의 미래 환경 스캐닝을 수행한다 충분히 길게.
 MD
 SHA=$(python3 -c "import hashlib;print(hashlib.sha256(open('$DOC',encoding='utf-8').read().encode()).hexdigest())")
-echo '{"version":1,"accounts":{"cysinsight":"x","ysfuture":"y"},"departments":{}}' > "$CYS_DEPT_CATALOG"
+# catalog에 future-research 등록(good=기존key) — exploit의 shadow-ops는 미등록(fabricated)
+echo '{"version":1,"accounts":{"cysinsight":"x","ysfuture":"y"},"departments":{"future-research":{"display":"미래연구부","account":"cysinsight"}}}' > "$CYS_DEPT_CATALOG"
 cat > "$T/m.json" <<JSON
 {"manifest_version":1,"kind":"org-manifest","reconcile_mode":"additive",
  "source":{"design_doc":"$DOC","design_doc_sha256":"$SHA"},
@@ -27,9 +28,11 @@ JSON
 
 echo "== self-test =="; python3 "$BIN" --self-test
 echo "== validate (PASS 기대) =="; python3 "$BIN" validate "$T/m.json"
-echo "== validate 오귀속 (FAIL 기대) =="
-python3 -c "import json;m=json.load(open('$T/m.json'));m['departments'][0]['key']='authoring';json.dump(m,open('$T/bad.json','w'))"
-if python3 "$BIN" validate "$T/bad.json"; then echo "E2E FAIL: 오귀속이 통과됨"; exit 1; else echo "  → 기대대로 FAIL"; fi
+echo "== validate 풀익스플로잇 오귀속 (FAIL 기대) =="
+# fabricated key(shadow-ops·미등록) + 실재 quote(미래연구부) + display 위장 + tasks 일관(v_refs 선점 제거)
+# → F1 결속(역인덱스)·신규key 승인플래그가 실제 실행되는 경로로 차단되는지 독립 검증
+python3 -c "import json;m=json.load(open('$T/m.json'));m['departments'][0]['key']='shadow-ops';m['tasks'][0]['dept']='shadow-ops';json.dump(m,open('$T/bad.json','w'))"
+if python3 "$BIN" validate "$T/bad.json"; then echo "E2E FAIL: 풀익스플로잇 오귀속이 통과됨"; exit 1; else echo "  → 기대대로 FAIL"; fi
 echo "== apply CSO 게이트 (exit3 기대·CYS_ROLE 없음) =="
 if CYS_ROLE= python3 "$BIN" apply "$T/m.json"; then echo "E2E FAIL: 비-CSO apply 통과"; exit 1; else echo "  → 기대대로 차단"; fi
 echo "ALL E2E PASS (라이브 무접촉)"; rm -rf "$T"

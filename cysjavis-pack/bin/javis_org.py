@@ -138,6 +138,7 @@ def v_quote_binding(depts, doc_text, catalog, dept_level=True):
     ndoc = _norm(doc_text)
     accounts = (catalog.get("accounts") or {}).keys()
     cat_depts = catalog.get("departments") or {}
+    disp_to_key = {v.get("display"): k for k, v in cat_depts.items() if v.get("display")}  # 역인덱스(R1 BLOCK-2)
     seen_quotes = {}
     for i, d in enumerate(depts):
         key, disp, acct = d.get("key",""), d.get("display",""), d.get("account","")
@@ -159,13 +160,22 @@ def v_quote_binding(depts, doc_text, catalog, dept_level=True):
                 errs.append(f"{tag}: source_quote가 {seen_quotes[q]}와 동일 span 재사용")
             seen_quotes[q] = tag
         if dept_level:
+            # ★key 결속(R1 BLOCK-2): quote가 가리키는 catalog display의 정규 key 중 매니페스트 key가
+            #   있어야 함. display 위장(실재 부서명을 허위 key에 부착)을 account 대조 없이 차단.
+            matched_keys = {ck for cd, ck in disp_to_key.items() if cd and cd in q}
+            if matched_keys and key not in matched_keys:
+                errs.append(f"{tag}: quote가 가리키는 정규 key {sorted(matched_keys)} 중 매니페스트 key='{key}' 없음 — 오귀속")
             # key↔account 일관성
             if key in cat_depts:
                 want = cat_depts[key].get("account")
                 if want and acct != want:
                     errs.append(f"{tag}: account 오배정({acct}≠catalog {want})")
-            elif acct not in accounts:
-                errs.append(f"{tag}: 신규 key의 account '{acct}'가 승인 accounts에 없음(박사님 승인 필요)")
+            else:
+                # 신규 key(catalog 미등록): account 유효성 + 박사님 승인 플래그 둘 다 필수 (R1 BLOCK-2)
+                if acct not in accounts:
+                    errs.append(f"{tag}: 신규 key의 account '{acct}'가 승인 accounts에 없음")
+                if not d.get("new_dept_approved"):
+                    errs.append(f"{tag}: 신규 key '{key}'는 박사님 승인 플래그(new_dept_approved) 필요 — account 유효성만으로 통과 불가")
             # cwd 규약 경로
             cwd = d.get("cwd", "")
             if disp and not cwd.replace("\\", "/").endswith(f"Desktop/CYSjavis/{disp}"):
@@ -384,6 +394,19 @@ def self_test():
     # 짧은 quote
     d_short = {**d_ok, "source_quote":"미래연구부"}
     chk("f1-short", any("길이" in e or "고유" in e for e in v_quote_binding([d_short], doc, cat)), "짧은 quote 미검출")
+    # --- R1 BLOCK-2: 오귀속이 account 대조가 아니라 '결속/승인플래그'로 잡히는가 ---
+    empty_cat = {"accounts":{"cysinsight":"x","ysfuture":"y"},"departments":{}}
+    # greenfield(empty catalog) fabricated 신규key + 실재 quote + display 위장 → 승인플래그 없으면 FAIL
+    d_mis_empty = {**d_ok, "key":"shadow-ops", "display":"미래연구부", "account":"cysinsight",
+                   "source_quote":"미래연구부는 모든 통찰의 원천 엔진이다."}
+    chk("f1-misattr-empty", v_quote_binding([d_mis_empty], doc, empty_cat) != [], "empty-catalog 오귀속(신규key 승인없음) 미검출")
+    # 승인 플래그 있으면 greenfield 신규 정상 통과 (account 유효 + 결속 OK)
+    d_new_ok = {**d_mis_empty, "key":"future-research", "new_dept_approved":True}
+    chk("f1-new-approved", v_quote_binding([d_new_ok], doc, empty_cat) == [], f"승인된 신규부서 오탐: {v_quote_binding([d_new_ok],doc,empty_cat)}")
+    # 오귀속이 '결속(역인덱스)'으로 잡히는가: populated catalog, 실재quote↔허위key, account유효+승인있어도 FAIL
+    d_keybind = {**d_ok, "key":"shadow-ops", "display":"미래연구부", "account":"cysinsight",
+                 "new_dept_approved":True, "source_quote":"미래연구부는 모든 통찰의 원천 엔진이다."}
+    chk("f1-keybind", any("오귀속" in e for e in v_quote_binding([d_keybind], doc, cat)), "결속(역인덱스)으로 오귀속 미검출")
     # --- Task4: v_refs / v_sha256 / validate_manifest ---
     chk("refs-ok", v_refs([good_dept],[{"dept":"future-research","to":"worker","task":"t","scope":"s","source_quote":"q"}])==[], "정상 참조 오류")
     chk("refs-bad", v_refs([good_dept],[{"dept":"no-such","to":"worker","task":"t","scope":"s","source_quote":"q"}])!=[], "붕뜬 task 미검출")
