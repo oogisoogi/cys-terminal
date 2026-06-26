@@ -96,6 +96,22 @@ def backfill_mission_key(depts_path, key, mission_key, display=None):
                     e["mission_key"] = mission_key
         _atomic_write(depts_path, reg)
 
+def v_catalog_consistency(depts, catalog):
+    """기존 catalog key의 recorded display/cwd ≠ manifest display/cwd면 거부 (R3-2 display drift 차단).
+    신규 key(catalog 미등록)는 대상 아님 — F1 승인플래그가 담당."""
+    errs = []
+    cat_depts = catalog.get("departments") or {}
+    for i, d in enumerate(depts):
+        key = d.get("key", "")
+        rec = cat_depts.get(key)
+        if not rec: continue  # 신규 key는 drift 대상 아님
+        tag = f"departments[{i}]({key})"
+        if rec.get("display") and d.get("display") and rec["display"] != d.get("display"):
+            errs.append(f"{tag}: catalog display drift — catalog '{rec['display']}' ≠ manifest '{d.get('display')}'")
+        if rec.get("cwd") and d.get("cwd") and expand(rec["cwd"]) != expand(d.get("cwd")):
+            errs.append(f"{tag}: catalog cwd drift — catalog '{rec['cwd']}' ≠ manifest '{d.get('cwd')}'")
+    return errs
+
 def v_refs(depts, tasks):
     keys = {d.get("key") for d in depts}
     return [f"tasks[{i}].dept '{t.get('dept')}' 미존재(참조 무결성)"
@@ -116,6 +132,7 @@ def validate_manifest(m, doc_text=None, catalog=None):
     errs += v_quote_binding(  # tasks는 quote-수준(길이/존재/고유)만 — 정체결속·account·cwd는 dept만
         [{"key":t.get("dept"),"display":"","account":"","cwd":"","source_quote":t.get("source_quote","")}
          for t in m.get("tasks", [])], doc_text, {"accounts":{},"departments":{}}, dept_level=False)
+    errs += v_catalog_consistency(m.get("departments", []), catalog)  # R3-2 display/cwd drift
     errs += v_refs(m.get("departments", []), m.get("tasks", []))
     return errs
 
@@ -469,6 +486,16 @@ def self_test():
     r4 = json.load(open(dpath))
     chk("backfill-hangul-no-bleed", r4["depts"]["d4"].get("mission_key") != "future-research",
         "한글 display 부분문자열(구미래연구부) 오탐")
+    # --- R3-2: catalog display/cwd drift 거부 (기존 key 재할당 위장 차단) ---
+    cat_drift = {"accounts":{"cysinsight":"x"},
+                 "departments":{"future-research":{"display":"미래연구부","account":"cysinsight","cwd":"$HOME/Desktop/CYSjavis/미래연구부"}}}
+    d_drift = [{"key":"future-research","display":"위장된딴부서","account":"cysinsight","cwd":"$HOME/Desktop/CYSjavis/미래연구부"}]
+    chk("catalog-drift-display", any("display" in e for e in v_catalog_consistency(d_drift, cat_drift)), "display drift 미검출")
+    d_cwd_drift = [{"key":"future-research","display":"미래연구부","account":"cysinsight","cwd":"$HOME/Desktop/CYSjavis/딴경로"}]
+    chk("catalog-drift-cwd", any("cwd" in e for e in v_catalog_consistency(d_cwd_drift, cat_drift)), "cwd drift 미검출")
+    d_consistent = [{"key":"future-research","display":"미래연구부","account":"cysinsight","cwd":"$HOME/Desktop/CYSjavis/미래연구부"}]
+    chk("catalog-consistent", v_catalog_consistency(d_consistent, cat_drift) == [], f"정합인데 오탐: {v_catalog_consistency(d_consistent, cat_drift)}")
+    chk("catalog-newkey-skip", v_catalog_consistency([{"key":"brand-new","display":"신규","cwd":"x"}], cat_drift) == [], "신규key를 drift로 오탐")
     # --- Task6: apply 분해(부수효과 없는 plan 생성) ---
     plan = apply_plan(m_ok)  # [(action, key/args), ...]
     chk("apply-order", plan[0][0]=="catalog_upsert" and "create_dept" in [p[0] for p in plan], "apply 순서/구성 오류")
