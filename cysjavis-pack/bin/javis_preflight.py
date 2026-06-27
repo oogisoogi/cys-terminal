@@ -213,6 +213,24 @@ APPBUILD_SKILLS = [
 ]
 APPBUILD_HOOK = "appbuild-gate.sh"  # PreToolUse 코드선행 금지 게이트
 
+# grill-me 최소 질문(결정론 floor) 게이트 — C55가 엔진 self-test·hook·등록·SKILL 핀 검증.
+# (오너 절대규칙 2026-06-27: grill-me는 합의 전 최소 20·복잡30 결정 브랜치를 강제 해소)
+GRILL_ENGINE = "grill_gate.py"
+GRILL_HOOK = "grill-gate.sh"            # PreToolUse check(gatekeeper) — distinct<floor면 deny
+GRILL_HOOK_EVENT = "PreToolUse"
+GRILL_HOOK_MATCHER = "Edit|Write|NotebookEdit"  # Bash 제외(인터뷰 중 탐색 자유)
+GRILL_COUNT_HOOK = "grill-count.sh"     # PostToolUse count(evaluator) — distinct 누적
+GRILL_COUNT_EVENT = "PostToolUse"
+GRILL_COUNT_MATCHER = "AskUserQuestion"
+# (GATE check hook, count evaluator hook) 쌍 — 둘 다 없으면 게이트가 fail-closed/무력.
+GRILL_HOOKS = (
+    (GRILL_HOOK, GRILL_HOOK_EVENT, GRILL_HOOK_MATCHER),
+    (GRILL_COUNT_HOOK, GRILL_COUNT_EVENT, GRILL_COUNT_MATCHER),
+)
+GRILL_SKILL_PINS = ["AskUserQuestion", "grill_gate", "최소 깊이"]  # pack SKILL 본문 핀
+GRILL_AGENTS_DIR = os.path.join(os.path.expanduser("~"), ".agents", "skills")
+GRILL_AGENTS_PINS = ["AskUserQuestion", "grill_gate", "20 distinct", "30 for complex"]
+
 # C28 자기교정·영속성 hook(외부 메모리 아키텍처 접목 이관) — (스크립트, [(event, matcher)…]).
 # inject/save 는 .config 구체계에서 패키지로 이관, reflect-scan·commit-nudge 는 신규.
 SELFCORR_HOOKS = [
@@ -2647,6 +2665,95 @@ class Preflight:
         else:
             self.add(cid, PASS, "cysd 코어 파일 LOC-cap 이내(%d개 감시)" % len(caps))
 
+    # ── C55 grill-me 최소 질문 게이트 (오너 절대규칙 2026-06-27) ──
+    # grill-me가 합의 전 floor(20·복잡30) 결정 브랜치를 강제 해소하도록 하는 인프라:
+    # 엔진(grill_gate.py)·hook(grill-gate.sh, PreToolUse deny)·SKILL 핀(pack+메인)을 검증.
+    # 등록은 결정론(마커 밖 fail-open이라 무관·무해 작업을 막지 않음 — 안전).
+    def c55_grill_gate(self):
+        cid = "C55.grill-gate"
+        if self.skipped(cid):
+            return
+        fixed, warns, fails = [], [], []
+        pd = pack_dir()
+        # (a) 엔진 존재 + self-test 통과(producer≠evaluator 분리 회귀보호)
+        engine = os.path.join(pd, "bin", GRILL_ENGINE)
+        if not os.path.isfile(engine):
+            fails.append("엔진 %s 미설치 — `cys init-pack`" % GRILL_ENGINE)
+        else:
+            try:
+                r = subprocess.run([sys.executable, engine, "--self-test"],
+                                   capture_output=True, text=True, timeout=30,
+                                   env=_utf8_env())
+                if r.returncode != 0:
+                    fails.append("grill_gate self-test 실패(rc=%d): %s"
+                                 % (r.returncode, (r.stderr or "").strip()[:120]))
+            except (OSError, subprocess.SubprocessError) as e:
+                warns.append("grill_gate self-test 미실행: %s" % e)
+        # (b)(c) 두 hook(check=PreToolUse·count=PostToolUse) 존재·실행권·등록.
+        # ★count(evaluator) 미배선이면 distinct가 영원히 0 → fail-CLOSED 마비라 FAIL로 강제.
+        #   check(gatekeeper)는 마커 밖 fail-open이라 미등록 시 WARN(강제 약화일 뿐 마비 아님).
+        targets = discover_claude_settings() or [
+            os.path.join(os.path.expanduser("~"), ".claude", "settings.json")]
+        for hname, hevent, hmatcher in GRILL_HOOKS:
+            hook = os.path.join(pd, "hooks", hname)
+            if not os.path.isfile(hook):
+                fails.append("hook %s 미설치 — `cys init-pack`" % hname)
+                continue
+            if os.name == "posix":
+                mode = os.stat(hook).st_mode
+                if not mode & stat.S_IXUSR and self.fix:
+                    os.chmod(hook, mode | 0o755)
+                    fixed.append("%s 실행권한" % hname)
+            unreg = 0
+            for t in targets:
+                if self._event_hook_registered(t, hevent, hname):
+                    continue
+                if self.fix:
+                    err = self._register_event_hook(t, hevent, hname, matcher=hmatcher)
+                    if err:
+                        warns.append("%s 등록 실패(%s): %s"
+                                     % (hname, os.path.basename(t), err))
+                    else:
+                        fixed.append("%s 등록(%s)"
+                                     % (hname, os.path.basename(os.path.dirname(t))))
+                else:
+                    unreg += 1
+            if unreg:
+                msg = "%s %d/%d 프로필 미등록(--fix로 등록)" % (hname, unreg, len(targets))
+                (fails if hname == GRILL_COUNT_HOOK else warns).append(msg)
+        # (d) pack SKILL 본문 핀(게이트 지시가 비워지면 검출)
+        sp = os.path.join(pd, "skills", "grill-me", "SKILL.md")
+        if os.path.isfile(sp):
+            try:
+                text = open(sp, encoding="utf-8").read()
+                lost = [p for p in GRILL_SKILL_PINS if p not in text]
+                if lost:
+                    fails.append("pack grill-me 핀 소실: %s" % "·".join(lost))
+            except (OSError, UnicodeDecodeError) as e:
+                warns.append("pack grill-me 읽기 실패: %s" % e)
+        # (e) 메인 .agents 핀 — Skill 도구가 실제 로드하는 사본(pack과 별개 SOT·C22 사각 교정)
+        ap = os.path.join(GRILL_AGENTS_DIR, "grill-me", "SKILL.md")
+        if os.path.isfile(ap):
+            try:
+                text = open(ap, encoding="utf-8").read()
+                lost = [p for p in GRILL_AGENTS_PINS if p not in text]
+                if lost:
+                    warns.append(".agents grill-me 핀 소실(수동 동기화 필요): %s"
+                                 % "·".join(lost))
+            except (OSError, UnicodeDecodeError) as e:
+                warns.append(".agents grill-me 읽기 실패: %s" % e)
+        # 판정
+        tail = (" · " + "; ".join(warns)) if warns else ""
+        if fails:
+            self.add(cid, FAIL, "grill-gate 결함: %s%s" % ("; ".join(fails), tail))
+        elif fixed:
+            self.add(cid, FIXED, "grill-gate 정비: %s%s" % ("; ".join(fixed), tail))
+        elif warns:
+            self.add(cid, WARN, "grill-gate: %s" % "; ".join(warns))
+        else:
+            self.add(cid, PASS, "grill-gate 인프라 건재(엔진 self-test·hook·"
+                     "PreToolUse 등록·SKILL 핀 pack+메인)")
+
     def run(self):
         self.c01_pack_dir()
         self.c02_directives()
@@ -2704,6 +2811,7 @@ class Preflight:
         self.c52_license_gate()
         self.c53_idempotency()
         self.c54_loc_cap()
+        self.c55_grill_gate()
         return self.results
 
 

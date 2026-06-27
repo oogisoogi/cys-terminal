@@ -94,6 +94,23 @@ pub const PACK: &[(&str, &str)] = &[
         "hooks/role-capability-gate.sh",
         include_str!("../cysjavis-pack/hooks/role-capability-gate.sh"),
     ),
+    // grill-me 최소 질문 게이트(오너 절대규칙 2026-06-27) — GATE-hook 3번째 사례.
+    // grill-gate.sh = PreToolUse(Edit|Write|NotebookEdit) check deny(gatekeeper);
+    // grill-count.sh = PostToolUse(AskUserQuestion) count(evaluator·항상 exit0);
+    // grill_gate.py = 결정론 엔진(begin/count/check/end). C55가 엔진 self-test·2hook 등록·
+    // SKILL 핀을 검증하고 `preflight --fix`가 배선한다(count 미등록=FAIL=fail-closed 방지).
+    (
+        "hooks/grill-gate.sh",
+        include_str!("../cysjavis-pack/hooks/grill-gate.sh"),
+    ),
+    (
+        "hooks/grill-count.sh",
+        include_str!("../cysjavis-pack/hooks/grill-count.sh"),
+    ),
+    (
+        "bin/grill_gate.py",
+        include_str!("../cysjavis-pack/bin/grill_gate.py"),
+    ),
     (
         "bin/javis_preflight.py",
         include_str!("../cysjavis-pack/bin/javis_preflight.py"),
