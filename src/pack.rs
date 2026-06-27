@@ -546,7 +546,7 @@ pub fn install(force: bool) -> Result<(usize, usize), String> {
         PACK.iter().chain(PACK_SKILLS.iter()).map(|(r, c)| (*r, *c)),
         force,
         env!("CARGO_PKG_VERSION"),
-        true, // embed/cysd 경로는 .pack-version을 종전대로 직접 기록(외부 동작 불변).
+        false, // embed/cysd 경로(비트랜잭션): .pack-version 직접 기록 + 매니페스트 best-effort(외부 동작 불변).
     )
 }
 
@@ -555,15 +555,19 @@ pub fn install(force: bool) -> Result<(usize, usize), String> {
 /// embed PACK iter(기존 경로)와 staged-tree iter(무중단 채널)가 같은 로직을 공유한다(중복 0·회귀 0).
 /// 다운그레이드 가드 비교 기준은 `target_version`(env! 직접 참조 제거 — staged 입력은 자기 버전을 넘김).
 /// force=false: 사용자 수정 파일 불가침 + 비수정 파일은 입력 신버전으로 자동 갱신. 반환: (written, kept).
-/// `write_version_marker`: true면 종전대로 마지막에 `.pack-version`을 best-effort 기록(embed/cysd
-/// 경로 — 외부 동작 불변). false면 기록하지 않는다 — 무중단 pack-update 트랜잭션
-/// (apply_pack_transactional)이 record_accepted **이후** `.pack-version`을 마지막 hard commit
-/// marker로 직접(검사 포함) 기록하기 위함(R2CODE HIGH #1).
+/// `transactional`: false면 embed/cysd/init-pack 경로 — 종전대로 마지막에 `.pack-version`을
+/// best-effort 기록하고 `.install-manifest.json` 영속도 best-effort(외부 동작 불변). true면
+/// 무중단 pack-update 트랜잭션(apply_pack_transactional) 경로 — ⓐ`.pack-version`을 여기서
+/// 기록하지 않는다(record_accepted **이후** apply_pack_transactional이 마지막 hard commit
+/// marker로 직접·검사 기록·R2CODE HIGH #1), ⓑ`.install-manifest.json` write 실패를 **fail-closed**로
+/// Err 반환해 apply_pack_transactional이 rollback_journal를 타게 한다 — 매니페스트가 손상/구상태로
+/// 남으면 다음 update preserve-gate가 새 파일을 사용자 수정본으로 오판(자동갱신·prune 차단)하는
+/// 부분커밋을 차단(R2CODE2 HIGH #1).
 pub fn install_from_iter<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
     items: I,
     force: bool,
     target_version: &str,
-    write_version_marker: bool,
+    transactional: bool,
 ) -> Result<(usize, usize), String> {
     // items를 한 번 Vec로 고정 — 쓰기 루프·prune embedded-set·exec bit 루프 세 곳이 같은 집합을 본다.
     let items: Vec<(&str, &str)> = items.into_iter().collect();
@@ -681,15 +685,33 @@ pub fn install_from_iter<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
             }
         }
     }
-    // 매니페스트 영속은 최선노력 — 실패해도 설치 자체는 유효하고, 다음 판정은
-    // 보존(안전측)으로 떨어진다.
-    if let Ok(json) = serde_json::to_string_pretty(&manifest) {
-        let _ = write_atomic(&manifest_path, json.as_bytes());
+    // 매니페스트 영속:
+    // - transactional=false(embed/cysd/init-pack): 최선노력 — 직렬화·write 실패해도 설치 자체는
+    //   유효하고 다음 판정은 보존(안전측)으로 떨어진다(외부 동작 불변).
+    // - transactional=true(pack-update): fail-closed — write 실패를 Err로 승격해
+    //   apply_pack_transactional이 rollback_journal를 타게 한다. 매니페스트가 손상/구상태로 남으면
+    //   다음 update preserve-gate가 새 파일을 사용자 수정본으로 오판(자동갱신·prune 차단)하기 때문
+    //   (R2CODE2 HIGH #1). 매니페스트 bytes는 apply_pack_transactional backup_set에 포함돼 rollback
+    //   대상이다.
+    match serde_json::to_string_pretty(&manifest) {
+        Ok(json) => {
+            let res = write_atomic(&manifest_path, json.as_bytes());
+            if transactional {
+                res.map_err(|e| format!("cannot write {}: {e}", manifest_path.display()))?;
+            } else {
+                let _ = res;
+            }
+        }
+        Err(e) => {
+            if transactional {
+                return Err(format!("cannot serialize manifest: {e}"));
+            }
+        }
     }
     // 팩 버전 기록 — 다음 install의 다운그레이드 판정 기준(target_version으로 갱신).
-    // ★pack-update 트랜잭션(write_version_marker=false)은 여기서 쓰지 않는다 — record_accepted
+    // ★pack-update 트랜잭션(transactional=true)은 여기서 쓰지 않는다 — record_accepted
     // 성공 후 apply_pack_transactional이 마지막 hard commit marker로 직접(검사) 기록한다.
-    if write_version_marker {
+    if !transactional {
         let _ = write_atomic(&dir.join(PACK_VERSION_FILE), target_version.as_bytes());
     }
     // cys 전용 CLAUDE_CONFIG_DIR 격리 셋업(박사님 2026-06-15) — 사용자 ~/.claude 오염으로부터
@@ -719,7 +741,7 @@ pub fn install_from_iter<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
 // 무중단 pack-update 적용 트랜잭션(§7-⑤ 옵션 b — 박사님 결정 ⑤ 확정: 심링크 마이그레이션 안 함).
 // backup journal + rollback + `.pack-version` = 마지막 hard commit marker로 전체 팩 적용에
 // all-or-nothing(부분적용 0)을 부여한다. ★install()/cysd 자동설치·init-pack 경로는 이 트랜잭션을
-// 거치지 않는다(install_from_iter를 write_version_marker=true로 직접 호출 — 외부 동작 불변).
+// 거치지 않는다(install_from_iter를 transactional=false로 직접 호출 — 외부 동작 불변).
 // pack-update만 apply_pack_transactional로 감싼다. R2CODE HIGH #1 해소.
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -817,6 +839,15 @@ pub fn rollback_journal() -> Result<(), String> {
             match std::fs::remove_file(&target) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                // 백업 시 파일이 아니라 디렉터리였던 경로(예: 손상돼 디렉터리가 된
+                // .install-manifest.json)는 bytes 백업 불가라 existed=false로 기록된다. remove_file은
+                // 디렉터리에 실패하므로 remove_dir_all로 손상물을 정리해 rollback이 중단 없이
+                // pre-state(손상물 부재=안전측)로 수렴하게 한다(R2CODE2 HIGH #1 fail-closed 경로).
+                Err(_) if target.is_dir() => {
+                    std::fs::remove_dir_all(&target).map_err(|e| {
+                        format!("journal 신규 디렉터리 삭제 실패 {}: {e}", target.display())
+                    })?;
+                }
                 Err(e) => {
                     return Err(format!("journal 신규파일 삭제 실패 {}: {e}", target.display()))
                 }
@@ -891,9 +922,10 @@ where
     }
     backup_set.insert(INSTALL_MANIFEST.to_string());
     write_journal(target_version, &backup_set)?;
-    // ② 파일 반영 — .pack-version은 여기서 쓰지 않는다(④에서 commit marker로).
+    // ② 파일 반영(transactional=true) — .pack-version은 여기서 쓰지 않고(④에서 commit marker로),
+    //    .install-manifest.json write 실패는 fail-closed로 Err가 되어 아래 rollback을 탄다.
     let (written, kept) =
-        match install_from_iter(items.iter().copied(), false, target_version, false) {
+        match install_from_iter(items.iter().copied(), false, target_version, true) {
             Ok(v) => v,
             Err(e) => {
                 let _ = rollback_journal();
@@ -1375,7 +1407,7 @@ mod tests {
             PACK.iter().chain(PACK_SKILLS.iter()).map(|(r, c)| (*r, *c)),
             false,
             env!("CARGO_PKG_VERSION"),
-            true,
+            false,
         );
         let fp_b = fingerprint_dir(&td_b);
 
@@ -1673,5 +1705,71 @@ mod tests {
         assert_eq!(recovered.expect("recover 실패"), true, "orphan 미발견");
         assert_eq!(soul, "NEW-SOUL", "커밋된 내용을 잘못 rollback함");
         assert!(!journal_exists, "정리 후 저널 잔존");
+    }
+
+    /// ★핵심(R2CODE2 HIGH #1): pack-update 트랜잭션에서 .install-manifest.json write_atomic 실패
+    /// (경로를 디렉터리로 만들어 rename 실패 유발)는 fail-closed로 Err가 되어 apply_pack_transactional이
+    /// rollback을 타야 한다. 트리 pre-state 복원(soul.md=OLD·new.txt 제거)·.pack-version 불변(미커밋)을
+    /// assert해 부분커밋 0을 증명한다.
+    #[test]
+    fn manifest_write_failure_transactional_rolls_back() {
+        let _g = PACK_ENV_LOCK.lock().unwrap();
+        let saved = std::env::var(ENV_PACK_DIR).ok();
+        let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
+        let (base, pd) = txn_prestate("manifest-fail", &[("soul.md", "OLD-SOUL")], "1.0.0");
+        // .install-manifest.json을 디렉터리로 치환 → write_atomic(rename) 실패 유발(IO fault 주입).
+        let mp = pd.join(INSTALL_MANIFEST);
+        std::fs::remove_file(&mp).unwrap();
+        std::fs::create_dir_all(mp.join("child")).unwrap();
+
+        let items: Vec<(&str, &str)> = vec![("soul.md", "NEW-SOUL"), ("new.txt", "NEW")];
+        let committed = std::cell::Cell::new(false);
+        let res = apply_pack_transactional(&items, "2.0.0", || {
+            committed.set(true);
+            Ok(())
+        });
+
+        let soul = std::fs::read_to_string(pd.join("soul.md")).unwrap();
+        let new_exists = pd.join("new.txt").exists();
+        let pv = std::fs::read_to_string(pd.join(PACK_VERSION_FILE)).unwrap();
+        let journal_exists = pack_journal_dir().exists();
+        restore_env(saved, saved_cfg);
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert!(res.is_err(), "매니페스트 write 실패인데 성공 반환(best-effort 흡수)");
+        assert!(!committed.get(), "파일 반영 실패 전에 commit_extra가 호출되면 안됨");
+        assert_eq!(soul, "OLD-SOUL", "rollback이 soul.md를 pre-state로 복원 못함");
+        assert!(!new_exists, "rollback이 신규 new.txt를 제거 못함(부분적용 잔존)");
+        assert_eq!(pv.trim(), "1.0.0", ".pack-version 불변이어야(미커밋)");
+        assert!(!journal_exists, "rollback 후 저널 잔존");
+    }
+
+    /// ★대조(외부 동작 불변): embed/cysd/init-pack 경로(transactional=false)는 .install-manifest.json이
+    /// 디렉터리여도 매니페스트 영속을 best-effort로 무시하고 설치를 진행한다 — 파일 반영·.pack-version
+    /// 기록이 종전대로 일어난다(fail-closed는 pack-update 트랜잭션 전용).
+    #[test]
+    fn manifest_write_failure_embed_best_effort_proceeds() {
+        let _g = PACK_ENV_LOCK.lock().unwrap();
+        let saved = std::env::var(ENV_PACK_DIR).ok();
+        let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
+        let (base, pd) = txn_prestate("manifest-embed", &[("soul.md", "OLD-SOUL")], "1.0.0");
+        let mp = pd.join(INSTALL_MANIFEST);
+        std::fs::remove_file(&mp).unwrap();
+        std::fs::create_dir_all(mp.join("child")).unwrap();
+
+        // new.txt는 신규(preserve-gate 충돌 없음)라 반영된다. soul.md는 매니페스트 불가독으로
+        // preserve-gate가 안전측 보존(OLD 유지) — 이는 manifest 손상의 정상 부작용이며 embed
+        // best-effort 분기와 무관하다. 핵심: 매니페스트 write 실패에도 Err 없이 진행 + 버전 마커 기록.
+        let items: Vec<(&str, &str)> = vec![("soul.md", "NEW-SOUL"), ("new.txt", "NEW")];
+        let res = install_from_iter(items.iter().copied(), false, "2.0.0", false);
+
+        let new_exists = pd.join("new.txt").exists();
+        let pv = std::fs::read_to_string(pd.join(PACK_VERSION_FILE)).unwrap();
+        restore_env(saved, saved_cfg);
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert!(res.is_ok(), "embed 경로(best-effort)인데 매니페스트 실패로 Err 반환");
+        assert!(new_exists, "embed 경로 신규 파일(new.txt) 반영 안됨");
+        assert_eq!(pv.trim(), "2.0.0", "embed 경로 .pack-version 기록 안됨(외부 동작 변경)");
     }
 }
