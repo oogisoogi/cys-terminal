@@ -708,11 +708,40 @@ pub fn persist_topology(daemon: &Arc<Daemon>) {
         })
         .collect();
     let dir = crate::state::state_dir(&daemon.socket_path);
-    let _ = std::fs::write(
-        dir.join("topology.json"),
-        serde_json::to_string_pretty(&json!({"updated_at": now_epoch(), "entries": entries}))
-            .unwrap_or_default(),
-    );
+    let content = serde_json::to_string_pretty(&json!({"updated_at": now_epoch(), "entries": entries}))
+        .unwrap_or_default();
+    // ★원자 쓰기 — SIGTERM/크래시가 쓰기 도중 끼어도 topology.json은 옛 완본 또는 새 완본만
+    // 남는다. 비원자 write면 torn write가 깨진 JSON을 남기고 load_topology가 빈 배열로 폴백해
+    // 전 노드 resume 핀(=전 세션 컨텍스트)이 증발한다. 패턴: reference_atomic-sidecar-json-write.
+    let _ = write_json_atomic(&dir, "topology.json", &content);
+}
+
+/// 손상-안전 원자 JSON 쓰기: 같은 디렉터리 temp에 write + fsync(file) → rename(원자 교체)
+/// → fsync(dir). rename 원자성 ≠ 데이터 내구성이므로 fsync(file)로 데이터를, fsync(dir)로
+/// rename을 영속한다(dir fsync 없으면 rename이 캐시에만 남아 크래시 시 옛 이름 복귀). 실패 시 temp 정리.
+fn write_json_atomic(dir: &std::path::Path, name: &str, content: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let target = dir.join(name);
+    let tmp = dir.join(format!(".{name}.tmp"));
+    let res = (|| -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(content.as_bytes())?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, &target)?;
+        Ok(())
+    })();
+    match res {
+        Ok(()) => {
+            if let Ok(d) = std::fs::File::open(dir) {
+                let _ = d.sync_all();
+            }
+            Ok(())
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
 }
 
 pub fn load_topology(daemon: &Arc<Daemon>) -> serde_json::Value {

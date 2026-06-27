@@ -465,6 +465,50 @@ fn resolve_sidecar(name: &str) -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from(name))
 }
 
+/// 업데이트 재시작 후 자동복귀 마커 경로 — install_update(재시작 직전)가 쓰고, 재시작된 cys-app
+/// setup이 읽는다. 두 프로세스가 공유하는 ~/.cys 아래에 둔다.
+fn pending_restore_path() -> std::path::PathBuf {
+    std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cys/.pending-restore")
+}
+
+/// 업데이트로 인한 재시작이면(마커 존재) 두 가지를 한다:
+///  ① 새 기능 배포 — 새 cys 바이너리에 embed된 팩(pack.rs include_str! + build.rs PACK_SKILLS)을
+///     `cys init-pack --no-install-hook`으로 ~/.cys/pack에 반영한다. --no-install-hook: hook 등록은
+///     최초 설치/launch-agent에서 끝나므로 매 업데이트마다 settings.json을 건드리지 않는다(.bak-cys
+///     백업 파괴·활성 프로필 재직렬화 방지 — 적대검증 serious). force 없이 호출하므로 preserve-gate가
+///     사용자 수정 파일을 보존하고 비수정·신규만 갱신한다.
+///  ② 자동복귀 — 팩 반영 성공 시에만 `cys restore --include-master`로 노드를 session_id resume
+///     재런칭(작업 무손실). init-pack 실패 시 마커를 보존하고 복원을 보류해, 노드가 구 디렉티브로
+///     조용히 각성하는 침묵 실패를 막는다(적대검증 fatal). restore는 멱등(run_restore cys.rs:3791).
+fn maybe_apply_pending_update(app: &AppHandle) {
+    let marker = pending_restore_path();
+    if !marker.exists() {
+        return;
+    }
+    // ① 새 팩(새 기능) 반영 — 성공 여부를 검사한다(침묵 실패 차단).
+    let pack_ok = std::process::Command::new(resolve_sidecar("cys"))
+        .arg("init-pack")
+        .arg("--no-install-hook")
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !pack_ok {
+        // 실패 — 마커를 보존(다음 재시작에 재시도)하고 노드 복원을 보류한다. 구 디렉티브로
+        // 조용히 각성하는 것을 막고 사용자에게 알린다.
+        let _ = app.emit(
+            "update-error",
+            "새 팩 반영(init-pack) 실패 — 노드 복원 보류, 다음 재시작에 재시도",
+        );
+        return;
+    }
+    // 성공 후에만 마커 제거 + 자동복귀.
+    let _ = std::fs::remove_file(&marker);
+    let _ = std::process::Command::new(resolve_sidecar("cys"))
+        .arg("restore")
+        .arg("--include-master")
+        .spawn();
+}
+
 /// D5/P1: UI 발 키 전송 — surface.send_key RPC 래퍼. send_input(send_text)과 달리 Return 등 키 전송 가능.
 /// human 플래그 미사용(데몬 send_key 핸들러는 전부 프로그램 경로 — 읽지 않음).
 #[tauri::command]
@@ -1064,8 +1108,10 @@ async fn install_update(app: AppHandle, force: bool) -> Result<(), String> {
     // 3) 데몬 핸드오프: 구 데몬을 정상 종료(SIGTERM — scoped 정리·소켓 제거)해야
     //    재시작 후 새 번들의 cysd가 뜬다. 종료 안 하면 구 데몬이 계속 세션을 들고 돈다.
     let _ = app.emit("update-progress", json!({"phase": "handoff"}));
+    // 재시작 후 자동복귀 예약 — 새 cys-app setup이 이 마커를 보고 cys restore로 노드를 resume 재런칭한다.
+    let _ = std::fs::write(pending_restore_path(), "");
     stop_running_daemon().await;
-    // 4) 앱 재시작 — setup의 ensure_daemon이 새 cysd를 자동 기동한다
+    // 4) 앱 재시작 — setup의 ensure_daemon이 새 cysd를 자동 기동, maybe_restore_after_update가 노드 복원
     app.restart();
 }
 
@@ -1196,7 +1242,10 @@ fn main() {
                     return;
                 }
                 let _ = handle.emit("daemon-ready", ());
-                spawn_event_forwarder(handle, default_socket());
+                // event-forwarder를 먼저 띄워 init-pack 블로킹이 양방향 이벤트 파이프를 막지 않게 한다(반쪽 부팅 방지).
+                spawn_event_forwarder(handle.clone(), default_socket());
+                // 업데이트 재시작 시: 새 팩(새 기능) 반영 + 노드 자동복귀(마커가 있을 때만).
+                maybe_apply_pending_update(&handle);
             });
             Ok(())
         })

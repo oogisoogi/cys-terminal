@@ -494,6 +494,46 @@ pub fn install(force: bool) -> Result<(usize, usize), String> {
         manifest.insert(rel.to_string(), content_hash(content));
         written += 1;
     }
+    // prune: 임베드에서 사라진 옛 파일(폐기 스킬·디렉티브)을 제거해 '기능 제거 배포'를 가능케 한다.
+    // 비수정(설치-당시 해시 == 현재 디스크 해시)만 삭제하고, 사용자 수정본·*_DIRECTIVE.md는 보존(안전측).
+    // embed 목록이 비정상적으로 비면(빌드 이상) 전량 삭제 재앙을 막기 위해 prune을 건너뛴다.
+    {
+        let embedded: std::collections::HashSet<&str> =
+            PACK.iter().chain(PACK_SKILLS.iter()).map(|(rel, _)| *rel).collect();
+        if !embedded.is_empty() {
+            let stale: Vec<String> = manifest
+                .keys()
+                .filter(|rel| !embedded.contains(rel.as_str()))
+                .cloned()
+                .collect();
+            let mut pruned = 0;
+            for rel in stale {
+                if rel.ends_with("_DIRECTIVE.md") {
+                    continue; // 디렉티브는 영구 보존(멀티마스터 정식화)
+                }
+                let path = dir.join(&rel);
+                match std::fs::read_to_string(&path) {
+                    // 비수정(설치-당시 해시 == 디스크 해시) → 제거 + 매니페스트에서 삭제.
+                    Ok(existing)
+                        if manifest.get(&rel).map(String::as_str)
+                            == Some(content_hash(&existing).as_str()) =>
+                    {
+                        if std::fs::remove_file(&path).is_ok() {
+                            manifest.remove(&rel);
+                            pruned += 1;
+                        }
+                    }
+                    Ok(_) => {} // 사용자 수정본 → 보존(매니페스트 유지)
+                    Err(_) => {
+                        manifest.remove(&rel); // 파일 이미 없음 → 매니페스트만 정리
+                    }
+                }
+            }
+            if pruned > 0 {
+                eprintln!("[init-pack] pruned {pruned} stale (removed) file(s)");
+            }
+        }
+    }
     // 매니페스트 영속은 최선노력 — 실패해도 설치 자체는 유효하고, 다음 판정은
     // 보존(안전측)으로 떨어진다.
     if let Ok(json) = serde_json::to_string_pretty(&manifest) {
