@@ -1059,6 +1059,73 @@ async fn check_update(app: AppHandle) -> Result<Option<Value>, String> {
     }
 }
 
+/// 기본 원격 pack-manifest.json URL — tauri.conf updater endpoint(latest.json)와 같은
+/// release 'latest' 자산에 동봉된다(release.yml이 함께 업로드, DESIGN §5 파일맵).
+fn default_pack_manifest_url() -> String {
+    "https://github.com/idoforgod/cys-terminal-releases/releases/latest/download/pack-manifest.json"
+        .to_string()
+}
+
+/// 무중단 팩 업데이트 가용성 확인(DESIGN §7-④ 3축 게이트) — 원격 pack-manifest.json만 경량
+/// 페치(curl)해 디스크 `.pack-version` 및 실행 바이너리 버전과 비교한다. ★pack.tar.gz·서명은
+/// 받지 않는다(폴링 비용 최소화) — 실제 다운로드·서명검증·원자적 반영·reinject는
+/// install_pack_update(사이드카 cys pack-update)가 전담한다(불가침).
+/// 반환:
+///   - None                       → 새 팩 없음(up-to-date) 또는 페치/파싱 실패(폴링이라 조용히).
+///   - Some({pack_version, manifest_url, min_binary_version, binary_too_old})
+///       binary_too_old=false → 무중단 가능(install_pack_update 경로)
+///       binary_too_old=true  → min_binary_version > 실행 바이너리 = 무중단 거부, 바이너리(재시작) 경로 안내
+#[tauri::command]
+async fn check_pack_update(manifest_url: Option<String>) -> Result<Option<Value>, String> {
+    let url = manifest_url.unwrap_or_else(default_pack_manifest_url);
+    // 경량 페치: manifest JSON만 stdout으로. blocking 풀에서 실행(install_pack_update curl 패턴 동형).
+    let fetch_url = url.clone();
+    let out = tokio::task::spawn_blocking(move || {
+        std::process::Command::new("curl").args(["-fsSL", &fetch_url]).output()
+    })
+    .await
+    .map_err(|e| format!("curl join 실패: {e}"))?
+    .map_err(|e| format!("curl 실행 실패: {e}"))?;
+    // 네트워크/부재로 페치 실패 = 조용히 None(폴링 — 에러 토스트 미발화).
+    if !out.status.success() {
+        return Ok(None);
+    }
+    // 미서명/필수필드 부재 manifest는 packsig PackManifest 역직렬화에서 fail-closed(거부).
+    let manifest: cys::packsig::PackManifest = match serde_json::from_slice(&out.stdout) {
+        Ok(m) => m,
+        Err(_) => return Ok(None),
+    };
+    let disk = std::fs::read_to_string(cys::pack::pack_dir().join(".pack-version"))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    // 축1 반영 판정: remote가 디스크보다 strictly-newer 여야(파싱 실패=거부=no-op). cys.rs version_gates와 동일 SOT.
+    if !cys::pack::remote_is_newer(&manifest.pack_version, &disk) {
+        return Ok(None);
+    }
+    // 축2 호환 게이트: min_binary_version ≤ 실행 바이너리(env CARGO_PKG_VERSION = 단일 버전선).
+    let binary_too_old = pack_binary_too_old(&manifest.min_binary_version, env!("CARGO_PKG_VERSION"));
+    Ok(Some(json!({
+        "pack_version": manifest.pack_version,
+        "min_binary_version": manifest.min_binary_version,
+        "manifest_url": url,
+        "binary_too_old": binary_too_old,
+    })))
+}
+
+/// 무중단 호환 게이트(DESIGN §7-④ 축2) 순수 판정 — min_binary_version > 실행 바이너리면 true(무중단
+/// 거부=바이너리 경로). 빈 값=제약 없음(false), 어느 쪽이든 파싱 실패=거부(true, 보수적).
+/// cys.rs version_gates의 호환 게이트와 동일 의미 — 단위테스트 대상.
+fn pack_binary_too_old(min_binary: &str, running: &str) -> bool {
+    let min = min_binary.trim();
+    if min.is_empty() {
+        return false;
+    }
+    match (cys::pack::parse_semver(min), cys::pack::parse_semver(running)) {
+        (Some(m), Some(r)) => m > r,
+        _ => true,
+    }
+}
+
 /// 데몬 핸드오프 정책(오너 결정): 살아있는 세션 0개면 데몬 종료까지 자동,
 /// 있으면 거부하고 세션 수를 알려 UI가 확인을 받게 한다(force=true면 강행).
 /// 반환: 종료된 세션 수.
@@ -1323,6 +1390,7 @@ fn main() {
             run_skill,
             skill_out_dir,
             check_update,
+            check_pack_update,
             live_session_count,
             install_update,
             install_pack_update,
@@ -1409,6 +1477,23 @@ mod tests {
             parse_reinject_counts("PACK_UPDATE_RESULT pack_version=1.2.3 injected=0 skipped=0 deferred=2 failed=0"),
             (0, 2)
         );
+    }
+
+    // check_pack_update 호환 게이트(DESIGN §7-④ 축2): min_binary_version > 실행 바이너리 = 무중단 거부.
+    #[test]
+    fn pack_binary_too_old_gate() {
+        // 빈 값 = 제약 없음 → 무중단 허용.
+        assert!(!pack_binary_too_old("", "0.4.2"));
+        assert!(!pack_binary_too_old("   ", "0.4.2"));
+        // min ≤ running → 허용.
+        assert!(!pack_binary_too_old("0.4.2", "0.4.2"), "동일 버전 허용");
+        assert!(!pack_binary_too_old("0.4.1", "0.4.2"), "min < running 허용");
+        // min > running → 거부(바이너리 경로).
+        assert!(pack_binary_too_old("0.5.0", "0.4.2"), "min > running 거부");
+        assert!(pack_binary_too_old("1.0.0", "0.4.2"));
+        // 파싱 실패 = 거부(보수적).
+        assert!(pack_binary_too_old("not-a-version", "0.4.2"));
+        assert!(pack_binary_too_old("0.5.0", "garbage"));
     }
 
     // 회귀: windows 업데이트 핸드오프가 데몬을 taskkill /F로 하드킬하면 cysd의

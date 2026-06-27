@@ -2496,27 +2496,64 @@ async function refreshFeed() {
 // ---------- 자동 업데이트 ----------
 
 let updateAvailable: { version: string; notes?: string } | null = null;
+// 무중단 팩 업데이트(check_pack_update) 결과 — 팩만 변경 시 세션·데몬 유지 경로(install_pack_update).
+let packUpdateAvailable: { pack_version: string; manifest_url: string; binary_too_old: boolean } | null = null;
 
 /// 업데이트 확인. silent=true면 시작 시 백그라운드 체크(결과 없으면 조용히).
+/// 바이너리(check_update·재시작)와 무중단 팩(check_pack_update·세션 유지)을 둘 다 확인해 분기한다.
 async function checkForUpdate(silent: boolean) {
-  let res: { version: string; current?: string; notes?: string } | null;
+  // 1) 바이너리 업데이트(Tauri updater latest.json) — 재시작 경로.
+  let bin: { version: string; current?: string; notes?: string } | null = null;
+  let binCheckFailed = false;
   try {
-    res = (await invoke("check_update")) as typeof res;
+    bin = (await invoke("check_update")) as typeof bin;
   } catch (e) {
+    // ★early-return 안 함(팩 체크는 계속) — 단, 바이너리 상태 불명을 기억해 아래 '최신' 단정을 억제한다.
+    binCheckFailed = true;
     if (!silent) toast("health", "업데이트 확인 실패", String(e));
-    return;
   }
+  // 2) 무중단 팩 업데이트(pack-manifest.json) — 세션·데몬 유지 경로. 실패는 조용히(폴링).
+  let pack: { pack_version: string; manifest_url: string; binary_too_old: boolean } | null = null;
+  try {
+    pack = (await invoke("check_pack_update")) as typeof pack;
+  } catch {
+    /* 팩 체크 실패(네트워크·부재) = 조용히 무시 */
+  }
+
+  updateAvailable = bin && bin.version ? { version: bin.version, notes: bin.notes } : null;
+  packUpdateAvailable =
+    pack && pack.pack_version
+      ? { pack_version: pack.pack_version, manifest_url: pack.manifest_url, binary_too_old: pack.binary_too_old }
+      : null;
+
   const badge = document.getElementById("update-badge")!;
-  if (res && res.version) {
-    updateAvailable = { version: res.version, notes: res.notes };
+  if (updateAvailable) {
+    // 바이너리 우선 — 재시작이 팩도 함께 반영(DESIGN '둘 다 → 바이너리 우선').
     badge.hidden = false;
     badge.textContent = "!";
+    badge.title = `새 버전 ${updateAvailable.version} (재시작 필요)`;
     if (!silent) promptInstall();
-    else toast("feed", "🔄 업데이트 있음", `새 버전 ${res.version} — 상단 Update 버튼`);
+    else toast("feed", "🔄 업데이트 있음", `새 버전 ${updateAvailable.version} — 상단 Update(재시작)`);
+  } else if (packUpdateAvailable && !packUpdateAvailable.binary_too_old) {
+    // 팩만 변경 + 바이너리 호환 → 무중단 가능(세션·데몬 생존).
+    badge.hidden = false;
+    badge.textContent = "↻";
+    badge.title = `팩 ${packUpdateAvailable.pack_version} (무중단·세션 유지)`;
+    if (!silent) promptPackInstall();
+    else
+      toast("feed", "↻ 무중단 팩 업데이트", `팩 ${packUpdateAvailable.pack_version} — 상단 Update(재시작 없음)`);
+  } else if (packUpdateAvailable && packUpdateAvailable.binary_too_old) {
+    // 팩은 있으나 min_binary_version > 설치 바이너리 → 무중단 불가, 바이너리 업데이트 필요.
+    badge.hidden = false;
+    badge.textContent = "!";
+    badge.title = `팩 ${packUpdateAvailable.pack_version}: 바이너리 업데이트 필요`;
+    const msg = `새 팩 ${packUpdateAvailable.pack_version}은 더 새로운 바이너리를 요구합니다 — 바이너리 업데이트(재시작) 후 적용됩니다.`;
+    if (!silent) toast("health", "바이너리 업데이트 필요", msg);
+    else toast("feed", "⚠ 업데이트 있음", msg);
   } else {
-    updateAvailable = null;
     badge.hidden = true;
-    if (!silent) toast("watchdog", "최신 버전", "이미 최신입니다.");
+    // 바이너리 체크가 실패했으면 상태 불명 — '이미 최신' 단정 금지(실패 토스트가 이미 알림, 모순 차단).
+    if (!silent && !binCheckFailed) toast("watchdog", "최신 버전", "이미 최신입니다.");
   }
 }
 
@@ -2552,6 +2589,33 @@ async function promptInstall() {
       toast("health", "업데이트 설치 실패", msg);
     }
   }
+}
+
+/// 무중단 팩 설치 — install_pack_update(세션·데몬 생존, app.restart 없음) 호출.
+/// 진행/완료/경고는 pack-progress·pack-updated·update-warning 리스너가 표시한다(아래 startup).
+/// ★"재시작" 확인 다이얼로그를 띄우지 않는다 — 세션이 죽지 않는 게 바이너리 경로와의 핵심 차이.
+async function promptPackInstall() {
+  if (!packUpdateAvailable) {
+    await checkForUpdate(false);
+    return;
+  }
+  const pv = packUpdateAvailable.pack_version;
+  toast("feed", "↻ 무중단 팩 업데이트", `팩 ${pv} 적용 중… 세션·데몬 유지(재시작 없음).`);
+  try {
+    await invoke("install_pack_update", { manifestUrl: packUpdateAvailable.manifest_url });
+    // 성공(또는 degraded)은 pack-updated/update-warning 리스너가 후속 처리.
+  } catch (e) {
+    // 백엔드가 update-error도 emit하지만, join/실행 단계 실패는 emit 없이 reject되므로 여기서 표시.
+    toast("health", "팩 업데이트 실패", String(e));
+  }
+}
+
+/// Update 버튼 디스패처 — 가용 업데이트 종류에 따라 경로를 고른다.
+/// 바이너리 우선(재시작이 팩 포함) → 무중단 팩 → 미확인/바이너리 필요 시 수동 재확인.
+async function onUpdateButton() {
+  if (updateAvailable) return promptInstall();
+  if (packUpdateAvailable && !packUpdateAvailable.binary_too_old) return promptPackInstall();
+  return checkForUpdate(false);
 }
 
 /// 간단한 확인 모달 (WKWebView confirm 회피). resolve(true/false).
@@ -3001,6 +3065,39 @@ async function start() {
 
   await listen("daemon-event", (e) => onDaemonEvent(e.payload as Record<string, unknown>));
 
+  // 무중단 팩 업데이트 진행 피드백(install_pack_update가 emit). ★app.restart 없음 — 세션 유지된 채 적용.
+  await listen("pack-progress", (e) => {
+    const p = (e.payload ?? {}) as { phase?: string };
+    if (p.phase === "start")
+      toast("feed", "🔄 무중단 적용 중", "서명검증 → 다운로드 → 원자적 팩 교체 → 노드 reinject…");
+  });
+  await listen("pack-updated", (e) => {
+    const p = (e.payload ?? {}) as { pack_version?: string; reinject_failed?: number; reinject_deferred?: number };
+    packUpdateAvailable = null;
+    const badge = document.getElementById("update-badge")!;
+    if (!updateAvailable) badge.hidden = true; // 바이너리 업데이트가 별도로 남아있지 않으면 배지 해제
+    // degraded(reinject 일부 실패/보류)면 '완료' 단정 회피 — 상세는 update-warning이 띄운다(모순 차단).
+    const failed = p.reinject_failed ?? 0;
+    const deferred = p.reinject_deferred ?? 0;
+    if (failed > 0 || deferred > 0) {
+      toast(
+        "watchdog",
+        "✅ 팩 디스크 반영 완료",
+        `팩 ${p.pack_version ?? ""} 적용 — 세션 유지(재시작 없음). 일부 노드 reinject 보류/실패는 다음 폴링에서 재시도.`,
+      );
+    } else {
+      toast(
+        "watchdog",
+        "✅ 팩 업데이트 완료",
+        `팩 ${p.pack_version ?? ""} 적용 — 세션 유지·노드 reinject 완료(재시작 없음).`,
+      );
+    }
+  });
+  await listen("update-warning", (e) => {
+    const p = (e.payload ?? {}) as { message?: string };
+    toast("health", "⚠ 팩 일부 미각성", p.message ?? "디스크 팩은 갱신됐으나 일부 노드 reinject 보류/실패(라이브 유지).");
+  });
+
   // 시작 시 + 6시간마다 백그라운드 업데이트 확인 (조용히 — 있으면 badge·toast)
   checkForUpdate(true);
   setInterval(() => checkForUpdate(true), 6 * 3600 * 1000);
@@ -3231,7 +3328,7 @@ document.getElementById("cc-sessions-redact")!.addEventListener("click", (e) => 
   ccSessionSelected = null;
   refreshSessions();
 });
-document.getElementById("btn-update")!.addEventListener("click", () => promptInstall());
+document.getElementById("btn-update")!.addEventListener("click", () => onUpdateButton());
 document.getElementById("btn-ws-new")!.addEventListener("click", () => addWorkspace());
 // 멀티마스터 F4 + ＋부서 자동화(패치5): 새 부서(독립 데몬) workspace 런칭. 부서 번호는 백엔드가 확정.
 const deptBtn = document.getElementById("btn-ws-dept") as HTMLButtonElement | null;
