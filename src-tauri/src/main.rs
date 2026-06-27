@@ -1070,35 +1070,43 @@ fn default_pack_manifest_url() -> String {
 /// 페치(curl)해 디스크 `.pack-version` 및 실행 바이너리 버전과 비교한다. ★pack.tar.gz·서명은
 /// 받지 않는다(폴링 비용 최소화) — 실제 다운로드·서명검증·원자적 반영·reinject는
 /// install_pack_update(사이드카 cys pack-update)가 전담한다(불가침).
-/// 반환:
-///   - None                       → 새 팩 없음(up-to-date) 또는 페치/파싱 실패(폴링이라 조용히).
-///   - Some({pack_version, manifest_url, min_binary_version, binary_too_old})
-///       binary_too_old=false → 무중단 가능(install_pack_update 경로)
-///       binary_too_old=true  → min_binary_version > 실행 바이너리 = 무중단 거부, 바이너리(재시작) 경로 안내
+/// 반환(★3상태 — UI가 'transient 장애'와 '확인된 no-update'를 구분해 fail-safe 상태보존):
+///   - Ok(Some({pack_version, manifest_url, min_binary_version, binary_too_old}))
+///       → 확인된 새 팩 있음. binary_too_old=false=무중단 가능(install_pack_update 경로) /
+///         true=min_binary_version > 실행 바이너리 = 무중단 거부, 바이너리(재시작) 경로 안내.
+///   - Ok(None)  → ★확인된 'no-update'에만(원격을 받아·파싱해 비교했고 디스크보다 새것이 아님).
+///                 UI는 이때만 packUpdateAvailable을 해제한다.
+///   - Err(..)   → transient/unknown 실패(spawn/join·curl 실행·HTTP 비정상·manifest 파싱/검증
+///                 실패). UI의 기존 catch가 packCheckFailed=true로 잡아 ★마지막 검증 상태를 보존하고
+///                 토스트는 띄우지 않는다(silent 폴링). '확인된 no-update'와 섞지 않는 게 핵심 —
+///                 일시 장애로 packUpdateAvailable이 소거돼 배지가 사라지는 것을 막는다.
+///                 (역직렬화 fail-closed는 보안상 유지 — 미서명/변조 manifest를 Some으로 오인하지 않고
+///                  unknown=Err로 분류한다.)
 #[tauri::command]
 async fn check_pack_update(manifest_url: Option<String>) -> Result<Option<Value>, String> {
     let url = manifest_url.unwrap_or_else(default_pack_manifest_url);
     // 경량 페치: manifest JSON만 stdout으로. blocking 풀에서 실행(install_pack_update curl 패턴 동형).
     let fetch_url = url.clone();
-    // ★폴링 silent 계약: spawn/join 실패·curl 실행 실패·HTTP 비정상 모두 조용히 None(에러 미전파).
-    //   업데이트 가용성 확인은 best-effort 폴링이라 일시 장애를 에러로 올리지 않는다(doc 주석과 정합).
+    // ★transient 실패(spawn/join·curl 실행·HTTP 비정상)는 Err로 돌린다 — UI catch가 상태보존(silent).
+    //   Ok(None)으로 접으면 '확인된 no-update'와 구분 불가 → 일시 장애에 배지 소거(codex R2 #1).
     let joined = tokio::task::spawn_blocking(move || {
         std::process::Command::new("curl").args(["-fsSL", &fetch_url]).output()
     })
     .await;
     let out = match joined {
         Ok(Ok(out)) if out.status.success() => out,
-        _ => return Ok(None),
+        Ok(Ok(out)) => return Err(format!("pack-manifest HTTP 실패(code {:?})", out.status.code())),
+        Ok(Err(e)) => return Err(format!("curl 실행 실패: {e}")),
+        Err(e) => return Err(format!("curl join 실패: {e}")),
     };
-    // 미서명/필수필드 부재 manifest는 packsig PackManifest 역직렬화에서 fail-closed(거부).
-    let manifest: cys::packsig::PackManifest = match serde_json::from_slice(&out.stdout) {
-        Ok(m) => m,
-        Err(_) => return Ok(None),
-    };
+    // 미서명/필수필드 부재 manifest는 packsig PackManifest 역직렬화에서 fail-closed(거부). Some으로 오인하지
+    // 않되 '확인된 no-update'(Ok(None))도 아닌 unknown → Err(상태보존). 보안(fail-closed) 유지.
+    let manifest: cys::packsig::PackManifest = serde_json::from_slice(&out.stdout)
+        .map_err(|e| format!("pack-manifest 파싱/검증 실패(fail-closed): {e}"))?;
     let disk = std::fs::read_to_string(cys::pack::pack_dir().join(".pack-version"))
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
-    // 축1 반영 판정: remote가 디스크보다 strictly-newer 여야(파싱 실패=거부=no-op). cys.rs version_gates와 동일 SOT.
+    // 축1 반영 판정: remote가 디스크보다 strictly-newer 여야. ★여기서 false면 '확인된 no-update' = Ok(None).
     if !cys::pack::remote_is_newer(&manifest.pack_version, &disk) {
         return Ok(None);
     }

@@ -2563,8 +2563,8 @@ async function checkForUpdate(silent: boolean) {
     // ★fail-safe: 양쪽 체크가 모두 성공적으로 '없음'을 확인했을 때만 배지를 해제한다. 장애(체크 실패)
     // 시엔 마지막 검증 상태(배지)를 유지한다 — 일시 장애로 배지가 사라지지 않게.
     if (!binCheckFailed && !packCheckFailed) badge.hidden = true;
-    // 바이너리 체크가 실패했으면 상태 불명 — '이미 최신' 단정 금지(실패 토스트가 이미 알림, 모순 차단).
-    if (!silent && !binCheckFailed) toast("watchdog", "최신 버전", "이미 최신입니다.");
+    // 어느 한쪽이라도 체크 실패면 상태 불명 — '이미 최신' 단정 금지(바이너리·팩 둘 다 성공 확인 시에만).
+    if (!silent && !binCheckFailed && !packCheckFailed) toast("watchdog", "최신 버전", "이미 최신입니다.");
   }
 }
 
