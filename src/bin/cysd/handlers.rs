@@ -1973,6 +1973,70 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             Reply::Single(ok_response(&id, json!({"surface_id": sid, "state": state})))
         }
 
+        // ─── ⑪ pack-reinject 마커 단일 write path: 주입 성공 직후 컨트롤러가 호출 ───
+        // status.set(자기보고) 확장이 아닌 전용 RPC다. 노드 자기보고로는 갱신 불가 —
+        // pack-update/reinject 컨트롤러(cysd-매개 발신)가 surface_id·pack_version·directive_hash로
+        // 마커를 확정한다. 락은 get_surface(surfaces 락 단발·짧게)만 — roles 락 미접촉(데드락 회피).
+        "reinject.mark" => {
+            let Some(sid) = resolve_surface_id(&params) else {
+                return Reply::Single(err_response(&id, "invalid_params", "missing surface_id"));
+            };
+            let Some(pack_version) = param_str(&params, "pack_version") else {
+                return Reply::Single(err_response(&id, "invalid_params", "missing pack_version"));
+            };
+            let Some(directive_hash) = param_str(&params, "directive_hash") else {
+                return Reply::Single(err_response(
+                    &id,
+                    "invalid_params",
+                    "missing directive_hash",
+                ));
+            };
+            let Some(surface) = daemon.get_surface(sid) else {
+                return Reply::Single(err_response(
+                    &id,
+                    "not_found",
+                    &format!("surface {sid} not found"),
+                ));
+            };
+            // 신원 게이트(status.set와 동형): reinject.mark는 dedup 마커의 단일 write path지만
+            // 권한이 없으면 어떤 노드 pane이든 임의 surface_id로 pack_version/directive_hash를
+            // 위조해 자기 디렉티브 갱신을 영구 회피하거나 타 노드 마커를 오염시켜 갱신 skip·
+            // context 오염을 유발한다(설계 §7-⑪ step2 'self-declared 신뢰 금지 — cysd-인증 발신만',
+            // claim_role·set_meta·send ACL과 동일한 '임의 surface 무인증 쓰기' 부류). 발신 pane은
+            // 커널 peer pid로만 확정한다. 발신이 surface로 해석되면(=노드 pane) 거부한다.
+            // 정당 발신(cys pack-update·cys restore)은 일시적 CLI라 caller_pid가 surface로
+            // 해석되지 않고(caller_sid None), 데몬 내부 발신도 caller_pid None — 둘 다 통과한다.
+            let caller_sid = caller_pid.and_then(|p| resolve_caller_surface(daemon, p));
+            if let Some(cs) = caller_sid {
+                daemon.bus.publish(
+                    "reinject.mark_denied",
+                    "system",
+                    Some(sid),
+                    json!({"requested_surface": sid,
+                           "caller_surface": cs, "caller_pid": caller_pid}),
+                );
+                return Reply::Single(err_response(
+                    &id,
+                    "reinject_denied",
+                    &format!(
+                        "reinject.mark denied: node panes may not set reinject markers; only the cysd-mediated controller (anonymous/non-pane caller) may (caller surface {cs})"
+                    ),
+                ));
+            }
+            *surface.pack_reinject.lock().unwrap() = Some(crate::state::PackReinject {
+                pack_version: pack_version.clone(),
+                directive_hash: directive_hash.clone(),
+            });
+            // 마커를 즉시 topology에 영속 — cysd 재기동/복원을 견뎌 동일 버전 일괄 재주입을 차단.
+            // persist_topology는 surfaces 락만 잡는다(roles 미접촉 — 위 락순서 규율 유지).
+            crate::governance::persist_topology(daemon);
+            Reply::Single(ok_response(
+                &id,
+                json!({"surface_id": sid, "pack_version": pack_version,
+                       "directive_hash": directive_hash}),
+            ))
+        }
+
         // ─── T5 사용량 관측: 세션 트랜스크립트 경로 등록 (SessionStart hook의 결정론 매핑) ───
         "usage.register" => {
             let Some(sid) = resolve_surface_id(&params) else {
@@ -2354,6 +2418,9 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         "agent": agent,
                         "state": state,
                         "idle_secs": idle_secs,
+                        // ⓑ 자기보고(status.set) state — reinject 게이트(§7-② step2)가 working 노드
+                        // 보류 판정에 쓴다. 미보고는 null(소비자가 보수적으로 working 취급).
+                        "agent_status": s.agent_status.lock().unwrap().as_ref().map(|st| st.state.clone()),
                         "usage": s.observed_usage.lock().unwrap().clone()
                             .and_then(|u| serde_json::to_value(u).ok()),
                     })
@@ -3582,6 +3649,21 @@ mod tests {
         Daemon::new(dir.join("cysd.sock"))
     }
 
+    /// claim_daemon은 dir 키가 {pid}-{epoch초}라 같은 초에 병렬 실행되는 테스트끼리 dir를
+    /// 공유해 topology.json을 서로 덮어쓴다. topology를 읽는 테스트는 단조 카운터로 dir를 격리한다.
+    fn isolated_daemon() -> Arc<Daemon> {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "cys-iso-{}-{}-{}",
+            std::process::id(),
+            crate::state::now_epoch() as u64,
+            n
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        Daemon::new(dir.join("cysd.sock"))
+    }
+
     fn make_surface(daemon: &Arc<Daemon>, role: Option<&str>) -> u64 {
         let s = daemon
             .create_surface(None, Some("sleep 30".into()), None, role.map(|r| r.into()), 24, 80)
@@ -4401,6 +4483,82 @@ mod tests {
             resp["ok"], json!(true),
             "익명(데몬 내부) 상태 보고가 막혔다 (응답: {resp})"
         );
+    }
+
+    /// ⑪(b) reinject.mark RPC가 Surface의 pack_reinject 마커를 set한다 (단일 write path).
+    #[test]
+    fn reinject_mark_sets_field() {
+        let daemon = isolated_daemon();
+        let node = make_surface(&daemon, Some("worker-1"));
+        let req = Request {
+            id: json!(1),
+            method: "reinject.mark".into(),
+            params: json!({"surface_id": node, "pack_version": "0.4.2",
+                           "directive_hash": "abc123"}),
+        };
+        let Reply::Single(resp) = dispatch(&daemon, req, None) else {
+            panic!("expected single reply");
+        };
+        assert_eq!(resp["ok"], json!(true), "reinject.mark 실패: {resp}");
+        let pr = daemon.surfaces.lock().unwrap()[&node]
+            .pack_reinject
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("마커가 set돼야");
+        assert_eq!(pr.pack_version, "0.4.2");
+        assert_eq!(pr.directive_hash, "abc123");
+    }
+
+    /// ⑪(a) pack_reinject persist→load 라운드트립: topology.json 직렬화/역직렬화 등가.
+    #[test]
+    fn pack_reinject_persist_load_roundtrip() {
+        let daemon = isolated_daemon();
+        let node = make_surface(&daemon, Some("worker-1"));
+        *daemon.surfaces.lock().unwrap()[&node]
+            .pack_reinject
+            .lock()
+            .unwrap() = Some(crate::state::PackReinject {
+            pack_version: "0.5.0".into(),
+            directive_hash: "deadbeef".into(),
+        });
+        crate::governance::persist_topology(&daemon);
+        let saved = crate::governance::load_topology(&daemon);
+        let entry = saved
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["role"] == "worker-1")
+            .expect("worker-1 entry");
+        assert_eq!(entry["pack_reinject"]["pack_version"], json!("0.5.0"));
+        assert_eq!(entry["pack_reinject"]["directive_hash"], json!("deadbeef"));
+    }
+
+    /// ⑪(c) 하위호환: 구 topology.json(pack_reinject 키 없음) 로드가 None으로 안전 폴백.
+    #[test]
+    fn pack_reinject_absent_loads_as_none() {
+        let daemon = isolated_daemon();
+        let dir = crate::state::state_dir(&daemon.socket_path);
+        let _ = std::fs::create_dir_all(&dir);
+        // pack_reinject 키가 없는 레거시 entry.
+        let legacy = json!({"updated_at": 0.0, "entries": [
+            {"role":"worker","agent":"claude","agent_bin":"claude",
+             "cwd":"/tmp","title":"t","session_id":null}
+        ]});
+        std::fs::write(dir.join("topology.json"), legacy.to_string()).unwrap();
+        let saved = crate::governance::load_topology(&daemon);
+        let entry = &saved.as_array().unwrap()[0];
+        assert!(
+            entry["pack_reinject"].is_null(),
+            "구 topology의 없는 키는 null이어야 (실제: {})",
+            entry["pack_reinject"]
+        );
+        // seed 경로의 안전 폴백: 없는 키 → as_str()=None → reinject.mark 호출 skip.
+        assert!(entry["pack_reinject"]["pack_version"].as_str().is_none());
+        // PackReinject Deserialize: null → Option None (역직렬화 안전 폴백).
+        let pr: Option<crate::state::PackReinject> =
+            serde_json::from_value(entry["pack_reinject"].clone()).unwrap();
+        assert!(pr.is_none(), "null은 None으로 역직렬화돼야");
     }
 
     fn usage_register(

@@ -54,4 +54,35 @@ fn main() {
     println!("cargo:rerun-if-changed=src/edit_kinds.rs");
     let kinds_json = "{\n  \"edit_kind\": [\"avatar\", \"broll\", \"graphic\", \"caption\", \"audio\", \"music\"],\n  \"mode\": [\"fullscreen\", \"left-card\", \"rounded-crop-pip\"],\n  \"transition\": [\"cut\", \"dissolve\", \"slide\"]\n}\n";
     fs::write(Path::new(&out_dir).join("cys_kinds.json"), kinds_json).expect("cys_kinds.json 생성 실패");
+
+    // §7-①/⑩: minisign 신뢰 키링 embed. 공개키 단일 SOT = src-tauri/tauri.conf.json(updater.pubkey).
+    // build.rs가 그 pubkey를 회전용 키링(cysjavis-pack/trusted-keys.json)의 부트스트랩 엔트리
+    // (pubkey "")에 주입해 병합 → OUT_DIR 상수로 방출(skills walk와 동형 코드젠·손목록 드리프트 0).
+    // 키를 두 곳에 두지 않으므로 양쪽 동일 보장. 기존 skills/kinds 코드젠은 불변(추가만).
+    println!("cargo:rerun-if-changed=src-tauri/tauri.conf.json");
+    println!("cargo:rerun-if-changed=cysjavis-pack/trusted-keys.json");
+    let tauri_conf =
+        fs::read_to_string("src-tauri/tauri.conf.json").expect("tauri.conf.json 읽기 실패");
+    let pubkey = extract_json_string(&tauri_conf, "pubkey")
+        .expect("tauri.conf.json updater.pubkey 부재 — 키링 embed 불가");
+    let keyring_src =
+        fs::read_to_string("cysjavis-pack/trusted-keys.json").expect("trusted-keys.json 읽기 실패");
+    // 부트스트랩 엔트리의 빈 pubkey("")에 tauri pubkey 주입(단일 SOT 유지).
+    let keyring = keyring_src.replace("\"pubkey\": \"\"", &format!("\"pubkey\": \"{pubkey}\""));
+    let keyring_code = format!(
+        "/// build.rs 자동 생성 — minisign 신뢰 키링(tauri.conf.json pubkey + trusted-keys.json 병합).\npub const TRUSTED_KEYS_JSON: &str = r####\"{keyring}\"####;\n"
+    );
+    fs::write(Path::new(&out_dir).join("pack_keyring.rs"), keyring_code)
+        .expect("pack_keyring.rs 생성 실패");
+}
+
+/// tauri.conf.json 등에서 `"key": "value"` 첫 매치의 value를 추출(JSON 파서 build-dep 없이).
+/// minisign base64 pubkey엔 `"`가 없어 안전. updater.pubkey가 파일 내 유일한 "pubkey"다.
+fn extract_json_string(json: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\"");
+    let start = json.find(&needle)? + needle.len();
+    let after_colon = &json[start..][json[start..].find(':')? + 1..];
+    let q1 = after_colon.find('"')? + 1;
+    let q2 = after_colon[q1..].find('"')? + q1;
+    Some(after_colon[q1..q2].to_string())
 }

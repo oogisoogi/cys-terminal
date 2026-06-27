@@ -1,6 +1,6 @@
 //! CYSJavis Pack: cys 터미널에 임베드된 멀티에이전트 운영체계 템플릿.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub const ENV_PACK_DIR: &str = "CYS_PACK_DIR";
 /// cys 전용 CLAUDE_CONFIG_DIR 오버라이드(주로 테스트 격리용). 미설정 시 pack_dir 형제(~/.cys/claude).
@@ -460,11 +460,98 @@ fn content_hash(content: &str) -> String {
     format!("{:x}", Sha256::digest(content.as_bytes()))
 }
 
+/// semver(major.minor.patch) 파싱 — version_gt 내부 parts와 동일 규칙('v' 접두 제거,
+/// prerelease/build suffix('-rc','+build') 분리, major 결측·비숫자는 None). ★version_gt와 달리
+/// 파싱 실패를 안전측 bool로 흡수하지 않고 Option으로 노출한다 — remote 비교(§7-④)는 실패=거부
+/// (fail-CLOSED 반영거부) 방향이라 보존 방향인 version_gt와 묶으면 안 된다.
+pub fn parse_semver(v: &str) -> Option<(u32, u32, u32)> {
+    let mut it = v.trim().trim_start_matches('v').split('.').map(|p| {
+        // prerelease/build suffix 분리: '10-rc' → '10', '0+build' → '0'
+        p.split(|c| c == '-' || c == '+')
+            .next()
+            .unwrap_or("")
+            .parse::<u32>()
+            .ok()
+    });
+    let major = it.next().flatten()?; // major 결측·비숫자 → 파싱 실패
+    Some((
+        major,
+        it.next().flatten().unwrap_or(0),
+        it.next().flatten().unwrap_or(0),
+    ))
+}
+
+/// 무중단 채널 반영 판정(§7-④): remote 팩 버전이 디스크 버전보다 새것인가.
+/// ★fail-CLOSED 반영거부: **둘 다 파싱 성공 AND remote > disk**일 때만 true. 어느 한쪽이라도
+/// 파싱 실패면 false(반영 거부)다 — version_gt(disk-vs-embed 보존용, 파싱 실패=보존=true)와 안전
+/// 방향이 반대다. P4 `cys pack-update`의 version_gates(반영 판정 축)가 호출한다.
+pub fn remote_is_newer(remote: &str, disk: &str) -> bool {
+    match (parse_semver(remote), parse_semver(disk)) {
+        (Some(r), Some(d)) => r > d,
+        _ => false, // 파싱 실패 = 신버전 아님 = 반영 거부(fail-CLOSED)
+    }
+}
+
+/// 원자적 파일 쓰기(§7-⑤): 같은 디렉터리 temp 파일에 쓰고 fsync → rename으로 원자 교체 →
+/// 디렉터리 fsync(best-effort). 쓰는 도중 crash 시 부분 파일이 최종 경로에 남지 않는다
+/// (std::fs::write는 비원자라 부분 쓰기 노출). cysd governance의 write_json_atomic과 동형.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent")
+    })?;
+    let fname = path.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no file name")
+    })?;
+    let tmp = parent.join(format!(".{fname}.tmp.{}", std::process::id()));
+    let res = (|| -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?; // 파일 본문 fsync (rename 전)
+        std::fs::rename(&tmp, path)?; // 원자 교체
+        Ok(())
+    })();
+    match res {
+        Ok(()) => {
+            // 디렉터리 엔트리 영속화 — best-effort(실패 무시).
+            if let Ok(d) = std::fs::File::open(parent) {
+                let _ = d.sync_all();
+            }
+            Ok(())
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
 /// PACK 템플릿 설치 (CLI init-pack과 데몬 첫 기동 자동 설치의 공용 코어).
 /// force=false: 사용자 수정 파일 불가침 + **비수정 파일은 임베드 신버전으로 자동 갱신**
 /// (설치 매니페스트의 설치-당시 해시와 현재 파일 해시가 일치 = 비수정). 매니페스트가
 /// 없는 구설치본 파일은 종전대로 보존한다(안전측). 반환: (written, kept).
 pub fn install(force: bool) -> Result<(usize, usize), String> {
+    // 얇은 래퍼: embed PACK+PACK_SKILLS를 입력원으로 install_from_iter에 위임한다.
+    // ★외부 동작(반환값·디스크 결과·부수효과)은 완전 불변 — C/D/E 호출처 무영향(§3 하위호환).
+    install_from_iter(
+        PACK.iter().chain(PACK_SKILLS.iter()).map(|(r, c)| (*r, *c)),
+        force,
+        env!("CARGO_PKG_VERSION"),
+    )
+}
+
+/// install의 **파일 반영 코어**(§7-⑤): `(rel, content)` 이터레이터를 입력원으로 받아 preserve-gate·
+/// prune·매니페스트·다운그레이드 차단·.pack-version 기록·격리 config·exec bit를 수행한다.
+/// embed PACK iter(기존 경로)와 staged-tree iter(무중단 채널)가 같은 로직을 공유한다(중복 0·회귀 0).
+/// 다운그레이드 가드 비교 기준은 `target_version`(env! 직접 참조 제거 — staged 입력은 자기 버전을 넘김).
+/// force=false: 사용자 수정 파일 불가침 + 비수정 파일은 입력 신버전으로 자동 갱신. 반환: (written, kept).
+pub fn install_from_iter<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
+    items: I,
+    force: bool,
+    target_version: &str,
+) -> Result<(usize, usize), String> {
+    // items를 한 번 Vec로 고정 — 쓰기 루프·prune embedded-set·exec bit 루프 세 곳이 같은 집합을 본다.
+    let items: Vec<(&str, &str)> = items.into_iter().collect();
     let dir = pack_dir();
     let manifest_path = dir.join(INSTALL_MANIFEST);
     let mut manifest: std::collections::BTreeMap<String, String> = std::fs::read_to_string(
@@ -473,19 +560,18 @@ pub fn install(force: bool) -> Result<(usize, usize), String> {
     .ok()
     .and_then(|s| serde_json::from_str(&s).ok())
     .unwrap_or_default();
-    // 다운그레이드 차단: 디스크 팩 버전이 이 바이너리 임베드보다 새것이면(구버전 cys로 롤백/오설치)
+    // 다운그레이드 차단: 디스크 팩 버전이 입력 버전(target_version)보다 새것이면(구버전 cys로 롤백/오설치)
     // 비강제 install이 비수정 파일·prune으로 신기능을 구 내용으로 후퇴시키는 사일런트 회귀를 막는다.
     // force(수동 init-pack --force)면 우회 — 의도적 재설치는 허용.
-    let embed_version = env!("CARGO_PKG_VERSION");
     if !force {
         if let Some(dv) = std::fs::read_to_string(dir.join(PACK_VERSION_FILE))
             .ok()
             .map(|s| s.trim().to_string())
         {
-            if version_gt(&dv, embed_version) {
+            if version_gt(&dv, target_version) {
                 // stdout 명시 — 정상 멱등 설치(0 written)와 구분되도록 호출처/UI가 차단을 인지하게 한다.
                 println!(
-                    "[init-pack] 다운그레이드 차단 — 팩 미반영 (디스크 {dv} > 바이너리 {embed_version}). 의도적 재설치는 force로."
+                    "[init-pack] 다운그레이드 차단 — 팩 미반영 (디스크 {dv} > 바이너리 {target_version}). 의도적 재설치는 force로."
                 );
                 return Ok((0, 0));
             }
@@ -493,7 +579,7 @@ pub fn install(force: bool) -> Result<(usize, usize), String> {
     }
     let mut written = 0;
     let mut kept = 0;
-    for (rel, content) in PACK.iter().chain(PACK_SKILLS.iter()) {
+    for (rel, content) in items.iter().copied() {
         let path = dir.join(rel);
         // 디렉티브 영구 보존(멀티마스터 정식화 F1): *_DIRECTIVE.md가 디스크에 임베드와 다른
         // 내용으로 존재하면(CEO 디렉티브·사용자 헌법 커스텀) force여도 절대 덮지 않는다.
@@ -501,7 +587,7 @@ pub fn install(force: bool) -> Result<(usize, usize), String> {
         // 기동 install(false)·init-pack --force가 임베드 표준본으로 파괴하는 것을 결정론 차단.
         if path.exists() && rel.ends_with("_DIRECTIVE.md") {
             if let Ok(existing) = std::fs::read_to_string(&path) {
-                if existing != *content {
+                if existing != content {
                     kept += 1;
                     continue;
                 }
@@ -509,7 +595,7 @@ pub fn install(force: bool) -> Result<(usize, usize), String> {
         }
         if path.exists() && !force {
             match std::fs::read_to_string(&path) {
-                Ok(existing) if existing == *content => {
+                Ok(existing) if existing == content => {
                     // 디스크 = 임베드: 최신. 매니페스트 공백(구설치본)이면 채택 기록해
                     // 다음 버전부터 자동 갱신 대상이 되게 한다.
                     manifest
@@ -519,7 +605,7 @@ pub fn install(force: bool) -> Result<(usize, usize), String> {
                     continue;
                 }
                 Ok(existing)
-                    if manifest.get(*rel).map(String::as_str)
+                    if manifest.get(rel).map(String::as_str)
                         == Some(content_hash(&existing).as_str()) =>
                 {
                     // 설치-당시 해시 그대로(사용자 비수정) + 임베드가 더 새 버전 → 갱신.
@@ -535,7 +621,7 @@ pub fn install(force: bool) -> Result<(usize, usize), String> {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
         }
-        std::fs::write(&path, content)
+        write_atomic(&path, content.as_bytes())
             .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
         manifest.insert(rel.to_string(), content_hash(content));
         written += 1;
@@ -545,7 +631,7 @@ pub fn install(force: bool) -> Result<(usize, usize), String> {
     // embed 목록이 비정상적으로 비면(빌드 이상) 전량 삭제 재앙을 막기 위해 prune을 건너뛴다.
     {
         let embedded: std::collections::HashSet<&str> =
-            PACK.iter().chain(PACK_SKILLS.iter()).map(|(rel, _)| *rel).collect();
+            items.iter().map(|(rel, _)| *rel).collect();
         if !embedded.is_empty() {
             let stale: Vec<String> = manifest
                 .keys()
@@ -583,10 +669,10 @@ pub fn install(force: bool) -> Result<(usize, usize), String> {
     // 매니페스트 영속은 최선노력 — 실패해도 설치 자체는 유효하고, 다음 판정은
     // 보존(안전측)으로 떨어진다.
     if let Ok(json) = serde_json::to_string_pretty(&manifest) {
-        let _ = std::fs::write(&manifest_path, json);
+        let _ = write_atomic(&manifest_path, json.as_bytes());
     }
-    // 팩 버전 기록 — 다음 install의 다운그레이드 판정 기준(embed 버전으로 갱신).
-    let _ = std::fs::write(dir.join(PACK_VERSION_FILE), embed_version);
+    // 팩 버전 기록 — 다음 install의 다운그레이드 판정 기준(target_version으로 갱신).
+    let _ = write_atomic(&dir.join(PACK_VERSION_FILE), target_version.as_bytes());
     // cys 전용 CLAUDE_CONFIG_DIR 격리 셋업(박사님 2026-06-15) — 사용자 ~/.claude 오염으로부터
     // cys 마스터를 분리한다. best-effort·보존 모드라 깨끗한 환경에서도 회귀 0.
     setup_isolated_config_dir();
@@ -597,7 +683,7 @@ pub fn install(force: bool) -> Result<(usize, usize), String> {
         // 추가 시 드리프트(fs::write가 exec 비트를 만들지 않아 직접 실행 스킬·hook
         // 등록이 신규 머신에서 깨짐)의 원천이었다. kept 파일에도 적용해 기존 설치본을
         // 복구한다.
-        for (rel, content) in PACK.iter().chain(PACK_SKILLS.iter()) {
+        for (rel, content) in items.iter().copied() {
             if !content.starts_with("#!") {
                 continue;
             }
@@ -1017,5 +1103,143 @@ mod tests {
                 None => std::env::remove_var(k),
             }
         }
+    }
+
+    /// 빈 임시 dir에서 디스크 산출물을 핑거프린트(rel → sha256)로 채집한다 —
+    /// install vs install_from_iter 등가성 비교용. 매니페스트·pack-version도 포함.
+    fn fingerprint_dir(root: &Path) -> std::collections::BTreeMap<String, String> {
+        fn walk(base: &Path, dir: &Path, out: &mut std::collections::BTreeMap<String, String>) {
+            if let Ok(rd) = std::fs::read_dir(dir) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if p.is_dir() {
+                        walk(base, &p, out);
+                    } else if let Ok(bytes) = std::fs::read(&p) {
+                        use sha2::{Digest, Sha256};
+                        let rel = p.strip_prefix(base).unwrap().to_string_lossy().into_owned();
+                        out.insert(rel, format!("{:x}", Sha256::digest(&bytes)));
+                    }
+                }
+            }
+        }
+        let mut out = std::collections::BTreeMap::new();
+        walk(root, root, &mut out);
+        out
+    }
+
+    /// ★등가성 박제(§7-⑤): install(false)의 디스크 결과 == install_from_iter(PACK+SKILLS, false,
+    /// CARGO_PKG_VERSION). 얇은 래퍼가 외부 동작을 완전 보존하는지(written/kept·전 파일 핑거프린트).
+    #[test]
+    fn install_from_iter_equivalent_to_install() {
+        let _g = PACK_ENV_LOCK.lock().unwrap();
+        let saved = std::env::var(ENV_PACK_DIR).ok();
+        let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
+        let base =
+            std::env::temp_dir().join(format!("cys-pack-equiv-test-{}", std::process::id()));
+        let td_a = base.join("a"); // install(false)
+        let td_b = base.join("b"); // install_from_iter
+        let _ = std::fs::remove_dir_all(&base);
+
+        // 격리 config dir은 pack dir **밖**에 둔다 — settings.json이 pack_dir 절대경로
+        // (hooks/session-start.sh)를 박으므로 td 안에 두면 td_a≠td_b 경로 차이가 핑거프린트를
+        // 오염시킨다. pack dir 콘텐츠 자체는 경로 무관 결정론이라 이 분리로 순수 등가 비교가 된다.
+        // A: 기존 래퍼
+        std::env::set_var(ENV_PACK_DIR, &td_a);
+        std::env::set_var(ENV_CONFIG_DIR, base.join("cfg-a"));
+        let res_a = install(false);
+        let fp_a = fingerprint_dir(&td_a);
+
+        // B: 추출 코어 직접 호출(동일 입력원·동일 버전)
+        std::env::set_var(ENV_PACK_DIR, &td_b);
+        std::env::set_var(ENV_CONFIG_DIR, base.join("cfg-b"));
+        let res_b = install_from_iter(
+            PACK.iter().chain(PACK_SKILLS.iter()).map(|(r, c)| (*r, *c)),
+            false,
+            env!("CARGO_PKG_VERSION"),
+        );
+        let fp_b = fingerprint_dir(&td_b);
+
+        match saved {
+            Some(v) => std::env::set_var(ENV_PACK_DIR, v),
+            None => std::env::remove_var(ENV_PACK_DIR),
+        }
+        match saved_cfg {
+            Some(v) => std::env::set_var(ENV_CONFIG_DIR, v),
+            None => std::env::remove_var(ENV_CONFIG_DIR),
+        }
+        let _ = std::fs::remove_dir_all(&base);
+
+        let (wa, ka) = res_a.expect("install 실패");
+        let (wb, kb) = res_b.expect("install_from_iter 실패");
+        assert_eq!((wa, ka), (wb, kb), "written/kept 불일치");
+        assert_eq!(wa, PACK.len() + PACK_SKILLS.len(), "전수 설치 아님");
+        // 핵심 파일 존재 + 전 파일 핑거프린트 동등
+        for probe in [
+            "skills/korean-humanizer/SKILL.md",
+            "bin/javis_route.py",
+            "directives/MASTER_DIRECTIVE.md",
+            PACK_VERSION_FILE,
+            INSTALL_MANIFEST,
+        ] {
+            assert!(fp_a.contains_key(probe), "A 산출물에 {probe} 부재");
+        }
+        assert_eq!(fp_a, fp_b, "install vs install_from_iter 디스크 산출물 불일치");
+    }
+
+    /// parse_semver: 자릿수·v접두·-rc/+build suffix 분리·실패=None.
+    #[test]
+    fn parse_semver_cases() {
+        assert_eq!(parse_semver("0.4.1"), Some((0, 4, 1)));
+        assert_eq!(parse_semver("0.4.10"), Some((0, 4, 10)), "patch 자릿수");
+        assert_eq!(parse_semver("v0.5.0"), Some((0, 5, 0)), "'v' 접두");
+        assert_eq!(parse_semver("0.4.10-rc"), Some((0, 4, 10)), "-rc suffix 분리");
+        assert_eq!(parse_semver("0.4.0+build"), Some((0, 4, 0)), "+build suffix 분리");
+        assert_eq!(parse_semver("1"), Some((1, 0, 0)), "minor/patch 결측=0");
+        assert_eq!(parse_semver("garbage"), None, "비숫자 major=실패");
+        assert_eq!(parse_semver(""), None, "빈 문자열=실패");
+    }
+
+    /// remote_is_newer: fail-CLOSED 반영거부 — malformed=false·정상 newer=true·동일=false.
+    #[test]
+    fn remote_is_newer_fail_closed() {
+        assert!(remote_is_newer("0.4.2", "0.4.1"), "정상 newer=true");
+        assert!(remote_is_newer("0.5.0", "0.4.9"), "minor newer=true");
+        assert!(!remote_is_newer("0.4.1", "0.4.1"), "동일=false");
+        assert!(!remote_is_newer("0.4.0", "0.4.1"), "낮음=false");
+        // ★fail-CLOSED: 한쪽이라도 파싱 실패 → false(반영 거부) — version_gt(보존=true)와 반대
+        assert!(!remote_is_newer("garbage", "0.4.1"), "malformed remote=false");
+        assert!(!remote_is_newer("0.5.0", "garbage"), "malformed disk=false");
+        assert!(!remote_is_newer("", "0.4.1"), "빈 remote=false");
+    }
+
+    /// write_atomic: 쓰고 읽어 일치 + 기존 파일 원자 교체.
+    #[test]
+    fn write_atomic_roundtrip_and_replace() {
+        let td =
+            std::env::temp_dir().join(format!("cys-write-atomic-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        std::fs::create_dir_all(&td).unwrap();
+        let p = td.join("sub").join("file.txt");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+
+        write_atomic(&p, b"first").expect("write 실패");
+        assert_eq!(std::fs::read(&p).unwrap(), b"first", "roundtrip 불일치");
+
+        // 기존 파일 교체
+        write_atomic(&p, b"second-longer-content").expect("replace 실패");
+        assert_eq!(
+            std::fs::read(&p).unwrap(),
+            b"second-longer-content",
+            "교체 후 내용 불일치"
+        );
+        // temp 잔존 없음(rename으로 소비)
+        let leftovers: Vec<_> = std::fs::read_dir(p.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "temp 파일 잔존: {leftovers:?}");
+
+        let _ = std::fs::remove_dir_all(&td);
     }
 }

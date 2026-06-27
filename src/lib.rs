@@ -8,6 +8,7 @@ pub mod action_catalog;
 pub mod directive_compose;
 pub mod edit_kinds;
 pub mod pack;
+pub mod packsig;
 pub mod overrides;
 pub mod wire;
 #[cfg(target_os = "macos")]

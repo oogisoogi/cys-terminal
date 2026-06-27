@@ -85,6 +85,10 @@ pub struct Surface {
     /// (4) resume 핀용 agent transcript session_id — analytics.rs의 회계 session_id와 무관(별개 개념).
     /// usage 수집기가 transcript 발견 시 1회 stash(is_none 가드)·topology에 영속해 정확한 세션 재개.
     pub agent_session_id: Mutex<Option<String>>,
+    /// ⑪ pack-reinject 추적 마커 — 마지막 주입 pack_version·directive_hash. 단일 write path는
+    /// `reinject.mark` RPC(주입 성공 직후 컨트롤러만 호출). topology 영속·restore 복원으로
+    /// 재기동을 견딘다. None=미주입(첫 pack-update에서 1회 주입). agent_session_id와 동일 위치 init.
+    pub pack_reinject: Mutex<Option<PackReinject>>,
     /// context.threshold 에지 게이트 — 자기보고(status.set)·관측(usage.rs) **공유**.
     /// true=발화 가능(임계 미만 관측됨). 분리하면 같은 교차에 두 경로가 각각 발화해
     /// master/CSO가 cycle-agent를 이중 집행한다. swap(false)가 원자적 1회 발화를 보장.
@@ -162,6 +166,16 @@ pub struct AgentStatus {
     pub context_pct: Option<u8>,
     pub task: Option<String>,
     pub updated_at: f64,
+}
+
+/// ⑪ pack-reinject 추적 마커: 한 surface에 마지막으로 주입된 팩 버전·합성 디렉티브 해시.
+/// pack-update/reinject 컨트롤러가 노드 주입 성공 직후 `reinject.mark` RPC로만 갱신한다
+/// (단일 write path — status.set 자기보고 경로로는 갱신 불가). topology에 영속되어 cysd
+/// 재기동·노드 복원 후에도 생존 → 같은 버전 일괄 재주입(토큰 폭증·컨텍스트 파괴)을 차단한다.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct PackReinject {
+    pub pack_version: String,
+    pub directive_hash: String,
 }
 
 /// 승인 Feed 항목: 워커(에이전트)의 승인 요청을 한 곳에 모은다.
@@ -848,6 +862,7 @@ impl Daemon {
             observed_usage: Mutex::new(None),
             registered_transcript: Mutex::new(None),
             agent_session_id: Mutex::new(None),
+            pack_reinject: Mutex::new(None),
             ctx_threshold_armed: AtomicBool::new(true),
             // 능력 가드: 생성 시 역할에서 도출(reviewer-*=read/search, full=worker/master/cso,
             // 그 외 deny-by-default none). claim_role이 역할 전이 시 동기 재도출한다.

@@ -1,0 +1,10 @@
+{
+  "keys": [
+    {
+      "key_id": "39E60A702949D6C3",
+      "pubkey": "",
+      "not_after": "2030-01-01T00:00:00Z"
+    }
+  ],
+  "revoked_key_ids": []
+}

@@ -318,6 +318,36 @@ enum Command {
         #[arg(long)]
         claude_settings: Option<String>,
     },
+    /// 무중단 팩 업데이트(재시작 0) — 서명된 팩을 검증→디스크 반영→살아있는 노드 reinject.
+    /// 핵심 경로는 --from(로컬 디렉터리: pack.tar.gz + pack-manifest.json + .minisig).
+    PackUpdate {
+        /// 로컬 소스 디렉터리(pack.tar.gz + pack-manifest.json + pack-manifest.json.minisig)
+        #[arg(long)]
+        from: Option<String>,
+        /// 원격 manifest URL (부차 — staging에 fetch; 핵심 로직은 --from으로 완전 테스트)
+        #[arg(long)]
+        manifest_url: Option<String>,
+        /// 검증·버전게이트만 수행하고 디스크 반영·reinject는 생략(점검용)
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// 임베드 PACK+PACK_SKILLS에서 권위 manifest(pack-manifest.json)를 stdout JSON으로 방출.
+    /// CI(release.yml)가 standalone 팩 manifest의 단일 SOT로 쓴다(임베드 콘텐츠→tree 동일성 게이트).
+    #[command(name = "pack-manifest")]
+    PackManifest {
+        /// 서명 key_id 주입(미지정 시 생략 — CI 서명단계가 채움)
+        #[arg(long)]
+        key_id: Option<String>,
+        /// 서명 발행 시각 Unix epoch 초(미지정 시 생략)
+        #[arg(long)]
+        signed_at: Option<i64>,
+        /// 서명 만료 시각 Unix epoch 초(미지정 시 생략)
+        #[arg(long)]
+        expires_at: Option<i64>,
+        /// 이 팩이 요구하는 최소 바이너리 버전(기본 빈 문자열=제약 없음)
+        #[arg(long, default_value = "")]
+        min_binary_version: String,
+    },
     /// Search the persistent transcript memory of ALL agents' terminal activity (FTS)
     Recall {
         /// Search text (substring matching via trigram FTS)
@@ -1371,6 +1401,14 @@ fn run(command: Command) -> i32 {
 
         Command::InitPack { force, install_hook: _, no_install_hook, claude_settings } => {
             return run_init_pack(force, no_install_hook, claude_settings);
+        }
+
+        Command::PackUpdate { from, manifest_url, dry_run } => {
+            return run_pack_update(from, manifest_url, dry_run);
+        }
+
+        Command::PackManifest { key_id, signed_at, expires_at, min_binary_version } => {
+            return run_pack_manifest(key_id, signed_at, expires_at, &min_binary_version);
         }
 
         Command::ClaimRole { role, surface } => target_surface(&surface, &None).and_then(|sid| {
@@ -3859,6 +3897,18 @@ fn run_restore(cwd: Option<String>, include_master: bool, no_resume: bool) -> i3
                 ok += 1;
                 if let Ok(r) = request("system.resolve_role", json!({"role": role})) {
                     if let Some(sid) = r["surface_id"].as_u64() {
+                        // ⑪ pack-reinject 마커 seed — session_id를 resume 핀으로 복원하는 것과
+                        // 동일 지점. 영속된 마커를 재생성 surface에 reinject.mark(단일 write path)로
+                        // 다시 심어, 복원 후에도 동일 팩 버전 중복 재주입을 막는다. 부재(구 topology)면 skip.
+                        if let (Some(pv), Some(dh)) = (
+                            entry["pack_reinject"]["pack_version"].as_str(),
+                            entry["pack_reinject"]["directive_hash"].as_str(),
+                        ) {
+                            let _ = request(
+                                "reinject.mark",
+                                json!({"surface_id": sid, "pack_version": pv, "directive_hash": dh}),
+                            );
+                        }
                         let _ = inject_text(sid, "[RESTORE] 조직 복원 절차다. _round/SESSION_STATE.md와 자기 TODO를 읽고 상태를 복원하라. ★작업 재개는 하지 말고 master의 지시를 기다려라.");
                     }
                 }
@@ -3934,6 +3984,564 @@ fn run_reinject(
             1
         }
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 무중단 팩 업데이트 (cys pack-update, DESIGN-noshutdown-pack-update §2-②/§7)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 버전 3축 게이트(§7-④) 판정. 순수 함수 — 단위테스트 대상.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum VersionGate {
+    /// remote 신버전 + 바이너리 호환 → 반영.
+    Apply,
+    /// remote가 디스크보다 새것이 아님(파싱 실패 포함) → 멱등 no-op.
+    UpToDate,
+    /// min_binary_version > 실행 바이너리 → 무중단 거부(바이너리 재시작 경로 안내).
+    BinaryTooOld,
+}
+
+/// 3축 버전 비교(§7-④) — remote→disk 반영 판정(remote_is_newer, fail-CLOSED) ∧ remote→running
+/// 호환 게이트(min_binary ≤ running). disk→embed 다운그레이드 가드는 install_from_iter가 담당.
+/// min_binary가 빈 문자열이면 제약 없음(manifest #[serde(default)] 호환)으로 본다.
+fn version_gates(remote_pack: &str, disk_pack: &str, min_binary: &str, running: &str) -> VersionGate {
+    // 축1 반영 판정: remote가 디스크보다 strictly-newer 여야(파싱 실패=거부=no-op).
+    if !cys::pack::remote_is_newer(remote_pack, disk_pack) {
+        return VersionGate::UpToDate;
+    }
+    // 축2 호환 게이트: min_binary ≤ running. 빈 값=제약 없음. 파싱 실패·초과=거부.
+    let min = min_binary.trim();
+    if min.is_empty() {
+        return VersionGate::Apply;
+    }
+    match (cys::pack::parse_semver(min), cys::pack::parse_semver(running)) {
+        (Some(m), Some(r)) if m <= r => VersionGate::Apply,
+        _ => VersionGate::BinaryTooOld,
+    }
+}
+
+/// surface별 마지막 reinject 마커(P3 reinject.mark가 set, system.topology가 노출).
+#[derive(Debug, Clone)]
+struct ReinjectMarker {
+    pack_version: String,
+    directive_hash: String,
+}
+
+/// reinject 3단 게이트(§7-②) 결정. 순수 함수 — 단위테스트 대상.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReinjectDecision {
+    /// 디렉티브 변경 + idle/ready + 신버전 → 주입.
+    Inject,
+    /// ⓐ해시 선검사: 합성 디렉티브 해시 == 마커 해시 → 주입 자체 스킵(토큰 0).
+    SkipUnchanged,
+    /// ⓒ버전 dedup: 마커 pack_version >= 새 버전 → 이미 주입됨, 스킵.
+    SkipDedup,
+    /// ⓑidle 게이트 미통과(working/미준비) → 다음 폴링까지 보류.
+    Defer,
+}
+
+/// reinject 결정(§7-② 순서 고정): ⓐ해시 선검사(SkipUnchanged) → ⓒ버전 dedup(SkipDedup) →
+/// ⓑidle 게이트(Defer) → Inject. 스킵(terminal)을 보류(Defer)보다 먼저 판정해, 주입할 게
+/// 없는 노드를 헛되이 deferral 시키지 않는다.
+/// ⓑ idle 게이트는 §7-② step2의 3신호 AND다: `idle`(ⓐ derive_node_state==idle) ∧
+/// `self_idle`(ⓑ 자기보고 agent_status≠working) ∧ `ready`(ⓒ 어댑터 prompt-ready). 셋 중 하나라도
+/// 불충족이면 Defer — long-thinking·자기보고 working 노드의 강제 주입(컨텍스트 오염)을 차단한다.
+fn reinject_decision(
+    marker: Option<&ReinjectMarker>,
+    new_ver: &str,
+    new_hash: &str,
+    idle: bool,
+    self_idle: bool,
+    ready: bool,
+) -> ReinjectDecision {
+    // ⓐ 해시 선검사 — 디렉티브 무변경이면 주입 불요(스킬/스크립트만 바뀐 릴리스).
+    if let Some(m) = marker {
+        if m.directive_hash == new_hash {
+            return ReinjectDecision::SkipUnchanged;
+        }
+        // ⓒ 버전 dedup — 같은(또는 더 높은) 버전을 이미 주입한 노드는 재주입 안 함.
+        if let (Some(mv), Some(nv)) =
+            (cys::pack::parse_semver(&m.pack_version), cys::pack::parse_semver(new_ver))
+        {
+            if mv >= nv {
+                return ReinjectDecision::SkipDedup;
+            }
+        }
+    }
+    // ⓑ idle 게이트(§7-② step2 3신호 AND) — derive_node_state idle ∧ 자기보고≠working ∧ 준비됨.
+    // 하나라도 불충족(busy·자기보고 working·미보고·미준비) = 보류(컨텍스트 오염 차단).
+    if !(idle && self_idle && ready) {
+        return ReinjectDecision::Defer;
+    }
+    ReinjectDecision::Inject
+}
+
+/// sha256 hex — 디렉티브 해시(§7-② ⓐ 선검사용). pack.rs content_hash와 동일 산식.
+fn sha256_hex(s: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(s.as_bytes()))
+}
+
+/// 임베드 PACK+PACK_SKILLS에서 권위 manifest Value를 산출(DESIGN-noshutdown §2-①). files는
+/// rel→sha256(content_hash 동일산식: sha256_hex). 임베드 콘텐츠에서 파생되므로 standalone 팩
+/// manifest의 단일 SOT다(같은 cysjavis-pack/ 소스 → tree와 일치 보장). key_id/signed_at/expires_at는
+/// 주입되면 채우고 미지정이면 생략한다(CI 서명단계가 채움 — 미서명 manifest는 packsig 필수필드라
+/// 무중단 검증에서 거부됨). 결정론: files는 BTreeMap(정렬), top-level은 serde_json Map(정렬).
+fn build_pack_manifest_value(
+    key_id: Option<String>,
+    signed_at: Option<i64>,
+    expires_at: Option<i64>,
+    min_binary_version: &str,
+) -> serde_json::Value {
+    let mut files: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for (rel, content) in cys::pack::PACK.iter().chain(cys::pack::PACK_SKILLS.iter()) {
+        files.insert((*rel).to_string(), sha256_hex(content));
+    }
+    let mut obj = serde_json::Map::new();
+    obj.insert("pack_version".into(), json!(env!("CARGO_PKG_VERSION")));
+    obj.insert("min_binary_version".into(), json!(min_binary_version));
+    if let Some(k) = key_id {
+        obj.insert("key_id".into(), json!(k));
+    }
+    if let Some(s) = signed_at {
+        obj.insert("signed_at".into(), json!(s));
+    }
+    if let Some(e) = expires_at {
+        obj.insert("expires_at".into(), json!(e));
+    }
+    obj.insert("files".into(), json!(files));
+    serde_json::Value::Object(obj)
+}
+
+/// `cys pack-manifest` 진입점 — 권위 manifest를 stdout으로 방출(§2-①). CI가 standalone 팩
+/// manifest.json의 단일 SOT로 캡처한다.
+fn run_pack_manifest(
+    key_id: Option<String>,
+    signed_at: Option<i64>,
+    expires_at: Option<i64>,
+    min_binary_version: &str,
+) -> i32 {
+    let v = build_pack_manifest_value(key_id, signed_at, expires_at, min_binary_version);
+    match serde_json::to_string_pretty(&v) {
+        Ok(s) => {
+            println!("{s}");
+            0
+        }
+        Err(e) => {
+            eprintln!("[pack-manifest] 직렬화 실패: {e}");
+            1
+        }
+    }
+}
+
+/// 시스템 tar로 tar.gz를 dest에 푼다(§ 소스 해석 — 신규 crate 의존 회피, shell-out).
+fn extract_tar_gz(tar_gz: &std::path::Path, dest: &std::path::Path) -> Result<(), String> {
+    std::fs::create_dir_all(dest).map_err(|e| format!("staging 생성 실패 {}: {e}", dest.display()))?;
+    let status = std::process::Command::new("tar")
+        .arg("-xzf")
+        .arg(tar_gz)
+        .arg("-C")
+        .arg(dest)
+        .status()
+        .map_err(|e| format!("tar 실행 실패: {e}"))?;
+    if !status.success() {
+        return Err(format!("tar 압축해제 실패(code {:?}) {}", status.code(), tar_gz.display()));
+    }
+    Ok(())
+}
+
+/// staging 트리를 (rel, content) 쌍으로 수집(install_from_iter 입력원). 모든 팩 파일은 UTF-8
+/// 텍스트(디렉티브·json·py·sh) — 비UTF8 파일은 fail-closed 에러. 디렉터리 재귀 walk.
+fn collect_tree(root: &std::path::Path) -> Result<Vec<(String, String)>, String> {
+    let mut out = Vec::new();
+    fn walk(
+        base: &std::path::Path,
+        dir: &std::path::Path,
+        out: &mut Vec<(String, String)>,
+    ) -> Result<(), String> {
+        let entries =
+            std::fs::read_dir(dir).map_err(|e| format!("read_dir 실패 {}: {e}", dir.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("dir entry 실패: {e}"))?;
+            let path = entry.path();
+            let ft = entry.file_type().map_err(|e| format!("file_type 실패: {e}"))?;
+            if ft.is_dir() {
+                walk(base, &path, out)?;
+            } else if ft.is_file() {
+                let rel = path
+                    .strip_prefix(base)
+                    .map_err(|e| format!("rel 경로 실패: {e}"))?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let content = std::fs::read_to_string(&path)
+                    .map_err(|e| format!("비UTF8/읽기 실패 {}: {e}", path.display()))?;
+                out.push((rel, content));
+            }
+        }
+        Ok(())
+    }
+    walk(root, root, &mut out)?;
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
+}
+
+/// flock(LOCK_EX) 임계영역에서 f를 실행(§7-⑧ 폴백 apply-lock — per-file write_atomic + writer 배타).
+/// non-unix는 잠금 없이 실행.
+///
+/// ⚠보장 범위(정직 명시): 이 락은 **writer 측 상호배제만** 제공한다. §6-4 심링크(pack_dir) 1회
+/// 마이그레이션이 보류된 현재(우선안=디렉터리 일괄 atomic 스왑은 미구현), §7-⑧이 본래 노리는
+/// **multi-file SET 일관성은 외부 동시 READER에 대해 보장되지 않는다.** §7-⑧ 폴백이 약한 수준에서
+/// 요구한 reader-측 차단(공유 flock)을 load-bearing 리더(compose_directive — MASTER_DIRECTIVE/soul.md/
+/// MEMORY.md/각 SKILL.md 순차 읽기 · Tauri read_board_catalog)가 취하지 않기 때문이다. 그 결과
+/// 1초 미만 apply 창 동안 외부 리더는 신규-directive + 구-soul 같은 혼재(torn) 집합을 관측할 수 있다.
+/// pack-update 자신의 reinject는 apply 이후 실행되어 안전하고, 노출 대상은 외부 동시 리더뿐이다.
+/// 진짜 집합 원자성은 §6-4 심링크 스왑 도입 시 확보된다(현재는 writer 배타까지만).
+fn with_apply_lock<T>(lock_path: &std::path::Path, f: impl FnOnce() -> T) -> Result<T, String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(lock_path)
+            .map_err(|e| format!("apply-lock 열기 실패 {}: {e}", lock_path.display()))?;
+        let fd = file.as_raw_fd();
+        if unsafe { libc::flock(fd, libc::LOCK_EX) } != 0 {
+            return Err(format!("flock 실패: {}", std::io::Error::last_os_error()));
+        }
+        let out = f();
+        unsafe {
+            libc::flock(fd, libc::LOCK_UN);
+        }
+        Ok(out)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = lock_path;
+        Ok(f())
+    }
+}
+
+/// pack-update 코어 결과(§2-② 흐름 1~5). reinject(6)는 라이브 데몬 단계로 분리.
+#[derive(Debug, Clone)]
+struct PackUpdateOutcome {
+    gate: VersionGate,
+    pack_version: String,
+    written: usize,
+    kept: usize,
+}
+
+/// `--from` 핵심 경로(검증+버전게이트+apply). 테스트 가능: keyring/now/running/accepted_path를
+/// 주입받고 라이브 데몬·embed 상수에 의존하지 않는다(do_apply=false면 검증·게이트만).
+/// 순서(§2-②): 소스읽기→staging 압축해제→서명검증(P2 fail-closed)→파일 sha256 대조→버전 3축
+/// 게이트→apply-lock+install_from_iter→record_accepted.
+fn pack_update_from_dir(
+    from_dir: &std::path::Path,
+    staging: &std::path::Path,
+    lock_path: &std::path::Path,
+    accepted_path: &std::path::Path,
+    now_unix: i64,
+    running_binary: &str,
+    keyring: &cys::packsig::Keyring,
+    do_apply: bool,
+) -> Result<PackUpdateOutcome, String> {
+    let manifest_path = from_dir.join("pack-manifest.json");
+    let sig_path = from_dir.join("pack-manifest.json.minisig");
+    let tar_path = from_dir.join("pack.tar.gz");
+    let manifest_bytes = std::fs::read(&manifest_path)
+        .map_err(|e| format!("manifest 읽기 실패 {}: {e}", manifest_path.display()))?;
+    let sig_bytes = std::fs::read(&sig_path)
+        .map_err(|e| format!("서명 읽기 실패 {}: {e}", sig_path.display()))?;
+
+    // staging: 깨끗이 비우고 tar 풀기.
+    let _ = std::fs::remove_dir_all(staging);
+    extract_tar_gz(&tar_path, staging)?;
+
+    // ⓐ 서명·신선도·replay 검증(P2, fail-closed) — 실패 시 staging 폐기·반영 0.
+    let manifest = match cys::packsig::verify_with_keyring(
+        &manifest_bytes,
+        &sig_bytes,
+        now_unix,
+        accepted_path,
+        keyring,
+    ) {
+        Ok(m) => m,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(staging);
+            return Err(format!("manifest 검증 실패: {e}"));
+        }
+    };
+
+    // ⓑ 파일별 sha256 대조(P2 verify_files) — manifest.files → staging 전방 무결성.
+    if let Err(e) = cys::packsig::verify_files(&manifest, staging) {
+        let _ = std::fs::remove_dir_all(staging);
+        return Err(format!("파일 무결성 검증 실패: {e}"));
+    }
+
+    // ⓑ' 역방향 커버리지(§7-①) — staging 트리의 전 파일이 서명 manifest.files에 등재돼야.
+    // tarball 미서명이라 전방 검증만으로는 미등재 파일 추가 변조(악성 bin/*.py 등)를 못 막는다.
+    // 전방+역방향으로 manifest ⇔ staging 집합 동치를 강제(fail-closed) — install_from_iter 진입 전 차단.
+    if let Err(e) = cys::packsig::verify_no_extra_files(&manifest, staging) {
+        let _ = std::fs::remove_dir_all(staging);
+        return Err(format!("staging 트리 커버리지 검증 실패: {e}"));
+    }
+
+    // 버전 3축 게이트(§7-④).
+    let disk_version = std::fs::read_to_string(cys::pack::pack_dir().join(".pack-version"))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    let gate = version_gates(
+        &manifest.pack_version,
+        &disk_version,
+        &manifest.min_binary_version,
+        running_binary,
+    );
+
+    let mut written = 0;
+    let mut kept = 0;
+    if gate == VersionGate::Apply && do_apply {
+        // 반영: apply-lock 배타 → install_from_iter(staged iter, force=false) → record_accepted.
+        let tree = collect_tree(staging)?;
+        let pv = manifest.pack_version.clone();
+        let res = with_apply_lock(lock_path, move || {
+            let items: Vec<(&str, &str)> =
+                tree.iter().map(|(r, c)| (r.as_str(), c.as_str())).collect();
+            cys::pack::install_from_iter(items, false, &pv)
+        })?;
+        let (w, k) = res?;
+        written = w;
+        kept = k;
+        // ★apply→record→reinject 비원자성 디커플(R2 LOW). 여기 도달 시 디스크 팩·.pack-version은
+        // 이미 새 버전으로 반영됐다. record_accepted(replay 단조 기준선 기록)가 실패할 때 ?로 중단하면
+        // run_pack_update가 1을 반환하고 run_pack_reinject에 도달하지 못한다 — 그런데 디스크는 이미
+        // 새 버전이라 재시도 시 version_gates가 remote==disk→UpToDate(no-op)로 판정해 reinject가
+        // 영영 실행되지 않고 라이브 노드가 해당 버전에 미각성으로 영구 잔류한다. 그래서 실패 시
+        // 중단하지 않고 경고만 남긴 뒤 outcome(gate=Apply)을 반환해 reinject로 진행시킨다(reinject는
+        // pack_reinject 마커로 멱등). 기준선 미갱신의 부작용은 같은 팩의 replay 허용뿐인데, 이미
+        // 디스크에 반영된 동일 정당 팩이라 보안 강등이 없고 다음 성공 pack-update가 기준선을 재기록한다.
+        if let Err(e) = cys::packsig::record_accepted(accepted_path, &manifest) {
+            eprintln!(
+                "[pack-update] ⚠ accepted 기록 실패(replay 기준선 미갱신): {e} — \
+                 디스크 팩은 이미 반영됨, reinject 계속 진행(멱등). 다음 pack-update가 기준선 재기록."
+            );
+        }
+    }
+
+    Ok(PackUpdateOutcome {
+        gate,
+        pack_version: manifest.pack_version,
+        written,
+        kept,
+    })
+}
+
+/// ~/.cys (pack_dir의 부모) — 무중단 채널 상태파일(.pack-staging·.pack-apply.lock·.pack-accepted.json) 루트.
+fn pack_state_base() -> std::path::PathBuf {
+    cys::pack::pack_dir()
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+}
+
+/// 어댑터 prompt-ready predicate(§7-⑨): ready_marker 정의 어댑터(claude·gemini)는 화면에
+/// 마커가 보이면 ready. 미정의 어댑터(codex)는 fallback = idle AND quiet ≥ 임계(영구 deferral 방지).
+fn adapter_ready(agent: &Option<String>, idle: bool, idle_secs: u64, scrollback_tail: &str) -> bool {
+    const QUIET_THRESHOLD_SECS: u64 = 8; // ACK timeout 근사 — turn-boundary 근사 quiet 창
+    let marker = agent
+        .as_ref()
+        .and_then(|a| load_agent_spec(a).ok())
+        .and_then(|spec| spec["ready_marker"].as_str().map(|s| s.to_string()));
+    match marker {
+        Some(m) if !m.is_empty() => scrollback_tail.contains(&m),
+        _ => idle && idle_secs >= QUIET_THRESHOLD_SECS, // ready_marker 부재 → fallback
+    }
+}
+
+/// 살아있는 노드에 무중단 reinject(§7-②) — control.dashboard(state)·system.topology(마커)를 읽어
+/// reinject_decision으로 판정, Inject만 디렉티브 주입 후 reinject.mark RPC로 기록(P3).
+/// ★라이브 데몬 필요 — 실주입 검증은 P7. 여기선 결정 로직 배선만(베스트에포트).
+fn run_pack_reinject(new_version: &str) -> Result<(usize, usize, usize, usize), String> {
+    // 마커(role → ReinjectMarker)는 system.topology.saved가 노출(P3가 pack_reinject 영속).
+    let topo = request("system.topology", json!({}))?;
+    let mut markers: std::collections::HashMap<String, ReinjectMarker> = std::collections::HashMap::new();
+    if let Some(saved) = topo["saved"].as_array() {
+        for e in saved {
+            if let (Some(role), Some(pr)) = (e["role"].as_str(), e.get("pack_reinject")) {
+                if let (Some(pv), Some(dh)) =
+                    (pr["pack_version"].as_str(), pr["directive_hash"].as_str())
+                {
+                    markers.insert(
+                        role.to_string(),
+                        ReinjectMarker { pack_version: pv.to_string(), directive_hash: dh.to_string() },
+                    );
+                }
+            }
+        }
+    }
+    // 라이브 노드 상태: control.dashboard(fleet[].state=derive_node_state·idle_secs).
+    let dash = request("control.dashboard", json!({}))?;
+    let fleet = dash["fleet"].as_array().cloned().unwrap_or_default();
+    let (mut injected, mut skipped, mut deferred, mut failed) = (0usize, 0usize, 0usize, 0usize);
+    for node in &fleet {
+        let Some(sid) = node["surface_id"].as_u64() else { continue };
+        let Some(role) = node["role"].as_str() else { continue };
+        let agent = node["agent"].as_str().map(|s| s.to_string());
+        let idle = node["state"].as_str() == Some("idle");
+        let idle_secs = node["idle_secs"].as_u64().unwrap_or(0);
+        // ⓑ 자기보고 게이트(§7-② step2) — agent_status≠working. 미보고(null)는 보수적으로
+        // '비idle' 취급(working일 수 있음 → 주입 안 함, 컨텍스트 오염 차단).
+        let self_idle = match node["agent_status"].as_str() {
+            Some(st) => st != "working",
+            None => false,
+        };
+        // 디렉티브 해시 — 합성 실패(비표준 역할 등)는 스킵.
+        let Ok(directive) = compose_directive(role) else { continue };
+        let new_hash = sha256_hex(&directive);
+        // ready predicate(§7-⑨) — ready_marker 어댑터는 화면 tail로, 아니면 idle+quiet fallback.
+        let tail = request("surface.read_text", json!({"surface_id": sid}))
+            .ok()
+            .and_then(|r| r["text"].as_str().map(|s| s.to_string()))
+            .unwrap_or_default();
+        let ready = adapter_ready(&agent, idle, idle_secs, &tail);
+        match reinject_decision(markers.get(role), new_version, &new_hash, idle, self_idle, ready) {
+            ReinjectDecision::Inject => {
+                // per-node 에러 격리(Fix3): 한 노드의 transient 실패가 나머지 건강 노드의 reinject를
+                // 중단시키지 않게 `?` 전파 대신 count+continue 한다.
+                if let Err(e) = inject_text(sid, &directive) {
+                    eprintln!("[pack-update] reinject 주입 실패(surface {sid}, role {role}): {e} — 다음 노드로 계속");
+                    failed += 1;
+                    continue;
+                }
+                // 주입 성공 후에만 마커 기록(P3 단일 write path). 마커 기록 실패는 '이미 주입됨'을
+                // 의미하므로 다음 pack-update에서 같은 버전이 재주입(중복 주입)될 수 있다 — 그 창을
+                // 가시화하도록 명시 경고하되 루프는 계속한다(나머지 노드 reinject 보장).
+                if let Err(e) = request(
+                    "reinject.mark",
+                    json!({"surface_id": sid, "pack_version": new_version,
+                           "directive_hash": new_hash}),
+                ) {
+                    eprintln!("[pack-update] ⚠ reinject.mark 기록 실패(surface {sid}, role {role}): {e} — \
+                               주입은 됐으나 마커 미기록 → 다음 pack-update에서 중복 주입 가능");
+                    failed += 1;
+                    continue;
+                }
+                injected += 1;
+            }
+            ReinjectDecision::SkipUnchanged | ReinjectDecision::SkipDedup => skipped += 1,
+            ReinjectDecision::Defer => deferred += 1,
+        }
+    }
+    Ok((injected, skipped, deferred, failed))
+}
+
+/// `cys pack-update` 진입점(§2-② 전체 흐름). --from(핵심)·--manifest-url(부차).
+fn run_pack_update(from: Option<String>, manifest_url: Option<String>, dry_run: bool) -> i32 {
+    let result = (|| -> Result<(), String> {
+        let base = pack_state_base();
+        let staging = base.join(".pack-staging");
+        let lock_path = base.join(".pack-apply.lock");
+        let accepted_path = base.join(".pack-accepted.json");
+
+        // 소스 해석: --from(로컬 디렉터리) 우선. --manifest-url은 staging에 fetch(부차).
+        let from_dir: std::path::PathBuf = match (from, manifest_url) {
+            (Some(d), _) => std::path::PathBuf::from(d),
+            (None, Some(url)) => fetch_remote_pack(&url, &base)?,
+            (None, None) => return Err("--from <dir> 또는 --manifest-url <url> 필요".into()),
+        };
+
+        let now_unix = chrono::Utc::now().timestamp();
+        let running = env!("CARGO_PKG_VERSION");
+        let keyring = cys::packsig::embedded_keyring()?;
+        let outcome = pack_update_from_dir(
+            &from_dir,
+            &staging,
+            &lock_path,
+            &accepted_path,
+            now_unix,
+            running,
+            &keyring,
+            !dry_run,
+        )?;
+
+        match outcome.gate {
+            VersionGate::UpToDate => {
+                println!(
+                    "[pack-update] 이미 최신 — 반영 0 (remote {} ≤ 디스크). no-op.",
+                    outcome.pack_version
+                );
+                return Ok(());
+            }
+            VersionGate::BinaryTooOld => {
+                eprintln!(
+                    "[pack-update] 거부 — 팩 {}이 더 새 바이너리를 요구한다(min_binary > 실행 {running}). \
+                     바이너리 업데이트(재시작) 경로로 진행하세요.",
+                    outcome.pack_version
+                );
+                return Err("binary-too-old".into());
+            }
+            VersionGate::Apply => {}
+        }
+
+        if dry_run {
+            println!(
+                "[pack-update] dry-run: 검증·게이트 통과(팩 {} 반영 가능) — 디스크 반영·reinject 생략.",
+                outcome.pack_version
+            );
+            return Ok(());
+        }
+
+        println!(
+            "[pack-update] 팩 {} 반영 완료 ({} written, {} preserved). 노드 reinject 점검…",
+            outcome.pack_version, outcome.written, outcome.kept
+        );
+
+        // 6) 살아있는 노드 reinject(§7-②) — 베스트에포트(데몬 미가동 시 경고만).
+        match run_pack_reinject(&outcome.pack_version) {
+            Ok((inj, skip, defer, fail)) => println!(
+                "[pack-update] reinject: {inj} injected, {skip} skipped, {defer} deferred, {fail} failed."
+            ),
+            Err(e) => eprintln!("[pack-update] reinject 스킵(데몬 점검 필요): {e}"),
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("error: {e}");
+            1
+        }
+    }
+}
+
+/// 원격 팩 fetch(부차) — 시스템 curl shell-out으로 manifest·sig·tar를 staging 형제 디렉터리에 받는다.
+/// 핵심 검증·반영 로직은 --from과 동일 경로(pack_update_from_dir)를 탄다.
+fn fetch_remote_pack(manifest_url: &str, base: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    let dl = base.join(".pack-download");
+    let _ = std::fs::remove_dir_all(&dl);
+    std::fs::create_dir_all(&dl).map_err(|e| format!("download dir 생성 실패: {e}"))?;
+    // manifest_url 형제 경로로 sig·tar URL 유도(같은 디렉터리에 동봉).
+    let base_url = manifest_url
+        .rsplit_once('/')
+        .map(|(b, _)| b.to_string())
+        .ok_or("manifest-url 형식 오류")?;
+    for (url, name) in [
+        (manifest_url.to_string(), "pack-manifest.json"),
+        (format!("{base_url}/pack-manifest.json.minisig"), "pack-manifest.json.minisig"),
+        (format!("{base_url}/pack.tar.gz"), "pack.tar.gz"),
+    ] {
+        let out = dl.join(name);
+        let status = std::process::Command::new("curl")
+            .args(["-fsSL", "-o"])
+            .arg(&out)
+            .arg(&url)
+            .status()
+            .map_err(|e| format!("curl 실행 실패: {e}"))?;
+        if !status.success() {
+            return Err(format!("fetch 실패({name}): {url}"));
+        }
+    }
+    Ok(dl)
 }
 
 /// 완화책 ③: scoped 실행 — 새 프로세스 그룹에서 실행하고 원장에 등록,
@@ -4045,6 +4653,400 @@ extern "C" fn scoped_cleanup_handler(sig: libc::c_int) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // pack-update 통합테스트는 CYS_PACK_DIR/CYS_CONFIG_DIR 전역 env를 공유하므로 직렬화한다.
+    static PACK_UPDATE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn sha256_of(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(bytes))
+    }
+
+    /// minisign keypair 생성 → (pubkey_base64_rawline, sign_fn).
+    fn gen_signer() -> (String, impl Fn(&[u8]) -> String) {
+        let kp = minisign::KeyPair::generate_unencrypted_keypair().expect("keypair");
+        let pk_b64 = kp.pk.to_base64();
+        let sk = kp.sk;
+        let signer = move |data: &[u8]| -> String {
+            let cursor = std::io::Cursor::new(data.to_vec());
+            minisign::sign(None, &sk, cursor, None, None)
+                .expect("sign")
+                .into_string()
+        };
+        (pk_b64, signer)
+    }
+
+    /// from_dir에 (pack.tar.gz + pack-manifest.json + .minisig)를 짓는다. 반환: manifest 바이트.
+    fn build_signed_pack(
+        from_dir: &std::path::Path,
+        files: &[(&str, &str)],
+        key_id: &str,
+        pack_version: &str,
+        min_binary: &str,
+        signed_at: i64,
+        expires_at: i64,
+        sign: &impl Fn(&[u8]) -> String,
+    ) {
+        let tree = from_dir.join("tree");
+        let _ = std::fs::remove_dir_all(&tree);
+        std::fs::create_dir_all(&tree).unwrap();
+        let mut files_map = serde_json::Map::new();
+        for (rel, content) in files {
+            let p = tree.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, content).unwrap();
+            files_map.insert(rel.to_string(), json!(sha256_of(content.as_bytes())));
+        }
+        // tar czf pack.tar.gz -C tree .
+        let status = std::process::Command::new("tar")
+            .arg("-czf")
+            .arg(from_dir.join("pack.tar.gz"))
+            .arg("-C")
+            .arg(&tree)
+            .arg(".")
+            .status()
+            .expect("tar czf");
+        assert!(status.success(), "tar czf 실패");
+        let manifest = json!({
+            "pack_version": pack_version,
+            "min_binary_version": min_binary,
+            "key_id": key_id,
+            "signed_at": signed_at,
+            "expires_at": expires_at,
+            "files": files_map,
+        });
+        let mbytes = serde_json::to_vec(&manifest).unwrap();
+        std::fs::write(from_dir.join("pack-manifest.json"), &mbytes).unwrap();
+        let sig = sign(&mbytes);
+        std::fs::write(from_dir.join("pack-manifest.json.minisig"), sig).unwrap();
+    }
+
+    fn test_keyring(key_id: &str, pubkey: &str) -> cys::packsig::Keyring {
+        cys::packsig::Keyring {
+            keys: vec![cys::packsig::TrustedKey {
+                key_id: key_id.to_string(),
+                pubkey: pubkey.to_string(),
+                not_after: "2099-01-01T00:00:00Z".to_string(),
+            }],
+            revoked_key_ids: vec![],
+        }
+    }
+
+    /// pack-manifest emit(§2-①) — files 키가 PACK+PACK_SKILLS 전부 포함 + sha256이 content_hash
+    /// (sha256_hex 동일산식)와 일치. 플래그 주입 채움·미지정 생략(fail-closed) 검증.
+    #[test]
+    fn pack_manifest_emits_embedded_files_with_content_hash() {
+        // 플래그 전건 주입.
+        let v = build_pack_manifest_value(Some("39E60A702949D6C3".into()), Some(100), Some(200), "0.4.1");
+        assert_eq!(v["pack_version"], json!(env!("CARGO_PKG_VERSION")));
+        assert_eq!(v["min_binary_version"], json!("0.4.1"));
+        assert_eq!(v["key_id"], json!("39E60A702949D6C3"));
+        assert_eq!(v["signed_at"], json!(100));
+        assert_eq!(v["expires_at"], json!(200));
+        let files = v["files"].as_object().expect("files object");
+        // PACK+PACK_SKILLS 전부 포함 + sha256 == content_hash 동일산식.
+        for (rel, content) in cys::pack::PACK.iter().chain(cys::pack::PACK_SKILLS.iter()) {
+            let got = files
+                .get(*rel)
+                .and_then(|x| x.as_str())
+                .unwrap_or_else(|| panic!("manifest files에 누락: {rel}"));
+            assert_eq!(got, sha256_hex(content), "sha256 불일치: {rel}");
+        }
+        // 임베드 외 항목이 끼지 않는다(rel 중복 없으므로 합집합 크기 == 항목 수).
+        let embedded: std::collections::BTreeSet<&str> = cys::pack::PACK
+            .iter()
+            .chain(cys::pack::PACK_SKILLS.iter())
+            .map(|(r, _)| *r)
+            .collect();
+        assert_eq!(files.len(), embedded.len(), "manifest files에 임베드 외 항목 존재");
+        // 미지정 플래그는 생략(fail-closed: 미서명 manifest는 무중단 검증에서 거부됨).
+        let v2 = build_pack_manifest_value(None, None, None, "");
+        assert!(v2.get("key_id").is_none(), "미지정 key_id가 방출됨");
+        assert!(v2.get("signed_at").is_none(), "미지정 signed_at가 방출됨");
+        assert!(v2.get("expires_at").is_none(), "미지정 expires_at가 방출됨");
+        assert_eq!(v2["min_binary_version"], json!(""), "min_binary_version 기본 빈문자열");
+    }
+
+    /// 버전 3축 게이트 — 반영 판정·호환 게이트·빈 min_binary·파싱 실패.
+    #[test]
+    fn version_gates_three_axes() {
+        // remote newer + min_binary ok → Apply
+        assert_eq!(version_gates("1.1.0", "1.0.0", "0.4.1", "1.0.0"), VersionGate::Apply);
+        // remote 같음/낮음 → UpToDate(멱등)
+        assert_eq!(version_gates("1.0.0", "1.0.0", "", "1.0.0"), VersionGate::UpToDate);
+        assert_eq!(version_gates("0.9.0", "1.0.0", "", "1.0.0"), VersionGate::UpToDate);
+        // remote 파싱 실패 → UpToDate(fail-CLOSED 반영거부)
+        assert_eq!(version_gates("garbage", "1.0.0", "", "1.0.0"), VersionGate::UpToDate);
+        // min_binary 초과 → BinaryTooOld
+        assert_eq!(version_gates("2.0.0", "1.0.0", "99.0.0", "1.0.0"), VersionGate::BinaryTooOld);
+        // min_binary 빈 값 → 제약 없음(Apply)
+        assert_eq!(version_gates("2.0.0", "1.0.0", "", "0.4.1"), VersionGate::Apply);
+        // min_binary == running → Apply (≤)
+        assert_eq!(version_gates("2.0.0", "1.0.0", "1.0.0", "1.0.0"), VersionGate::Apply);
+        // min_binary 파싱 실패 → BinaryTooOld(fail-CLOSED)
+        assert_eq!(version_gates("2.0.0", "1.0.0", "junk", "1.0.0"), VersionGate::BinaryTooOld);
+    }
+
+    /// reinject 3단 게이트 결정 — unchanged·dedup·defer·inject.
+    #[test]
+    fn reinject_decision_gate() {
+        let m = ReinjectMarker { pack_version: "1.0.0".into(), directive_hash: "HASH_A".into() };
+        // 인자 순서: (marker, new_ver, new_hash, idle, self_idle, ready)
+        // ⓐ 해시 동일 → SkipUnchanged (게이트 신호 무관)
+        assert_eq!(
+            reinject_decision(Some(&m), "1.1.0", "HASH_A", true, true, true),
+            ReinjectDecision::SkipUnchanged
+        );
+        assert_eq!(
+            reinject_decision(Some(&m), "1.1.0", "HASH_A", false, false, false),
+            ReinjectDecision::SkipUnchanged
+        );
+        // ⓒ 해시 변경이지만 마커 버전 >= 새 버전 → SkipDedup
+        assert_eq!(
+            reinject_decision(Some(&m), "1.0.0", "HASH_B", true, true, true),
+            ReinjectDecision::SkipDedup
+        );
+        assert_eq!(
+            reinject_decision(Some(&m), "0.9.0", "HASH_B", true, true, true),
+            ReinjectDecision::SkipDedup
+        );
+        // ⓑ 해시 변경 + 신버전이지만 busy/자기보고working/미준비 → Defer (3신호 AND 각 축)
+        assert_eq!(
+            reinject_decision(Some(&m), "1.1.0", "HASH_B", false, true, true),
+            ReinjectDecision::Defer
+        );
+        assert_eq!(
+            reinject_decision(Some(&m), "1.1.0", "HASH_B", true, false, true),
+            ReinjectDecision::Defer
+        );
+        assert_eq!(
+            reinject_decision(Some(&m), "1.1.0", "HASH_B", true, true, false),
+            ReinjectDecision::Defer
+        );
+        // 통과: 해시 변경 + 신버전 + idle + self_idle + ready → Inject
+        assert_eq!(
+            reinject_decision(Some(&m), "1.1.0", "HASH_B", true, true, true),
+            ReinjectDecision::Inject
+        );
+        // 마커 부재(첫 주입): 3신호 모두 true면 Inject, 하나라도 false면 Defer
+        assert_eq!(
+            reinject_decision(None, "1.0.0", "HASH_X", true, true, true),
+            ReinjectDecision::Inject
+        );
+        assert_eq!(
+            reinject_decision(None, "1.0.0", "HASH_X", false, true, true),
+            ReinjectDecision::Defer
+        );
+        assert_eq!(
+            reinject_decision(None, "1.0.0", "HASH_X", true, false, true),
+            ReinjectDecision::Defer
+        );
+    }
+
+    /// ★오프라인 통합: 서명된 테스트 팩을 --from 코어로 적용 → .pack-version·파일·accepted 반영.
+    #[test]
+    fn pack_update_from_dir_applies_signed_pack() {
+        let _g = PACK_UPDATE_ENV_LOCK.lock().unwrap();
+        let saved = std::env::var(cys::pack::ENV_PACK_DIR).ok();
+        let saved_cfg = std::env::var(cys::pack::ENV_CONFIG_DIR).ok();
+        let td = std::env::temp_dir().join(format!("cys-pu-apply-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        let pack_dir = td.join("pack");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        std::env::set_var(cys::pack::ENV_PACK_DIR, &pack_dir);
+        std::env::set_var(cys::pack::ENV_CONFIG_DIR, td.join("cysclaude"));
+        // 이미 설치된 팩(구버전) 시뮬 — .pack-version 선존.
+        std::fs::write(pack_dir.join(".pack-version"), "0.0.1").unwrap();
+
+        let (pk, sign) = gen_signer();
+        let kr = test_keyring("TESTKEY", &pk);
+        let from_dir = td.join("from");
+        std::fs::create_dir_all(&from_dir).unwrap();
+        let files = [
+            ("soul.md", "SOUL v2 content\n"),
+            ("directives/MASTER_DIRECTIVE.md", "MASTER v2\n"),
+        ];
+        build_signed_pack(&from_dir, &files, "TESTKEY", "1.0.0", "0.4.1", 1000, 9_000_000_000, &sign);
+
+        let staging = td.join("staging");
+        let lock = td.join(".lock");
+        let accepted = td.join(".accepted.json");
+        let res = pack_update_from_dir(
+            &from_dir, &staging, &lock, &accepted, 5000, "0.4.1", &kr, true,
+        );
+
+        // env 복원(assert 전).
+        let restore = || {
+            match &saved {
+                Some(v) => std::env::set_var(cys::pack::ENV_PACK_DIR, v),
+                None => std::env::remove_var(cys::pack::ENV_PACK_DIR),
+            }
+            match &saved_cfg {
+                Some(v) => std::env::set_var(cys::pack::ENV_CONFIG_DIR, v),
+                None => std::env::remove_var(cys::pack::ENV_CONFIG_DIR),
+            }
+        };
+        let outcome = match res {
+            Ok(o) => o,
+            Err(e) => {
+                restore();
+                let _ = std::fs::remove_dir_all(&td);
+                panic!("적용 실패: {e}");
+            }
+        };
+        let disk_ver = std::fs::read_to_string(pack_dir.join(".pack-version")).unwrap();
+        let soul = std::fs::read_to_string(pack_dir.join("soul.md")).unwrap();
+        let acc_exists = accepted.is_file();
+        let acc = std::fs::read_to_string(&accepted).unwrap_or_default();
+        restore();
+        let _ = std::fs::remove_dir_all(&td);
+
+        assert_eq!(outcome.gate, VersionGate::Apply);
+        assert_eq!(disk_ver.trim(), "1.0.0", ".pack-version 반영");
+        assert_eq!(soul, "SOUL v2 content\n", "파일 내용 반영");
+        assert!(outcome.written >= 2, "written {}", outcome.written);
+        assert!(acc_exists, "accepted 기록 부재");
+        assert!(acc.contains("1.0.0"), "accepted에 pack_version 부재");
+    }
+
+    /// ★오프라인 통합 거부 케이스: 위조 서명·만료·구버전·min_binary 초과.
+    #[test]
+    fn pack_update_from_dir_rejects_invalid() {
+        let _g = PACK_UPDATE_ENV_LOCK.lock().unwrap();
+        let saved = std::env::var(cys::pack::ENV_PACK_DIR).ok();
+        let saved_cfg = std::env::var(cys::pack::ENV_CONFIG_DIR).ok();
+        let td = std::env::temp_dir().join(format!("cys-pu-reject-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        let pack_dir = td.join("pack");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        std::env::set_var(cys::pack::ENV_PACK_DIR, &pack_dir);
+        std::env::set_var(cys::pack::ENV_CONFIG_DIR, td.join("cysclaude"));
+        std::fs::write(pack_dir.join(".pack-version"), "1.0.0").unwrap();
+
+        let (pk, sign) = gen_signer();
+        let (_pk_other, sign_other) = gen_signer();
+        let kr = test_keyring("TESTKEY", &pk);
+        let files = [("soul.md", "S\n")];
+        let staging = td.join("staging");
+        let lock = td.join(".lock");
+
+        // ① 위조 서명(다른 키) → 거부 (do_apply=false로 충분, 검증 단계에서 막힘)
+        let d1 = td.join("from1");
+        std::fs::create_dir_all(&d1).unwrap();
+        build_signed_pack(&d1, &files, "TESTKEY", "2.0.0", "0.4.1", 1000, 9_000_000_000, &sign_other);
+        let acc1 = td.join(".acc1.json");
+        let r1 = pack_update_from_dir(&d1, &staging, &lock, &acc1, 5000, "0.4.1", &kr, false);
+
+        // ② 만료(now > expires_at) → 거부
+        let d2 = td.join("from2");
+        std::fs::create_dir_all(&d2).unwrap();
+        build_signed_pack(&d2, &files, "TESTKEY", "2.0.0", "0.4.1", 1000, 2000, &sign);
+        let acc2 = td.join(".acc2.json");
+        let r2 = pack_update_from_dir(&d2, &staging, &lock, &acc2, 5000, "0.4.1", &kr, false);
+
+        // ③ 구버전(remote 1.0.0 == disk 1.0.0) → UpToDate(no-op, 거부 아님이지만 미반영)
+        let d3 = td.join("from3");
+        std::fs::create_dir_all(&d3).unwrap();
+        build_signed_pack(&d3, &files, "TESTKEY", "1.0.0", "0.4.1", 3000, 9_000_000_000, &sign);
+        let acc3 = td.join(".acc3.json");
+        let r3 = pack_update_from_dir(&d3, &staging, &lock, &acc3, 5000, "0.4.1", &kr, true);
+
+        // ④ min_binary 초과 → BinaryTooOld(미반영)
+        let d4 = td.join("from4");
+        std::fs::create_dir_all(&d4).unwrap();
+        build_signed_pack(&d4, &files, "TESTKEY", "2.0.0", "99.0.0", 3000, 9_000_000_000, &sign);
+        let acc4 = td.join(".acc4.json");
+        let r4 = pack_update_from_dir(&d4, &staging, &lock, &acc4, 5000, "0.4.1", &kr, true);
+
+        let restore = || {
+            match &saved {
+                Some(v) => std::env::set_var(cys::pack::ENV_PACK_DIR, v),
+                None => std::env::remove_var(cys::pack::ENV_PACK_DIR),
+            }
+            match &saved_cfg {
+                Some(v) => std::env::set_var(cys::pack::ENV_CONFIG_DIR, v),
+                None => std::env::remove_var(cys::pack::ENV_CONFIG_DIR),
+            }
+        };
+        let disk_after = std::fs::read_to_string(pack_dir.join(".pack-version")).unwrap_or_default();
+        restore();
+        let _ = std::fs::remove_dir_all(&td);
+
+        assert!(r1.is_err(), "위조 서명 통과");
+        assert!(r2.is_err(), "만료 서명 통과");
+        assert_eq!(r3.expect("구버전 검증 자체는 통과").gate, VersionGate::UpToDate);
+        assert_eq!(r4.expect("min_binary 검증 자체는 통과").gate, VersionGate::BinaryTooOld);
+        assert_eq!(disk_after.trim(), "1.0.0", "거부/no-op인데 디스크 버전 변경됨");
+    }
+
+    /// ★오프라인 통합(Fix1 §7-① 역방향 커버리지): 서명 manifest에 없는 파일을 tarball에 주입한
+    /// 팩은 거부되고 디스크는 불변이어야 한다. tarball 미서명이므로 verify_files(전방)만으로는
+    /// 못 막던 '미등재 파일 추가' 변조를 verify_no_extra_files(역방향)가 fail-closed로 차단한다.
+    #[test]
+    fn pack_update_from_dir_rejects_extra_unlisted_file() {
+        let _g = PACK_UPDATE_ENV_LOCK.lock().unwrap();
+        let saved = std::env::var(cys::pack::ENV_PACK_DIR).ok();
+        let saved_cfg = std::env::var(cys::pack::ENV_CONFIG_DIR).ok();
+        let td = std::env::temp_dir().join(format!("cys-pu-extra-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        let pack_dir = td.join("pack");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        std::env::set_var(cys::pack::ENV_PACK_DIR, &pack_dir);
+        std::env::set_var(cys::pack::ENV_CONFIG_DIR, td.join("cysclaude"));
+        std::fs::write(pack_dir.join(".pack-version"), "1.0.0").unwrap();
+
+        let (pk, sign) = gen_signer();
+        let kr = test_keyring("TESTKEY", &pk);
+        let from_dir = td.join("from");
+        std::fs::create_dir_all(&from_dir).unwrap();
+        // 서명 manifest는 soul.md만 등재(유효 서명·신선창·신버전 2.0.0).
+        build_signed_pack(
+            &from_dir, &[("soul.md", "S\n")], "TESTKEY", "2.0.0", "0.4.1", 3000, 9_000_000_000, &sign,
+        );
+        // tarball에 미등재 악성 파일(bin/evil.py with #!) 주입 후 재압축 — manifest·서명은 그대로.
+        let tree = from_dir.join("tree");
+        let evil = tree.join("bin/evil.py");
+        std::fs::create_dir_all(evil.parent().unwrap()).unwrap();
+        std::fs::write(&evil, "#!/usr/bin/env python3\nprint('pwned')\n").unwrap();
+        let status = std::process::Command::new("tar")
+            .arg("-czf")
+            .arg(from_dir.join("pack.tar.gz"))
+            .arg("-C")
+            .arg(&tree)
+            .arg(".")
+            .status()
+            .expect("tar czf");
+        assert!(status.success(), "tar czf 실패");
+
+        let staging = td.join("staging");
+        let lock = td.join(".lock");
+        let accepted = td.join(".accepted.json");
+        let res =
+            pack_update_from_dir(&from_dir, &staging, &lock, &accepted, 5000, "0.4.1", &kr, true);
+
+        let restore = || {
+            match &saved {
+                Some(v) => std::env::set_var(cys::pack::ENV_PACK_DIR, v),
+                None => std::env::remove_var(cys::pack::ENV_PACK_DIR),
+            }
+            match &saved_cfg {
+                Some(v) => std::env::set_var(cys::pack::ENV_CONFIG_DIR, v),
+                None => std::env::remove_var(cys::pack::ENV_CONFIG_DIR),
+            }
+        };
+        let disk_after = std::fs::read_to_string(pack_dir.join(".pack-version")).unwrap_or_default();
+        let evil_installed = pack_dir.join("bin/evil.py").exists();
+        let soul_installed = pack_dir.join("soul.md").exists();
+        let acc_exists = accepted.is_file();
+        restore();
+        let _ = std::fs::remove_dir_all(&td);
+
+        assert!(res.is_err(), "미등재 파일 포함 팩이 통과(서명/무결성 우회)");
+        assert!(!evil_installed, "미등재 악성 파일이 설치됨(transitive-integrity 위반)");
+        assert!(!soul_installed, "거부됐는데 등재 파일이 설치됨(원자성 위반)");
+        assert!(!acc_exists, "거부됐는데 accepted 기록됨(replay 기준선 오염)");
+        assert_eq!(disk_after.trim(), "1.0.0", "거부인데 디스크 버전 변경됨");
+    }
 
     /// (2c) 회귀 박제: transient 화이트리스트가 cys connect()의 실제 에러 문자열과 정렬돼야
     /// (2a) slow_consumer return 후 재연결이 작동한다. cys connect_raw는 누락 소켓에

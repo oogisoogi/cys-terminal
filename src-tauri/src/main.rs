@@ -1126,6 +1126,56 @@ async fn install_update(app: AppHandle, force: bool) -> Result<(), String> {
     app.restart();
 }
 
+/// P5: 무중단 팩 업데이트 UI 브리지(DESIGN-noshutdown-pack-update §2-②·§7-③/④).
+/// UI "업데이트 버튼"이 호출 → `cys pack-update`(P4) 사이드카를 실행해 서명검증→디스크 반영→
+/// 살아있는 노드 reinject를 시킨다. ★`app.restart()`를 **절대 호출하지 않는다** — cysd·cys-app·
+/// 세션이 단 한 번도 죽지 않는 게 install_update(재시작)와의 핵심 차이(무중단).
+/// 오케스트레이션은 cys(Rust)에 있고 cys CLI엔 AppHandle이 없으므로, **이 command가 사이드카를
+/// 래핑**해(make_ticket/run_skill 패턴 동형) 성공 종료 후 자신이 `app.emit("pack-updated", …)`
+/// 한다 — 프런트가 read_board_catalog 등 캐시 의존 호출을 재실행해 stale 캐시를 갱신(§2-② UI 브리지).
+/// 인자: from(로컬 디렉터리) 우선, 없으면 manifest_url(원격) — cys pack-update의 --from/--manifest-url에 전달.
+#[tauri::command]
+async fn install_pack_update(
+    app: AppHandle,
+    manifest_url: Option<String>,
+    from: Option<String>,
+) -> Result<String, String> {
+    let _ = app.emit("pack-progress", json!({"phase": "start"}));
+    let cys = resolve_sidecar(if cfg!(windows) { "cys.exe" } else { "cys" });
+    let mut cmd = std::process::Command::new(&cys);
+    cmd.arg("pack-update");
+    match (&from, &manifest_url) {
+        (Some(d), _) => {
+            cmd.args(["--from", d]);
+        }
+        (None, Some(u)) => {
+            cmd.args(["--manifest-url", u]);
+        }
+        (None, None) => return Err("from 또는 manifest_url 인자 필요".into()),
+    }
+    // 네트워크·디스크 작업이 길 수 있어 blocking 풀에서 실행(tokio 워커 점유 방지 — install_update drain 패턴).
+    let out = tokio::task::spawn_blocking(move || cmd.output())
+        .await
+        .map_err(|e| format!("pack-update join 실패: {e}"))?
+        .map_err(|e| format!("cys pack-update 실행 실패 ({}): {e}", cys.display()))?;
+    if !out.status.success() {
+        // ★실패 — "pack-updated"는 emit하지 않는다(구 캐시 유지가 stale 갱신보다 안전). update-error만.
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        let _ = app.emit(
+            "update-error",
+            json!({"phase": "pack-update", "message": stderr.clone()}),
+        );
+        return Err(format!("pack-update 실패: {stderr}"));
+    }
+    // ★성공 종료 후에만 — 디스크 .pack-version을 읽어 새 팩 버전으로 브로드캐스트(§2-②/§7-③).
+    //   read_board_catalog가 pack_dir의 정적 파일을 읽는 것과 동일 SOT(pack_dir).
+    let pack_version = std::fs::read_to_string(cys::pack::pack_dir().join(".pack-version"))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    let _ = app.emit("pack-updated", json!({"pack_version": pack_version}));
+    Ok(pack_version)
+}
+
 /// `ledger.list` 응답에서 scoped 프로세스 pid만 추린다.
 /// windows 핸드오프(taskkill /F=TerminateProcess)는 데몬의 콘솔 이벤트 핸들러를
 /// 못 깨워 shutdown_cleanup이 실행되지 않으므로, 데몬이 살아있는 동안 UI가
@@ -1223,6 +1273,7 @@ fn main() {
             check_update,
             live_session_count,
             install_update,
+            install_pack_update,
             launch_dept_daemon,
             allocate_dept_daemon,
             stop_dept_daemon,

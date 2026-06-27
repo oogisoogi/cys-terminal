@@ -703,7 +703,8 @@ pub fn persist_topology(daemon: &Arc<Daemon>) {
                 json!({"role": role, "agent": meta.as_ref().map(|(n, _)| n.clone()),
                        "agent_bin": meta.map(|(_, b)| b),
                        "cwd": s.cwd, "title": s.title.lock().unwrap().clone(),
-                       "session_id": s.agent_session_id.lock().unwrap().clone()})
+                       "session_id": s.agent_session_id.lock().unwrap().clone(),
+                       "pack_reinject": s.pack_reinject.lock().unwrap().clone()})
             })
         })
         .collect();
