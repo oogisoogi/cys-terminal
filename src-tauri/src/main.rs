@@ -1107,6 +1107,17 @@ async fn install_update(app: AppHandle, force: bool) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     // 3) 데몬 핸드오프: 구 데몬을 정상 종료(SIGTERM — scoped 정리·소켓 제거)해야
     //    재시작 후 새 번들의 cysd가 뜬다. 종료 안 하면 구 데몬이 계속 세션을 들고 돈다.
+    // drain(best-effort): 재시작 전 살아있는 노드에 저장 신호 + 유예를 준다. 노드 LLM 협조 의존이라
+    // 무손실 보장은 아니며(마지막 미저장분은 손실 가능), 주 복원 경로는 재시작 후 resume이다.
+    // spawn_blocking으로 tokio 워커 점유를 막는다(파일 내 launch_dept_daemon 패턴과 일치). cys drain은
+    // 자체 watchdog(12s)로 hang 시에도 종료되므로 별도 timeout 없이 await해도 업데이트가 멈추지 않는다.
+    let _ = app.emit("update-progress", json!({"phase": "drain"}));
+    let _ = tokio::task::spawn_blocking(|| {
+        std::process::Command::new(resolve_sidecar("cys"))
+            .arg("drain")
+            .status()
+    })
+    .await;
     let _ = app.emit("update-progress", json!({"phase": "handoff"}));
     // 재시작 후 자동복귀 예약 — 새 cys-app setup이 이 마커를 보고 cys restore로 노드를 resume 재런칭한다.
     let _ = std::fs::write(pending_restore_path(), "");

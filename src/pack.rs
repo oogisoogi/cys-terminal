@@ -426,6 +426,34 @@ fn setup_isolated_config_dir() {
 /// 설치 매니페스트: rel → 설치 당시 내용의 sha256. "지금 디스크에 있는 파일이 우리가
 /// 설치한 그대로인가(=사용자 비수정)"를 판정하는 유일한 근거다.
 const INSTALL_MANIFEST: &str = ".install-manifest.json";
+const PACK_VERSION_FILE: &str = ".pack-version";
+
+/// semver(major.minor.patch) 비교 — a > b. 'v' 접두·prerelease/build suffix('-rc','+build') 분리,
+/// major 결측·비숫자는 파싱 실패로 본다. ★fail-CLOSED: 디스크 버전(a) 파싱 실패 시 보수적으로
+/// true(=다운그레이드로 간주, 보존)를 반환해 사일런트 회귀를 막는다(0 폴백의 fail-OPEN 방지).
+fn version_gt(a: &str, b: &str) -> bool {
+    fn parts(v: &str) -> Option<(u32, u32, u32)> {
+        let mut it = v.trim().trim_start_matches('v').split('.').map(|p| {
+            // prerelease/build suffix 분리: '10-rc' → '10', '0+build' → '0'
+            p.split(|c| c == '-' || c == '+')
+                .next()
+                .unwrap_or("")
+                .parse::<u32>()
+                .ok()
+        });
+        let major = it.next().flatten()?; // major 결측·비숫자 → 파싱 실패
+        Some((
+            major,
+            it.next().flatten().unwrap_or(0),
+            it.next().flatten().unwrap_or(0),
+        ))
+    }
+    match (parts(a), parts(b)) {
+        (Some(pa), Some(pb)) => pa > pb,
+        (None, _) => true,        // 디스크 버전 비정상 → 안전측(보존/차단)
+        (Some(_), None) => false, // embed 비정상(env! 상수라 사실상 불가) → 차단 안 함
+    }
+}
 
 fn content_hash(content: &str) -> String {
     use sha2::{Digest, Sha256};
@@ -445,6 +473,24 @@ pub fn install(force: bool) -> Result<(usize, usize), String> {
     .ok()
     .and_then(|s| serde_json::from_str(&s).ok())
     .unwrap_or_default();
+    // 다운그레이드 차단: 디스크 팩 버전이 이 바이너리 임베드보다 새것이면(구버전 cys로 롤백/오설치)
+    // 비강제 install이 비수정 파일·prune으로 신기능을 구 내용으로 후퇴시키는 사일런트 회귀를 막는다.
+    // force(수동 init-pack --force)면 우회 — 의도적 재설치는 허용.
+    let embed_version = env!("CARGO_PKG_VERSION");
+    if !force {
+        if let Some(dv) = std::fs::read_to_string(dir.join(PACK_VERSION_FILE))
+            .ok()
+            .map(|s| s.trim().to_string())
+        {
+            if version_gt(&dv, embed_version) {
+                // stdout 명시 — 정상 멱등 설치(0 written)와 구분되도록 호출처/UI가 차단을 인지하게 한다.
+                println!(
+                    "[init-pack] 다운그레이드 차단 — 팩 미반영 (디스크 {dv} > 바이너리 {embed_version}). 의도적 재설치는 force로."
+                );
+                return Ok((0, 0));
+            }
+        }
+    }
     let mut written = 0;
     let mut kept = 0;
     for (rel, content) in PACK.iter().chain(PACK_SKILLS.iter()) {
@@ -539,6 +585,8 @@ pub fn install(force: bool) -> Result<(usize, usize), String> {
     if let Ok(json) = serde_json::to_string_pretty(&manifest) {
         let _ = std::fs::write(&manifest_path, json);
     }
+    // 팩 버전 기록 — 다음 install의 다운그레이드 판정 기준(embed 버전으로 갱신).
+    let _ = std::fs::write(dir.join(PACK_VERSION_FILE), embed_version);
     // cys 전용 CLAUDE_CONFIG_DIR 격리 셋업(박사님 2026-06-15) — 사용자 ~/.claude 오염으로부터
     // cys 마스터를 분리한다. best-effort·보존 모드라 깨끗한 환경에서도 회귀 0.
     setup_isolated_config_dir();

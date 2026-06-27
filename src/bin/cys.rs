@@ -132,6 +132,8 @@ enum Command {
     },
     /// kill-switch 해제 — 동결된 큐·스케줄 재개
     Resume,
+    /// 업데이트 재시작 전 살아있는 노드에 저장 신호 + 유예 (best-effort drain)
+    Drain,
     /// preflight 게이트: exit 0 = running, 4 = paused (자율주행 매 action 전 확인용)
     GateCheck,
     /// 미배달 큐 검사·철회 (kill-switch의 짝)
@@ -1103,6 +1105,34 @@ fn run(command: Command) -> i32 {
 
         Command::Resume => request("system.resume", json!({}))
             .map(|_| println!("RESUMED — 동결된 큐·스케줄 재개")),
+
+        Command::Drain => {
+            // 업데이트 재시작 전 살아있는 역할 노드에 저장 신호를 보내고 짧게 유예한다(best-effort).
+            // 노드(LLM) 협조 의존이라 무손실 보장은 아니며, 주 복원 경로는 재시작 후 resume이다.
+            // ★hard watchdog: 데몬 무응답으로 RPC(read_line)가 hang해도 12s 내 무조건 종료해,
+            // 호출처(install_update)가 영구 정지하지 않게 한다.
+            std::thread::spawn(|| {
+                std::thread::sleep(std::time::Duration::from_secs(12));
+                std::process::exit(0);
+            });
+            let mut n = 0;
+            if let Ok(topo) = request("system.topology", json!({})) {
+                for e in topo["live"].as_array().cloned().unwrap_or_default() {
+                    let Some(role) = e["role"].as_str() else { continue };
+                    if let Ok(r) = request("system.resolve_role", json!({"role": role})) {
+                        if let Some(sid) = r["surface_id"].as_u64() {
+                            let _ = inject_text(sid, "[DRAIN] 업데이트 재시작이 임박했다. 승인 프롬프트 대기 중이면 이 메시지는 무시하라. 아니면 지금 _round/SESSION_STATE.md와 자기 TODO를 저장하고 작업을 멈춰라. 작업 재개는 복원 후 master 지시를 기다린다.");
+                            n += 1;
+                        }
+                    }
+                }
+            }
+            if n > 0 {
+                std::thread::sleep(std::time::Duration::from_secs(8));
+            }
+            println!("drained {n} node(s)");
+            return 0;
+        }
 
         Command::GateCheck => {
             return match request("system.gate_check", json!({})) {
