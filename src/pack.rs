@@ -831,6 +831,66 @@ mod tests {
         let _ = std::fs::remove_dir_all(&td);
     }
 
+    /// version_gt: 자릿수 비교·prerelease suffix 분리·fail-CLOSED(파싱 실패 시 보수적 차단).
+    #[test]
+    fn version_gt_basic_prerelease_and_fail_closed() {
+        assert!(version_gt("0.10.0", "0.4.1"), "minor 자릿수");
+        assert!(version_gt("0.4.10", "0.4.9"), "patch 자릿수(문자열 비교면 실패)");
+        assert!(!version_gt("0.4.1", "0.4.1"), "동일 → false");
+        assert!(!version_gt("0.4.0", "0.4.1"), "낮음 → false");
+        assert!(version_gt("v0.5.0", "0.4.9"), "'v' 접두");
+        // prerelease/build suffix 분리 — 이전 fail-OPEN(10-rc→0)이 뚫렸던 회귀 케이스
+        assert!(version_gt("0.4.10-rc", "0.4.9"), "patch 10-rc → 10 > 9");
+        assert!(version_gt("0.5.0-rc1", "0.4.9"));
+        assert!(version_gt("0.4.0+build", "0.3.9"));
+        assert!(!version_gt("0.4.9", "0.4.10-rc"), "역방향");
+        // ★fail-CLOSED: 디스크 버전(a) 파싱 실패 → true(보존/차단)
+        assert!(version_gt("garbage", "0.4.1"), "비숫자 major → fail-CLOSED");
+        assert!(version_gt("", "0.4.1"), "빈 문자열 → fail-CLOSED");
+    }
+
+    /// 다운그레이드 차단: 디스크 .pack-version이 embed보다 새것이면 비강제 install이 (0,0)으로
+    /// 차단하고 디스크 버전을 보존한다. force는 우회한다.
+    #[test]
+    fn install_blocks_downgrade_when_disk_version_newer() {
+        let _g = PACK_ENV_LOCK.lock().unwrap();
+        let saved = std::env::var(ENV_PACK_DIR).ok();
+        let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
+        let td = std::env::temp_dir().join(format!("cys-pack-downgrade-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        std::env::set_var(ENV_PACK_DIR, &td);
+        std::env::set_var(ENV_CONFIG_DIR, td.join("cysclaude"));
+
+        let embed = env!("CARGO_PKG_VERSION");
+        // 1) 정상 설치 → .pack-version = embed 기록
+        install(false).expect("최초 install 실패");
+        let disk_v1 = std::fs::read_to_string(td.join(PACK_VERSION_FILE)).unwrap();
+        // 2) 디스크 .pack-version을 더 새 버전으로 위조(구버전 cys 롤백/오설치 시뮬)
+        std::fs::write(td.join(PACK_VERSION_FILE), "99.0.0").unwrap();
+        // 3) install(false) → 다운그레이드 차단 → (0,0), .pack-version 유지(embed로 안 덮음)
+        let blocked = install(false).expect("install 실패");
+        let disk_after = std::fs::read_to_string(td.join(PACK_VERSION_FILE)).unwrap();
+        // 4) force는 우회 → 갱신
+        install(true).expect("force install 실패");
+        let disk_forced = std::fs::read_to_string(td.join(PACK_VERSION_FILE)).unwrap();
+
+        // env 복원(assert 전 — 패닉해도 전역 env 누수 없게)
+        match saved {
+            Some(v) => std::env::set_var(ENV_PACK_DIR, v),
+            None => std::env::remove_var(ENV_PACK_DIR),
+        }
+        match saved_cfg {
+            Some(v) => std::env::set_var(ENV_CONFIG_DIR, v),
+            None => std::env::remove_var(ENV_CONFIG_DIR),
+        }
+        let _ = std::fs::remove_dir_all(&td);
+
+        assert_eq!(disk_v1.trim(), embed, "최초 install이 .pack-version을 embed로 기록");
+        assert_eq!(blocked, (0, 0), "다운그레이드는 차단되어 (0,0) 반환");
+        assert_eq!(disk_after.trim(), "99.0.0", "차단 시 디스크 버전 유지");
+        assert_eq!(disk_forced.trim(), embed, "force는 다운그레이드 우회해 embed로 갱신");
+    }
+
     /// ★불변식 박제: force=false 업그레이드 의미론 (전수조사 발견 B 보완).
     /// ① 사용자 비수정 파일(설치-당시 해시 일치) → 임베드 신버전으로 자동 갱신
     /// ② 사용자 수정 파일 → 불가침 보존
