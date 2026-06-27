@@ -1074,14 +1074,13 @@ fn default_pack_manifest_url() -> String {
 ///   - Ok(Some({pack_version, manifest_url, min_binary_version, binary_too_old}))
 ///       → 확인된 새 팩 있음. binary_too_old=false=무중단 가능(install_pack_update 경로) /
 ///         true=min_binary_version > 실행 바이너리 = 무중단 거부, 바이너리(재시작) 경로 안내.
-///   - Ok(None)  → ★확인된 'no-update'에만(원격을 받아·파싱해 비교했고 디스크보다 새것이 아님).
-///                 UI는 이때만 packUpdateAvailable을 해제한다.
-///   - Err(..)   → transient/unknown 실패(spawn/join·curl 실행·HTTP 비정상·manifest 파싱/검증
-///                 실패). UI의 기존 catch가 packCheckFailed=true로 잡아 ★마지막 검증 상태를 보존하고
-///                 토스트는 띄우지 않는다(silent 폴링). '확인된 no-update'와 섞지 않는 게 핵심 —
-///                 일시 장애로 packUpdateAvailable이 소거돼 배지가 사라지는 것을 막는다.
-///                 (역직렬화 fail-closed는 보안상 유지 — 미서명/변조 manifest를 Some으로 오인하지 않고
-///                  unknown=Err로 분류한다.)
+///   - Ok(None)  → ① 정상 no-update(원격을 받아·파싱해 비교했고 디스크보다 새것이 아님) 또는
+///                 ② 미서명/필수필드 부재 manifest의 fail-closed 거부(보안 경계 — 받았으나 신뢰 불가,
+///                 설치 안 함). UI는 이때만 packUpdateAvailable을 해제한다(확인된 '새 팩 없음').
+///   - Err(..)   → ★일시 fetch 장애(spawn/join·curl 실행·HTTP 비정상). UI의 기존 catch가
+///                 packCheckFailed=true로 잡아 마지막 검증 상태를 보존하고 토스트는 띄우지 않는다
+///                 (silent 폴링). '확인된 no-update'와 섞지 않는 게 핵심 — 일시 장애로
+///                 packUpdateAvailable이 소거돼 배지가 사라지는 것을 막는다.
 #[tauri::command]
 async fn check_pack_update(manifest_url: Option<String>) -> Result<Option<Value>, String> {
     let url = manifest_url.unwrap_or_else(default_pack_manifest_url);
@@ -1099,10 +1098,13 @@ async fn check_pack_update(manifest_url: Option<String>) -> Result<Option<Value>
         Ok(Err(e)) => return Err(format!("curl 실행 실패: {e}")),
         Err(e) => return Err(format!("curl join 실패: {e}")),
     };
-    // 미서명/필수필드 부재 manifest는 packsig PackManifest 역직렬화에서 fail-closed(거부). Some으로 오인하지
-    // 않되 '확인된 no-update'(Ok(None))도 아닌 unknown → Err(상태보존). 보안(fail-closed) 유지.
-    let manifest: cys::packsig::PackManifest = serde_json::from_slice(&out.stdout)
-        .map_err(|e| format!("pack-manifest 파싱/검증 실패(fail-closed): {e}"))?;
+    // 미서명/필수필드 부재 manifest = packsig PackManifest 역직렬화 fail-closed(거부) = 보안 경계.
+    //   받았으나 신뢰 불가 → '새 팩 없음'으로 취급(Ok(None), 설치 안 함). fetch 장애(Err·상태보존)와
+    //   달리 재시도해도 동일하므로 unknown이 아닌 확정 거부 — UI는 packUpdateAvailable을 해제한다.
+    let manifest: cys::packsig::PackManifest = match serde_json::from_slice(&out.stdout) {
+        Ok(m) => m,
+        Err(_) => return Ok(None),
+    };
     let disk = std::fs::read_to_string(cys::pack::pack_dir().join(".pack-version"))
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
