@@ -1080,16 +1080,16 @@ async fn check_pack_update(manifest_url: Option<String>) -> Result<Option<Value>
     let url = manifest_url.unwrap_or_else(default_pack_manifest_url);
     // 경량 페치: manifest JSON만 stdout으로. blocking 풀에서 실행(install_pack_update curl 패턴 동형).
     let fetch_url = url.clone();
-    let out = tokio::task::spawn_blocking(move || {
+    // ★폴링 silent 계약: spawn/join 실패·curl 실행 실패·HTTP 비정상 모두 조용히 None(에러 미전파).
+    //   업데이트 가용성 확인은 best-effort 폴링이라 일시 장애를 에러로 올리지 않는다(doc 주석과 정합).
+    let joined = tokio::task::spawn_blocking(move || {
         std::process::Command::new("curl").args(["-fsSL", &fetch_url]).output()
     })
-    .await
-    .map_err(|e| format!("curl join 실패: {e}"))?
-    .map_err(|e| format!("curl 실행 실패: {e}"))?;
-    // 네트워크/부재로 페치 실패 = 조용히 None(폴링 — 에러 토스트 미발화).
-    if !out.status.success() {
-        return Ok(None);
-    }
+    .await;
+    let out = match joined {
+        Ok(Ok(out)) if out.status.success() => out,
+        _ => return Ok(None),
+    };
     // 미서명/필수필드 부재 manifest는 packsig PackManifest 역직렬화에서 fail-closed(거부).
     let manifest: cys::packsig::PackManifest = match serde_json::from_slice(&out.stdout) {
         Ok(m) => m,

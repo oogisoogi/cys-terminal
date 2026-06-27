@@ -2514,17 +2514,26 @@ async function checkForUpdate(silent: boolean) {
   }
   // 2) 무중단 팩 업데이트(pack-manifest.json) — 세션·데몬 유지 경로. 실패는 조용히(폴링).
   let pack: { pack_version: string; manifest_url: string; binary_too_old: boolean } | null = null;
+  let packCheckFailed = false;
   try {
     pack = (await invoke("check_pack_update")) as typeof pack;
   } catch {
     /* 팩 체크 실패(네트워크·부재) = 조용히 무시 */
+    packCheckFailed = true;
   }
 
-  updateAvailable = bin && bin.version ? { version: bin.version, notes: bin.notes } : null;
-  packUpdateAvailable =
-    pack && pack.pack_version
-      ? { pack_version: pack.pack_version, manifest_url: pack.manifest_url, binary_too_old: pack.binary_too_old }
-      : null;
+  // ★fail-safe: 체크가 성공했을 때만 상태를 갱신한다. 일시 네트워크/업데이터 장애로 체크가 실패하면
+  // 마지막으로 검증된 상태(있던 업데이트 배지)를 보존한다 — 장애로 배지가 사라져 "업데이트 없음"으로
+  // 오인하는 것을 막는다(fresh 성공 시에만 갱신·해제).
+  if (!binCheckFailed) {
+    updateAvailable = bin && bin.version ? { version: bin.version, notes: bin.notes } : null;
+  }
+  if (!packCheckFailed) {
+    packUpdateAvailable =
+      pack && pack.pack_version
+        ? { pack_version: pack.pack_version, manifest_url: pack.manifest_url, binary_too_old: pack.binary_too_old }
+        : null;
+  }
 
   const badge = document.getElementById("update-badge")!;
   if (updateAvailable) {
@@ -2551,7 +2560,9 @@ async function checkForUpdate(silent: boolean) {
     if (!silent) toast("health", "바이너리 업데이트 필요", msg);
     else toast("feed", "⚠ 업데이트 있음", msg);
   } else {
-    badge.hidden = true;
+    // ★fail-safe: 양쪽 체크가 모두 성공적으로 '없음'을 확인했을 때만 배지를 해제한다. 장애(체크 실패)
+    // 시엔 마지막 검증 상태(배지)를 유지한다 — 일시 장애로 배지가 사라지지 않게.
+    if (!binCheckFailed && !packCheckFailed) badge.hidden = true;
     // 바이너리 체크가 실패했으면 상태 불명 — '이미 최신' 단정 금지(실패 토스트가 이미 알림, 모순 차단).
     if (!silent && !binCheckFailed) toast("watchdog", "최신 버전", "이미 최신입니다.");
   }
