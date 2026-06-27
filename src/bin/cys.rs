@@ -4290,6 +4290,13 @@ fn with_apply_lock<T>(lock_path: &std::path::Path, f: impl FnOnce() -> T) -> Res
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;
+        // CI fresh 환경엔 ~/.cys/ 가 없어 lock 파일 open이 ENOENT로 실패한다.
+        // 락 파일 열기 직전 부모 디렉토리를 보장한다(이미 있으면 무해).
+        if let Some(parent) = lock_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                format!("apply-lock 부모 디렉토리 생성 실패 {}: {e}", parent.display())
+            })?;
+        }
         let file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -6228,5 +6235,27 @@ mod tests {
             None => std::env::remove_var(cys::pack::ENV_PACK_DIR),
         }
         let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// 회귀: ~/.cys/ 가 없는 CI fresh 환경에서 with_apply_lock이 락 파일 부모 디렉토리를
+    /// create_dir_all로 보장하지 못해 dry-run이 ENOENT로 실패한 버그(v0.4.2 CI).
+    /// 락 경로의 부모가 존재하지 않아도 with_apply_lock이 성공하고 클로저가 실행돼야 한다.
+    #[cfg(unix)]
+    #[test]
+    fn apply_lock_creates_missing_parent_dir() {
+        // 존재하지 않는 부모(~/.cys/ 부재 모사): base/<없는 .cys>/.pack-apply.lock
+        let base =
+            std::env::temp_dir().join(format!("cys-applylock-fresh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let missing_cys = base.join("nonexistent-dot-cys");
+        let lock_path = missing_cys.join(".pack-apply.lock");
+        assert!(!missing_cys.exists(), "사전조건: 부모 디렉토리가 없어야 함");
+
+        let ran = with_apply_lock(&lock_path, || 42).expect("부모 부재여도 lock 성공해야 함");
+        assert_eq!(ran, 42, "클로저가 실행돼 반환값이 전달돼야 함");
+        assert!(missing_cys.exists(), "lock이 부모 디렉토리를 생성했어야 함");
+        assert!(lock_path.exists(), "lock 파일이 생성됐어야 함");
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
