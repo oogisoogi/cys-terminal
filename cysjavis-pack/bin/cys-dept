@@ -11,6 +11,12 @@
 # 단일 진입점: Tauri/UI·CLI 모두 이 도구를 거쳐 부서를 운용한다(직접 cysd spawn 금지 — 레지스트리/ACL 미시드 방지).
 set -euo pipefail
 
+# ★PATH 보강(GUI Finder/Dock 런칭 대응): cys.app은 launchd 기본 PATH(/usr/bin:/bin:/usr/sbin:/sbin)만
+# 상속해 cys(/opt/homebrew/bin)·claude(~/.local/bin)를 못 찾는다 → 부서장 각성 시 javis_boot_node 의
+# `cys status` 실패·dept cysd 의 claude spawn 실패 = 0 pane. 이 도구가 spawn 하는 모든 자식(cysd·
+# python3 javis_boot_node·그 아래 claude)이 상속하도록 단일 지점에서 로그인 셸 표준 경로를 prepend.
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin${PATH:+:$PATH}"
+
 REG="${CYS_DEPTS_JSON:-$HOME/.cys/depts.json}"
 PACK_DEFAULT="$HOME/.cys/pack"
 CYSD="$(command -v cysd || echo /opt/homebrew/bin/cysd)"
@@ -336,19 +342,18 @@ PY
       "$0" down "$name" >/dev/null 2>&1 || true; trap - EXIT; exit 6
     fi
     trap - EXIT   # 격리 확정 — 회수 취소
-    # ★A) 부서장 master 자동각성(기본 ON·Decision A: 새 ws=전용 격리 데몬+부서장). allocate 데몬도 부서장을
-    #   가져 계정격리·reaper 보호된다. CYS_DEPT_NO_MASTER=1이면 빈 데몬(생략). 더블master guard 동일(이미 master면
-    #   재각성 생략·멱등). awaken 실패는 비치명(데몬·격리 보존·warn) — create 각성 블록과 동형. cwd=CYS_DEPT_CWD(기본 $HOME).
+    # ★박사님 지시(2026-06-29): 부서 생성 시 claude 자동연결 폐지 → role=master '빈 셸'만 띄운다.
+    #   사용자가 그 터미널에서 직접 claude 를 실행해 부서장으로 연결한다(Decision A '부서장 자동각성'을
+    #   allocate 경로에서 폐지). UI 자동입양은 role 있는 surface 만 받으므로(main.ts:1268 !s.role 가드)
+    #   --role master 필수·--cmd 생략=기본 로그인 셸. CYS_DEPT_NO_MASTER=1=셸도 생략(빈 데몬). 이미 master면 멱등.
     if [ "${CYS_DEPT_NO_MASTER:-0}" = 1 ]; then
-      echo "[cys-dept] $name CYS_DEPT_NO_MASTER=1 — 부서장 미각성(빈 데몬)" >&2
+      echo "[cys-dept] $name CYS_DEPT_NO_MASTER=1 — 셸 미생성(빈 데몬)" >&2
     elif dept_has_master "$sock"; then
-      echo "[cys-dept] $name 이미 live master surface 존재 — 재각성 생략(멱등 더블master 방지)" >&2
-    elif CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" CYS_ACCOUNT_DIR="$acctdir" \
-         python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_boot_node.py" \
-           --role master --agent claude --cwd "${CYS_DEPT_CWD:-$HOME}" 1>&2; then
-      echo "[cys-dept] $name 부서장 master 자동각성 완료 (cwd=${CYS_DEPT_CWD:-$HOME})" >&2
+      echo "[cys-dept] $name 이미 master surface 존재 — 셸 생성 생략(멱등)" >&2
+    elif CYS_SOCKET="$sock" "$CYS" new-surface --socket "$sock" --role master --cwd "${CYS_DEPT_CWD:-$HOME}" >/dev/null 2>&1; then
+      echo "[cys-dept] $name role=master 빈 셸 생성 완료 — 사용자가 직접 claude 연결 (cwd=${CYS_DEPT_CWD:-$HOME})" >&2
     else
-      echo "[cys-dept] WARN: $name 부서장 각성 미확정 — read-screen 점검(데몬·격리는 정상)" >&2
+      echo "[cys-dept] WARN: $name 셸 생성 실패 — read-screen 점검(데몬·격리는 정상)" >&2
     fi
     echo "[cys-dept] $name allocate 완료 (sock=$sock acct=$acctdir)" >&2
     echo "$name"   # ★stdout 마지막 줄 = 확정 name (Tauri 파싱). 진단은 전부 >&2
