@@ -2220,21 +2220,15 @@ async function addDeptWorkspace(catalogKey?: string): Promise<Workspace> {
       if (firstSid != null) setFocus(firstSid);
       return dup;
     }
-    // master 자동기동을 제거했으므로 UI가 plain 셸 1개를 직접 만들어 첫 pane으로 채운다(고아 0).
-    // 순서 고정: socket 확정 → pending 유지한 채 newSurface await → tree 할당 후 pending=false
-    // (그래야 3초 자동입양 인터벌이 await 중 빈 placeholder를 오입양하지 않는다).
+    // 안 A(C4 더블 surface 해소): cys-dept(create=javis_boot_node·allocate=자동각성)가 부서장 role=master
+    // surface를 띄우므로 UI는 plain 셸을 직접 만들지 않는다. socket 확정 + pending 해제 → refreshPaneTitles
+    // 자동입양이 그 master를 '첫 pane'으로 채운다(rolePri master=0 → 좌측·focus). 빈 셸 0·더블 surface 0.
+    // 탭이 await 중 닫혀도(close 핸들러가 socket 기준 데몬 teardown) 좀비 없음 — 별도 plain-셸 회수 불필요.
     ws.socket = info.socket;
-    const sid = await newSurface(null, info.socket);
-    // await 중 사용자가 placeholder ×를 눌렀으면(close 핸들러가 데몬 teardown 가능) — 좀비 방지.
-    if (workspaces.indexOf(ws) < 0) {
-      await invoke("close_surface", { socket: info.socket, surfaceId: sid }).catch(() => {});
-      if (info.socket) await invoke("stop_dept_daemon_by_socket", { socket: info.socket }).catch(() => {});
-      return ws;
-    }
-    ws.tree = { type: "pane", sid };
     ws.pending = false;
     render();
-    refreshPaneTitles(); // 나중에 수동 boot한 master/노드 자동입양은 그대로 유지
+    await refreshPaneTitles(); // 방금 띄운 master surface를 즉시 입양(3초 인터벌 대기 없이). 부팅 실패 시
+    //                            tree:null로 남고 master 등장 시 인터벌이 재입양(start()의 비활성 부서 처리와 정합).
     return ws;
   } catch (e) {
     // 실패 시 placeholder 롤백 — 유령 탭이 남지 않게 제거.
@@ -3340,7 +3334,12 @@ document.getElementById("cc-sessions-redact")!.addEventListener("click", (e) => 
   refreshSessions();
 });
 document.getElementById("btn-update")!.addEventListener("click", () => onUpdateButton());
-document.getElementById("btn-ws-new")!.addEventListener("click", () => addWorkspace());
+// 박사님 Decision A: 새 워크스페이스 = 항상 전용 격리 데몬 + 부서장(master). btn-ws-new를 무카탈로그
+// addDeptWorkspace(allocate=계정격리+부서장 자동각성)로 라우팅한다. 기본/CEO 데몬은 첫 ws(start)·전탭닫힘
+// 폴백(addWorkspace)만 사용 — 불변. 실패는 placeholder 롤백(addDeptWorkspace) + 토스트.
+document.getElementById("btn-ws-new")!.addEventListener("click", () =>
+  addDeptWorkspace().catch((e) => toast("watchdog", "새 워크스페이스 실패", String(e))),
+);
 // 멀티마스터 F4 + ＋부서 자동화(패치5): 새 부서(독립 데몬) workspace 런칭. 부서 번호는 백엔드가 확정.
 const deptBtn = document.getElementById("btn-ws-dept") as HTMLButtonElement | null;
 // 부서 런칭 실행(공통) — placeholder 탭·in-flight 버튼 가드. catalogKey=undefined → 레거시 dept-N.
