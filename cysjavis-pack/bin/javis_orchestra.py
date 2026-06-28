@@ -1132,6 +1132,99 @@ def cmd_channel_health(args):
     return r.returncode
 
 
+# ── guard-master-claim: misrouted-master 부트 가드 (Fix 2'·결정론·이중방어) ──
+# 공유 데몬에 2번째 master를 선언하는 잔여 경로(수동 claim-role·명령팔레트)에 대한 이중방어.
+# 데몬 내부의 privileged-role 점유 차단(cysd handlers.rs)이 1차 방어, 이 명령이 2차(부트 전 선검사).
+def _surface_id_env():
+    """내 surface id 문자열 반환(없으면 None). cys::env_compat 우선순위(AITERM_*→JAVIS_*→CYS_*)와 정합 —
+    AITERM_SURFACE_ID를 먼저 보되, cysd가 실제 주입하는 CYS_SURFACE_ID(src/lib.rs ENV_SURFACE_ID)도 인식한다.
+    셋 다 미설정(외부 셸 세션)이면 None → 호출부가 PASS(부팅 차단 회귀 방지·gemini D2)."""
+    for k in ("AITERM_SURFACE_ID", "JAVIS_SURFACE_ID", "CYS_SURFACE_ID"):
+        v = os.environ.get(k, "").strip()
+        if v:
+            return v
+    return None
+
+
+def _parse_ref(s):
+    """'surface:31' 또는 '31' → 31(int). 파싱불가 → None."""
+    s = (s or "").strip()
+    if s.startswith("surface:"):
+        s = s[len("surface:"):]
+    try:
+        return int(s)
+    except (TypeError, ValueError):
+        return None
+
+
+def _cys_list_masters():
+    """현재 데몬(상속 CYS_SOCKET)의 live(미exited) role=master surface id 리스트. cys list 실패 시 None.
+    cys list 라인 형식: '{surface_ref}\\trole={role}\\tpid={pid}\\texited={bool}\\t{title}\\t{cwd}'."""
+    cys = shutil.which("cys")
+    if not cys:
+        return None
+    try:
+        r = subprocess.run([cys, "list"], capture_output=True, timeout=10)
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    masters = []
+    for line in r.stdout.decode("utf-8", "replace").splitlines():
+        f = line.split("\t")
+        if len(f) < 4:
+            continue
+        role = f[1][5:] if f[1].startswith("role=") else ""
+        exited = f[3].strip().endswith("true")
+        if role == "master" and not exited:
+            sid = _parse_ref(f[0])
+            if sid is not None:
+                masters.append(sid)
+    return masters
+
+
+def guard_master_verdict(my_env, masters):
+    """순수 판정(cys 의존 없음·self-test 핀). 반환 (code, kind).
+    my_env=내 surface id 문자열(None=미설정) · masters=live master id 리스트(None=cys list 실패).
+    ★결정론·false-block 회귀 금지(gemini D2): 미설정/파싱불가/조회실패는 전부 PASS(0). 오직 '내 id가
+    유효하고 다른 유효 master가 존재'할 때만 MISROUTED(9)."""
+    if my_env is None:
+        return 0, "unset"
+    my_id = _parse_ref(my_env)
+    if my_id is None:
+        return 0, "unparsed"        # set-but-malformed → 보수적 PASS(false-block 금지)
+    if masters is None:
+        return 0, "list_fail"       # 결정론 신호 부재 → 보수적 PASS
+    if [m for m in masters if m != my_id]:
+        return 9, "misrouted"
+    return (0, "idempotent") if my_id in masters else (0, "no_master")
+
+
+def cmd_guard_master_claim(args):
+    """claim-role master 직전 결정론 선검사. AITERM/CYS_SURFACE_ID 미설정(외부 셸)→PASS(0).
+    설정 시 내 surface 와 다른 live master 보유자가 있으면 MISROUTED_MASTER + exit 9.
+    보유자=나(멱등)·master 부재→PASS(0)."""
+    my_env = _surface_id_env()
+    masters = _cys_list_masters() if (my_env is not None and _parse_ref(my_env) is not None) else None
+    code, kind = guard_master_verdict(my_env, masters)
+    if kind == "unset":
+        print("[guard-master-claim] surface id env 미설정(외부 셸 세션) — PASS(부팅 차단 회귀 방지)")
+    elif kind == "unparsed":
+        print("[guard-master-claim] surface id env 파싱불가(%r) — PASS(false-block 회귀 방지)" % my_env)
+    elif kind == "list_fail":
+        print("[guard-master-claim] cys list 미수집(데몬 미응답?) — PASS(부팅 차단 회귀 방지)")
+    elif kind == "misrouted":
+        my_id = _parse_ref(my_env)
+        holder = next(m for m in masters if m != my_id)
+        print("MISROUTED_MASTER: 이 surface(surface:%d)는 이미 master(surface:%d)가 있는 공유 데몬에 떴습니다. "
+              "2번째 master 선언 금지 — 격리된(전용 데몬) master 워크스페이스로 옮겨 다시 선언하세요." % (my_id, holder))
+    elif kind == "idempotent":
+        print("[guard-master-claim] 내가 이미 master 보유자(surface:%d) — 멱등 PASS" % _parse_ref(my_env))
+    else:  # no_master
+        print("[guard-master-claim] live master 부재 — claim 허용(PASS)")
+    return code
+
+
 def cmd_self_test(args):
     """순수 로직 자기검증 (cys 의존 없음) — preflight C19가 호출. assert 실패는 exit 1."""
     try:
@@ -1427,6 +1520,15 @@ def cmd_self_test(args):
             with contextlib.redirect_stdout(_rbuf):
                 cmd_review_prompt(_RA())
             assert "명시기준ZZZ" in _rbuf.getvalue(), "명시 --success가 리뷰 프롬프트에 미반영(하위호환 깨짐)"
+        # ★Fix2' guard-master-claim 순수 판정 배터리(cys 의존 없음·결정론):
+        assert _parse_ref("surface:7") == 7 and _parse_ref("7") == 7 and _parse_ref("x") is None, "_parse_ref 오류"
+        assert guard_master_verdict(None, None) == (0, "unset"), "미설정인데 PASS/unset 아님(부팅 차단 회귀)"
+        assert guard_master_verdict("31", [99, 31])[0] == 9, "타 master(99) 보유인데 exit9 아님"
+        assert guard_master_verdict("surface:31", [99])[0] == 9, "타 master(surface 접두) 보유인데 exit9 아님"
+        assert guard_master_verdict("31", [31]) == (0, "idempotent"), "내가 보유자(멱등)인데 PASS 아님"
+        assert guard_master_verdict("31", []) == (0, "no_master"), "master 부재인데 PASS 아님"
+        assert guard_master_verdict("31", None) == (0, "list_fail"), "cys list 실패인데 PASS/list_fail 아님(부팅 차단 회귀)"
+        assert guard_master_verdict("notanumber", [99]) == (0, "unparsed"), "파싱불가 env가 false-block(회귀)"
     except AssertionError as e:
         print("javis_orchestra self-test FAIL: %s" % e, file=sys.stderr)
         return 1
@@ -1524,6 +1626,10 @@ def main():
     ch.add_argument("--json", action="store_true", help="기계판(verdict 배열) — 기본은 silence-first")
     ch.add_argument("channels", nargs="*", help="부분집합(예: reddit x). 비우면 전체")
 
+    sub.add_parser("guard-master-claim",
+                   help="Fix2' misrouted-master 부트 가드 — claim-role master 직전 결정론 선검사"
+                        "(surface id env 미설정=PASS·타 master 보유=exit 9)")
+
     args = ap.parse_args()
     return {
         "check": cmd_check,
@@ -1538,6 +1644,7 @@ def main():
         "next-action": cmd_next_action,
         "silent-failure-catalog": cmd_silent_failure_catalog,
         "channel-health": cmd_channel_health,
+        "guard-master-claim": cmd_guard_master_claim,
     }[args.cmd](args)
 
 

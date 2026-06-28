@@ -954,6 +954,51 @@ class Preflight:
         else:
             self.add(cid, FAIL, "PATH에 cys 없음 — cys 터미널 설치/PATH 확인 필요")
 
+    # ── C11b cys-dept PATH 노출 (Fix3' — CEO fan-out `cys-dept list`가 풀경로 없이 동작) ──
+    def c11b_cys_dept_path(self):
+        cid = "C11b.cys-dept-path"
+        if self.skipped(cid):
+            return
+        # cys·cysd는 컴파일 바이너리(scripts/deploy_gate.py가 target/release→/opt/homebrew/bin 복사)지만
+        # cys-dept는 팩 bash 스크립트(~/.cys/pack/bin/cys-dept)라 PATH에 없다 → CEO 디렉티브의
+        # `cys-dept list` fan-out이 풀경로 없이 실패한다(GUI/백엔드는 pack_dir()/bin 풀경로라 무관).
+        # cys 옆(=같은 PATH dir)에 팩 스크립트로의 심링크를 둬 노출한다 — 가역·멱등·자가치유(스킬 심링크와
+        # 동일 규약: 실파일은 덮지 않음). 비가역 외부설치가 아니므로 may_mutate 불요(reversible local).
+        src = os.path.join(pack_dir(), "bin", "cys-dept")
+        if not os.path.isfile(src):
+            self.add(cid, WARN, "팩에 bin/cys-dept 없음 — `cys init-pack` 재실행")
+            return
+        existing = shutil.which("cys-dept")
+        if existing and os.path.realpath(existing) == os.path.realpath(src):
+            self.add(cid, PASS, existing)
+            return
+        cys = shutil.which("cys")
+        if not cys:
+            self.add(cid, SKIP, "cys 부재로 PATH dir 판정 불가 (C11 먼저)")
+            return
+        link = os.path.join(os.path.dirname(cys), "cys-dept")  # cys와 같은 PATH dir
+        if self._symlink_ok(link, src):
+            self.add(cid, PASS, link)
+            return
+        if os.path.exists(link) and not os.path.islink(link):
+            self.add(cid, WARN, "%s 실파일 존재 — 자동 심링크 보류(수동 확인)" % link)
+            return
+        if self.fix:
+            try:
+                # PATH 해소(which/셸)는 대상이 실행가능해야 한다 — 팩 cys-dept가 0644면 심링크해도
+                # `cys-dept`가 안 잡힌다. 실행비트를 보강(가역·멱등)한 뒤 심링크한다(Fix1' 실행비트 의존 해소).
+                st = os.stat(src).st_mode
+                if not (st & 0o111):
+                    os.chmod(src, st | 0o111)
+                if os.path.islink(link):
+                    os.unlink(link)  # stale/오타깃 심링크 교체
+                os.symlink(src, link)
+                self.add(cid, FIXED, "%s → %s 심링크(PATH 노출·+x 보강)" % (link, src))
+            except OSError as e:
+                self.add(cid, WARN, "심링크/실행비트 실패(%s 쓰기권한?): %s" % (os.path.dirname(link), e))
+        else:
+            self.add(cid, WARN, "cys-dept PATH 미노출 — --fix로 %s 심링크 생성" % link)
+
     # ── C12 cysd 데몬 생존 ──
     def c12_daemon(self):
         cid = "C12.daemon"
@@ -2766,6 +2811,7 @@ class Preflight:
         self.c09_round_core()
         self.c10_todo_files()
         self.c11_cys_binary()
+        self.c11b_cys_dept_path()
         self.c12_daemon()
         self.c13_claude_md()
         self.c14_self()
