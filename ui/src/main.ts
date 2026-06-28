@@ -1371,6 +1371,11 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
   el.append(header, termHost);
 
   const term = new Terminal({
+    // create_surface(아래 newSurface, rows:35/cols:120)로 띄운 PTY와 초기 폭을 일치시킨다.
+    // 불일치(xterm 기본 80 < PTY 120) 시 zsh promptsp의 EOL 마커(반전 %)+(cols-1)공백이
+    // 80폭에서 wrap돼 첫 줄(0,0)에 고립 표시된다. fit.fit()은 첫 프롬프트 뒤라 소급 정정 안 됨.
+    cols: 120,
+    rows: 35,
     fontFamily: "Menlo, 'SF Mono', 'Apple SD Gothic Neo', 'Noto Sans KR', Consolas, monospace",
     fontSize,
     theme: { background: "#0d1117", foreground: "#c9d1d9" },
@@ -2558,7 +2563,7 @@ async function checkForUpdate(silent: boolean) {
     // 시엔 마지막 검증 상태(배지)를 유지한다 — 일시 장애로 배지가 사라지지 않게.
     if (!binCheckFailed && !packCheckFailed) badge.hidden = true;
     // 어느 한쪽이라도 체크 실패면 상태 불명 — '이미 최신' 단정 금지(바이너리·팩 둘 다 성공 확인 시에만).
-    if (!silent && !binCheckFailed && !packCheckFailed) toast("watchdog", "최신 버전", "이미 최신입니다.");
+    if (!silent && !binCheckFailed && !packCheckFailed) toast("watchdog", "✅ 최신 버전", "최신 버전입니다. 추가 업데이트가 없습니다.");
   }
 }
 

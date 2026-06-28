@@ -859,7 +859,7 @@ class Preflight:
     # cysd events 테이블에 적재(E3 스킬 TOP·반복실패 토대). hook은 fail-open(에이전트 무차단)이라
     # 무관 작업 불간섭. C32와 동일 규약(체인보존·symlink/파손 거부·원자적). FAIL 없음(미등록=WARN).
     EVENT_HOOK = "cys-hook.sh"
-    EVENT_HOOK_EVENTS = ("PreToolUse", "PostToolUse", "PermissionRequest", "ExitPlanMode", "AskUserQuestion")
+    EVENT_HOOK_EVENTS = ("PreToolUse", "PostToolUse", "PermissionRequest")
 
     def c33_event_hooks(self):
         cid = "C33.event-hooks"
