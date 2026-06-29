@@ -318,7 +318,10 @@ PY
     trap 'reg_remove "$name" 2>/dev/null || true' EXIT   # 예약 후 비정상종료=예약 회수(SIGKILL 제외)
     sock="$(dept_sock "$name")"; pack="$(dept_pack "$name")"
     # ★계정격리(Fix1'): 기본계정 base 해석 → 부서별 fork dir(<base>-<name>). base 해석불가=fail-closed.
-    acct="${CYS_DEPT_DEFAULT_ACCOUNT:-ysfuture}"
+    # 기본계정은 CYS_DEPT_DEFAULT_ACCOUNT로 명시 지정한다(공개 배포본에 특정 오너 핸들을 박지 않는다 —
+    # 운영자가 한 번 설정: export CYS_DEPT_DEFAULT_ACCOUNT=<account>).
+    acct="${CYS_DEPT_DEFAULT_ACCOUNT:-}"
+    [ -n "$acct" ] || { echo "[cys-dept] allocate: 기본계정 미지정 — 'export CYS_DEPT_DEFAULT_ACCOUNT=<account>'로 지정하세요(부서별 격리 base 해석에 필요) — fail-closed" >&2; exit 5; }
     base="$(resolve_default_base "$acct")" || { echo "[cys-dept] allocate: 기본계정 base 해석 불가($acct) — fail-closed" >&2; exit 5; }
     [ -n "$base" ] || { echo "[cys-dept] allocate: 기본계정 base 빈값($acct) — fail-closed" >&2; exit 5; }
     acctdir="${base%/}-$name"; mkdir -p "$acctdir"
