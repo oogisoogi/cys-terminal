@@ -3299,6 +3299,18 @@ document.getElementById("btn-cc-density")!.addEventListener("click", () =>
 document.getElementById("btn-cc-glance-face")!.addEventListener("click", () =>
   applyGlanceFace(ccGlanceFace === "tasks" ? "live" : "tasks"),
 );
+document.getElementById("btn-install-cli")?.addEventListener("click", async () => {
+  try {
+    const r = (await invoke("install_cli_to_path")) as {
+      cys_link: string; cysd_link: string; shadowed_by: string | null; warnings: string[];
+    };
+    let msg = `설치 완료:\n  ${r.cys_link}\n  ${r.cysd_link}\n\n새 터미널을 열면 'cys'를 바로 쓸 수 있습니다.`;
+    if (r.warnings?.length) msg += `\n\n⚠ ${r.warnings.join("\n⚠ ")}`;
+    alert(msg);
+  } catch (e) {
+    alert(`설치 실패: ${e}`);
+  }
+});
 document.querySelectorAll("#cc-tabs .cc-tab").forEach((b) =>
   b.addEventListener("click", () => setCcTab((b as HTMLElement).dataset.view as typeof ccTab)),
 );
