@@ -21,4 +21,69 @@ fi
 mkdir -p src-tauri/binaries
 cp "$bindir/cys" "src-tauri/binaries/cys-$triple"
 cp "$bindir/cysd" "src-tauri/binaries/cysd-$triple"
-echo "bundle-prep ready (ui/dist + binaries for $triple)"
+
+# ── pack.tar.gz를 .app Contents/Resources/ 에 동봉 (옵션4 — 오프라인 자기완결·가시·핫스왑) ──
+# 임베드 PACK_ALL(build.rs가 git-추적 cysjavis-pack/ 전 트리에서 생성한 권위 테이블)을 단일 SOT로
+# `cys pack-manifest`가 방출 → 정확히 그 파일집합만으로 결정론 tar(정렬·고정 mtime 2020-01-01·owner 0/0)
+# 를 만들어 src-tauri/resources/ 에 둔다. release.yml pack-artifacts의 결정론 tar 로직과 동일하되,
+# bundle-prep은 macOS(bsdtar — --sort/--mtime 미지원) beforeBuildCommand라 동일 로직을 python3로
+# 표현한다(release.yml도 동일성·tar 단계를 python3 heredoc으로 수행). ★raw 트리 글롭이 아니라
+# manifest.files(스캔·동일성 게이트 통과 집합)만 박제 — 개인정보·미추적 쓰레기 박제 회피.
+# 미서명 로컬 빌드라 minisig는 생략(서명은 CI 무중단 채널 pack-artifacts가 별도 수행).
+host_triple="$(rustc -vV | sed -n 's/^host: //p')"
+if [ "$triple" = "$host_triple" ]; then
+  manifest_cys="$bindir/cys"          # 호스트 네이티브 사이드카 — 그대로 실행 가능
+else
+  # 크로스 빌드 레그(예: arm64 러너에서 x86_64): 사이드카는 타깃 ABI라 실행 불가 →
+  # 호스트 cys를 별도 빌드해 manifest emit에 쓴다(팩 콘텐츠는 타깃 무관 = 동일 manifest).
+  cargo build --release --bin cys
+  manifest_cys="target/release/cys"
+fi
+
+mkdir -p src-tauri/resources
+"$manifest_cys" pack-manifest > src-tauri/resources/pack-manifest.json
+python3 - <<'PY'
+import gzip, hashlib, io, json, os, sys, tarfile
+
+ROOT = "cysjavis-pack"
+man = json.load(open("src-tauri/resources/pack-manifest.json"))
+files = man["files"]
+if not files:
+    print("bundle-prep: manifest.files 비어있음 — 팩 임베드 실패", file=sys.stderr)
+    sys.exit(1)
+
+def sha256_file(p):
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 16), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+# 정확히 manifest.files 집합만 결정론 tar로(정렬 + 고정 mtime + owner 0/0 + gzip mtime 0).
+# 각 파일은 디스크 sha256 == 임베드 권위 sha256 을 확인(드리프트 시 fail-closed).
+with open("src-tauri/resources/pack.tar.gz", "wb") as raw:
+    gz = gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0)
+    tf = tarfile.open(fileobj=gz, mode="w")
+    for rel in sorted(files):
+        src = os.path.join(ROOT, rel)
+        if not os.path.isfile(src):
+            print(f"bundle-prep: manifest 등재 파일이 트리에 없음: {rel}", file=sys.stderr)
+            sys.exit(1)
+        got = sha256_file(src)
+        if got != files[rel]:
+            print(f"bundle-prep: 동일성 불일치 {rel}: embed {files[rel]} != tree {got}", file=sys.stderr)
+            sys.exit(1)
+        data = open(src, "rb").read()
+        ti = tarfile.TarInfo(rel)
+        ti.size = len(data)
+        ti.mtime = 1577836800            # 2020-01-01T00:00:00Z (release.yml --mtime 과 동일 고정값)
+        ti.uid = ti.gid = 0
+        ti.uname = ti.gname = ""
+        ti.mode = 0o644
+        tf.addfile(ti, io.BytesIO(data))
+    tf.close()
+    gz.close()
+print(f"bundle-prep: pack.tar.gz {len(files)}개 파일 결정론 동봉 → src-tauri/resources/")
+PY
+
+echo "bundle-prep ready (ui/dist + binaries + resources/pack.tar.gz for $triple)"

@@ -31,6 +31,10 @@
       "binaries/cysd",
       "binaries/cys"
     ],
+    "resources": {
+      "resources/pack.tar.gz": "./",
+      "resources/pack-manifest.json": "./"
+    },
     "icon": [
       "icons/icon.icns",
       "icons/icon.png"
