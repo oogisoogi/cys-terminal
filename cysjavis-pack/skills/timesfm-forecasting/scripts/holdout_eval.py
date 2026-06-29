@@ -113,7 +113,8 @@ def forecaster_seasonal_naive(history, horizon, m):
 
 
 TIA_SKILL_DIR = os.environ.get(
-    "CYS_TIA_DIR", "/Users/cys/.claude/skills/foresight-trend-impact-analysis"
+    "CYS_TIA_DIR",
+    os.path.expanduser("~/.claude/skills/foresight-trend-impact-analysis"),
 )
 
 
