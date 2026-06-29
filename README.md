@@ -32,6 +32,8 @@ pane 안의 AI는 `cys identify`로 자기 주소를 즉시 안다.
 - Windows: `cys-0.2.0-windows-{x64,arm64}.msi` (CLI+데몬 중심).
 - 24/365 상시 가동(선택): `cys daemon install` (launchd KeepAlive / 작업 스케줄러).
 
+> 외부 터미널에서 `cys` 명령을 쓰려면: 앱 Control Center → **"셸에 cys 설치"** 1클릭(1회 관리자 승인). 자세히는 docs/INSTALL.md §B.
+
 ## git 설치 (소스 빌드·기여 시 필요)
 
 GUI 앱(DMG/MSI)만 쓰면 git이 필요 없다. 다만 **소스 클론·빌드·기여**, harness-creator 툴체인
