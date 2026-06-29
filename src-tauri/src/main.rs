@@ -465,6 +465,125 @@ fn resolve_sidecar(name: &str) -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from(name))
 }
 
+// ── CLI PATH 설치(명시 메뉴) — 가드/스크립트 순수 헬퍼 ─────────────────
+#[derive(PartialEq, Debug)]
+enum BundleKind {
+    Canonical,    // /Applications/cys.app 또는 ~/Applications/cys.app
+    Translocated, // Gatekeeper AppTranslocation 휘발 경로
+    Backup,       // cys.app.bak-*/*.prev*
+    NonStandard,  // 그 외(Downloads 등) — 경고와 함께 진행
+}
+
+/// 셸 단일따옴표 이스케이프(경로의 공백·특수문자·따옴표 안전).
+fn sh_squote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// `<bundle>/Contents/MacOS` 디렉토리를 분류한다.
+fn classify_bundle_dir(macos_dir: &std::path::Path) -> BundleKind {
+    let s = macos_dir.to_string_lossy();
+    if s.contains("/AppTranslocation/") {
+        return BundleKind::Translocated;
+    }
+    // macos_dir = <bundle>.app/Contents/MacOS → bundle = parent.parent
+    let bundle = macos_dir.parent().and_then(|p| p.parent());
+    if let Some(b) = bundle {
+        let name = b
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if name.starts_with("cys.app.bak") || name.starts_with("cys.app.prev") {
+            return BundleKind::Backup;
+        }
+        if name == "cys.app" {
+            let parent = b
+                .parent()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if parent == "/Applications" || parent.ends_with("/Applications") {
+                return BundleKind::Canonical;
+            }
+        }
+    }
+    BundleKind::NonStandard
+}
+
+/// `do shell script` 본문: target_dir 생성 + cys·cysd 심볼릭 멱등 생성(`ln -sf`).
+fn build_install_script(
+    cys: &std::path::Path,
+    cysd: &std::path::Path,
+    target_dir: &str,
+) -> String {
+    format!(
+        "mkdir -p {td} && ln -sf {c} {tc} && ln -sf {d} {tdd}",
+        td = sh_squote(target_dir),
+        c = sh_squote(&cys.to_string_lossy()),
+        tc = sh_squote(&format!("{target_dir}/cys")),
+        d = sh_squote(&cysd.to_string_lossy()),
+        tdd = sh_squote(&format!("{target_dir}/cysd")),
+    )
+}
+
+/// `which -a cys` 출력 → precedence 순 경로 리스트(공백줄 제거).
+fn parse_which_a(stdout: &str) -> Vec<String> {
+    stdout
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+/// 설치 계획(순수): 가드 판정 + 소스 경로 + osascript 인자 + 경고. osascript 실행은 포함하지 않는다.
+#[allow(dead_code)]
+struct CliInstallPlan {
+    cys_src: std::path::PathBuf,
+    cysd_src: std::path::PathBuf,
+    target_dir: String,
+    osascript_arg: String, // `do shell script '...' with administrator privileges`
+    warnings: Vec<String>,
+}
+
+fn plan_cli_install(
+    macos_dir: &std::path::Path,
+    target_dir: &str,
+) -> Result<CliInstallPlan, String> {
+    match classify_bundle_dir(macos_dir) {
+        BundleKind::Translocated => {
+            return Err("cys.app이 Gatekeeper에 의해 임시 위치에서 실행 중입니다. \
+Finder에서 cys.app을 Applications 폴더로 옮긴 뒤 다시 열고 시도하세요."
+                .into());
+        }
+        BundleKind::Backup => {
+            return Err("백업 번들에서 실행 중입니다. \
+정규 cys.app(Applications)에서 실행한 뒤 시도하세요."
+                .into());
+        }
+        BundleKind::Canonical | BundleKind::NonStandard => {}
+    }
+    let mut warnings = vec![];
+    if classify_bundle_dir(macos_dir) == BundleKind::NonStandard {
+        warnings.push(
+            "cys.app이 표준 위치(Applications)가 아닌 곳에서 실행 중입니다. \
+앱을 옮기면 심볼릭이 깨지니 Applications로 이동을 권장합니다."
+                .into(),
+        );
+    }
+    let cys_src = macos_dir.join("cys");
+    let cysd_src = macos_dir.join("cysd");
+    let script = build_install_script(&cys_src, &cysd_src, target_dir);
+    let osascript_arg = format!(
+        "do shell script {} with administrator privileges",
+        sh_squote(&script)
+    );
+    Ok(CliInstallPlan {
+        cys_src,
+        cysd_src,
+        target_dir: target_dir.to_string(),
+        osascript_arg,
+        warnings,
+    })
+}
+
 /// 업데이트 재시작 후 자동복귀 마커 경로 — install_update(재시작 직전)가 쓰고, 재시작된 cys-app
 /// setup이 읽는다. 두 프로세스가 공유하는 ~/.cys 아래에 둔다.
 fn pending_restore_path() -> std::path::PathBuf {
@@ -1591,5 +1710,108 @@ mod tests {
             assert!(hung.is_err(), "무응답 소켓은 timeout(Elapsed)이어야 한다");
         });
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── CLI PATH 설치 헬퍼 ──────────────────────────────────────────
+    #[test]
+    fn sh_squote_escapes_spaces_and_quotes() {
+        assert_eq!(sh_squote("/usr/local/bin"), "'/usr/local/bin'");
+        assert_eq!(sh_squote("/Users/a b/cys.app"), "'/Users/a b/cys.app'");
+        // 단일따옴표는 '\'' 시퀀스로 안전 이스케이프
+        assert_eq!(sh_squote("a'b"), "'a'\\''b'");
+    }
+
+    #[test]
+    fn build_install_script_emits_idempotent_symlinks() {
+        let cys = std::path::Path::new("/Applications/cys.app/Contents/MacOS/cys");
+        let cysd = std::path::Path::new("/Applications/cys.app/Contents/MacOS/cysd");
+        let s = build_install_script(cys, cysd, "/usr/local/bin");
+        assert_eq!(
+            s,
+            "mkdir -p '/usr/local/bin' && \
+ln -sf '/Applications/cys.app/Contents/MacOS/cys' '/usr/local/bin/cys' && \
+ln -sf '/Applications/cys.app/Contents/MacOS/cysd' '/usr/local/bin/cysd'"
+        );
+    }
+
+    #[test]
+    fn classify_bundle_dir_distinguishes_canonical_translocated_backup_nonstandard() {
+        use std::path::Path;
+        assert_eq!(
+            classify_bundle_dir(Path::new("/Applications/cys.app/Contents/MacOS")),
+            BundleKind::Canonical
+        );
+        assert_eq!(
+            classify_bundle_dir(Path::new("/Users/x/Applications/cys.app/Contents/MacOS")),
+            BundleKind::Canonical
+        );
+        assert_eq!(
+            classify_bundle_dir(Path::new(
+                "/private/var/folders/aa/bb/AppTranslocation/CCCC/d/cys.app/Contents/MacOS"
+            )),
+            BundleKind::Translocated
+        );
+        assert_eq!(
+            classify_bundle_dir(Path::new("/Applications/cys.app.bak-044/Contents/MacOS")),
+            BundleKind::Backup
+        );
+        assert_eq!(
+            classify_bundle_dir(Path::new("/Applications/cys.app.prev-210050/Contents/MacOS")),
+            BundleKind::Backup
+        );
+        assert_eq!(
+            classify_bundle_dir(Path::new("/Users/x/Downloads/cys.app/Contents/MacOS")),
+            BundleKind::NonStandard
+        );
+    }
+
+    #[test]
+    fn parse_which_a_returns_precedence_ordered_paths() {
+        let out = "/Users/x/.local/bin/cys\n/opt/homebrew/bin/cys\n\n/usr/local/bin/cys\n";
+        assert_eq!(
+            parse_which_a(out),
+            vec![
+                "/Users/x/.local/bin/cys".to_string(),
+                "/opt/homebrew/bin/cys".to_string(),
+                "/usr/local/bin/cys".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_cli_install_refuses_translocated_and_backup() {
+        // translocated → Err
+        assert!(plan_cli_install(
+            std::path::Path::new("/private/var/folders/x/AppTranslocation/Y/d/cys.app/Contents/MacOS"),
+            "/usr/local/bin"
+        ).is_err());
+        // backup → Err
+        assert!(plan_cli_install(
+            std::path::Path::new("/Applications/cys.app.bak-044/Contents/MacOS"),
+            "/usr/local/bin"
+        ).is_err());
+    }
+
+    #[test]
+    fn plan_cli_install_warns_on_nonstandard_but_proceeds() {
+        let plan = plan_cli_install(
+            std::path::Path::new("/Users/x/Downloads/cys.app/Contents/MacOS"),
+            "/usr/local/bin"
+        ).expect("nonstandard는 경고와 함께 진행");
+        assert!(plan.osascript_arg.contains("with administrator privileges"));
+        assert!(plan.warnings.iter().any(|w| w.contains("표준 위치")));
+        assert_eq!(plan.cys_src, std::path::PathBuf::from("/Users/x/Downloads/cys.app/Contents/MacOS/cys"));
+    }
+
+    #[test]
+    fn plan_cli_install_canonical_has_no_location_warning() {
+        let plan = plan_cli_install(
+            std::path::Path::new("/Applications/cys.app/Contents/MacOS"),
+            "/usr/local/bin"
+        ).expect("정규 번들은 진행");
+        assert!(plan.warnings.iter().all(|w| !w.contains("표준 위치")));
+        // osascript 인자는 do shell script + 승격 + 멱등 스크립트를 감싼다
+        assert!(plan.osascript_arg.starts_with("do shell script '"));
+        assert!(plan.osascript_arg.ends_with("' with administrator privileges"));
     }
 }
