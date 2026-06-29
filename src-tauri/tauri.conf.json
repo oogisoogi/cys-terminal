@@ -36,8 +36,7 @@
       "icons/icon.png"
     ],
     "macOS": {
-      "entitlements": "entitlements.plist",
-      "signingIdentity": "Developer ID Application: yoonsik choi (Q43YA2NMF9)"
+      "entitlements": "entitlements.plist"
     }
   },
   "plugins": {
