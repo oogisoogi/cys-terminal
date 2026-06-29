@@ -1,50 +1,75 @@
-//! cysjavis-pack/skills/ 전체를 컴파일 타임에 자동 임베드하는 매니페스트 생성기.
+//! cysjavis-pack의 git-추적 전체 트리를 컴파일 타임에 자동 임베드하는 매니페스트 생성기.
 //!
-//! 스킬 파일을 pack.rs PACK 목록에 손으로 추가하는 방식은 임베드 드리프트(소스 수정 후
-//! 목록 누락 → 신규 머신에 구버전/누락 배포)의 원천이라, 디렉터리 스캔으로 결정론 환원한다.
-//! 새 스킬은 cysjavis-pack/skills/<name>/ 에 두기만 하면 빌드가 자동 임베드한다.
+//! 파일을 pack.rs 목록에 손으로 추가하는 방식은 임베드 드리프트(소스 수정 후 목록 누락 →
+//! 신규 머신에 구버전/누락 배포)의 원천이라, `git ls-files cysjavis-pack`(추적전용) 소싱으로
+//! 결정론 환원한다. cysjavis-pack/ 아래에 파일을 두고 git add 하면 빌드가 자동 임베드한다.
+//! 추적 집합을 SOT로 삼아 gitignore(개인정보) 경계를 구조적으로 강제하고, untracked 개인파일은
+//! 임베드하지 않는다.
 
 use std::env;
 use std::fs;
 use std::path::Path;
-
-fn walk(dir: &Path, base: &Path, out: &mut Vec<String>) {
-    let Ok(entries) = fs::read_dir(dir) else { return };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy().into_owned();
-        // 숨김 파일(.DS_Store 등)·테스트 디렉터리는 배포 대상이 아니다
-        if name.starts_with('.') || name == "tests" || name == "__pycache__" {
-            continue;
-        }
-        if path.is_dir() {
-            walk(&path, base, out);
-        } else if let Ok(rel) = path.strip_prefix(base) {
-            out.push(rel.to_string_lossy().replace('\\', "/"));
-        }
-    }
-}
+use std::process::Command;
 
 fn main() {
-    println!("cargo:rerun-if-changed=cysjavis-pack/skills");
-    let base = Path::new("cysjavis-pack/skills");
-    let mut files = Vec::new();
-    walk(base, base, &mut files);
-    files.sort();
+    // cysjavis-pack 전체를 임베드한다. 소스 = git 인덱스(`git ls-files`) — 디렉터리 워크가
+    // 아니라 추적 집합을 SOT로 삼아 gitignore 경계를 그대로 따른다. 어떤 파일이든 변경 시 재빌드.
+    println!("cargo:rerun-if-changed=cysjavis-pack");
+
+    let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR 없음");
+    let output = Command::new("git")
+        .args(["ls-files", "cysjavis-pack"])
+        .current_dir(&manifest_dir)
+        .output();
+    let stdout = match output {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+        _ => String::new(),
+    };
+    // ★가드①: git 명령 실패/빈 출력 → 빈 pack 출하(비-hermetic) 차단. loud fail.
+    if stdout.trim().is_empty() {
+        panic!("pack 소스 비었음 — git 인덱스 부재? 빌드 중단");
+    }
+
+    // 추적 파일 → cysjavis-pack/ 접두 제거한 rel. 제외규칙(기존 walk와 동형): 경로 컴포넌트가
+    // '.'로 시작(.gitignore 등 dotfile/dotdir)·tests·__pycache__ 이면 배포 대상이 아니다.
+    let mut rels: Vec<String> = Vec::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        let Some(rel) = line.strip_prefix("cysjavis-pack/") else {
+            continue;
+        };
+        if rel
+            .split('/')
+            .any(|c| c.starts_with('.') || c == "tests" || c == "__pycache__")
+        {
+            continue;
+        }
+        rels.push(rel.to_string());
+    }
+    rels.sort();
+    rels.dedup();
+
+    // ★가드②: 임베드 엔트리 < 250 → 비정상 빈-pack(빌드 이상)으로 보고 차단.
+    if rels.len() < 250 {
+        panic!(
+            "pack 임베드 엔트리 {}개 < 250 — 비정상(빌드 이상?). 빌드 중단",
+            rels.len()
+        );
+    }
 
     let mut code = String::from(
-        "/// build.rs 자동 생성 — cysjavis-pack/skills/ 전체 임베드 (수동 목록 드리프트 차단).\n\
-         pub const PACK_SKILLS: &[(&str, &str)] = &[\n",
+        "/// build.rs 자동 생성 — cysjavis-pack git-추적 전체 트리 임베드 (수동 목록 드리프트 차단).\n\
+         pub const PACK_ALL: &[(&str, &str)] = &[\n",
     );
-    for rel in &files {
+    for rel in &rels {
         code.push_str(&format!(
-            "    (\"skills/{rel}\", include_str!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/cysjavis-pack/skills/{rel}\"))),\n"
+            "    (\"{rel}\", include_str!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/cysjavis-pack/{rel}\"))),\n"
         ));
     }
     code.push_str("];\n");
 
     let out_dir = env::var("OUT_DIR").expect("OUT_DIR 없음");
-    fs::write(Path::new(&out_dir).join("pack_skills.rs"), code).expect("pack_skills.rs 생성 실패");
+    fs::write(Path::new(&out_dir).join("pack_all.rs"), code).expect("pack_all.rs 생성 실패");
 
     // T1-2: 단일진실 enum → OUT_DIR/cys_kinds.json (스키마·검증기 파리티의 기준).
     // 기존 디렉터리스캔 코드젠 철학과 동형(손목록 드리프트 차단). enum 정의는 src/edit_kinds.rs가

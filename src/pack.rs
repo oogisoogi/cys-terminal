@@ -15,360 +15,17 @@ pub const EXIT_REINJECT_DEGRADED: i32 = 3;
 /// 브리지)가 failed/deferred를 정확히 파싱하도록 사람용 메시지와 별개의 안정 토큰으로 둔다.
 pub const REINJECT_RESULT_PREFIX: &str = "PACK_UPDATE_RESULT";
 
-/// (상대경로, 내용) — init-jarvis 가 설치한다.
-pub const PACK: &[(&str, &str)] = &[
-    ("README.md", include_str!("../cysjavis-pack/README.md")),
-    ("soul.md", include_str!("../cysjavis-pack/soul.md")),
-    (
-        "directives/MASTER_DIRECTIVE.md",
-        include_str!("../cysjavis-pack/directives/MASTER_DIRECTIVE.md"),
-    ),
-    (
-        "directives/WORKER_DIRECTIVE.md",
-        include_str!("../cysjavis-pack/directives/WORKER_DIRECTIVE.md"),
-    ),
-    (
-        "directives/CSO_DIRECTIVE.md",
-        include_str!("../cysjavis-pack/directives/CSO_DIRECTIVE.md"),
-    ),
-    (
-        "directives/REVIEWER_DIRECTIVE.md",
-        include_str!("../cysjavis-pack/directives/REVIEWER_DIRECTIVE.md"),
-    ),
-    (
-        "directives/RSI_LEARNING_DIRECTIVE.md",
-        include_str!("../cysjavis-pack/directives/RSI_LEARNING_DIRECTIVE.md"),
-    ),
-    (
-        "directives/CEO_TEMPLATE.md",
-        include_str!("../cysjavis-pack/directives/CEO_TEMPLATE.md"),
-    ),
-    (
-        "CLAUDE.md.template",
-        include_str!("../cysjavis-pack/CLAUDE.md.template"),
-    ),
-    (
-        "memory/MEMORY.md",
-        include_str!("../cysjavis-pack/memory/MEMORY.md"),
-    ),
-    (
-        "memory/feedback_autonomous-pilot-mandate.md",
-        include_str!("../cysjavis-pack/memory/feedback_autonomous-pilot-mandate.md"),
-    ),
-    (
-        "round/SESSION_STATE.md",
-        include_str!("../cysjavis-pack/round/SESSION_STATE.md"),
-    ),
-    (
-        "round/RECOVERY.md",
-        include_str!("../cysjavis-pack/round/RECOVERY.md"),
-    ),
-    ("agents.json", include_str!("../cysjavis-pack/agents.json")),
-    ("acl.json", include_str!("../cysjavis-pack/acl.json")),
-    // D5 스킬 버튼 보드 큐레이션 — read_board_catalog가 pack/board-catalog.json을 읽는다.
-    (
-        "board-catalog.json",
-        include_str!("../cysjavis-pack/board-catalog.json"),
-    ),
-    (
-        "alerts-config.json",
-        include_str!("../cysjavis-pack/alerts-config.json"),
-    ),
-    (
-        "schedule.json",
-        include_str!("../cysjavis-pack/schedule.json"),
-    ),
-    (
-        "hooks/session-start.sh",
-        include_str!("../cysjavis-pack/hooks/session-start.sh"),
-    ),
-    (
-        "hooks/cys-statusline.sh",
-        include_str!("../cysjavis-pack/hooks/cys-statusline.sh"),
-    ),
-    (
-        "hooks/cys-hook.sh",
-        include_str!("../cysjavis-pack/hooks/cys-hook.sh"),
-    ),
-    (
-        "hooks/appbuild-gate.sh",
-        include_str!("../cysjavis-pack/hooks/appbuild-gate.sh"),
-    ),
-    // Wave3 T4-4⊕T6-P3 capability gate — WIRED(GATE-hook 클래스, appbuild-gate에 이은 2번째 사례).
-    // reviewer/planner surface의 변형 도구를 PreToolUse에서 deny(modern permission-decision JSON,
-    // exit 0)해 producer≠evaluator를 봉쇄. C47이 프로필 PreToolUse 실제 등록까지 검증하고
-    // `preflight --fix`가 배선한다. cys-hook.sh:6 '막지 않는다'는 OBSERVABILITY hook 전용 불변이라
-    // 이 GATE hook과 충돌하지 않는다(별개 클래스 — 차단이 목적).
-    (
-        "hooks/role-capability-gate.sh",
-        include_str!("../cysjavis-pack/hooks/role-capability-gate.sh"),
-    ),
-    // grill-me 최소 질문 게이트(오너 절대규칙 2026-06-27) — GATE-hook 3번째 사례.
-    // grill-gate.sh = PreToolUse(Edit|Write|NotebookEdit) check deny(gatekeeper);
-    // grill-count.sh = PostToolUse(AskUserQuestion) count(evaluator·항상 exit0);
-    // grill_gate.py = 결정론 엔진(begin/count/check/end). C55가 엔진 self-test·2hook 등록·
-    // SKILL 핀을 검증하고 `preflight --fix`가 배선한다(count 미등록=FAIL=fail-closed 방지).
-    (
-        "hooks/grill-gate.sh",
-        include_str!("../cysjavis-pack/hooks/grill-gate.sh"),
-    ),
-    (
-        "hooks/grill-count.sh",
-        include_str!("../cysjavis-pack/hooks/grill-count.sh"),
-    ),
-    (
-        "bin/grill_gate.py",
-        include_str!("../cysjavis-pack/bin/grill_gate.py"),
-    ),
-    (
-        "bin/javis_preflight.py",
-        include_str!("../cysjavis-pack/bin/javis_preflight.py"),
-    ),
-    (
-        "bin/javis_report.py",
-        include_str!("../cysjavis-pack/bin/javis_report.py"),
-    ),
-    (
-        "bin/javis_fleet_report.py",
-        include_str!("../cysjavis-pack/bin/javis_fleet_report.py"),
-    ),
-    (
-        "bin/javis_route.py",
-        include_str!("../cysjavis-pack/bin/javis_route.py"),
-    ),
-    (
-        "bin/route_triggers.json",
-        include_str!("../cysjavis-pack/bin/route_triggers.json"),
-    ),
-    (
-        "bin/javis_memory.py",
-        include_str!("../cysjavis-pack/bin/javis_memory.py"),
-    ),
-    // 스킬 보안·품질 결정론 게이트 (SkillSpector 규칙 stdlib 포트) + 규칙 사이드카.
-    // javis_memory가 P0.2 포이즌 WARN에 optional import 하므로 함께 배포된다(없으면 graceful).
-    (
-        "bin/javis_skillscan.py",
-        include_str!("../cysjavis-pack/bin/javis_skillscan.py"),
-    ),
-    (
-        "bin/skillscan_rules.json",
-        include_str!("../cysjavis-pack/bin/skillscan_rules.json"),
-    ),
-    (
-        "bin/javis_mcpgate.py",
-        include_str!("../cysjavis-pack/bin/javis_mcpgate.py"),
-    ),
-    // ── AgentReach 22 OPP 콘텐츠/거버넌스 채널 도구 — preflight C45/C49/C50/C53(위 javis_preflight.py)가
-    // 존재·self-test 를 결정론 게이트한다. semver=strictly-newer 버전비교 advisory(C45)·channels=콘텐츠
-    // 채널 per-channel 헬스 doctor(C49)·channel_watch=silence-first 채널 감시(C50)·idempotency=관찰
-    // 명령 부작용 금지 멱등성 봉인(C53). engine 신규(proc·cred_guard·disk_signal·dep_doctor)·
-    // skills/_VENDOR_MANIFEST.json 은 build.rs 가 skills/ 자동 walk 임베드하므로 PACK 수동 등재 불요 —
-    // bin 4종만 여기 수동 등재한다. exec 비트는 shebang 으로 자동.
-    (
-        "bin/javis_semver.py",
-        include_str!("../cysjavis-pack/bin/javis_semver.py"),
-    ),
-    (
-        "bin/javis_channels.py",
-        include_str!("../cysjavis-pack/bin/javis_channels.py"),
-    ),
-    (
-        "bin/javis_channel_watch.py",
-        include_str!("../cysjavis-pack/bin/javis_channel_watch.py"),
-    ),
-    (
-        "bin/javis_idempotency.py",
-        include_str!("../cysjavis-pack/bin/javis_idempotency.py"),
-    ),
-    // ── Serena 코드-의미 인덱스 MCP 채택 (S0~S8) — preflight C43/C44(위 javis_preflight.py)가
-    // 등록·도달성·거버넌스를 게이트한다. probe=생명주기 heartbeat(S4)·eval=crossover 측정
-    // 하베스터(S7)·nudge=PreToolUse 심볼-tool steering(S5, never updatedInput/exit2)·
-    // cys-codex-readonly.yml=codex 리뷰어 구조적 read-only context(S6). exec 비트는 shebang으로 자동.
-    (
-        "bin/javis_serena_probe.py",
-        include_str!("../cysjavis-pack/bin/javis_serena_probe.py"),
-    ),
-    (
-        "bin/javis_serena_eval.py",
-        include_str!("../cysjavis-pack/bin/javis_serena_eval.py"),
-    ),
-    (
-        "hooks/serena-nudge.sh",
-        include_str!("../cysjavis-pack/hooks/serena-nudge.sh"),
-    ),
-    (
-        "resources/contexts/cys-codex-readonly.yml",
-        include_str!("../cysjavis-pack/resources/contexts/cys-codex-readonly.yml"),
-    ),
-    (
-        "bin/javis_orchestra.py",
-        include_str!("../cysjavis-pack/bin/javis_orchestra.py"),
-    ),
-    (
-        "bin/javis_org.py",
-        include_str!("../cysjavis-pack/bin/javis_org.py"),
-    ),
-    (
-        "bin/javis_org_e2e.sh",
-        include_str!("../cysjavis-pack/bin/javis_org_e2e.sh"),
-    ),
-    (
-        "bin/javis_boot_node.py",
-        include_str!("../cysjavis-pack/bin/javis_boot_node.py"),
-    ),
-    (
-        "bin/javis_rsi.py",
-        include_str!("../cysjavis-pack/bin/javis_rsi.py"),
-    ),
-    (
-        "bin/javis_learn.py",
-        include_str!("../cysjavis-pack/bin/javis_learn.py"),
-    ),
-    (
-        "bin/rsi-gate.sh",
-        include_str!("../cysjavis-pack/bin/rsi-gate.sh"),
-    ),
-    (
-        "bin/javis_adr.py",
-        include_str!("../cysjavis-pack/bin/javis_adr.py"),
-    ),
-    (
-        "bin/javis_docsdiff.py",
-        include_str!("../cysjavis-pack/bin/javis_docsdiff.py"),
-    ),
-    (
-        "bin/javis_reflect.py",
-        include_str!("../cysjavis-pack/bin/javis_reflect.py"),
-    ),
-    (
-        "bin/javis_cleanroom.py",
-        include_str!("../cysjavis-pack/bin/javis_cleanroom.py"),
-    ),
-    (
-        "bin/javis_session.py",
-        include_str!("../cysjavis-pack/bin/javis_session.py"),
-    ),
-    (
-        "bin/cys-dept",
-        include_str!("../cysjavis-pack/bin/cys-dept"),
-    ),
-    (
-        "bin/javis_registry.py",
-        include_str!("../cysjavis-pack/bin/javis_registry.py"),
-    ),
-    (
-        "bin/javis_select.py",
-        include_str!("../cysjavis-pack/bin/javis_select.py"),
-    ),
-    (
-        "bin/javis_verdict.py",
-        include_str!("../cysjavis-pack/bin/javis_verdict.py"),
-    ),
-    (
-        "bin/javis_manifest.py",
-        include_str!("../cysjavis-pack/bin/javis_manifest.py"),
-    ),
-    (
-        "bin/check_timeline.py",
-        include_str!("../cysjavis-pack/bin/check_timeline.py"),
-    ),
-    (
-        "bin/javis_timeline.py",
-        include_str!("../cysjavis-pack/bin/javis_timeline.py"),
-    ),
-    (
-        "bin/javis_params.py",
-        include_str!("../cysjavis-pack/bin/javis_params.py"),
-    ),
-    (
-        "bin/caption_shape.py",
-        include_str!("../cysjavis-pack/bin/caption_shape.py"),
-    ),
-    (
-        "schemas/workflow_manifest.schema.json",
-        include_str!("../cysjavis-pack/schemas/workflow_manifest.schema.json"),
-    ),
-    (
-        "schemas/edit_decisions.schema.json",
-        include_str!("../cysjavis-pack/schemas/edit_decisions.schema.json"),
-    ),
-    (
-        "schemas/verdict_schema.json",
-        include_str!("../cysjavis-pack/schemas/verdict_schema.json"),
-    ),
-    (
-        "round/video_provider_catalog.json",
-        include_str!("../cysjavis-pack/round/video_provider_catalog.json"),
-    ),
-    (
-        "round/video-archetypes/animated-explainer/workflow.json",
-        include_str!("../cysjavis-pack/round/video-archetypes/animated-explainer/workflow.json"),
-    ),
-    (
-        "round/video-archetypes/animation/workflow.json",
-        include_str!("../cysjavis-pack/round/video-archetypes/animation/workflow.json"),
-    ),
-    (
-        "round/video-archetypes/avatar-spokesperson/workflow.json",
-        include_str!("../cysjavis-pack/round/video-archetypes/avatar-spokesperson/workflow.json"),
-    ),
-    (
-        "round/video-archetypes/character-animation/workflow.json",
-        include_str!("../cysjavis-pack/round/video-archetypes/character-animation/workflow.json"),
-    ),
-    (
-        "round/video-archetypes/cinematic/workflow.json",
-        include_str!("../cysjavis-pack/round/video-archetypes/cinematic/workflow.json"),
-    ),
-    (
-        "round/video-archetypes/clip-factory/workflow.json",
-        include_str!("../cysjavis-pack/round/video-archetypes/clip-factory/workflow.json"),
-    ),
-    (
-        "round/video-archetypes/documentary-montage/workflow.json",
-        include_str!("../cysjavis-pack/round/video-archetypes/documentary-montage/workflow.json"),
-    ),
-    (
-        "round/video-archetypes/hybrid/workflow.json",
-        include_str!("../cysjavis-pack/round/video-archetypes/hybrid/workflow.json"),
-    ),
-    (
-        "round/video-archetypes/localization-dub/workflow.json",
-        include_str!("../cysjavis-pack/round/video-archetypes/localization-dub/workflow.json"),
-    ),
-    (
-        "round/video-archetypes/podcast-repurpose/workflow.json",
-        include_str!("../cysjavis-pack/round/video-archetypes/podcast-repurpose/workflow.json"),
-    ),
-    (
-        "round/video-archetypes/screen-demo/workflow.json",
-        include_str!("../cysjavis-pack/round/video-archetypes/screen-demo/workflow.json"),
-    ),
-    (
-        "round/video-archetypes/talking-head/workflow.json",
-        include_str!("../cysjavis-pack/round/video-archetypes/talking-head/workflow.json"),
-    ),
-    (
-        "hooks/inject-context.sh",
-        include_str!("../cysjavis-pack/hooks/inject-context.sh"),
-    ),
-    (
-        "hooks/save-state.sh",
-        include_str!("../cysjavis-pack/hooks/save-state.sh"),
-    ),
-    (
-        "hooks/reflect-scan.sh",
-        include_str!("../cysjavis-pack/hooks/reflect-scan.sh"),
-    ),
-    (
-        "hooks/commit-memory-nudge.sh",
-        include_str!("../cysjavis-pack/hooks/commit-memory-nudge.sh"),
-    ),
-];
+// cysjavis-pack의 git-추적 전체 트리는 build.rs가 `git ls-files cysjavis-pack` 소싱으로
+// 컴파일 타임 자동 임베드한다(PACK_ALL — README·directives·bin·hooks·schemas·skills 등 전체). 새
+// 파일은 cysjavis-pack/ 아래에 두고 git add 하면 재빌드 시 자동 통합 — 수동 목록 갱신 불필요. 추적
+// 집합이 SOT이므로 gitignore(개인정보) 경계가 구조적으로 강제되고 untracked 개인파일은 임베드되지 않는다.
+include!(concat!(env!("OUT_DIR"), "/pack_all.rs"));
 
-// skills/ 전체는 build.rs가 디렉터리 스캔으로 자동 임베드한다 (PACK_SKILLS).
-// 새 스킬은 cysjavis-pack/skills/<name>/ 에 추가하면 끝 — 수동 목록 갱신 불필요.
-include!(concat!(env!("OUT_DIR"), "/pack_skills.rs"));
+/// 하위호환 별칭 — 전체 트리는 PACK_ALL 단일 소스다. 외부 호출처(src/bin/cys.rs의 pack-manifest
+/// 산출)가 `PACK.iter().chain(PACK_SKILLS.iter())`로 참조하므로 심볼을 보존한다: PACK은 PACK_ALL
+/// 그대로, 옛 skills 전용 PACK_SKILLS는 전체 트리에 흡수돼 빈 슬라이스다(이중 카운트 0).
+pub const PACK: &[(&str, &str)] = PACK_ALL;
+pub const PACK_SKILLS: &[(&str, &str)] = &[];
 
 /// 설치 위치: $CYS_PACK_DIR (구 JAVIS_PACK_DIR·AITERM_JARVIS_DIR 폴백) 또는 ~/.cys/pack
 pub fn pack_dir() -> PathBuf {
@@ -412,7 +69,7 @@ fn setup_isolated_config_dir() {
     // 라우터: 임베드 CLAUDE.md.template → <cfg>/CLAUDE.md (없을 때만 — 역할선언→~/.cys/pack 라우팅)
     let claude_md = cfg.join("CLAUDE.md");
     if !claude_md.exists() {
-        if let Some((_, tmpl)) = PACK.iter().find(|(rel, _)| *rel == "CLAUDE.md.template") {
+        if let Some((_, tmpl)) = PACK_ALL.iter().find(|(rel, _)| *rel == "CLAUDE.md.template") {
             let _ = std::fs::write(&claude_md, tmpl);
         }
     }
@@ -540,10 +197,10 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// (설치 매니페스트의 설치-당시 해시와 현재 파일 해시가 일치 = 비수정). 매니페스트가
 /// 없는 구설치본 파일은 종전대로 보존한다(안전측). 반환: (written, kept).
 pub fn install(force: bool) -> Result<(usize, usize), String> {
-    // 얇은 래퍼: embed PACK+PACK_SKILLS를 입력원으로 install_from_iter에 위임한다.
+    // 얇은 래퍼: embed PACK_ALL(git-추적 전체 트리)를 입력원으로 install_from_iter에 위임한다.
     // ★외부 동작(반환값·디스크 결과·부수효과)은 완전 불변 — C/D/E 호출처 무영향(§3 하위호환).
     install_from_iter(
-        PACK.iter().chain(PACK_SKILLS.iter()).map(|(r, c)| (*r, *c)),
+        PACK_ALL.iter().map(|(r, c)| (*r, *c)),
         force,
         env!("CARGO_PKG_VERSION"),
         false, // embed/cysd 경로(비트랜잭션): .pack-version 직접 기록 + 매니페스트 best-effort(외부 동작 불변).
@@ -552,7 +209,7 @@ pub fn install(force: bool) -> Result<(usize, usize), String> {
 
 /// install의 **파일 반영 코어**(§7-⑤): `(rel, content)` 이터레이터를 입력원으로 받아 preserve-gate·
 /// prune·매니페스트·다운그레이드 차단·.pack-version 기록·격리 config·exec bit를 수행한다.
-/// embed PACK iter(기존 경로)와 staged-tree iter(무중단 채널)가 같은 로직을 공유한다(중복 0·회귀 0).
+/// embed PACK_ALL iter(기존 경로)와 staged-tree iter(무중단 채널)가 같은 로직을 공유한다(중복 0·회귀 0).
 /// 다운그레이드 가드 비교 기준은 `target_version`(env! 직접 참조 제거 — staged 입력은 자기 버전을 넘김).
 /// force=false: 사용자 수정 파일 불가침 + 비수정 파일은 입력 신버전으로 자동 갱신. 반환: (written, kept).
 /// `transactional`: false면 embed/cysd/init-pack 경로 — 종전대로 마지막에 `.pack-version`을
@@ -1030,7 +687,7 @@ mod tests {
     /// 어긋나면 노드 색인에서 누락된다.
     #[test]
     fn pack_skills_embed_adopted_set_and_indexable() {
-        let names: Vec<&str> = PACK_SKILLS.iter().map(|(p, _)| *p).collect();
+        let names: Vec<&str> = PACK_ALL.iter().map(|(p, _)| *p).collect();
         for skill in [
             "korean-humanizer", "korean-spell-check", "korean-character-count",
             "naver-blog-research", "kosis-stats", "hwp", "rhwp-edit",
@@ -1087,10 +744,10 @@ mod tests {
             assert!(names.iter().any(|p| *p == want), "appbuild 스킬 임베드 누락: {skill}");
         }
         // appbuild 코드선행 금지 hook이 임베드돼야 C27이 설치·등록할 수 있다.
-        let pack_names: Vec<&str> = PACK.iter().map(|(p, _)| *p).collect();
+        let pack_names: Vec<&str> = PACK_ALL.iter().map(|(p, _)| *p).collect();
         assert!(pack_names.contains(&"hooks/appbuild-gate.sh"), "appbuild-gate hook 임베드 누락");
         assert!(names.contains(&"skills/THIRD_PARTY.md"), "외부 유래 출처 고지(MIT) 누락");
-        for (path, content) in PACK_SKILLS.iter() {
+        for (path, content) in PACK_ALL.iter() {
             if path.ends_with("/SKILL.md") {
                 // 실파서(compose_directive)는 name 값이 비어있으면 색인에서 제외한다 —
                 // 존재만 보면 빈 name이 거짓 통과한다(적대 검증 R1).
@@ -1126,7 +783,7 @@ mod tests {
         }
         let (written, kept) = result.expect("install 실패");
         assert_eq!(kept, 0, "빈 디렉터리인데 kept>0");
-        assert_eq!(written, PACK.len() + PACK_SKILLS.len(), "임베드 전수 설치 아님");
+        assert_eq!(written, PACK_ALL.len(), "임베드 전수 설치 아님");
         // ★격리 config dir 셋업(박사님 2026-06-15): cys 라우터+hook이 전용 dir에 설치되고,
         // 사용자 ~/.claude 와 분리된다. 라우터는 ~/.cys/pack 디렉티브로 라우팅해야 한다.
         let router = std::fs::read_to_string(cfgdir.join("CLAUDE.md")).expect("격리 CLAUDE.md 미설치");
@@ -1151,7 +808,7 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             let mut shebang_seen = 0;
-            for (rel, content) in PACK.iter().chain(PACK_SKILLS.iter()) {
+            for (rel, content) in PACK_ALL.iter() {
                 if !content.starts_with("#!") {
                     continue;
                 }
@@ -1404,7 +1061,7 @@ mod tests {
         std::env::set_var(ENV_PACK_DIR, &td_b);
         std::env::set_var(ENV_CONFIG_DIR, base.join("cfg-b"));
         let res_b = install_from_iter(
-            PACK.iter().chain(PACK_SKILLS.iter()).map(|(r, c)| (*r, *c)),
+            PACK_ALL.iter().map(|(r, c)| (*r, *c)),
             false,
             env!("CARGO_PKG_VERSION"),
             false,
@@ -1424,7 +1081,7 @@ mod tests {
         let (wa, ka) = res_a.expect("install 실패");
         let (wb, kb) = res_b.expect("install_from_iter 실패");
         assert_eq!((wa, ka), (wb, kb), "written/kept 불일치");
-        assert_eq!(wa, PACK.len() + PACK_SKILLS.len(), "전수 설치 아님");
+        assert_eq!(wa, PACK_ALL.len(), "전수 설치 아님");
         // 핵심 파일 존재 + 전 파일 핑거프린트 동등
         for probe in [
             "skills/korean-humanizer/SKILL.md",
