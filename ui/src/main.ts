@@ -1134,10 +1134,6 @@ const root = document.getElementById("root")!;
 
 const current = (): Workspace => workspaces[activeWs];
 
-// 06: 그룹 헬퍼.
-const groupById = (gid: number | undefined): GroupMeta | undefined =>
-  gid == null ? undefined : groups.find((g) => g.id === gid);
-
 // 그룹의 anchor(부서) ws — anchorSocket이 일치하는 ws. 부서 그룹만 존재.
 const anchorWsOf = (g: GroupMeta): Workspace | undefined =>
   g.anchorSocket ? workspaces.find((w) => w.socket === g.anchorSocket) : undefined;
@@ -3339,12 +3335,11 @@ document.getElementById("cc-sessions-redact")!.addEventListener("click", (e) => 
   refreshSessions();
 });
 document.getElementById("btn-update")!.addEventListener("click", () => onUpdateButton());
-// 박사님 Decision A: 새 워크스페이스 = 항상 전용 격리 데몬 + 부서장(master). btn-ws-new를 무카탈로그
-// addDeptWorkspace(allocate=계정격리+부서장 자동각성)로 라우팅한다. 기본/CEO 데몬은 첫 ws(start)·전탭닫힘
-// 폴백(addWorkspace)만 사용 — 불변. 실패는 placeholder 롤백(addDeptWorkspace) + 토스트.
-document.getElementById("btn-ws-new")!.addEventListener("click", () =>
-  addDeptWorkspace().catch((e) => toast("watchdog", "새 워크스페이스 실패", String(e))),
-);
+// 역할 분리(박사님 2026-06-29 결정): "새 워크스페이스"(btn-ws-new) = 기본/현재 데몬의 일반 워크스페이스
+// (addWorkspace) — 부서가 아니다. 격리 부서 데몬 생성은 "+부서"(btn-ws-dept→addDeptWorkspace) 전담.
+// 새 ws를 master로 선언 시 공유 데몬 claim 충돌은 데몬 레벨 claim_denied(cysd handlers.rs·kill 없음)가
+// 비파괴 방어한다(생태계 죽지 않음·거부만). guard-master-claim(Fix2') 부트 자동발동 배선은 별건(헌법 토큰).
+document.getElementById("btn-ws-new")!.addEventListener("click", () => addWorkspace());
 // 멀티마스터 F4 + ＋부서 자동화(패치5): 새 부서(독립 데몬) workspace 런칭. 부서 번호는 백엔드가 확정.
 const deptBtn = document.getElementById("btn-ws-dept") as HTMLButtonElement | null;
 // 부서 런칭 실행(공통) — placeholder 탭·in-flight 버튼 가드. catalogKey=undefined → 레거시 dept-N.
