@@ -3,7 +3,7 @@ members = ["src-tauri"]
 
 [package]
 name = "cys-terminal"
-version = "0.4.8"
+version = "0.4.9"
 edition = "2021"
 description = "cys — the CYSJavis terminal: bidirectional socket IPC, multi-agent OS (CYSJavis Pack), governance, heartbeat"
 license = "MIT"
