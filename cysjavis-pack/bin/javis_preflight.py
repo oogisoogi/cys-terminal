@@ -22,6 +22,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 
 PASS, FAIL, WARN, FIXED, SKIP = "PASS", "FAIL", "WARN", "FIXED", "SKIP"
@@ -909,6 +910,118 @@ class Preflight:
         else:
             self.add(cid, WARN, "이벤트 hook 미등록: %d건 — --fix로 설치(claude 재시작 후 적용)"
                      % len(pending))
+
+    # ── C56 dept-hook 누수 invariant (결정론 재발방지 — 예방 가드 _pack_is_dept의 짝) ──
+    # invariant: 비-부서 글로벌 settings(discover_claude_settings 반환)에 pack-dept-* 훅은 0이어야.
+    # 부서 config는 discover의 _acct/_pack 가드가 애초에 제외 → 자기 dept 훅은 안전(검사 대상 아님).
+    # report=FAIL(누수 N 탐지) · fix=청소(base 보존·빈 블록 제거·백업·원자적 쓰기). 수동 #2의 코드화.
+    def _dept_hooks_in(self, settings_path):
+        """결정론: settings.json hooks command 경로에 '/pack-dept-' 포함한 (event,bi,hi) 목록.
+        마커는 예방 가드(discover/_pack_is_dept)의 'pack-dept-'와 동일 — 명명부서(pack-dept-<custom>)도
+        탐지(가드의 짝). 경로경계 '/' 앵커로 비앵커 substring 오탐 제거. base(/pack/)·CEO(/pack-ceo/) 미매치."""
+        try:
+            with open(settings_path) as f:
+                data = json.load(f)
+        except Exception:
+            return []
+        hroot = data.get("hooks")
+        if not isinstance(hroot, dict):  # 청소기와 대칭(무raise 계약·malformed 입력 부트크래시 방지)
+            return []
+        out = []
+        for ev, blocks in hroot.items():
+            if not isinstance(blocks, list):
+                continue
+            for bi, blk in enumerate(blocks):
+                hooks = blk.get("hooks", []) if isinstance(blk, dict) else []
+                for hi, h in enumerate(hooks):
+                    if "/pack-dept-" in (h.get("command", "") if isinstance(h, dict) else ""):
+                        out.append((ev, bi, hi))
+        return out
+
+    def _strip_dept_hooks(self, settings_path):
+        """백업 후 dept 훅 제거(base 보존·빈 블록 제거·원자적). 반환 (removed, err)."""
+        try:
+            with open(settings_path) as f:
+                data = json.load(f)
+        except Exception as e:
+            return (0, str(e))
+        H = data.get("hooks")
+        if not isinstance(H, dict):
+            return (0, "hooks 루트가 객체 아님")
+        removed = 0
+        for ev in list(H.keys()):
+            blocks = H[ev] if isinstance(H[ev], list) else []
+            nb = []
+            for blk in blocks:
+                hooks = blk.get("hooks", []) if isinstance(blk, dict) else []
+                kept = [h for h in hooks
+                        if "/pack-dept-" not in (h.get("command", "") if isinstance(h, dict) else "")]
+                removed += len(hooks) - len(kept)
+                if kept:
+                    b2 = dict(blk); b2["hooks"] = kept; nb.append(b2)
+            H[ev] = nb
+        if removed:
+            try:
+                bak = settings_path + ".bak-deptleak"
+                if not os.path.exists(bak):
+                    shutil.copy(settings_path, bak)
+                # 프로세스 고유 tmp(동시 --fix 레이스 방지) + 권한 보존 후 원자적 replace
+                fd, tmp = tempfile.mkstemp(dir=os.path.dirname(settings_path) or ".",
+                                           prefix=".deptleak.", suffix=".tmp")
+                try:
+                    with os.fdopen(fd, "w") as f:
+                        json.dump(data, f, indent=2, ensure_ascii=False)
+                    shutil.copystat(settings_path, tmp)
+                    os.replace(tmp, settings_path)
+                except Exception:
+                    if os.path.exists(tmp):
+                        os.unlink(tmp)
+                    raise
+            except Exception as e:
+                return (0, str(e))
+        return (removed, "")
+
+    def c56_dept_hook_leak(self):
+        cid = "C56.dept-hook-leak"
+        if self.skipped(cid):
+            return
+        # 부서 컨텍스트(account 또는 pack이 dept)면 글로벌 누수 탐지 대상 아님 — master/CEO preflight 소관.
+        _acct = os.environ.get("CYS_ACCOUNT_DIR")
+        if _acct and "dept-" in os.path.basename(os.path.normpath(_acct)):
+            self.add(cid, SKIP, "부서 컨텍스트(account=dept) — 누수 탐지는 master/CEO preflight 소관")
+            return
+        if "pack-dept-" in os.path.basename(os.path.normpath(pack_dir())):
+            self.add(cid, SKIP, "부서 pack 컨텍스트 — 글로벌 검사 대상 아님")
+            return
+        targets = discover_claude_settings()
+        if not targets:
+            self.add(cid, WARN, "~/.claude*/settings.json 미발견")
+            return
+        leaks = {t: self._dept_hooks_in(t) for t in targets}
+        leaks = {t: v for t, v in leaks.items() if v}
+        if not leaks:
+            self.add(cid, PASS, "%d개 글로벌 settings에 dept 훅 누수 0 (invariant 충족)" % len(targets))
+            return
+        total = sum(len(v) for v in leaks.values())
+        summary = ", ".join("%s:%d" % (os.path.basename(os.path.dirname(t)), len(v))
+                            for t, v in leaks.items())
+        if self.fix:
+            done, errs = [], []
+            for t in leaks:
+                n, err = self._strip_dept_hooks(t)
+                if err:
+                    errs.append("%s: %s" % (os.path.basename(os.path.dirname(t)), err))
+                else:
+                    done.append("%s(-%d)" % (os.path.basename(os.path.dirname(t)), n))
+            if errs:
+                self.add(cid, WARN, "일부 청소 실패: %s | 성공: %s"
+                         % ("; ".join(errs), ", ".join(done)))
+            else:
+                self.add(cid, FIXED, "dept 훅 누수 %d개 제거(base 보존·백업): %s — ★claude 재시작 후 적용"
+                         % (total, ", ".join(done)))
+        else:
+            self.add(cid, FAIL, "글로벌 settings dept 훅 누수 %d개 탐지: %s (--fix로 청소)"
+                     % (total, summary))
 
     # ── C09 round 핵심 문서 ──
     def c09_round_core(self):
@@ -2871,6 +2984,7 @@ class Preflight:
         self.c53_idempotency()
         self.c54_loc_cap()
         self.c55_grill_gate()
+        self.c56_dept_hook_leak()
         return self.results
 
 
