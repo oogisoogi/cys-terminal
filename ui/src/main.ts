@@ -132,7 +132,7 @@ let ccTimer: number | null = null;
 let ccClockTimer: number | null = null;
 let ccUptimeBase = 0;
 let ccUptimeFetchedAt = 0;
-let ccTab: "live" | "eff" | "skills" | "sessions" | "weekly" | "learn" | "board" | "tasks" = "live";
+let ccTab: "live" | "eff" | "skills" | "sessions" | "weekly" | "learn" | "board" | "tasks" | "feed" = "live";
 let ccEffWindow = "today";
 let ccSkillsWindow = "today";
 let ccSessionsWindow = "7d";
@@ -258,6 +258,7 @@ async function refreshControlCenter() {
   if (ccTab === "learn") refreshLearn();
   // Tasks 안전망 reconcile: 이벤트 누락·부서 신규 기동을 5초 폴링으로 보정(평시는 이벤트 드리븐).
   if (ccTab === "tasks") refreshTasks();
+  if (ccTab === "feed") refreshFeed();
 }
 
 // E6 경보 — 헤더 배지(개수) + Live 뷰 상단 스트립. severity: warn(주황)/crit(빨강).
@@ -308,7 +309,7 @@ async function refreshWeekly() {
   }
 }
 
-function setCcTab(view: "live" | "eff" | "skills" | "sessions" | "weekly" | "learn" | "board" | "tasks") {
+function setCcTab(view: "live" | "eff" | "skills" | "sessions" | "weekly" | "learn" | "board" | "tasks" | "feed") {
   ccTab = view;
   document.getElementById("cc-view-live")!.hidden = view !== "live";
   document.getElementById("cc-view-eff")!.hidden = view !== "eff";
@@ -318,6 +319,7 @@ function setCcTab(view: "live" | "eff" | "skills" | "sessions" | "weekly" | "lea
   document.getElementById("cc-view-learn")!.hidden = view !== "learn";
   document.getElementById("cc-view-board")!.hidden = view !== "board";
   document.getElementById("cc-view-tasks")!.hidden = view !== "tasks";
+  document.getElementById("cc-view-feed")!.hidden = view !== "feed";
   document.querySelectorAll("#cc-tabs .cc-tab").forEach((b) =>
     b.classList.toggle("active", (b as HTMLElement).dataset.view === view),
   );
@@ -328,6 +330,7 @@ function setCcTab(view: "live" | "eff" | "skills" | "sessions" | "weekly" | "lea
   if (view === "learn") refreshLearn();
   if (view === "board") refreshBoard();
   if (view === "tasks") refreshTasks();
+  if (view === "feed") refreshFeed();
 }
 
 // D5: 스킬 버튼 보드 — 카탈로그 큐레이션 렌더 + 일회용 워커 실행 + 산출물 회수(터미널 입력 0회).
@@ -568,7 +571,7 @@ async function runSkillButton(s: any) {
   }
 }
 
-// RSI 학습 탭 — learn.status(canonical state) 폴링 렌더 + 대기추천은 기존 feed 패널 재사용.
+// RSI 학습 탭 — learn.status(canonical state) 폴링 렌더 + 대기추천은 승인 Feed 탭(cc-view-feed) 재사용.
 async function refreshLearn() {
   let state: any = {};
   try {
@@ -626,13 +629,13 @@ async function refreshLearn() {
     .map(([l, v]) => `<div class="cc-mix-row"><span class="cc-mix-name">${ccEsc(l)}</span><span class="cc-call-n">${v}</span></div>`)
     .join("");
 
-  // 대기 배지 — 기존 feed에서 learn_proposal pending 필터(승인/거부는 Feed 패널 재사용·중복 UI 0).
+  // 대기 배지 — 기존 feed에서 learn_proposal pending 필터(승인/거부는 승인 Feed 탭 재사용·중복 UI 0).
   try {
     const f = (await invoke("feed_list", { status: null })) as any;
     const items: any[] = f?.items ?? [];
     const lp = items.filter((i) => i?.status === "pending" && i?.kind === "learn_proposal");
     document.getElementById("cc-learn-pending")!.innerHTML = lp.length
-      ? lp.map((i) => `<div class="cc-learn-pending-item">⏳ ${ccEsc(String(i.title ?? "학습 추천"))} <span class="cc-dim">— Feed 패널에서 승인/거부</span></div>`).join("")
+      ? lp.map((i) => `<div class="cc-learn-pending-item">⏳ ${ccEsc(String(i.title ?? "학습 추천"))} <span class="cc-dim">— 승인 Feed 탭에서 승인/거부</span></div>`).join("")
       : `<div class="cc-empty">대기 중 자율추천 없음</div>`;
   } catch {
     document.getElementById("cc-learn-pending")!.innerHTML = `<div class="cc-empty">—</div>`;
@@ -1778,7 +1781,18 @@ async function refreshSidebarStatus() {
     }
   }
   pendingApprovals = pend;
+  updatePendingBadges(pend); // CC 버튼·승인 Feed 탭 배지 동기
   renderWsTabs(); // 신호 반영 재렌더
+}
+
+// 승인 대기 건수 배지 — 상단 Control Center 버튼 + 편입된 '승인 Feed' 탭 둘 다 갱신.
+function updatePendingBadges(n: number) {
+  for (const id of ["cc-pending-badge", "cc-feed-tabbadge"]) {
+    const b = document.getElementById(id);
+    if (!b) continue;
+    b.hidden = n === 0;
+    b.textContent = String(n);
+  }
 }
 
 // ws별 고유색 (id 기반 — 세션 복원에도 같은 ws는 같은 색)
@@ -2337,7 +2351,7 @@ function removeDeadPane(sid: number, socket?: string) {
   if (focusedSid != null) setFocus(focusedSid);
 }
 
-// ---------- feed panel ----------
+// ---------- 승인 Feed (Control Center 탭) ----------
 
 interface FeedItem {
   request_id: string;
@@ -2349,12 +2363,11 @@ interface FeedItem {
   decision: string | null;
 }
 
-let feedOpen = false;
-
-function setFeedOpen(open: boolean) {
-  feedOpen = open;
-  document.getElementById("feed-panel")!.hidden = !open;
-  if (open) refreshFeed();
+// 승인 Feed는 Control Center의 '승인 Feed' 탭으로 편입됨(독립 패널 폐기).
+// 여는 동작 = CC 패널 오픈 + 탭 활성(setCcTab이 refreshFeed 호출).
+function openFeed() {
+  if (!ccOpen) setCcOpen(true);
+  setCcTab("feed");
 }
 
 // ---------- file tree (오른쪽 섹션 — 선택한 surface의 폴더 탐색) ----------
@@ -2439,13 +2452,11 @@ async function refreshFeed() {
     | null;
   if (!r) return;
   const items = r.items.slice().reverse();
-  const pending = items.filter((i) => i.status === "pending");
-  const badge = document.getElementById("feed-badge")!;
-  badge.hidden = pending.length === 0;
-  badge.textContent = String(pending.length);
 
-  if (!feedOpen) return;
-  const box = document.getElementById("feed-items")!;
+  // 대기 배지는 refreshSidebarStatus(전체 소켓 집계)가 단독 소유 — 여기선 목록만 렌더.
+  // (feed_list는 기본 데몬 1개만 조회하므로 멀티부서 집계와 스코프가 달라 배지 구동에 부적합.)
+  if (!(ccOpen && ccTab === "feed")) return;
+  const box = document.getElementById("cc-feed-items")!;
   box.innerHTML = "";
   if (items.length === 0) {
     box.textContent = "(비어 있음)";
@@ -2474,6 +2485,7 @@ async function refreshFeed() {
         btn.addEventListener("click", async () => {
           await invoke("feed_reply", { requestId: item.request_id, decision }).catch(() => {});
           refreshFeed();
+          refreshSidebarStatus(); // 결정 직후 집계 배지 즉시 갱신
         });
         actions.appendChild(btn);
       }
@@ -2727,6 +2739,7 @@ async function approveOldestFeed() {
   const oldest = pending[0]; // feed.list는 삽입순(handlers.rs items.iter()) → [0]=가장 오래된
   await invoke("feed_reply", { requestId: oldest.request_id, decision: "allow" });
   refreshFeed();
+  refreshSidebarStatus(); // 승인 직후 집계 배지 즉시 갱신
 }
 
 // org.status로 노드 행 생성 + 빌트인 액션 행 추가. socket = 활성 ws socket(1차: 단일 소켓).
@@ -2808,7 +2821,7 @@ async function buildPaletteItems(): Promise<PaletteItem[]> {
     { id: "act:close", title: "패널 닫기", keywords: "close 닫기", action: () => actionClose() },
     { id: "act:equalize", title: "패널 균등화", keywords: "equalize 균등", action: () => actionEqualize() },
     { id: "act:cc", title: "Control Center 토글", keywords: "control center dashboard 대시보드", action: () => setCcOpen(!ccOpen) },
-    { id: "act:feed-panel", title: "Feed 패널 토글", keywords: "feed panel 피드 패널", action: () => setFeedOpen(!feedOpen) },
+    { id: "act:feed-panel", title: "승인 Feed 탭 열기", keywords: "feed panel 피드 패널 승인 control center", action: () => openFeed() },
     { id: "act:dept", title: "부서 워크스페이스 추가", keywords: "dept workspace 부서", action: () => addDeptWorkspace() },
   );
   return items;
@@ -2982,7 +2995,7 @@ function onDaemonEvent(event: Record<string, unknown>) {
   if (name === "approval.request") {
     toast("approval", "⚠ 승인 대기", `${payload.role ?? ""} ${payload.surface_ref ?? ""} — ${String(payload.excerpt ?? "").slice(0, 100)}`);
     osBanner("⚠ 승인 대기", `${payload.role ?? ""} ${payload.surface_ref ?? ""} — ${String(payload.excerpt ?? "").slice(0, 100)}`); // B4 OS 배너(고우선)
-    setFeedOpen(true); // 승인은 즉시 Feed 오픈 (feed.item.created의 wait 경로와 정합)
+    openFeed(); // 승인은 즉시 승인 Feed 탭 오픈 (feed.item.created의 wait 경로와 정합)
     refreshFeed();
     refreshSidebarStatus(); // 사이드바 ⚠ 배지 갱신 (B3)
     return;
@@ -3034,9 +3047,10 @@ function onDaemonEvent(event: Record<string, unknown>) {
   } else if (category === "feed") {
     if (name === "feed.item.created") {
       toast("feed", "📥 승인 요청", String(payload.title ?? ""));
-      if (payload.wait === true) setFeedOpen(true);
+      if (payload.wait === true) openFeed();
     }
     refreshFeed();
+    refreshSidebarStatus(); // 피드 이벤트 시 집계 배지 갱신(멀티부서 정합)
   } else if (name === "surface.exited" || name === "surface.closed" || name === "surface.reaped") {
     // 종료 즉시 죽은 pane 자동 제거 (A안) — 데몬 reap을 기다리지 않는다. 멱등.
     // 멀티마스터 F4: 출처 데몬을 socket_slug로 특정해 그 부서 pane만 제거(타 부서 같은 sid 보호).
@@ -3287,8 +3301,6 @@ document.getElementById("btn-split-h")!.addEventListener("click", () => actionSp
 document.getElementById("btn-split-v")!.addEventListener("click", () => actionSplit("col"));
 document.getElementById("btn-equalize")!.addEventListener("click", actionEqualize);
 document.getElementById("btn-close")!.addEventListener("click", actionClose);
-document.getElementById("btn-feed")!.addEventListener("click", () => setFeedOpen(!feedOpen));
-document.getElementById("btn-feed-close")!.addEventListener("click", () => setFeedOpen(false));
 document.getElementById("btn-files")!.addEventListener("click", () => setFtOpen(!ftOpen));
 document.getElementById("btn-ft-close")!.addEventListener("click", () => setFtOpen(false));
 document.getElementById("btn-cc")!.addEventListener("click", () => setCcOpen(!ccOpen));

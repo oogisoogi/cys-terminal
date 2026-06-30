@@ -16,9 +16,8 @@
     <button id="btn-split-v" title="아래 분할 (⌘⇧D)">Split ↓</button>
     <button id="btn-equalize" title="역할별 표준 배치로 정렬 — master·CSO(좌) · 워커(가운데 균등) · agy·codex(우) · 수동 크기 조절엔 영향 없음">정렬</button>
     <button id="btn-close" title="pane 닫기 — 자식 트리 강제 종료 (⌘W)">Close</button>
-    <button id="btn-feed" title="승인 Feed">Feed <span id="feed-badge" class="badge" hidden>0</span></button>
     <button id="btn-files" title="파일 트리 (선택한 surface의 폴더)">Files</button>
-    <button id="btn-cc" title="Control Center — 실시간 플릿·사용량·시스템 모니터링">Control Center</button>
+    <button id="btn-cc" title="Control Center — 실시간 플릿·사용량·시스템 모니터링 · 승인 Feed">Control Center <span id="cc-pending-badge" class="badge" hidden>0</span></button>
     <button id="btn-update" title="업데이트 확인">Update <span id="update-badge" class="badge" hidden>!</span></button>
   </header>
   <div id="body-row">
@@ -31,10 +30,6 @@
       <div id="ft-body"></div>
     </aside>
     <main id="root"></main>
-    <aside id="feed-panel" hidden>
-      <div id="feed-panel-head">승인 Feed <button id="btn-feed-close">×</button></div>
-      <div id="feed-items"></div>
-    </aside>
     <aside id="cc-panel" hidden>
       <div id="cc-header">
         <span class="cc-pulse"></span>
@@ -56,6 +51,7 @@
         <button class="cc-tab" data-view="learn">학습</button>
         <button class="cc-tab" data-view="board">스킬 보드</button>
         <button class="cc-tab" data-view="tasks">작업</button>
+        <button class="cc-tab" data-view="feed">승인 Feed <span id="cc-feed-tabbadge" class="badge" hidden>0</span></button>
       </div>
       <div id="cc-body">
         <div id="cc-view-live">
@@ -128,7 +124,7 @@
           <div class="cc-section"><div class="cc-h">🔬 학습 라운드 타임라인</div><div id="cc-learn-timeline"></div></div>
           <div class="cc-section"><div class="cc-h">♻️ 채택 · 롤백 (retention)</div><div id="cc-learn-retention"></div></div>
           <div class="cc-section"><div class="cc-h">🧭 발견 누적 (Discovery)</div><div id="cc-learn-discovery"></div></div>
-          <div class="cc-section"><div class="cc-h">⏳ 자율추천 대기 (승인은 Feed 패널)</div><div id="cc-learn-pending"></div></div>
+          <div class="cc-section"><div class="cc-h">⏳ 자율추천 대기 (승인은 승인 Feed 탭)</div><div id="cc-learn-pending"></div></div>
         </div>
         <div id="cc-view-board" hidden>
           <div class="cc-board-note">클릭 = 보이는 일회용 워커가 task-prompt 티켓(성공기준·4규칙) 경유로 실행합니다. 산출물은 "AI 보조 생성 · 박사님 검수 전"입니다.</div>
@@ -138,6 +134,10 @@
         <div id="cc-view-tasks" hidden>
           <div class="cc-board-note">모든 부서의 모든 노드가 지금 무슨 업무를 하는지 실시간 표시(관측 전용·입력 주입 없음). 📍자기보고 = 노드가 보고한 업무 · ⚙파생 = 활동 추론.</div>
           <div id="cc-tasks-depts"></div>
+        </div>
+        <div id="cc-view-feed" hidden>
+          <div class="cc-board-note">노드·CSO·워커가 올린 승인 요청을 검토하고 Allow/Deny 합니다. 대기 건수는 상단 Control Center 버튼과 이 탭에 표시됩니다.</div>
+          <div class="cc-section"><div class="cc-h">승인 Feed</div><div id="cc-feed-items"></div></div>
         </div>
         <div id="cc-footer"></div>
       </div>
