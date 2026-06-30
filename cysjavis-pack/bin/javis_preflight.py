@@ -358,6 +358,19 @@ def discover_claude_settings():
     아니므로 미대상. 함수는 절대 raise 안 함(부재/이상 dir은 부분 커버리지로 graceful 강등)."""
     home = os.path.expanduser("~")
     found = []
+    # 축A 근본복원(2026-06-30): 부서 데몬 컨텍스트(CYS_ACCOUNT_DIR이 부서 전용 dir·basename에
+    # 'dept-')에서는 home-glob을 생략하고 자기 account_dir settings.json에만 hook을 등록한다.
+    # home-glob을 그대로 두면 부서 preflight가 CEO(~/.claude-ysfuture)·타부서 config에까지
+    # hook을 append해 dept-3·dept-4처럼 무한 재발한다(부서장 config 공유와 무관한 절차 버그).
+    _acct = os.environ.get("CYS_ACCOUNT_DIR")
+    _acct_is_dept = bool(_acct and "dept-" in os.path.basename(os.path.normpath(_acct)))
+    # R2 강화(2026-06-30): CYS_ACCOUNT_DIR 누락 엣지에서도 pack_dir이 pack-dept-* 면 부서로 판별 →
+    # home-glob 진입을 차단해 CEO·타부서 settings 재누수를 env 비의존으로 원천 봉쇄.
+    _pack_is_dept = "pack-dept-" in os.path.basename(os.path.normpath(pack_dir()))
+    if _acct_is_dept or _pack_is_dept:
+        if _acct and os.path.isdir(_acct):
+            return [os.path.join(_acct, "settings.json")]
+        return []  # account_dir 미상 시: 글로벌 등록 절대 금지(누수방지 우선·부서 settings는 cys-dept가 생성)
     try:
         names = os.listdir(home)
     except OSError:
