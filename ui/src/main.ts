@@ -1375,7 +1375,9 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
     // 80폭에서 wrap돼 첫 줄(0,0)에 고립 표시된다. fit.fit()은 첫 프롬프트 뒤라 소급 정정 안 됨.
     cols: 120,
     rows: 35,
-    fontFamily: "Menlo, 'SF Mono', 'Apple SD Gothic Neo', 'Noto Sans KR', Consolas, monospace",
+    // ★Windows: Latin 등폭폰트(Cascadia Mono/Consolas)를 CJK 폰트보다 앞에 둔다. 아니면 Menlo/SF Mono
+    //   부재 시 xterm가 셀 폭을 CJK 전각폰트(Noto Sans KR)로 측정해 Latin 글자가 넓게 벌어진다(자간 이상).
+    fontFamily: "Menlo, 'SF Mono', 'Cascadia Mono', Consolas, 'Apple SD Gothic Neo', 'Malgun Gothic', 'Noto Sans KR', monospace",
     fontSize,
     theme: { background: "#0d1117", foreground: "#c9d1d9" },
     scrollback: 5000,
