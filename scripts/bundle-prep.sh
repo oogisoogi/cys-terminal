@@ -6,6 +6,10 @@
 set -e
 cd "$(dirname "$0")/.."
 
+# Windows(.exe)·python3-부재 환경 대응: python 인터프리터를 OS 무관하게 해석
+# (Windows CPython은 python3 없이 python만 제공하는 경우가 있어 폴백).
+PY="$(command -v python3 || command -v python || true)"
+
 sh ui/build.sh
 
 if [ -n "$CYS_TARGET" ]; then
@@ -18,9 +22,11 @@ else
   bindir="target/release"
 fi
 
+# Windows 사이드카는 .exe 확장자 필수(tauri externalBin은 cys-<triple>.exe 를 찾음).
+case "$triple" in *windows*) exe=".exe" ;; *) exe="" ;; esac
 mkdir -p src-tauri/binaries
-cp "$bindir/cys" "src-tauri/binaries/cys-$triple"
-cp "$bindir/cysd" "src-tauri/binaries/cysd-$triple"
+cp "$bindir/cys$exe" "src-tauri/binaries/cys-$triple$exe"
+cp "$bindir/cysd$exe" "src-tauri/binaries/cysd-$triple$exe"
 
 # ── pack.tar.gz를 .app Contents/Resources/ 에 동봉 (옵션4 — 오프라인 자기완결·가시·핫스왑) ──
 # 임베드 PACK_ALL(build.rs가 git-추적 cysjavis-pack/ 전 트리에서 생성한 권위 테이블)을 단일 SOT로
@@ -31,18 +37,19 @@ cp "$bindir/cysd" "src-tauri/binaries/cysd-$triple"
 # manifest.files(스캔·동일성 게이트 통과 집합)만 박제 — 개인정보·미추적 쓰레기 박제 회피.
 # 미서명 로컬 빌드라 minisig는 생략(서명은 CI 무중단 채널 pack-artifacts가 별도 수행).
 host_triple="$(rustc -vV | sed -n 's/^host: //p')"
+case "$host_triple" in *windows*) host_exe=".exe" ;; *) host_exe="" ;; esac
 if [ "$triple" = "$host_triple" ]; then
-  manifest_cys="$bindir/cys"          # 호스트 네이티브 사이드카 — 그대로 실행 가능
+  manifest_cys="$bindir/cys$exe"      # 호스트 네이티브 사이드카 — 그대로 실행 가능
 else
   # 크로스 빌드 레그(예: arm64 러너에서 x86_64): 사이드카는 타깃 ABI라 실행 불가 →
   # 호스트 cys를 별도 빌드해 manifest emit에 쓴다(팩 콘텐츠는 타깃 무관 = 동일 manifest).
   cargo build --release --bin cys
-  manifest_cys="target/release/cys"
+  manifest_cys="target/release/cys$host_exe"
 fi
 
 mkdir -p src-tauri/resources
 "$manifest_cys" pack-manifest > src-tauri/resources/pack-manifest.json
-python3 - <<'PY'
+"$PY" - <<'PY'
 import gzip, hashlib, io, json, os, sys, tarfile
 
 ROOT = "cysjavis-pack"

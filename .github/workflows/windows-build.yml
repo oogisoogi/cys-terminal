@@ -1,0 +1,49 @@
+name: windows-build (feasibility)
+
+# ★목적: Windows x64 GUI(Tauri NSIS) 빌드 가능성 확인 전용 잡. 릴리스·발행 없음.
+#   feat/windows-x64-dist 브랜치 push 시 자동 실행 → 산출물(setup.exe)을 Actions 아티팩트로 업로드.
+#   release.yml(태그 트리거·공개 repo 발행)과 완전 독립 — 이 잡은 어떤 릴리스도 만들지 않는다.
+#   서명 없음(미서명 프로파일 A). createUpdaterArtifacts=false(tauri.windows.conf.json)라 서명키 불요.
+
+on:
+  push:
+    branches: ['feat/windows-x64-dist']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Setup Rust (x86_64-pc-windows-msvc = 러너 네이티브)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          key: windows-x64-feasibility
+
+      - name: python 인터프리터 확인 (bundle-prep의 pack.tar.gz 생성용)
+        shell: bash
+        run: |
+          command -v python3 && python3 --version || (command -v python && python --version)
+
+      - name: Build Windows x64 (Tauri → NSIS setup.exe)
+        shell: bash
+        run: |
+          bunx @tauri-apps/cli@2 build
+
+      - name: Upload NSIS installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cys-windows-x64-nsis
+          path: |
+            target/release/bundle/nsis/*.exe
+          if-no-files-found: error
