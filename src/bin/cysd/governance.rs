@@ -350,6 +350,7 @@ fn check_agent_death(
         let sid = s.id;
         let attempts = *count;
         tokio::spawn(async move {
+            use crate::state::HideConsole;
             let cli = crate::state::sibling_cli_path();
             let _ = tokio::time::timeout(
                 Duration::from_secs(180),
@@ -357,6 +358,7 @@ fn check_agent_death(
                     .arg("node-recover")
                     .arg("--surface")
                     .arg(cys::surface_ref(sid))
+                    .hide_console()
                     .output(),
             )
             .await;
@@ -1099,8 +1101,10 @@ pub fn kill_pid(pid: u32) {
     }
     #[cfg(windows)]
     {
+        use crate::state::HideConsole;
         let _ = std::process::Command::new("taskkill")
             .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .hide_console()
             .output();
     }
 }

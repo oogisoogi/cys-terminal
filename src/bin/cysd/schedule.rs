@@ -2,7 +2,7 @@
 //! cron과의 차이: 살아있는 AI 세션의 stdin에 자연어 과업을 push하고,
 //! 대상 역할이 부재하면 launch-agent로 깨워서 주입한다.
 
-use crate::state::{now_epoch, state_dir, Daemon};
+use crate::state::{now_epoch, state_dir, Daemon, HideConsole};
 use chrono::{Datelike, Local, NaiveTime, TimeZone};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -411,6 +411,7 @@ async fn run_text_command(cmd: &str) -> Result<String, String> {
     let fut = tokio::process::Command::new("sh")
         .arg("-c")
         .arg(cmd)
+        .hide_console()
         .output();
     let out = match tokio::time::timeout(Duration::from_secs(30), fut).await {
         Ok(Ok(o)) => o,
@@ -555,7 +556,7 @@ async fn launch_via_cli(daemon: &Arc<Daemon>, spec: &LaunchSpec) -> Result<u64, 
         cmd.arg("--cwd").arg(cwd);
     }
     // hang된 launch-agent가 fire 태스크를 영구 점유하지 않게 상한
-    let out = tokio::time::timeout(Duration::from_secs(180), cmd.output())
+    let out = tokio::time::timeout(Duration::from_secs(180), cmd.hide_console().output())
         .await
         .map_err(|_| "launch-agent timed out (180s)".to_string())?
         .map_err(|e| format!("launch-agent spawn failed: {e}"))?;
@@ -603,6 +604,7 @@ async fn fire_command(daemon: &Arc<Daemon>, job: &Job) -> Result<String, String>
         tokio::process::Command::new(shell)
             .arg(flag)
             .arg(command)
+            .hide_console()
             .output(),
     )
     .await

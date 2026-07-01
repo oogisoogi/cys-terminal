@@ -535,6 +535,32 @@ pub fn state_dir(socket_path: &std::path::Path) -> PathBuf {
 
 /// 데몬과 같은 디렉터리에 놓인 형제 `cys` CLI 경로.
 /// Windows에서는 실행파일명이 `cys.exe`이므로 플랫폼별 확장자를 붙인다
+/// Windows: 데몬(cysd)이 스폰하는 콘솔 자식(CLI·셸·taskkill 등)이 콘솔 창을 띄우지 않게
+/// CREATE_NO_WINDOW 를 건다(Win11 기본터미널=Windows Terminal 일 때 매 스폰마다 검은 창이
+/// 순간 떠오르는 flash 차단). 타 OS 무동작. std·tokio Command 모두 지원.
+pub trait HideConsole {
+    fn hide_console(&mut self) -> &mut Self;
+}
+impl HideConsole for std::process::Command {
+    fn hide_console(&mut self) -> &mut Self {
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            self.creation_flags(0x0800_0000);
+        }
+        self
+    }
+}
+impl HideConsole for tokio::process::Command {
+    fn hide_console(&mut self) -> &mut Self {
+        #[cfg(windows)]
+        {
+            self.creation_flags(0x0800_0000);
+        }
+        self
+    }
+}
+
 /// (cys.rs `sibling_daemon_path`·main.rs `ensure_daemon`과 동일 패턴).
 /// 형제 바이너리가 없으면 PATH 탐색용 파일명만 반환한다.
 pub fn sibling_cli_path() -> PathBuf {
