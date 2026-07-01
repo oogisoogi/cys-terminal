@@ -697,9 +697,10 @@ fn maybe_apply_pending_update(app: &AppHandle) {
         return;
     }
     // ① 새 팩(새 기능) 반영 — 성공 여부를 검사한다(침묵 실패 차단).
-    let pack_ok = std::process::Command::new(resolve_sidecar("cys"))
-        .arg("init-pack")
-        .arg("--no-install-hook")
+    let mut init_cmd = std::process::Command::new(resolve_sidecar("cys"));
+    init_cmd.arg("init-pack").arg("--no-install-hook");
+    no_console(&mut init_cmd);
+    let pack_ok = init_cmd
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
@@ -714,10 +715,10 @@ fn maybe_apply_pending_update(app: &AppHandle) {
     }
     // 성공 후에만 마커 제거 + 자동복귀.
     let _ = std::fs::remove_file(&marker);
-    let _ = std::process::Command::new(resolve_sidecar("cys"))
-        .arg("restore")
-        .arg("--include-master")
-        .spawn();
+    let mut restore_cmd = std::process::Command::new(resolve_sidecar("cys"));
+    restore_cmd.arg("restore").arg("--include-master");
+    no_console(&mut restore_cmd);
+    let _ = restore_cmd.spawn();
 }
 
 /// D5/P1: UI 발 키 전송 — surface.send_key RPC 래퍼. send_input(send_text)과 달리 Return 등 키 전송 가능.
@@ -762,12 +763,15 @@ fn make_ticket(task: String, scope: String, success: String, to: String) -> Resu
     } else {
         scope.clone()
     };
-    let output = std::process::Command::new("python3")
+    let mut orch_cmd = std::process::Command::new("python3");
+    orch_cmd
         .arg(&script)
         .arg("task-prompt")
         .args(["--task", &task, "--scope", &scope_full, "--success", &success, "--to", &to])
         .arg("--no-survival-gate")
-        .args(["--output-format", out_fmt])
+        .args(["--output-format", out_fmt]);
+    no_console(&mut orch_cmd);
+    let output = orch_cmd
         .output()
         .map_err(|e| format!("javis_orchestra 실행 실패: {e}"))?;
     if !output.status.success() {
@@ -790,8 +794,9 @@ fn run_skill(name: String, ticket: String, agent: Option<String>, close_after: O
     if let Some(ca) = close_after {
         cmd.args(["--close-after", &ca.to_string()]);
     }
-    cmd.stdin(std::process::Stdio::null())
-        .spawn()
+    cmd.stdin(std::process::Stdio::null());
+    no_console(&mut cmd);
+    cmd.spawn()
         .map_err(|e| format!("cys skill run 실행 실패 ({}): {e}", cys.display()))?;
     Ok(json!({"ok": true, "name": name}))
 }
@@ -978,6 +983,21 @@ async fn maybe_autoregister_launchd() -> bool {
     }
 }
 
+/// Windows: GUI(windows_subsystem)가 콘솔 바이너리(cys/cysd/python3)를 스폰할 때 콘솔 창이
+/// 뜨지 않게 CREATE_NO_WINDOW 를 붙인다(검은 빈 Windows Terminal 창·ConPTY 오염 방지). 타 OS 무동작.
+fn no_console(cmd: &mut std::process::Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = cmd;
+    }
+}
+
 /// Ensure aitermd is running: try to connect, otherwise spawn the bundled/sibling binary.
 async fn ensure_daemon() -> Result<(), String> {
     if connect().await.is_ok() {
@@ -992,10 +1012,13 @@ async fn ensure_daemon() -> Result<(), String> {
         Some(p) if p.exists() => p,
         _ => std::path::PathBuf::from(daemon_name), // fall back to PATH
     };
-    std::process::Command::new(&program)
+    let mut command = std::process::Command::new(&program);
+    command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    no_console(&mut command);
+    command
         .spawn()
         .map_err(|e| format!("failed to start cysd ({}): {e}", program.display()))?;
     if wait_for_connect(40).await {

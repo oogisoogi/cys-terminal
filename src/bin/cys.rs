@@ -882,6 +882,13 @@ fn spawn_detached_daemon(path: &std::path::Path) -> std::io::Result<()> {
             });
         }
     }
+    #[cfg(windows)]
+    {
+        // CREATE_NO_WINDOW: 데몬에 콘솔 창을 붙이지 않는다(검은 빈 창·ConPTY 오염 방지).
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
     cmd.spawn().map(|_| ())
 }
 
