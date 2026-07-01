@@ -1115,11 +1115,10 @@ async fn launch_dept_daemon(app: AppHandle, name: String) -> Result<Value, Strin
     let tool = dept_tool();
     let n = name.clone();
     let out = tokio::task::spawn_blocking(move || {
-        std::process::Command::new("bash")
-            .arg(&tool)
-            .arg("launch")
-            .arg(&n)
-            .output()
+        let mut cmd = std::process::Command::new("bash");
+        cmd.arg(&tool).arg("launch").arg(&n);
+        no_console(&mut cmd);
+        cmd.output()
     })
     .await
     .map_err(|e| e.to_string())?
@@ -1156,6 +1155,7 @@ async fn allocate_dept_daemon(app: AppHandle, catalog_key: Option<String>) -> Re
                 cmd.arg("allocate");
             } // 레거시: 번호만 발급(회귀 무변경)
         }
+        no_console(&mut cmd);
         cmd.output()
     })
     .await
@@ -1205,11 +1205,10 @@ async fn allocate_dept_daemon(app: AppHandle, catalog_key: Option<String>) -> Re
 async fn stop_dept_daemon(name: String) -> Result<(), String> {
     let tool = dept_tool();
     let _ = tokio::task::spawn_blocking(move || {
-        std::process::Command::new("bash")
-            .arg(&tool)
-            .arg("down")
-            .arg(&name)
-            .output()
+        let mut cmd = std::process::Command::new("bash");
+        cmd.arg(&tool).arg("down").arg(&name);
+        no_console(&mut cmd);
+        cmd.output()
     })
     .await;
     Ok(())
@@ -1269,11 +1268,10 @@ fn read_dept_catalog() -> Result<Value, String> {
 async fn stop_dept_daemon_by_socket(socket: String) -> Result<(), String> {
     let tool = dept_tool();
     let _ = tokio::task::spawn_blocking(move || {
-        std::process::Command::new("bash")
-            .arg(&tool)
-            .arg("down-sock")
-            .arg(&socket)
-            .output()
+        let mut cmd = std::process::Command::new("bash");
+        cmd.arg(&tool).arg("down-sock").arg(&socket);
+        no_console(&mut cmd);
+        cmd.output()
     })
     .await;
     Ok(())
@@ -1323,7 +1321,12 @@ async fn check_pack_update(manifest_url: Option<String>) -> Result<Option<Value>
     // ★transient 실패(spawn/join·curl 실행·HTTP 비정상)는 Err로 돌린다 — UI catch가 상태보존(silent).
     //   Ok(None)으로 접으면 '확인된 no-update'와 구분 불가 → 일시 장애에 배지 소거(codex R2 #1).
     let joined = tokio::task::spawn_blocking(move || {
-        std::process::Command::new("curl").args(["-fsSL", &fetch_url]).output()
+        let mut cmd = std::process::Command::new("curl");
+        cmd.args(["-fsSL", &fetch_url]);
+        // startup + 6시간 폴링마다 실행 — GUI(무콘솔)가 콘솔 자식(curl)을 그냥 스폰하면
+        // Win11(기본터미널=WT)에서 검은 창이 깜빡인다. 첫 실행 flash의 단일 최우선 원인.
+        no_console(&mut cmd);
+        cmd.output()
     })
     .await;
     let out = match joined {
@@ -1424,9 +1427,10 @@ async fn install_update(app: AppHandle, force: bool) -> Result<(), String> {
     // 자체 watchdog(12s)로 hang 시에도 종료되므로 별도 timeout 없이 await해도 업데이트가 멈추지 않는다.
     let _ = app.emit("update-progress", json!({"phase": "drain"}));
     let _ = tokio::task::spawn_blocking(|| {
-        std::process::Command::new(resolve_sidecar("cys"))
-            .arg("drain")
-            .status()
+        let mut cmd = std::process::Command::new(resolve_sidecar("cys"));
+        cmd.arg("drain");
+        no_console(&mut cmd);
+        cmd.status()
     })
     .await;
     let _ = app.emit("update-progress", json!({"phase": "handoff"}));
@@ -1455,6 +1459,7 @@ async fn install_pack_update(
     let cys = resolve_sidecar(if cfg!(windows) { "cys.exe" } else { "cys" });
     let mut cmd = std::process::Command::new(&cys);
     cmd.arg("pack-update");
+    no_console(&mut cmd);
     match (&from, &manifest_url) {
         (Some(d), _) => {
             cmd.args(["--from", d]);
@@ -1579,9 +1584,10 @@ async fn stop_running_daemon() {
                     let _ = rpc("ledger.kill", json!({ "pid": spid })).await;
                 }
             }
-            let _ = std::process::Command::new("taskkill")
-                .args(["/PID", &pid.to_string(), "/F"])
-                .output();
+            let mut kill = std::process::Command::new("taskkill");
+            kill.args(["/PID", &pid.to_string(), "/F"]);
+            no_console(&mut kill);
+            let _ = kill.output();
         }
         // 종료·소켓 unlink 대기 (최대 3초)
         for _ in 0..30 {
