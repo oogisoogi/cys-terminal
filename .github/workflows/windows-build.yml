@@ -60,7 +60,9 @@ jobs:
         env:
           PYTHONUTF8: '1'   # Windows Python 기본 cp1252 stdout에서 한국어 print 크래시 방지
         run: |
-          bunx @tauri-apps/cli@2 build
+          # createUpdaterArtifacts=false 인라인 override — 이 잡은 서명키 없는 가능성 빌드라
+          # updater 서명 산출을 끈다(릴리스 경로 release.yml은 windows conf 기본값 true+서명키 사용).
+          bunx @tauri-apps/cli@2 build --config '{"bundle":{"createUpdaterArtifacts":false}}'
 
       - name: Upload NSIS installer artifact
         if: always()
