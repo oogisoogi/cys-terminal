@@ -17,7 +17,7 @@ use winapi::shared::winerror::{HRESULT, S_OK};
 use winapi::um::handleapi::*;
 use winapi::um::processthreadsapi::*;
 use winapi::um::winbase::{
-    CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, STARTF_USESTDHANDLES,
+    CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, STARTF_USESTDHANDLES,
     STARTUPINFOEXW,
 };
 use winapi::um::wincon::COORD;
@@ -143,10 +143,11 @@ impl PsuedoCon {
                 ptr::null_mut(),
                 ptr::null_mut(),
                 0,
-                // ★cys 패치: CREATE_NO_WINDOW — Win11 기본터미널=Windows Terminal 일 때 ConPTY
-                //   자식(셸) 생성 시 콘솔 창이 순간 떠오르는 flash 를 차단(pseudoconsole 첨부 자식이라도
-                //   Win11에서 새 콘솔 호스트 창을 낼 수 있음). node-pty 등 PTY 라이브러리 표준 수정.
-                EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
+                // ★제약: ConPTY 자식에 CREATE_NO_WINDOW 를 넣으면 안 된다 — 자식이 pseudoconsole
+                //   대신 별도의 숨은 콘솔에 붙어 출력이 PTY 에 도달하지 않는다(검은 pane).
+                //   node-pty·MS 공식 샘플 모두 이 두 플래그만 사용한다. pseudoconsole 첨부 자식은
+                //   설계상 창을 만들지 않으므로 flash 억제 목적으로도 불필요.
+                EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
                 cmd.environment_block().as_mut_slice().as_mut_ptr() as *mut _,
                 cwd.as_ref()
                     .map(|c| c.as_slice().as_ptr())
