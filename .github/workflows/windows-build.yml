@@ -103,3 +103,42 @@ jobs:
           & $py.FullName -c "import sqlite3, ssl, json, hashlib, urllib.request, ast; print('embeddable stdlib OK (sqlite3+ssl+json+hashlib+urllib+ast)')"
           if ($LASTEXITCODE -ne 0) { throw "동봉 python3 stdlib import 실패" }
           Write-Host "OK: 자기완결 런타임 설치·실행·경로일치 검증 통과"
+
+      - name: PTY 스모크 (검은 pane 회귀 게이트 — ConPTY 셸 출력·실행 실측)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $inst = Get-ChildItem "$env:LOCALAPPDATA" -Recurse -Filter cysd.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $inst) { throw "설치된 cysd.exe 미발견" }
+          $dir = $inst.Directory.FullName
+          $cys = Join-Path $dir 'cys.exe'
+          # ping이 형제 cysd를 자동 기동(4초 대기 내장) — 첫 시도 실패 시 1회 재시도.
+          & $cys ping; if ($LASTEXITCODE -ne 0) { Start-Sleep -Seconds 3; & $cys ping }
+          if ($LASTEXITCODE -ne 0) { throw "cysd 기동 실패 (named pipe 미응답)" }
+          $ref = (& $cys new-surface --title pty-smoke | Select-Object -Last 1).Trim()
+          if (-not $ref) { throw "new-surface 실패" }
+          Write-Host "surface: $ref"
+          # ① 셸 프롬프트 도달 실측 — 검은 pane 회귀 시 여기서 실패한다.
+          #    (ConPTY 자식이 pseudoconsole에 못 붙으면 출력이 PTY에 영영 도달하지 않는다.)
+          $deadline = (Get-Date).AddSeconds(60); $screen = ''
+          while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 3
+            $screen = (& $cys read-screen --surface $ref) -join "`n"
+            if ($screen -match 'PS ') { break }
+          }
+          Write-Host "== screen(prompt) =="; Write-Host $screen
+          if ($screen -notmatch '\S') { throw "PTY 출력 0바이트 — 검은 pane 회귀 (셸 출력이 pseudoconsole에 도달하지 않음)" }
+          if ($screen -notmatch 'PS ') { throw "PowerShell 프롬프트 미검출 — 셸이 pseudoconsole에 붙지 않았거나 즉시 종료" }
+          # ② 입력→실행→출력 왕복 실측 — 문자열 연결 결과는 셸이 실제 평가해야만 화면에 나타난다
+          #    (타이핑 에코만으로는 'cys-exec-proof' 원문이 등장하지 않게 조합).
+          & $cys send --surface $ref "echo ('cys-exec-' + 'proof')"
+          & $cys send-key --surface $ref Return
+          $deadline = (Get-Date).AddSeconds(40); $ok = $false
+          while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 3
+            $screen = (& $cys read-screen --surface $ref) -join "`n"
+            if ($screen -match 'cys-exec-proof') { $ok = $true; break }
+          }
+          if (-not $ok) { Write-Host "== screen(roundtrip) =="; Write-Host $screen; throw "실행 왕복 실패 — PTY 입력 또는 셸 실행 경로 결함" }
+          Write-Host "OK: ConPTY 프롬프트·실행 왕복 실측 통과"
+          Get-Process cys,cysd -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
