@@ -1,5 +1,7 @@
 [workspace]
 members = ["src-tauri"]
+# 벤더링된 portable-pty(ConPTY 창 flash 수정 패치)는 워크스페이스 멤버가 아니라 path 의존이다.
+exclude = ["vendor/portable-pty"]
 
 [package]
 name = "cys-terminal"
@@ -24,7 +26,8 @@ path = "src/bin/cys.rs"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal", "process"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-portable-pty = "0.9"
+# ★벤더링 + 패치: ConPTY 자식 생성에 CREATE_NO_WINDOW 추가(Win11 검은 창 flash 차단). vendor/portable-pty/ 참조.
+portable-pty = { path = "vendor/portable-pty" }
 vt100 = "0.15"
 clap = { version = "4", features = ["derive"] }
 regex = "1"
