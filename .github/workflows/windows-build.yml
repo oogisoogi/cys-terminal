@@ -114,8 +114,9 @@ jobs:
           if (-not $inst) { throw "설치된 cysd.exe 미발견" }
           $dir = $inst.Directory.FullName
           $cys = Join-Path $dir 'cys.exe'
-          # ping이 형제 cysd를 자동 기동(4초 대기 내장) — 첫 시도 실패 시 1회 재시도.
-          & $cys ping; if ($LASTEXITCODE -ne 0) { Start-Sleep -Seconds 3; & $cys ping }
+          # list가 형제 cysd를 자동 기동(4초 대기 내장) — ping은 순수 프로브라 autostart가
+          # 의도적으로 꺼져 있어(cys.rs) 부트스트랩에 못 쓴다. 첫 시도 실패 시 1회 재시도.
+          & $cys list; if ($LASTEXITCODE -ne 0) { Start-Sleep -Seconds 3; & $cys list }
           if ($LASTEXITCODE -ne 0) { throw "cysd 기동 실패 (named pipe 미응답)" }
           $ref = (& $cys new-surface --title pty-smoke | Select-Object -Last 1).Trim()
           if (-not $ref) { throw "new-surface 실패" }
