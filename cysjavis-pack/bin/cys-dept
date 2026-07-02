@@ -22,7 +22,14 @@ PACK_DEFAULT="$HOME/.cys/pack"
 CYSD="$(command -v cysd || echo /opt/homebrew/bin/cysd)"
 CYS="$(command -v cys || echo /opt/homebrew/bin/cys)"
 
-dept_sock(){ echo "$HOME/.local/state/cys-dept-$1/cys.sock"; }
+# RC-4: 부서 소켓 규약 — Windows(MSYS/Git-Bash)는 named pipe `\\.\pipe\cys-dept-<n>`
+# (cysd가 CYS_SOCKET을 named pipe로 바인드·Rust cys::dept_socket_path와 정합), 그 외는 unix .sock.
+dept_sock(){
+  case "$(uname -s 2>/dev/null)" in
+    MINGW*|MSYS*|CYGWIN*) echo "\\\\.\\pipe\\cys-dept-$1" ;;
+    *) echo "$HOME/.local/state/cys-dept-$1/cys.sock" ;;
+  esac
+}
 dept_pack(){ echo "$HOME/.cys/pack-dept-$1"; }
 
 reg_init(){ [ -f "$REG" ] || { mkdir -p "$(dirname "$REG")"; printf '{"depts":{}}\n' > "$REG"; }; }

@@ -1144,13 +1144,11 @@ fn dept_tool() -> std::path::PathBuf {
     cys::pack::pack_dir().join("bin").join("cys-dept")
 }
 
-/// 부서 데몬 소켓 경로 — cys-dept 규약과 동일(~/.local/state/cys-dept-<name>/cys.sock).
+/// 부서 데몬 소켓 경로 — RC-4: 공용 규약(cys::dept_socket_path)에 위임.
+/// Windows=named pipe `\\.\pipe\cys-dept-<name>`, unix=~/.local/state/cys-dept-<name>/cys.sock.
+/// (구: HOME 직접사용 unix .sock 고정 → Windows named pipe 미대응·HOME 미설정 이중결함 RC-4/RC-7.)
 fn dept_socket_path(name: &str) -> std::path::PathBuf {
-    let home = std::env::var("HOME").unwrap_or_default();
-    std::path::PathBuf::from(home)
-        .join(".local/state")
-        .join(format!("cys-dept-{name}"))
-        .join("cys.sock")
+    cys::dept_socket_path(name)
 }
 
 /// 새 부서 workspace 런칭 = 부서 데몬 spawn. 단일 진입점 cys-dept launch를 OS 호출해

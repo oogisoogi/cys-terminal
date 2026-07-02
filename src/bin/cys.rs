@@ -3505,13 +3505,11 @@ fn run_fleet(as_json: bool) -> i32 {
         if let Ok(v) = serde_json::from_str::<Value>(&s) {
             if let Some(depts) = v["depts"].as_object() {
                 for (name, meta) in depts {
+                    // RC-4: socket 필드 부재 시 공용 규약으로 폴백(Windows named pipe·unix .sock).
                     let sock = meta["socket"]
                         .as_str()
                         .map(std::path::PathBuf::from)
-                        .unwrap_or_else(|| {
-                            std::path::PathBuf::from(&home)
-                                .join(format!(".local/state/cys-dept-{name}/cys.sock"))
-                        });
+                        .unwrap_or_else(|| cys::dept_socket_path(name));
                     let disp = meta["display_name"].as_str().unwrap_or(name).to_string();
                     targets.push((sock, disp));
                 }

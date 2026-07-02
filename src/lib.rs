@@ -103,6 +103,25 @@ pub fn runtime_prefixed_path(exe_dir: &Path, current_path: &str) -> Option<Strin
     Some(format!("{}{}{}", add.join(&sep.to_string()), sep, current_path))
 }
 
+/// 부서 데몬 소켓/파이프 경로(RC-4 · 공용 — GUI(src-tauri)·cys fleet가 공유, 규약 단일화).
+/// Windows: named pipe `\\.\pipe\cys-dept-<name>`(기본 데몬 `\\.\pipe\cys`와 대칭 · RC-13 state_dir
+/// 슬러그 `cys-dept-<name>`과 정합). unix: `~/.local/state/cys-dept-<name>/cys.sock`(cys-dept 규약).
+/// HOME 미설정 함정(RC-7) 회피 — unix도 dirs::home_dir() 사용.
+pub fn dept_socket_path(name: &str) -> PathBuf {
+    #[cfg(windows)]
+    {
+        PathBuf::from(format!(r"\\.\pipe\cys-dept-{name}"))
+    }
+    #[cfg(not(windows))]
+    {
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".local/state")
+            .join(format!("cys-dept-{name}"))
+            .join("cys.sock")
+    }
+}
+
 /// Parse a surface reference: "surface:31", "31", or 31 → 31.
 pub fn parse_surface_ref(s: &str) -> Option<u64> {
     let t = s.trim();
@@ -186,6 +205,20 @@ mod tests {
         assert_eq!(parse_surface_ref("surface:31"), Some(31));
         assert_eq!(parse_surface_ref("31"), Some(31));
         assert_eq!(parse_surface_ref("x"), None);
+    }
+
+    #[test]
+    fn dept_socket_path_os_convention() {
+        // RC-4 회귀 핀: OS별 부서 소켓 규약. 기본 socket_path와 대칭(둘 다 windows=named pipe).
+        let p = dept_socket_path("dept-3");
+        let s = p.to_string_lossy();
+        #[cfg(windows)]
+        assert_eq!(s, r"\\.\pipe\cys-dept-dept-3", "windows named pipe");
+        #[cfg(not(windows))]
+        {
+            assert!(s.ends_with(".local/state/cys-dept-dept-3/cys.sock"), "unix .sock: {s}");
+            assert!(!s.starts_with('/') || s.contains("/.local/state/"), "home 기반: {s}");
+        }
     }
 
     #[test]
