@@ -248,27 +248,23 @@ sock_alive(){ CYS_SOCKET="$1" "$CYS" ping >/dev/null 2>&1; }
 #   ★[5] grace: reserved_at(인자) 또는 소켓 mtime이 CYS_DEPT_REAP_GRACE(기본 60)초 이내면 mid-boot/사람
 #        셸 보호로 ACTIVE 취급. probe 불가는 보수적 ACTIVE(오회수 방지).
 dept_classify_idle(){ CYS_REAP_GRACE="${CYS_DEPT_REAP_GRACE:-60}" python3 - "$1" "${2:-0}" <<'PY'
-import sys,os,json,time,socket as S
+import sys,os,json,time,subprocess
 sk=sys.argv[1]; rat=float(sys.argv[2] or 0)
 GRACE=float(os.environ.get("CYS_REAP_GRACE","60")); now=time.time()
 recent=rat
-try: recent=max(recent, os.stat(sk).st_mtime)
+try: recent=max(recent, os.stat(sk).st_mtime)   # named pipe(Windows)면 OSError→rat만 사용
 except OSError: pass
 if recent and now-recent < GRACE:
     print("ACTIVE:grace(%.0fs<%g)"%(now-recent,GRACE)); sys.exit(0)
+# RC-6 잔여(T2.1·codex CONFIRMED): AF_UNIX surface.list → `cys status --json`(OS중립·named pipe 대응).
+# result에 surfaces[{role,agent,exited}] 포함(handlers 2320·2324·2328·request가 result 언랩). 판정 로직 동일.
 try:
-    c=S.socket(S.AF_UNIX); c.settimeout(3); c.connect(sk)
-    c.sendall((json.dumps({"id":1,"method":"surface.list","params":{}})+"\n").encode())
-    buf=b""
-    while b"\n" not in buf:
-        d=c.recv(65536)
-        if not d: break
-        buf+=d
-    c.close()
-    resp=json.loads(buf.split(b"\n",1)[0].decode())
-    surfaces=(resp.get("result") or {}).get("surfaces",[])
+    r=subprocess.run(["cys","status","--json"], env={**os.environ,"CYS_SOCKET":sk},
+                     capture_output=True, timeout=5)
+    if r.returncode!=0: raise RuntimeError("cys status rc=%d"%r.returncode)
+    surfaces=(json.loads(r.stdout.decode("utf-8","replace")) or {}).get("surfaces",[])
 except Exception:
-    print("ACTIVE:probe-failed"); sys.exit(0)   # 조회 불가 → 보수적 비유휴(오회수 차단)
+    print("ACTIVE:probe-failed"); sys.exit(0)   # 조회 불가 → 보수적 비유휴(오회수 차단·정책 유지)
 for s in surfaces:
     if s.get("exited"): continue
     role=s.get("role") or ""
