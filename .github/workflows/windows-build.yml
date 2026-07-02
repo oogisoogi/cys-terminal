@@ -253,3 +253,70 @@ jobs:
           $failed = $crit | Where-Object { -not $results["$_"] }
           if ($failed) { throw ("크리티컬 T3 행 실패: " + ($failed -join ',')) }
           Write-Host "OK: T3 크리티컬 스모크 통과 (나머지 행은 집계 로그로 승격 판독)"
+
+      # ─────────────────────────────────────────────────────────────────────────
+      # T4 무중단 재설치 스모크 (P1 rename-swap + P1b 잔해청소 — nsis-hooks.nsh의 실기기 검증).
+      # 핵심 assert: 라이브 데몬+세션 위로 setup.exe /S 재설치 → 데몬 PID 불변·세션 생존·
+      # cysd.prev.exe 존재(kill이 아니라 rename이었다는 증거) → 새 cysd 기동 시 prev 청소(P1b).
+      # 이 기능은 "업데이트=전 세션 사망" 불안을 없애는 축이라 실기기 검증 없이 출하 금지.
+      # ─────────────────────────────────────────────────────────────────────────
+      - name: T4 무중단 재설치 스모크 (rename-swap 데몬 생존)
+        shell: pwsh
+        timeout-minutes: 10
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function Bx($exe,$argv,$ms){
+            $o=[System.IO.Path]::GetTempFileName(); $e=[System.IO.Path]::GetTempFileName()
+            try {
+              $p=Start-Process -FilePath $exe -ArgumentList $argv -NoNewWindow -PassThru -RedirectStandardOutput $o -RedirectStandardError $e
+              if(-not $p.WaitForExit($ms)){ try{$p.Kill($true)}catch{}; return @{Code=-1;Out=''} }
+              return @{Code=$p.ExitCode;Out="$(Get-Content $o -Raw -ErrorAction SilentlyContinue)$(Get-Content $e -Raw -ErrorAction SilentlyContinue)"}
+            } finally { Remove-Item $o,$e -Force -ErrorAction SilentlyContinue }
+          }
+          $inst = Get-ChildItem "$env:LOCALAPPDATA" -Recurse -Filter cysd.exe -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq 'cysd.exe' } | Select-Object -First 1
+          if (-not $inst) { throw "T4: 설치된 cysd.exe 미발견" }
+          $dir = $inst.Directory.FullName; $cys = Join-Path $dir 'cys.exe'; $cysd = $inst.FullName
+          $setup = Get-ChildItem src-tauri/target/release/bundle/nsis -Filter *.exe | Select-Object -First 1
+          if (-not $setup) { throw "T4: setup.exe 미발견" }
+
+          # ① 데몬 기동 + PID 기록 + 라이브 세션(role=master 셸) 생성
+          Get-Process cys,cysd -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          Start-Sleep 1
+          Start-Process -FilePath $cysd -WindowStyle Hidden
+          $r = $null; foreach($i in 1..20){ Start-Sleep 1; $r = Bx $cys @('list') 15000; if($r.Code -eq 0){ break } }
+          if ($r.Code -ne 0) { throw "T4: 데몬 기동 실패(pipe 미응답)" }
+          $pidBefore = (Get-Process cysd | Select-Object -First 1).Id
+          (Bx $cys @('new-surface','--role','master') 30000).Out | Out-Host
+          $before = (Bx $cys @('list') 15000).Out
+          if ($before -notmatch 'role=master') { throw "T4: 사전 세션 생성 실패: $before" }
+          Write-Host "T4 사전상태: daemon pid=$pidBefore, master surface 생성됨"
+
+          # ② 라이브 상태 그대로 silent 재설치 (rename-swap 경로)
+          $ri = Start-Process -FilePath $setup.FullName -ArgumentList '/S' -PassThru -Wait
+          Write-Host ("T4-1 RESULT: {0}  reinstall exit={1}" -f ($(if($ri.ExitCode -eq 0){'PASS'}else{'FAIL'})), $ri.ExitCode)
+          if ($ri.ExitCode -ne 0) { throw "T4-1: 재설치 실패 exit=$($ri.ExitCode)" }
+          Start-Sleep 2
+
+          # ③ assert: 데몬 PID 불변 + pipe 응답 + 세션 생존 + prev 존재 + 새 cysd.exe 존재
+          $alive = Get-Process -Id $pidBefore -ErrorAction SilentlyContinue
+          Write-Host ("T4-2 RESULT: {0}  daemon pid={1} alive" -f ($(if($alive){'PASS'}else{'FAIL'})), $pidBefore)
+          $after = (Bx $cys @('list') 20000)
+          $sessOk = ($after.Code -eq 0 -and $after.Out -match 'role=master')
+          Write-Host ("T4-3 RESULT: {0}  pipe+session (code={1})" -f ($(if($sessOk){'PASS'}else{'FAIL'})), $after.Code)
+          $prevOk = Test-Path (Join-Path $dir 'cysd.prev.exe')
+          Write-Host ("T4-4 RESULT: {0}  cysd.prev.exe 존재(rename 증거)" -f ($(if($prevOk){'PASS'}else{'FAIL'})))
+          $newOk = Test-Path $cysd
+          Write-Host ("T4-5 RESULT: {0}  새 cysd.exe 존재" -f ($(if($newOk){'PASS'}else{'FAIL'})))
+          if (-not ($alive -and $sessOk -and $prevOk -and $newOk)) { Write-Host "== after list =="; Write-Host $after.Out; throw "T4: 무중단 재설치 assert 실패" }
+
+          # ④ P1b: 구 데몬 종료 → 새 cysd 기동 → prev 잔해 자가청소 assert
+          Stop-Process -Id $pidBefore -Force; Start-Sleep 2
+          Start-Process -FilePath $cysd -WindowStyle Hidden
+          $r2 = $null; foreach($i in 1..20){ Start-Sleep 1; $r2 = Bx $cys @('list') 15000; if($r2.Code -eq 0){ break } }
+          if ($r2.Code -ne 0) { throw "T4: 새 데몬 기동 실패" }
+          Start-Sleep 2
+          $cleaned = -not (Test-Path (Join-Path $dir 'cysd.prev.exe'))
+          Write-Host ("T4-6 RESULT: {0}  새 cysd 기동 후 prev 잔해 청소(P1b)" -f ($(if($cleaned){'PASS'}else{'FAIL'})))
+          Get-Process cys,cysd -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          if (-not $cleaned) { throw "T4-6: prev 잔해 미청소" }
+          Write-Host "OK: T4 무중단 재설치 스모크 전행 통과 — 업데이트 중 데몬·세션 무사망 실증"

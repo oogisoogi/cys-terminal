@@ -59,6 +59,23 @@ fn scrub_claude_session_env() {
 #[tokio::main]
 async fn main() {
     scrub_claude_session_env();
+    // ★무중단 rename-swap 잔해 청소(nsis-hooks.nsh의 짝): 업데이트가 구 데몬을 죽이지 않고
+    // cysd.exe→cysd.prev*.exe 로 밀어두므로, 새 cysd 기동 시 형제 .prev*.exe 를 best-effort
+    // 삭제한다. 구 lame-duck 데몬이 아직 점유 중이면 삭제가 실패하는데 그게 정상 — 조용히
+    // 스킵하고 다음 기동이 마저 청소한다(fail-open · 세션 보존 우선).
+    #[cfg(windows)]
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            for base in ["cysd", "cys"] {
+                for suffix in ["prev", "prev2", "prev3"] {
+                    let p = dir.join(format!("{base}.{suffix}.exe"));
+                    if p.is_file() && std::fs::remove_file(&p).is_ok() {
+                        eprintln!("[cysd] stale update leftover removed: {}", p.display());
+                    }
+                }
+            }
+        }
+    }
     // crash recovery(§7-⑤): 직전 pack-update가 apply 도중 죽어 남긴 orphan 저널을 install(false)
     // **이전에** 자가치유한다(미커밋=rollback / 커밋완료=정리). 순서가 중요 — install(false)가
     // 부분반영 트리 위에서 돌면 안 되므로 반드시 선행한다.

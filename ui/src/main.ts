@@ -3111,6 +3111,23 @@ async function start() {
   const status = (await invoke("daemon_status")) as Record<string, unknown>;
   info.textContent = `daemon pid=${status.daemon_pid} sock=${status.socket_path}`;
 
+  // ★P2 버전 스큐 배지(무중단 rename-swap의 짝): 업데이트 후 구 데몬(lame-duck)이 세션을 계속
+  // 보존하는 동안 "데몬 vX ↔ 앱 vY" 스큐를 비차단으로 알린다. 강제 재시작 없음 — 세션 보존이 우선.
+  try {
+    const appVer = (await invoke("app_version")) as string;
+    const daemonVer = String(status.version ?? "");
+    if (daemonVer && appVer && daemonVer !== appVer) {
+      const badge = document.createElement("span");
+      badge.className = "ver-skew-badge";
+      badge.textContent = `데몬 v${daemonVer} · 앱 v${appVer} — 세션 보존 중`;
+      badge.title =
+        "업데이트가 적용됐지만 실행 중인 세션(마스터·워커·부서)을 보존하기 위해 기존 데몬이 계속 봉사합니다.\n모든 작업이 유휴일 때 데몬을 재시작하면 새 버전으로 교대됩니다. 세션은 죽지 않습니다.";
+      info.appendChild(badge);
+    }
+  } catch {
+    /* 배지는 부가 기능 — 실패해도 시작을 막지 않는다 */
+  }
+
   await listen("daemon-event", (e) => onDaemonEvent(e.payload as Record<string, unknown>));
 
   // 무중단 팩 업데이트 진행 피드백(install_pack_update가 emit). ★app.restart 없음 — 세션 유지된 채 적용.

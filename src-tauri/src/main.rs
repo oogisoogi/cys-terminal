@@ -161,6 +161,13 @@ async fn daemon_status(socket: Option<String>) -> Result<Value, String> {
     rpc_on(&resolve_socket(&socket), "system.identify", json!({"caller": "ui"})).await
 }
 
+/// GUI(cys-app) 자기 버전 — 데몬 버전(system.identify .version)과 비교해 rename-swap 후
+/// lame-duck 스큐(구 데몬 + 새 앱)를 UI 배지로 알리는 용도(P2 · 비차단·강제 재시작 없음).
+#[tauri::command]
+fn app_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
 #[tauri::command]
 async fn list_surfaces(socket: Option<String>) -> Result<Value, String> {
     rpc_on(&resolve_socket(&socket), "surface.list", json!({})).await
@@ -1717,6 +1724,7 @@ fn main() {
             list_depts,
             read_dept_catalog,
             install_cli_to_path,
+            app_version,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
