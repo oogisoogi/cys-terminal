@@ -806,6 +806,15 @@ impl Daemon {
         {
             if let Some(c) = &cmd {
                 builder = CommandBuilder::new(&shell);
+                // D8(RC-19·mac): 로그인셸이 path_helper로 runtime 선두주입(아래 builder.env PATH)을 맨 뒤로
+                // 강등한다(검증 완료) → /usr/bin/git·python3(CLT-shim)이 이겨 순정 맥서 개발도구 프롬프트.
+                // 프로파일 실행 뒤 도는 -c 명령 앞에서 runtime bin dir를 재선두주입해 동봉본이 이기게 한다.
+                // shebang(#!/usr/bin/env python3)도 이 PATH로 해소. runtime 부재(비동봉)면 no-op.
+                #[cfg(target_os = "macos")]
+                let c_eff = mac_runtime_lc_prefix().map(|pfx| format!("{pfx}{c}"));
+                #[cfg(target_os = "macos")]
+                builder.args(["-lc", c_eff.as_deref().unwrap_or(c.as_str())]);
+                #[cfg(not(target_os = "macos"))]
                 builder.args(["-lc", c]);
             } else {
                 // 대화형 surface도 로그인 셸(-l)로 기동 — Finder(GUI) 기동 시 빈곤한 PATH를
@@ -1543,6 +1552,27 @@ fn default_shell() -> String {
             .or_else(|| std::env::var("SHELL").ok())
             .unwrap_or_else(|| "/bin/zsh".into())
     }
+}
+
+/// D8(RC-19·mac): 로그인셸 `-lc` 명령 앞에 붙일 `export PATH="<runtime bin dirs>:$PATH"; ` 프리픽스.
+/// 로그인 프로파일(path_helper)이 동봉 runtime을 PATH 뒤로 강등한 뒤 실행되는 -c 명령에서 재선두주입해
+/// 동봉 git/python3/uv/node가 /usr/bin CLT-shim을 이기게 한다. runtime 부재(개발/비동봉)면 None(no-op).
+/// dir는 셸 안전 큰따옴표. cysd 자기 exe_dir(Contents/MacOS) 기준 runtime_bin_dirs와 단일화.
+#[cfg(target_os = "macos")]
+fn mac_runtime_lc_prefix() -> Option<String> {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))?;
+    let dirs = cys::runtime_bin_dirs(&exe_dir);
+    if dirs.is_empty() {
+        return None;
+    }
+    let joined = dirs
+        .iter()
+        .map(|d| format!("\"{}\"", d.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"")))
+        .collect::<Vec<_>>()
+        .join(":");
+    Some(format!("export PATH={joined}:\"$PATH\"; "))
 }
 
 /// 오너 완화책 ① 기본 내장 룰: 로그인 만료·401·토큰 만료를 즉시 감지한다.
