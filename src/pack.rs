@@ -54,7 +54,10 @@ pub fn pack_dir() -> PathBuf {
 pub fn session_start_hook_command(pack_dir: &Path) -> String {
     let script = pack_dir.join("hooks/session-start.sh");
     if cfg!(windows) {
-        format!("bash {}", script.display())
+        // RC-2 잔여(T2.1·codex CONFIRMED): 공백 포함 경로(C:\Users\John Doe\.cys\pack\...) 대응 — Windows만
+        // quote로 감싼다. unix는 **무변경**(기존 install에 등록된 미quote 문자열과 install_claude_hook의
+        // already-매칭이 유지돼야 중복 등록이 안 생긴다 — quote 추가 시 불일치→매 기동 중복 append 회귀).
+        format!("bash \"{}\"", script.display())
     } else {
         format!("sh {}", script.display())
     }
@@ -667,7 +670,23 @@ mod tests {
         #[cfg(unix)]
         assert_eq!(cmd, "sh /pack/hooks/session-start.sh", "unix 제로 회귀");
         #[cfg(windows)]
-        assert!(cmd.starts_with("bash "), "windows must use bash: {cmd:?}");
+        assert!(cmd.starts_with("bash \""), "windows must use quoted bash: {cmd:?}");
+    }
+
+    #[test]
+    fn session_start_hook_command_quotes_windows_space_path() {
+        // RC-2 잔여(T2.1): 공백 포함 pack 경로 — Windows는 quote(공백 깨짐 방지), unix는 무변경
+        // (기존 등록 문자열과 already 매칭 유지 → 중복 등록 방지).
+        let cmd = session_start_hook_command(Path::new("/pack dir/x"));
+        assert!(cmd.contains("session-start.sh"), "hook 스크립트 대상: {cmd:?}");
+        #[cfg(not(windows))]
+        assert_eq!(cmd, "sh /pack dir/x/hooks/session-start.sh", "unix 무변경(quote 없음)");
+        #[cfg(windows)]
+        {
+            assert!(cmd.starts_with("bash \""), "windows 공백경로 quote 시작: {cmd:?}");
+            assert!(cmd.ends_with('"'), "windows quote 종료: {cmd:?}");
+            assert!(cmd.contains("pack dir"), "공백 경로 보존: {cmd:?}");
+        }
     }
 
     #[test]
