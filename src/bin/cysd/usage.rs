@@ -18,6 +18,9 @@
 //! ② codex: 에이전트 프로세스의 열린 fd(lsof)에서 rollout 경로 직독
 //! ③ 휴리스틱 폴백: 에이전트 프로세스 cwd 기준 디렉터리에서 pane 생성 이후 mtime 최신 파일
 //!    (동시 세션 경합 시 오귀속 가능 — usage.source로 구분 노출)
+//!
+//! 외부(비-pane) 세션: pane 밖 Claude Code 세션의 트랜스크립트도 주기 스윕으로 소비만
+//! 적재한다(role="external[:프로필]") — collect_external 참조.
 
 use crate::state::{now_epoch, Daemon, Surface};
 use serde_json::{json, Value};
@@ -39,6 +42,10 @@ const REDISCOVER_SECS: f64 = 30.0;
 /// statusline 보고(usage.report) 신선도 창 초 — claude는 이 안에 statusline 보고가 있으면
 /// 트랜스크립트 tail이 ctx를 덮어써 rate limit을 유실시키지 않게 수집을 건너뛴다(우선순위 병합).
 const STATUSLINE_FRESH_SECS: f64 = 60.0;
+/// 외부(비-pane) 세션 스윕 주기 초 기본값 — CYS_USAGE_EXTERNAL_SECS로 조정(0=끔)
+const EXTERNAL_SWEEP_SECS_DEFAULT: u64 = 15;
+/// 외부 세션 추적 시작 조건: 이 창 안에 mtime이 있는 활동 파일만 (과거 세션 소급 적재 금지)
+const EXTERNAL_ACTIVE_SECS: f64 = 600.0;
 
 /// rate limit 윈도우 1개 (codex primary/secondary; Phase 2에서 claude 5h/7d 합류)
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
@@ -82,11 +89,12 @@ pub fn spawn_usage_collector(daemon: Arc<Daemon>) {
     tokio::spawn(async move {
         let mut tails: HashMap<u64, TailState> = HashMap::new();
         let mut attempts: HashMap<u64, f64> = HashMap::new();
+        let mut ext = ExternalTails::default();
         loop {
             tokio::time::sleep(Duration::from_secs(poll_secs())).await;
             // 패닉 격리 — watchdog과 동일: 한 틱의 패닉이 수집기를 영구 침묵시키지 않게
             let tick = std::panic::AssertUnwindSafe(|| {
-                collect_tick(&daemon, &mut tails, &mut attempts)
+                collect_tick(&daemon, &mut tails, &mut attempts, &mut ext)
             });
             if std::panic::catch_unwind(tick).is_err() {
                 daemon.bus.publish(
@@ -104,6 +112,7 @@ fn collect_tick(
     daemon: &Arc<Daemon>,
     tails: &mut HashMap<u64, TailState>,
     attempts: &mut HashMap<u64, f64>,
+    ext: &mut ExternalTails,
 ) {
     let surfaces: Vec<Arc<Surface>> = daemon.surfaces.lock().unwrap().values().cloned().collect();
     let live_ids: HashSet<u64> = surfaces
@@ -113,7 +122,7 @@ fn collect_tick(
         .collect();
     tails.retain(|sid, _| live_ids.contains(sid));
     attempts.retain(|sid, _| live_ids.contains(sid));
-    for s in surfaces {
+    for s in &surfaces {
         if s.exited.load(Ordering::Relaxed) {
             continue;
         }
@@ -121,12 +130,13 @@ fn collect_tick(
             continue;
         };
         match agent.as_str() {
-            "claude" => collect_for(daemon, &s, "claude", &bin, tails, attempts),
-            "codex" => collect_for(daemon, &s, "codex", &bin, tails, attempts),
+            "claude" => collect_for(daemon, s, "claude", &bin, tails, attempts),
+            "codex" => collect_for(daemon, s, "codex", &bin, tails, attempts),
             // gemini(agy)·grok: 로컬 평문 산출물에 토큰 미기록 — Phase 2 (로컬 RPC) 대상
             _ => {}
         }
     }
+    collect_external(daemon, ext, &surfaces, tails);
 }
 
 /// 단일 surface 수집: 세션 파일 결정 → 증분 read → 파싱 → 스냅샷 갱신 → 이벤트 발행
@@ -346,6 +356,173 @@ fn collect_for(
     if let Some(p) = new.ctx_pct {
         crate::handlers::maybe_fire_context_threshold(daemon, s, p, "observed", Some(&new.agent));
     }
+}
+
+// ───────────────────────── 외부(비-pane) 세션 소비 수집 ─────────────────────────
+// cys pane 밖에서 도는 Claude Code 세션(예: 데스크톱 앱·직접 CLI)의 트랜스크립트도
+// 비용·효율 집계에 포함한다 — pane 미기동 세션의 모델 사용(fable-5 등)이 CC에서
+// 통째로 누락되는 사각지대 해소(2026-07-02 오너 지시).
+// 귀속: role = "external"(기본 프로필) / "external:<프로필>"(~/.claude-X → external:X).
+// ObservedUsage·ctx 임계 발화는 pane 전용이므로 여기선 소비 적재만 한다.
+
+/// 외부 세션 tail 상태 (수집기 태스크 로컬)
+#[derive(Default)]
+struct ExternalTails {
+    tails: HashMap<PathBuf, TailState>,
+    last_sweep: f64,
+}
+
+fn external_sweep_secs() -> u64 {
+    cys::env_compat("CYS_USAGE_EXTERNAL_SECS")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(EXTERNAL_SWEEP_SECS_DEFAULT)
+}
+
+fn collect_external(
+    daemon: &Arc<Daemon>,
+    ext: &mut ExternalTails,
+    surfaces: &[Arc<Surface>],
+    pane_tails: &HashMap<u64, TailState>,
+) {
+    let period = external_sweep_secs();
+    if period == 0 {
+        return; // 명시적 비활성화
+    }
+    let now = now_epoch();
+    if now - ext.last_sweep < period as f64 {
+        return;
+    }
+    ext.last_sweep = now;
+
+    // pane이 소유한 파일 = 등록 transcript + 현재 pane tail 경로 (원경로·정규화 모두 제외)
+    let mut claimed: HashSet<PathBuf> = HashSet::new();
+    let mut claim = |p: PathBuf| {
+        if let Ok(c) = std::fs::canonicalize(&p) {
+            claimed.insert(c);
+        }
+        claimed.insert(p);
+    };
+    for s in surfaces {
+        if let Some(reg) = s.registered_transcript.lock().unwrap().clone() {
+            claim(PathBuf::from(reg));
+        }
+    }
+    for t in pane_tails.values() {
+        claim(t.path.clone());
+    }
+    // 미등록 claude pane의 휴리스틱 후보 가드 — (munged cwd, created_at). 이 조합에 걸리는
+    // 파일은 pane 수집이 나중에 집어갈 수 있으므로 외부로 세지 않는다(이중계수·오귀속 방지).
+    let guards: Vec<(String, f64)> = surfaces
+        .iter()
+        .filter(|s| !s.exited.load(Ordering::Relaxed))
+        .filter(|s| {
+            s.agent_meta.lock().unwrap().as_ref().map(|(a, _)| a == "claude").unwrap_or(false)
+                && s.registered_transcript.lock().unwrap().is_none()
+        })
+        .map(|s| (claude_project_component(&s.cwd), s.created_at))
+        .collect();
+
+    // pane이 소유권을 가져간(또는 삭제된) 파일은 외부 추적에서 해제
+    ext.tails.retain(|p, _| !claimed.contains(p) && p.exists());
+
+    // 발견: ~/.claude*/projects/*/*.jsonl 중 최근 활동 파일 (심링크 프로필 중복 제거)
+    if let Some(home) = dirs::home_dir() {
+        let mut seen_proj: HashSet<PathBuf> = HashSet::new();
+        for e in std::fs::read_dir(&home).into_iter().flatten().flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name != ".claude" && !name.starts_with(".claude-") {
+                continue;
+            }
+            let projects = e.path().join("projects");
+            for proj in std::fs::read_dir(&projects).into_iter().flatten().flatten() {
+                let dir = proj.path();
+                let canon = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+                if !seen_proj.insert(canon) {
+                    continue;
+                }
+                let comp = proj.file_name().to_string_lossy().into_owned();
+                for f in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                    let p = f.path();
+                    if p.extension().and_then(|x| x.to_str()) != Some("jsonl") {
+                        continue;
+                    }
+                    if ext.tails.contains_key(&p) || claimed.contains(&p) {
+                        continue;
+                    }
+                    let mt = mtime_epoch(&p);
+                    if !external_eligible(now, mt, &comp, &guards) {
+                        continue;
+                    }
+                    let len = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+                    ext.tails.insert(
+                        p.clone(),
+                        TailState {
+                            path: p,
+                            offset: len.saturating_sub(FIRST_ATTACH_TAIL),
+                            carry: String::new(),
+                            heuristic: false,
+                            last_discovery: now,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    // tail + 소비 적재 (pane 경로와 동일 파이프라인 — 락 순서 consumption→analytics)
+    for state in ext.tails.values_mut() {
+        let lines = read_new_lines(state);
+        if lines.is_empty() {
+            continue;
+        }
+        let msgs: Vec<MsgCost> = lines.iter().filter_map(|l| parse_claude_message_cost(l)).collect();
+        if msgs.is_empty() {
+            continue;
+        }
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let sess = state.path.to_string_lossy().into_owned();
+        let role = external_role(&state.path);
+        let mut c = daemon.consumption.lock().unwrap();
+        let alog = daemon.analytics.lock().unwrap();
+        for m in msgs {
+            let cost = crate::cost::calculate_cost(
+                m.input_tokens, m.output, m.cache_creation, m.cache_read, &m.model,
+            );
+            c.record_message(
+                &sess, m.input_tokens + m.cache_creation, m.output, cost, &m.model, now, &today,
+            );
+            if let Some(conn) = alog.as_ref() {
+                crate::analytics::record_usage(
+                    conn, &sess, &role, "claude", &m.model, m.input_tokens, m.output,
+                    m.cache_creation, m.cache_read, cost, now,
+                );
+            }
+        }
+    }
+}
+
+/// 외부 추적 시작 가능 판정 (순수함수 — 테스트 핀): 최근 활동 + pane 휴리스틱 후보 아님
+fn external_eligible(now: f64, mtime: f64, comp: &str, guards: &[(String, f64)]) -> bool {
+    if now - mtime > EXTERNAL_ACTIVE_SECS {
+        return false; // 과거 세션 소급 적재 금지
+    }
+    // discover_claude_transcript의 후보 조건(mtime + 5.0 >= created_at)과 동일 기준
+    !guards.iter().any(|(c, created)| c == comp && mtime + 5.0 >= *created)
+}
+
+/// 트랜스크립트 경로의 프로필 → 외부 귀속 role. ~/.claude → "external",
+/// ~/.claude-cysinsight → "external:cysinsight" (by_tier에 그대로 노출)
+fn external_role(path: &Path) -> String {
+    for comp in path.components() {
+        let s = comp.as_os_str().to_string_lossy();
+        if let Some(rest) = s.strip_prefix(".claude-") {
+            return format!("external:{rest}");
+        }
+        if s == ".claude" {
+            return "external".into();
+        }
+    }
+    "external".into()
 }
 
 fn source_label(base: &str, heuristic: bool) -> String {
@@ -980,6 +1157,39 @@ pub fn spawn_agy_collector(daemon: Arc<Daemon>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── 외부(비-pane) 세션 수집 — 귀속·판정 핀 ──
+
+    #[test]
+    fn external_role_maps_profile_dirs() {
+        let p = |s: &str| PathBuf::from(s);
+        assert_eq!(external_role(&p("/Users/x/.claude/projects/-a/s.jsonl")), "external");
+        assert_eq!(
+            external_role(&p("/Users/x/.claude-cysinsight/projects/-a/s.jsonl")),
+            "external:cysinsight"
+        );
+        assert_eq!(
+            external_role(&p("/Users/x/.claude-ysfuture/projects/-a/s.jsonl")),
+            "external:ysfuture"
+        );
+        assert_eq!(external_role(&p("/tmp/other/s.jsonl")), "external");
+    }
+
+    #[test]
+    fn external_eligible_requires_recent_activity_and_no_pane_candidate() {
+        let now = 10_000.0;
+        // 최근 활동 아님 → 부적격 (과거 세션 소급 적재 금지)
+        assert!(!external_eligible(now, now - EXTERNAL_ACTIVE_SECS - 1.0, "-a", &[]));
+        // 최근 활동 + 가드 없음 → 적격
+        assert!(external_eligible(now, now - 1.0, "-a", &[]));
+        // 같은 comp의 미등록 pane이 있고 mtime이 pane 생성 이후 → pane 휴리스틱 후보라 부적격
+        let guards = vec![("-a".to_string(), now - 100.0)];
+        assert!(!external_eligible(now, now - 1.0, "-a", &guards));
+        // pane 생성 훨씬 이전 mtime(남의 세션 아님이 확실) → 적격
+        assert!(external_eligible(now, now - 300.0, "-a", &guards));
+        // 다른 comp의 pane은 무관 → 적격
+        assert!(external_eligible(now, now - 1.0, "-b", &guards));
+    }
 
     // ── claude 파서: 실측 스키마(2026-06-13, CLI 2.1.176) 핀 ──
 
