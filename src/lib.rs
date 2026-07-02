@@ -103,6 +103,13 @@ pub fn runtime_prefixed_path(exe_dir: &Path, current_path: &str) -> Option<Strin
     Some(format!("{}{}{}", add.join(&sep.to_string()), sep, current_path))
 }
 
+/// 홈 디렉토리(RC-7 공용). Windows는 HOME 미설정이 기본이라 `env::var("HOME")`은 빈값으로 폴백돼
+/// `~/.cys/...` 경로를 CWD 상대경로로 붕괴시킨다(부서목록·프로파일·pending-restore 오지정). dirs::home_dir()
+/// (Windows=USERPROFILE/HOMEDRIVE 기반·unix=$HOME)로 OS중립 해소. 코어(cys)·GUI(src-tauri) 공유.
+pub fn home_dir() -> PathBuf {
+    dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
+}
+
 /// 부서 데몬 소켓/파이프 경로(RC-4 · 공용 — GUI(src-tauri)·cys fleet가 공유, 규약 단일화).
 /// Windows: named pipe `\\.\pipe\cys-dept-<name>`(기본 데몬 `\\.\pipe\cys`와 대칭 · RC-13 state_dir
 /// 슬러그 `cys-dept-<name>`과 정합). unix: `~/.local/state/cys-dept-<name>/cys.sock`(cys-dept 규약).

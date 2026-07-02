@@ -679,7 +679,7 @@ fn install_cli_to_path() -> Result<InstallCliReport, String> {
 /// 업데이트 재시작 후 자동복귀 마커 경로 — install_update(재시작 직전)가 쓰고, 재시작된 cys-app
 /// setup이 읽는다. 두 프로세스가 공유하는 ~/.cys 아래에 둔다.
 fn pending_restore_path() -> std::path::PathBuf {
-    std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cys/.pending-restore")
+    cys::home_dir().join(".cys/.pending-restore")
 }
 
 /// 업데이트로 인한 재시작이면(마커 존재) 두 가지를 한다:
@@ -740,7 +740,7 @@ fn read_board_catalog() -> Result<Value, String> {
 
 /// D6: 청중 프로파일(~/.cys/profile.json·사용자 로컬·pack 밖) audience 읽기 — 없으면 "custom"(전체보기 폴백·안전).
 fn read_profile_audience() -> String {
-    let path = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cys/profile.json");
+    let path = cys::home_dir().join(".cys/profile.json");
     std::fs::read_to_string(&path)
         .ok()
         .and_then(|s| serde_json::from_str::<Value>(&s).ok())
@@ -805,7 +805,7 @@ fn run_skill(name: String, ticket: String, agent: Option<String>, close_after: O
 /// D5/SB-6: 산출물 회수 결정론 위치(~/.cys/_round/skill-out) — make_ticket output_format과 정합.
 #[tauri::command]
 fn skill_out_dir() -> String {
-    std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+    cys::home_dir()
         .join(".cys/_round/skill-out")
         .to_string_lossy()
         .to_string()
@@ -1268,7 +1268,7 @@ fn list_depts() -> Result<Value, String> {
     let reg = std::env::var("CYS_DEPTS_JSON")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| {
-            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cys/depts.json")
+            cys::home_dir().join(".cys/depts.json")
         });
     match std::fs::read_to_string(&reg) {
         Ok(s) => serde_json::from_str::<Value>(&s).map_err(|e| e.to_string()),
@@ -1282,7 +1282,7 @@ fn dept_display_name(name: &str) -> Option<String> {
     let reg = std::env::var("CYS_DEPTS_JSON")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| {
-            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cys/depts.json")
+            cys::home_dir().join(".cys/depts.json")
         });
     let s = std::fs::read_to_string(&reg).ok()?;
     let v: Value = serde_json::from_str(&s).ok()?;
@@ -1300,7 +1300,7 @@ fn read_dept_catalog() -> Result<Value, String> {
     let cat = std::env::var("CYS_DEPT_CATALOG")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| {
-            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+            cys::home_dir()
                 .join(".cys/dept-catalog.json")
         });
     match std::fs::read_to_string(&cat) {

@@ -3495,7 +3495,8 @@ fn request_on(socket: &std::path::Path, method: &str, params: Value) -> Result<V
 /// Tasks Control Center(CLI) — depts.json을 읽어 본부+각 부서 소켓에 org.status를 순회 집계한다.
 /// master 능동 모니터링: 모든 부서의 모든 노드가 지금 하는 업무를 1콜로 본다. 도달불가 부서는 표기.
 fn run_fleet(as_json: bool) -> i32 {
-    let home = std::env::var("HOME").unwrap_or_default();
+    // RC-7: HOME 미설정(Windows) 함정 회피 — dirs 기반 공용 해소.
+    let home = cys::home_dir().to_string_lossy().into_owned();
     let mut targets: Vec<(std::path::PathBuf, String)> =
         vec![(socket_path(), "본부 · CEO".to_string())];
     let reg = std::env::var("CYS_DEPTS_JSON")
