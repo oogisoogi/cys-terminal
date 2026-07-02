@@ -3918,6 +3918,18 @@ fn run_node_recover(surface: Option<String>, role: Option<String>) -> i32 {
                 "agent '{agent}'가 살아있는 것으로 보임 — 강제 재기동은 close-surface 후 launch-agent"
             ));
         }
+        // RC-3 잔여(T2.1·codex CONFIRMED): Windows node-recover는 기존 pane에 **순수 cmd**를 재기동한다
+        // (RC-3 B′). 그 pane이 env 미주입(create_surface_with_env 경유 아님 — 수동 생성·구세션)이면
+        // CLAUDE_CONFIG_DIR 등이 pane env에 없어 claude가 오염된 기본 config로 뜬다. fail-closed로 차단
+        // (unix는 인라인 `KEY="val" cmd` 재조립이 env를 셸 전개하므로 무관 — Windows 한정 가드).
+        #[cfg(windows)]
+        if entry["env_injected"].as_bool() != Some(true) {
+            return Err(format!(
+                "surface:{sid}는 env 미주입 pane(수동 생성·구세션) — Windows에선 순수 cmd 재기동 시 \
+                 CLAUDE_CONFIG_DIR 등이 실리지 않아 안전하지 않다. `cys restore` 또는 \
+                 `cys close-surface {sid}` 후 `cys launch-agent`로 재기동하라"
+            ));
+        }
         let role_name = entry["role"].as_str().unwrap_or("worker").to_string();
         let spec = load_agent_spec(&agent)?;
         eprintln!("[node-recover] surface:{sid} 위에 {agent} 재기동 (role={role_name})");

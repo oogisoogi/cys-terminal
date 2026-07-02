@@ -698,6 +698,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         "pid": s.pid,
                         "exited": s.exited.load(Ordering::Relaxed),
                         "created_at": s.created_at,
+                        "env_injected": s.env_injected, // RC-3 잔여(T2.1): node-recover 안전판정용
                         "agent": agent,
                         "agent_alive": agent_alive,
                         "usage": s.observed_usage.lock().unwrap().clone()

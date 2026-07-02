@@ -45,6 +45,10 @@ pub struct Surface {
     pub cwd: String,
     pub pid: u32,
     pub created_at: f64,
+    /// RC-3 잔여(T2.1): 이 surface가 create_surface_with_env로 **env 주입**되어 생성됐는가.
+    /// Windows node-recover가 기존 pane 재사용 전, pane env에 CLAUDE_CONFIG_DIR 등이 실려있는지
+    /// (=순수 cmd 재기동이 안전한지) 판정하는 근거. env 미주입 pane(수동·구세션) 재사용 시 fail-closed.
+    pub env_injected: bool,
     pub exited: AtomicBool,
     /// 자력종료(셸 EOF) 시각 — watchdog reap의 grace 측정 기준 (exited와 함께 stamp)
     pub exited_at: Mutex<Option<Instant>>,
@@ -905,6 +909,7 @@ impl Daemon {
             cwd: cwd_str,
             pid,
             created_at: now_epoch(),
+            env_injected: !env.is_empty(), // RC-3 잔여(T2.1): env 주입 여부 기록(node-recover 안전 판정)
             exited: AtomicBool::new(false),
             exited_at: Mutex::new(None),
             write_tx,
@@ -1594,6 +1599,26 @@ mod tests {
         // 방어적 sanitize: 마지막 컴포넌트에서 안전문자(영숫자·-·_)만 — `.`는 제거됨
         // (슬래시/역슬래시 모두에서 마지막 성분 추출: `cys.sock` → `cyssock`)
         assert_eq!(pipe_slug(std::path::Path::new("/tmp/cys-dept-9/cys.sock")), "cyssock");
+    }
+
+    #[test]
+    fn create_surface_with_env_records_env_injected_flag() {
+        // RC-3 잔여(T2.1·codex CONFIRMED) 회귀 핀: env 주입 여부가 Surface.env_injected에 정확 기록돼야
+        // Windows node-recover가 "순수 cmd 재기동 안전"을 판정할 수 있다. env 有→true·env 無→false.
+        let daemon = Daemon::new(isolated_sock("env-injected"));
+        let s1 = daemon
+            .create_surface_with_env(
+                None, Some("sleep 30".into()), None, Some("worker-1".into()), 24, 80,
+                &[("CLAUDE_CONFIG_DIR".to_string(), "/x/.cys/claude".to_string())],
+            )
+            .unwrap();
+        assert!(s1.env_injected, "env 주입 surface는 env_injected=true여야 node-recover 허용");
+        let s2 = daemon
+            .create_surface_with_env(
+                None, Some("sleep 30".into()), None, Some("worker-2".into()), 24, 80, &[],
+            )
+            .unwrap();
+        assert!(!s2.env_injected, "env 미주입 surface는 env_injected=false → Windows node-recover fail-closed");
     }
 
     #[test]
