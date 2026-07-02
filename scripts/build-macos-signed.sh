@@ -37,6 +37,33 @@ if ! security find-identity -v -p codesigning 2>/dev/null | grep -q "Developer I
 fi
 [ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ] || echo "⚠ TAURI_SIGNING_PRIVATE_KEY 미설정 — 자동업데이트 .sig 미생성(설치 DMG는 정상)"
 
+# ── 동봉 런타임 준비 + inside-out 재서명 (RC-22/T6b — 공증 필수) ──
+# tauri.conf.json bundle.resources("runtime/")는 Contents/Resources/runtime 으로 실리지만 Tauri는
+# resources 내 Mach-O를 자동 서명하지 않는다(#12001) → ad-hoc(python·uv)/타팀(node) 서명 그대로면
+# 공증이 "signature invalid / hardened runtime 미적용"으로 거부. tauri build **전에** 개별 재서명해
+# .app 안으로 Developer ID 서명본이 실리게 한다. ★codesign --deep 금지(entitlement 오염·실행 차단) —
+# inside-out(라이브러리 먼저·실행 바이너리 나중) 개별 서명. 인터프리터(python/node JIT)는 entitlements 적용.
+if [ ! -x "src-tauri/runtime/python/bin/python3" ]; then
+  echo "== 동봉 런타임 준비(호스트 아키텍처) =="
+  bash scripts/prep-mac-runtime.sh
+fi
+echo "== 동봉 runtime Mach-O inside-out 재서명 (Developer ID + hardened + timestamp) =="
+ENT="src-tauri/entitlements.plist"
+SIGN_N=0
+# 1) 동적 라이브러리·로드가능 번들(.dylib/.so/.node) 먼저 — entitlements 불요
+while IFS= read -r -d '' lib; do
+  codesign --force --timestamp --options runtime --sign "$APPLE_SIGNING_IDENTITY" "$lib"
+  SIGN_N=$((SIGN_N+1))
+done < <(find src-tauri/runtime \( -name '*.dylib' -o -name '*.so' -o -name '*.node' \) -type f -print0)
+# 2) Mach-O 실행 바이너리(라이브러리 제외) — 인터프리터 JIT/라이브러리검증 entitlements 적용
+while IFS= read -r -d '' exe; do
+  if file "$exe" | grep -q 'Mach-O'; then
+    codesign --force --timestamp --options runtime --entitlements "$ENT" --sign "$APPLE_SIGNING_IDENTITY" "$exe"
+    SIGN_N=$((SIGN_N+1))
+  fi
+done < <(find src-tauri/runtime -type f -perm +111 ! -name '*.dylib' ! -name '*.so' ! -name '*.node' -print0)
+echo "  ✓ runtime Mach-O $SIGN_N개 재서명 (검증은 tauri build 후 app 전체 codesign -vvv --strict)"
+
 echo "== Apple 공증 빌드 v$VERSION (Tauri 자동 codesign[hardened]+notarize+staple) =="
 bun x @tauri-apps/cli build
 
