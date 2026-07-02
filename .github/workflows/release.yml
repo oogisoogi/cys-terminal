@@ -87,6 +87,15 @@ jobs:
           printf 'Bundled runtimes and their licenses:\n- Git for Windows (git): GPLv2 (https://github.com/git-for-windows/git)\n- MSYS2 bash + GNU coreutils: GPLv3\n- CPython (embeddable): PSF License (https://www.python.org)\n- pip (get-pip bootstrap): MIT\n- uv (astral-sh): Apache-2.0 OR MIT (https://github.com/astral-sh/uv)\nWritten offer for corresponding source: contact the distributor.\n' > "$RT/LICENSES/BUNDLED-RUNTIMES.txt"
           ls -la "$RT/git/usr/bin/bash.exe" "$RT/git/cmd/git.exe" "$RT/python/python3.exe"
 
+      # macOS 자기완결 런타임 동봉 (RC-20/T6b — 순정 맥=개발도구 없는 소비자. python3·git은 CLT-shim이라
+      # 실행 시 개발도구 프롬프트 → 동봉 필수). tauri.conf.json bundle.resources("runtime/")가 이 트리를
+      # Contents/Resources/runtime 으로 싣고, runtime_bin_dirs(RC-18)가 PATH 해소한다. per-arch(matrix.target).
+      # ★공증: 동봉 Mach-O는 ad-hoc(python·uv)/Node서명이라 로컬 build-macos-signed.sh가 inside-out 재서명.
+      - name: 동봉 런타임 준비 (Python·git·uv·node — macOS 전용, per-arch)
+        if: matrix.platform == 'macos-latest'
+        shell: bash
+        run: bash scripts/prep-mac-runtime.sh "${{ matrix.target }}"
+
       # tauri build → beforeBuildCommand(bundle-prep.sh)가 UI 번들 + cys/cysd 릴리스 빌드 + externalBin
       # 배치 → 번들(dmg/app) → createUpdaterArtifacts(.app.tar.gz + .sig + latest.json) → 비공개 repo 릴리스 업로드.
       # Windows: NSIS setup.exe + .sig — tauri-action이 같은 릴리스의 latest.json에 platforms.windows-x86_64를 병합.
