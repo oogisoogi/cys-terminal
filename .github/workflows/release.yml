@@ -3,7 +3,8 @@ name: release
 # 옵션 A — 소스는 비공개 repo에서 빌드·서명하고, 산출물만 공개 repo로 내보낸다.
 #   build    : tag(vX.Y.Z) push → macOS 앱 빌드 → minisign 서명 → 이 비공개 repo에 릴리스 생성
 #   relocate : 산출물(.dmg/.app.tar.gz/.sig/latest.json)을 공개 repo(cys-terminal-releases)로 복사,
-#              latest.json의 다운로드 URL을 공개 repo로 치환 → 공개 repo에 draft 릴리스 생성
+#              latest.json의 다운로드 URL을 공개 repo로 치환 → 공개 repo에 릴리스 자동 발행(--latest)
+#              (P0: 종전 --draft 는 수동 Publish 누락 시 채널이 옛 버전에 영구 정지 → updater 먹통. 자동발행으로 교정.)
 # 사용: 버전 5곳 범프 후  git tag v0.2.3 && git push origin v0.2.3
 #       (수동 실행도 가능 — Actions 탭 Run workflow)
 # 활성 조건(시크릿):  TAURI_SIGNING_PRIVATE_KEY · RELEASES_REPO_TOKEN  (키 암호는 무암호 → 아래 빈 문자열로 처리)
@@ -357,16 +358,20 @@ jobs:
           sed -i "s#${SRC_REPO}/releases/download#${DST_REPO}/releases/download#g" dist/latest.json
           echo "── 치환 후 latest.json ──"; cat dist/latest.json
 
-      # 3) 공개 repo에 draft 릴리스 생성 + 자산 업로드 (검토 후 수동 Publish → updater가 latest로 인식)
-      - name: Publish to public releases repo (draft)
+      # 3) 공개 repo에 릴리스 자동 발행 + 자산 업로드 (updater가 즉시 latest로 인식 → Update 버튼 활성)
+      - name: Publish to public releases repo
         env:
           GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
         run: |
           set -euo pipefail
           # 재실행 안전: 기존 동일 태그 릴리스가 있으면 정리
           gh release delete "${{ github.ref_name }}" -R "$DST_REPO" --yes --cleanup-tag 2>/dev/null || true
+          # ★P0(2026-07-02): 종전 --draft 는 사람이 수동 Publish 안 하면 공개 채널이 옛 버전에 영구 정지된다
+          #   (0.6.2·0.6.3이 draft로 방치돼 updater가 0.6.1에 고정됐던 근본원인 — "Update 눌러도 안 올라감").
+          #   이 잡은 build·pack-artifacts가 전부 성공(needs)한 뒤에만 도므로 자동 발행이 안전하다.
+          #   --latest 로 /releases/latest(=updater 엔드포인트)가 이 태그를 가리키게 강제한다.
           gh release create "${{ github.ref_name }}" -R "$DST_REPO" dist/* \
             --title "cys ${{ github.ref_name }}" \
             --notes "cys 터미널 ${{ github.ref_name }}. 아래 .dmg를 내려받아 설치하세요. 기존 사용자는 앱 내 Update 버튼으로 자동 갱신됩니다." \
-            --draft
-          echo "✅ 공개 repo draft 릴리스 생성됨 — 검토 후 Publish 하면 배포·자동업데이트가 활성화됩니다."
+            --latest
+          echo "✅ 공개 repo 릴리스 자동 발행됨 — updater가 즉시 ${{ github.ref_name }}을 latest로 인식합니다."

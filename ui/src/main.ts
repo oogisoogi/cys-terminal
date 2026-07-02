@@ -1390,6 +1390,10 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
   // xterm이 일반 키로 처리하면 자모가 분리 입력된다 — 조합 완성분만 onData로 흐르게 차단.
   term.attachCustomKeyEventHandler((e) => {
     if (e.isComposing || e.keyCode === 229) return false;
+    // ★붙여넣기(F2): Ctrl/Cmd+V·Ctrl+Shift+V 를 xterm이 \x16(literal)로 삼키지 않게 false 반환 →
+    // 브라우저 네이티브 paste 이벤트가 발화되고 아래 paste 리스너가 클립보드를 PTY로 보낸다.
+    // (WebView2에서 xterm 기본 붙여넣기가 안 먹던 문제 — permission 불요의 clipboardData 경로.)
+    if ((e.ctrlKey || e.metaKey) && (e.key === "v" || e.key === "V")) return false;
     return true;
   });
 
@@ -1402,6 +1406,21 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
       .catch(() => {});
     return sendChain;
   };
+
+  // ── 붙여넣기(clipboard → PTY) — WebView2/모든 플랫폼 ──
+  // permission 불요: paste 이벤트의 clipboardData를 동기로 읽는다(navigator.clipboard 권한·Tauri 플러그인 불요).
+  // capture(true)+preventDefault+stopPropagation 로 xterm 기본 paste 핸들러의 이중 처리·textarea 삽입을 차단하고,
+  // term.paste()로 넘겨 bracketed-paste(멀티라인 자동실행 방지)·줄바꿈 정규화를 보존한 뒤 onData→sendRaw로 흐르게 한다.
+  term.textarea?.addEventListener(
+    "paste",
+    (e: ClipboardEvent) => {
+      const text = e.clipboardData?.getData("text") ?? "";
+      e.preventDefault();
+      e.stopPropagation();
+      if (text) term.paste(text);
+    },
+    true,
+  );
 
   // ── WKWebView 한글 IME 조합 상태 머신 ──────────────────────────────────
   // WKWebView는 composition 이벤트 없이 ①음절 첫 자모를 insertText로 커밋(xterm이 즉시
