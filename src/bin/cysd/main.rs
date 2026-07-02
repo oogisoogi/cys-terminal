@@ -15,6 +15,7 @@ mod cost;
 mod events;
 mod governance;
 mod handlers;
+mod hwmon;
 mod recall;
 mod schedule;
 mod severity;

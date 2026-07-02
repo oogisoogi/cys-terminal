@@ -250,6 +250,17 @@ html, body {
 .cc-tbar-fill.crit { background: #ef4444; }
 .cc-tbar-pct { color: #e2e8f0; font-variant-numeric: tabular-nums; min-width: 70px; text-align: right; }
 .cc-tbar-reset { color: #64748b; min-width: 66px; }
+/* 하드웨어 섹션(#cc-hw) — CPU 코어별 막대 + GPU/NPU/MEM 바 (라벨에 코어수 포함이라 폭 상향) */
+#cc-hw .cc-tbar-lab { min-width: 84px; }
+.cc-hw-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 6px; font-size: 12px; }
+.cc-hw-title { color: #94a3b8; }
+.cc-hw-brand { flex: 1; color: #64748b; font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cc-hw-pct { color: #e2e8f0; font-variant-numeric: tabular-nums; }
+.cc-core-grid { display: flex; align-items: flex-end; gap: 2px; height: 32px; margin-bottom: 10px; }
+.cc-core { flex: 1; display: flex; align-items: flex-end; height: 100%; background: rgba(255,255,255,.06); border-radius: 2px; overflow: hidden; }
+.cc-core-fill { display: block; width: 100%; background: #22c55e; border-radius: 2px 2px 0 0; transition: height .3s ease; }
+.cc-core-fill.warn { background: #f59e0b; }
+.cc-core-fill.crit { background: #ef4444; }
 .cc-token-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin: 12px 0; }
 .cc-stat { background: rgba(255,255,255,.03); border-radius: 8px; padding: 10px; text-align: center; }
 .cc-stat-t { font-size: 11px; color: #64748b; }
@@ -480,7 +491,7 @@ body.cc-glance #cc-tabs { display: none; }
 body.cc-glance #cc-view-live .cc-spark,
 body.cc-glance #cc-view-live .cc-mix,
 body.cc-glance #cc-view-live .cc-token-stats,
-body.cc-glance #cc-view-live #cc-sys { display: none; }
+body.cc-glance #cc-view-live #cc-hw { display: none; }
 /* 2) 큰 글씨·한국어 가독성(비기술자) — 다크 유지하되 본문 대비 상향. 레이아웃/크기/가시성만 변경 */
 body.cc-glance #cc-body { max-width: 920px; }
 body.cc-glance .cc-card-val { font-size: 40px; }

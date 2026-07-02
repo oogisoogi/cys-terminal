@@ -306,6 +306,11 @@ async fn control_dashboard() -> Result<Value, String> {
 }
 
 #[tauri::command]
+async fn control_hw() -> Result<Value, String> {
+    rpc("control.hw", json!({})).await
+}
+
+#[tauri::command]
 async fn control_analytics(window: Option<String>) -> Result<Value, String> {
     rpc("control.analytics", json!({ "window": window })).await
 }
@@ -1693,6 +1698,7 @@ fn main() {
             control_session_detail,
             control_session_star,
             control_dashboard,
+            control_hw,
             learn_status,
             create_surface,
             send_input,

@@ -2473,6 +2473,9 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             ))
         }
 
+        // ─── Control Center 하드웨어 모니터링 (CPU 코어별·GPU·NPU·MEM — UI 2초 폴링) ───
+        "control.hw" => Reply::Single(ok_response(&id, crate::hwmon::snapshot())),
+
         // ─── T7 E2: 비용·효율 집계 (Control Center 비용·효율 탭) ───
         "control.analytics" => {
             let now = crate::state::now_epoch();

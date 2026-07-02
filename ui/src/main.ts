@@ -129,6 +129,7 @@ function renderUsage(el: HTMLElement, u: ObservedUsage | null | undefined) {
 // ---------- T6 Control Center (전용 풀 패널 — 네이티브 실시간 모니터링) ----------
 let ccOpen = false;
 let ccTimer: number | null = null;
+let ccHwTimer: number | null = null;
 let ccClockTimer: number | null = null;
 let ccUptimeBase = 0;
 let ccUptimeFetchedAt = 0;
@@ -219,11 +220,14 @@ function setCcOpen(open: boolean) {
   if (open) {
     applyCcDensity(ccDensity); // 저장된 밀도 모드 복원(class·버튼 라벨)
     refreshControlCenter();
+    refreshHw();
     tickCc();
     if (ccTimer == null) ccTimer = setInterval(refreshControlCenter, 5000) as unknown as number;
+    if (ccHwTimer == null) ccHwTimer = setInterval(refreshHw, 2000) as unknown as number;
     if (ccClockTimer == null) ccClockTimer = setInterval(tickCc, 1000) as unknown as number;
   } else {
     if (ccTimer != null) { clearInterval(ccTimer); ccTimer = null; }
+    if (ccHwTimer != null) { clearInterval(ccHwTimer); ccHwTimer = null; }
     if (ccClockTimer != null) { clearInterval(ccClockTimer); ccClockTimer = null; }
   }
 }
@@ -323,6 +327,7 @@ function setCcTab(view: "live" | "eff" | "skills" | "sessions" | "weekly" | "lea
   document.querySelectorAll("#cc-tabs .cc-tab").forEach((b) =>
     b.classList.toggle("active", (b as HTMLElement).dataset.view === view),
   );
+  if (view === "live") refreshHw();
   if (view === "eff") refreshEfficiency();
   if (view === "skills") refreshSkills();
   if (view === "sessions") refreshSessions();
@@ -1083,17 +1088,58 @@ function renderControlCenter(d: any) {
     spark.map((v) => `<span class="cc-spark-bar" style="height:${Math.max(2, Math.round((v / max) * 100))}%" title="${ccFmtTokens(v)}"></span>`).join("") +
     `</div>`;
 
-  const sys = d.system ?? {};
-  const cpu = Math.round(sys.cpu_pct ?? 0);
-  const memU = sys.mem_used ?? 0;
-  const memT = sys.mem_total ?? 1;
-  const memPct = Math.round((memU / memT) * 100);
-  const gb = (b: number) => (b / 1024 / 1024 / 1024).toFixed(1);
-  document.getElementById("cc-sys")!.innerHTML =
-    `<div class="cc-tbar"><span class="cc-tbar-lab">CPU</span><span class="cc-tbar-track"><span class="cc-tbar-fill ${sevClass(cpu, 60, 85)}" style="width:${Math.min(100, cpu)}%"></span></span><span class="cc-tbar-pct">${cpu}%</span></div>` +
-    `<div class="cc-tbar"><span class="cc-tbar-lab">MEM</span><span class="cc-tbar-track"><span class="cc-tbar-fill ${sevClass(memPct, 70, 90)}" style="width:${Math.min(100, memPct)}%"></span></span><span class="cc-tbar-pct">${gb(memU)}/${gb(memT)}G</span></div>`;
-
   document.getElementById("cc-footer")!.textContent = `cys Control Center · v${d.version ?? ""} · 5초 새로고침`;
+}
+
+// 하드웨어 모니터링 — control.hw 2초 폴링 (CPU 코어별·GPU·NPU·MEM 실시간)
+async function refreshHw() {
+  if (!ccOpen || ccTab !== "live") return;
+  try {
+    renderHw(await invoke("control_hw"));
+  } catch {
+    /* 데몬 일시 부재 — 다음 틱 재시도 */
+  }
+}
+
+function renderHw(d: any) {
+  const el = document.getElementById("cc-hw");
+  if (!el) return;
+  const cpu = d.cpu ?? {};
+  const mem = d.mem ?? {};
+  const gpu = d.gpu ?? {};
+  const npu = d.npu ?? {};
+  const gb = (b: number) => (b / 1024 / 1024 / 1024).toFixed(1);
+  const cores: number[] = cpu.per_core_pct ?? [];
+  const cpuPct = Math.round(cpu.total_pct ?? 0);
+  const pe = cpu.perf_cores != null && cpu.eff_cores != null ? ` (${cpu.perf_cores}P+${cpu.eff_cores}E)` : "";
+  const memU = mem.used ?? 0;
+  const memT = mem.total ?? 1;
+  const memPct = Math.round((memU / memT) * 100);
+  // pct=null → 이 플랫폼에서 측정 경로 없음("—")
+  const bar = (lab: string, pct: number | null, right: string, warn = 60, crit = 85) =>
+    pct == null
+      ? `<div class="cc-tbar"><span class="cc-tbar-lab">${lab}</span><span class="cc-tbar-track"></span><span class="cc-tbar-pct">—</span></div>`
+      : `<div class="cc-tbar"><span class="cc-tbar-lab">${lab}</span><span class="cc-tbar-track"><span class="cc-tbar-fill ${sevClass(pct, warn, crit)}" style="width:${Math.min(100, pct)}%"></span></span><span class="cc-tbar-pct">${right}</span></div>`;
+  el.innerHTML =
+    `<div class="cc-hw-head"><span class="cc-hw-title">CPU ${cores.length}코어${pe}</span><span class="cc-hw-brand">${ccEsc(cpu.brand ?? "")}</span><span class="cc-hw-pct">${cpuPct}%</span></div>` +
+    `<div class="cc-core-grid">` +
+    cores
+      .map((v, i) => {
+        const p = Math.round(v);
+        return `<span class="cc-core" title="코어 ${i + 1}: ${p}%"><span class="cc-core-fill ${sevClass(p, 60, 85)}" style="height:${Math.max(4, Math.min(100, p))}%"></span></span>`;
+      })
+      .join("") +
+    `</div>` +
+    bar(`GPU ${gpu.cores != null ? gpu.cores + "코어" : ""}`, gpu.pct != null ? Math.round(gpu.pct) : null, `${Math.round(gpu.pct ?? 0)}%`) +
+    npuRow(npu) +
+    bar("MEM", memPct, `${gb(memU)}/${gb(memT)}G`, 70, 90);
+}
+
+// NPU 줄 — macOS는 활용률(%) 공개 API가 없어 실측 전력(W)으로 표시(환각 지표 생성 금지).
+function npuRow(npu: any): string {
+  const lab = `NPU ${npu.cores != null ? npu.cores + "코어" : ""}`;
+  const val = npu.watts != null ? `${Number(npu.watts).toFixed(1)}W` : "—";
+  return `<div class="cc-tbar" title="macOS는 NPU 활용률을 공개 API로 노출하지 않아 실측 전력(W)으로 표시"><span class="cc-tbar-lab">${lab}</span><span class="cc-tbar-track"></span><span class="cc-tbar-pct">${val}</span></div>`;
 }
 
 let fontSize = Number(localStorage.getItem("cys-font-size") || 13);
