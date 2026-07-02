@@ -516,13 +516,36 @@ pub fn now_epoch() -> f64 {
         .unwrap_or(0.0)
 }
 
+/// Windows named pipe 경로(`\\.\pipe\<name>`)에서 `<name>` 슬러그를 추출한다(RC-13).
+/// 기본 데몬 `\\.\pipe\cys` → `"cys"`(호출자가 %LOCALAPPDATA%\cys 루트로 매핑·기존 호환 유지),
+/// 부서 데몬 `\\.\pipe\cys-dept-<n>` → `"cys-dept-<n>"`(루트 하위 부서 고유 디렉토리).
+/// 순수 문자열 함수(전 OS 컴파일·mac서 테스트 가능). 역슬래시·슬래시 모두에서 마지막 컴포넌트를 취하고
+/// 파일시스템 안전 문자(영숫자·`-`·`_`)만 남긴다(부서명은 dept-N·카탈로그 키라 이미 안전 — 방어적 sanitize).
+// windows state_dir 전용 — mac에선 테스트만 사용(비-windows 비-test 빌드 dead_code 허용).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn pipe_slug(socket_path: &std::path::Path) -> String {
+    let s = socket_path.to_string_lossy();
+    let last = s.rsplit(|c| c == '\\' || c == '/').next().unwrap_or("");
+    last.chars()
+        .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+        .collect()
+}
+
 /// 영속 상태 디렉터리 — 소켓과 같은 곳 (unix). Windows는 LOCALAPPDATA 하위.
+/// RC-13: Windows에서 부서 데몬마다 pipe명 슬러그로 **고유 디렉토리**를 파생해 transcripts.db·feed.jsonl
+/// 격리를 보장한다(구: 모든 부서가 단일 %LOCALAPPDATA%\cys 공유 → SQLite 락 경합·부서간 오염).
+/// 기본 데몬(`\\.\pipe\cys`)은 %LOCALAPPDATA%\cys 유지(호환 예외·마이그레이션 불요).
 pub fn state_dir(socket_path: &std::path::Path) -> PathBuf {
     #[cfg(windows)]
     {
-        let _ = socket_path; // named pipe path is not a directory
         let base = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".into());
-        PathBuf::from(base).join("cys")
+        let root = PathBuf::from(base).join("cys");
+        let slug = pipe_slug(socket_path);
+        if slug.is_empty() || slug == "cys" {
+            root // 기본 데몬 — 기존 경로 유지(호환)
+        } else {
+            root.join(slug) // 부서 데몬 — 슬러그별 격리 디렉토리
+        }
     }
     #[cfg(not(windows))]
     {
@@ -1575,6 +1598,38 @@ fn default_health_rules() -> Vec<HealthRule> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── RC-13 회귀 핀(agy 요구): Windows 부서 상태 격리 슬러그 ──
+    // 버그: state_dir Windows 분기가 socket_path를 폐기하고 %LOCALAPPDATA%\cys 고정 → 모든 부서가
+    // 동일 transcripts.db·feed.jsonl 공유(SQLite 락 경합·부서간 오염). pipe_slug로 부서별 격리.
+    #[test]
+    fn pipe_slug_maps_base_and_dept_pipes() {
+        // 기본 데몬 → "cys"(호출자가 루트로 매핑)
+        assert_eq!(pipe_slug(std::path::Path::new(r"\\.\pipe\cys")), "cys");
+        // 부서 데몬 → 고유 슬러그
+        assert_eq!(
+            pipe_slug(std::path::Path::new(r"\\.\pipe\cys-dept-3")),
+            "cys-dept-3"
+        );
+        assert_eq!(
+            pipe_slug(std::path::Path::new(r"\\.\pipe\cys-dept-future")),
+            "cys-dept-future"
+        );
+        // 방어적 sanitize: 마지막 컴포넌트에서 안전문자(영숫자·-·_)만 — `.`는 제거됨
+        // (슬래시/역슬래시 모두에서 마지막 성분 추출: `cys.sock` → `cyssock`)
+        assert_eq!(pipe_slug(std::path::Path::new("/tmp/cys-dept-9/cys.sock")), "cyssock");
+    }
+
+    #[test]
+    fn pipe_slug_dept_differs_from_base_for_isolation() {
+        // 핵심 불변식: 부서 슬러그 ≠ 기본("cys") → state_dir가 서로 다른 디렉토리 파생(격리 보장).
+        let base = pipe_slug(std::path::Path::new(r"\\.\pipe\cys"));
+        let d1 = pipe_slug(std::path::Path::new(r"\\.\pipe\cys-dept-1"));
+        let d2 = pipe_slug(std::path::Path::new(r"\\.\pipe\cys-dept-2"));
+        assert_ne!(d1, base);
+        assert_ne!(d2, base);
+        assert_ne!(d1, d2, "부서끼리도 서로 다른 상태 디렉토리");
+    }
 
     // ── writer 스레드 누수 회귀 가드 (state.rs run_writer_loop) ──
     // 버그: 자력 종료(셸 EOF) surface는 close_surface를 거치지 않아 write_tx가 surfaces
