@@ -145,3 +145,91 @@ jobs:
           if (-not $ok) { Write-Host "== screen(roundtrip) =="; Write-Host $screen; throw "실행 왕복 실패 — PTY 입력 또는 셸 실행 경로 결함" }
           Write-Host "OK: ConPTY 프롬프트·실행 왕복 실측 통과"
           Get-Process cys,cysd -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+
+      # ─────────────────────────────────────────────────────────────────────────
+      # T3 기능 스모크 (WINFIX_T3_SMOKE_PLAN.md · row별 PASS/FAIL). release 무관.
+      # 행별 결과를 "T3-N RESULT: PASS|FAIL" 로 stdout에 남긴다(매트릭스 승격 판독원). 크리티컬 행만 throw.
+      # ─────────────────────────────────────────────────────────────────────────
+      - name: T3 기능 스모크 (온보딩·hook·env주입·부서·python3)
+        shell: pwsh
+        run: |
+          $inst = Get-ChildItem "$env:LOCALAPPDATA" -Recurse -Filter cysd.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $inst) { throw "설치된 cysd.exe 미발견" }
+          $dir = $inst.Directory.FullName
+          $cys = Join-Path $dir 'cys.exe'
+          $results = @{}
+          function Rec($id,$ok,$note){ $results[$id] = $ok; Write-Host ("T3-{0} RESULT: {1}  {2}" -f $id, ($(if($ok){'PASS'}else{'FAIL'})), $note) }
+          $home = $env:USERPROFILE
+
+          # ── T3-1/T3-2: 온보딩(init-pack) + hook 등록·내용(RC-1·RC-2) ──
+          try {
+            & $cys init-pack 2>&1 | Out-Host
+            $packOk = Test-Path (Join-Path $home '.cys\pack\agents.json')
+            # hook: ~/.cys/claude/settings.json 또는 ~/.claude*/settings.json 중 SessionStart command 확인
+            $settings = @(Get-ChildItem (Join-Path $home '.cys\claude\settings.json'),(Join-Path $home '.claude\settings.json') -ErrorAction SilentlyContinue)
+            $hookCmd = ''
+            foreach ($s in $settings) { try { $j=Get-Content $s.FullName -Raw|ConvertFrom-Json; $c=$j.hooks.SessionStart.hooks.command; if($c){$hookCmd="$c"} } catch {} }
+            Rec 1 ($packOk) "pack=$packOk"
+            # RC-2: hook command가 bash로(sh 아님)·경로 quote 시작
+            Rec 2 ($hookCmd -match '^bash "') "hookCmd=$hookCmd"
+          } catch { Rec 1 $false "$_"; Rec 2 $false "$_" }
+
+          # ── T3-1(autostart) daemon install → schtasks 등록(RC-1) ──
+          try { & $cys daemon install 2>&1 | Out-Host; $q = (schtasks /Query /TN cysd 2>&1); Rec '1b' ($LASTEXITCODE -eq 0) "schtasks cysd" } catch { Rec '1b' $false "$_" }
+
+          # ── 데몬 기동(named pipe 바인드·RC-4 기본) ──
+          & $cys list 2>&1 | Out-Null; if ($LASTEXITCODE -ne 0) { Start-Sleep 3; & $cys list 2>&1 | Out-Null }
+          Rec 'pipe' ($LASTEXITCODE -eq 0) "named pipe \\.\pipe\cys bind"
+
+          # ── T3-13: python3 해소(RC-12) — 동봉 runtime python3.exe 실재+실행 ──
+          try { $py = Join-Path $dir 'runtime\python\python3.exe'; & $py -c "print('PYOK')" | Out-Host; Rec 13 ($LASTEXITCODE -eq 0 -and (Test-Path $py)) "python3=$py" } catch { Rec 13 $false "$_" }
+
+          # ── T3-3/T3-4(env주입 메커니즘·스텁): claude 실로그인 불가 → 스텁 에이전트로 env 주입만 검증 ──
+          # 설치된 agents.json에 stub 에이전트 추가(JSON 쓰기는 bundled python3로 견고하게). 스텁 cmd는
+          # powershell이 CLAUDE_CONFIG_DIR을 echo + prompt=STUBREADY>(ready_marker). env 맵의
+          # ${CYS_ACCOUNT_DIR:-ENVINJECT_OK}는 CYS_ACCOUNT_DIR 미설정→"ENVINJECT_OK"로 해소·pane env 주입.
+          try {
+            $py = Join-Path $dir 'runtime\python\python3.exe'
+            $aj = Join-Path $home '.cys\pack\agents.json'
+            # 한 줄 python(-c) — YAML/pwsh here-string 충돌 회피(닫는 @'는 column0 필요). pwsh 단일따옴표라
+            # 내부 \" 는 python에 그대로 전달(escaped double-quote). python 내 single-quote 없음(안전).
+            $pyprog = 'import json,sys; aj=sys.argv[1]; d=json.load(open(aj,encoding="utf-8")); d["stubenv"]={"cmd":"Write-Host CCDPROOF=$env:CLAUDE_CONFIG_DIR","env":{"CLAUDE_CONFIG_DIR":"${CYS_ACCOUNT_DIR:-ENVINJECT_OK}"},"inject_delay_secs":3,"ready_marker":"CCDPROOF=","clear_cmd":"/clear"}; json.dump(d,open(aj,"w",encoding="utf-8"),ensure_ascii=False,indent=2); print("stubenv OK")'
+            & $py -c $pyprog $aj | Out-Host
+            & $cys launch-agent --role worker --agent stubenv 2>&1 | Out-Host
+            # env 주입 증거(견고): launch-agent가 세운 worker pane(env_injected)에 fresh probe를 보내
+            # 출력을 읽는다(디렉티브 주입 스크롤백 회피). CI pwsh 단일따옴표라 $env:는 리터럴 전송→pane 확장.
+            & $cys send --to worker 'Write-Host CCDFRESH=$env:CLAUDE_CONFIG_DIR' 2>&1 | Out-Null
+            & $cys send-key --to worker Return 2>&1 | Out-Null
+            $envProof = $false; $scr=''
+            $deadline=(Get-Date).AddSeconds(45)
+            while((Get-Date) -lt $deadline){ Start-Sleep 3; $scr=(& $cys read-screen --to worker 2>&1) -join "`n"; if($scr -match 'CCDFRESH=ENVINJECT_OK'){$envProof=$true;break} }
+            if (-not $envProof) { Write-Host "== stub screen =="; Write-Host $scr }
+            Rec 3 $envProof "env주입 스텁 CCDFRESH=ENVINJECT_OK (해소+주입 E2E · claude 실발동은 박사님 실기 마커)"
+          } catch { Rec 3 $false "$_" }
+
+          # ── T3-7/T3-9/T3-10/T3-6: 부서 스폰·격리(RC-5/6/15/13·단일부서만·RC-13 후) ──
+          try {
+            $bash = Join-Path $dir 'runtime\git\usr\bin\bash.exe'
+            $deptTool = Join-Path $home '.cys\pack\bin\cys-dept'
+            $env:PATH = "$dir;$(Join-Path $dir 'runtime\git\usr\bin');$(Join-Path $dir 'runtime\python');$env:PATH"
+            $out = & $bash $deptTool allocate 2>&1; Write-Host "cys-dept allocate: $out"
+            $name = ($out | Select-Object -Last 1).Trim()
+            $deptOk = $name -match '^dept-\d+$'
+            # RC-15: dept_logdir = %LOCALAPPDATA%\cys\cys-dept-<name> 생성·cysd.log
+            $logdir = Join-Path $env:LOCALAPPDATA "cys\cys-dept-$name"
+            Start-Sleep 3
+            $logOk = Test-Path (Join-Path $logdir 'cysd.log')
+            Rec 7 $deptOk "cys-dept allocate → $name"
+            Rec 10 $logOk "dept_logdir cysd.log @ $logdir"
+            if ($deptOk) { & $bash $deptTool down $name 2>&1 | Out-Host }
+          } catch { Rec 7 $false "$_"; Rec 10 $false "$_" }
+
+          # ── 집계 + 크리티컬 게이트 ──
+          Write-Host "== T3 SMOKE 집계 =="
+          $results.GetEnumerator() | Sort-Object Name | ForEach-Object { Write-Host ("  T3-{0}: {1}" -f $_.Key, ($(if($_.Value){'PASS'}else{'FAIL'}))) }
+          Get-Process cys,cysd -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          # 크리티컬(온보딩·hook·pipe·python3)만 hard gate — 나머지는 로그로 승격 판독.
+          $crit = @('1','2','1b','pipe','13')
+          $failed = $crit | Where-Object { -not $results[$_] }
+          if ($failed) { throw ("크리티컬 T3 행 실패: " + ($failed -join ',')) }
+          Write-Host "OK: T3 크리티컬 스모크 통과 (나머지 행은 집계 로그로 승격 판독)"
