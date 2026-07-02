@@ -160,7 +160,7 @@ jobs:
           $cys = Join-Path $dir 'cys.exe'
           $results = @{}
           $userHome = $env:USERPROFILE
-          function Rec($id,$ok,$note){ $results[$id] = $ok; Write-Host ("T3-{0} RESULT: {1}  {2}" -f $id, ($(if($ok){'PASS'}else{'FAIL'})), $note) }
+          function Rec($id,$ok,$note){ $results["$id"] = [bool]$ok; Write-Host ("T3-{0} RESULT: {1}  {2}" -f $id, ($(if($ok){'PASS'}else{'FAIL'})), $note) }
           # ★바운드 실행: 외부 exe가 hang해도 스텝이 멈추지 않게 timeout kill. @{Code;Out} 반환(Code=-1=timeout).
           function Bx($exe,$argv,$ms){
             $o=[System.IO.Path]::GetTempFileName(); $e=[System.IO.Path]::GetTempFileName()
@@ -199,10 +199,11 @@ jobs:
             $py = Join-Path $dir 'runtime\python\python3.exe'
             $aj = Join-Path $userHome '.cys\pack\agents.json'
             $pyprog = 'import json,sys; aj=sys.argv[1]; d=json.load(open(aj,encoding="utf-8")); d["stubenv"]={"cmd":"Write-Host CCDPROOF=$env:CLAUDE_CONFIG_DIR","env":{"CLAUDE_CONFIG_DIR":"${CYS_ACCOUNT_DIR:-ENVINJECT_OK}"},"inject_delay_secs":3,"ready_marker":"CCDPROOF=","clear_cmd":"/clear"}; json.dump(d,open(aj,"w",encoding="utf-8"),ensure_ascii=False,indent=2); print("stubenv OK")'
-            (Bx $py @('-c',$pyprog,$aj) 15000).Out | Out-Host
+            # 복잡인자(공백·$·따옴표)는 Bx(Start-Process 재-quoting)가 깨뜨림 → 직접 & 호출(빠른 파일쓰기·hang 무).
+            & $py -c $pyprog $aj | Out-Host
             (Bx $cys @('launch-agent','--role','worker','--agent','stubenv') 90000).Out | Out-Host
-            (Bx $cys @('send','--to','worker','Write-Host CCDFRESH=$env:CLAUDE_CONFIG_DIR') 15000) | Out-Null
-            (Bx $cys @('send-key','--to','worker','Return') 15000) | Out-Null
+            & $cys send --to worker 'Write-Host CCDFRESH=$env:CLAUDE_CONFIG_DIR' 2>&1 | Out-Null
+            & $cys send-key --to worker Return 2>&1 | Out-Null
             $envProof=$false; $scr=''
             $deadline=(Get-Date).AddSeconds(40)
             while((Get-Date) -lt $deadline){ Start-Sleep 3; $scr=(Bx $cys @('read-screen','--to','worker') 15000).Out; if($scr -match 'CCDFRESH=ENVINJECT_OK'){$envProof=$true;break} }
@@ -215,6 +216,7 @@ jobs:
             $bash = Join-Path $dir 'runtime\git\usr\bin\bash.exe'
             $deptTool = Join-Path $userHome '.cys\pack\bin\cys-dept'
             $env:PATH = "$dir;$(Join-Path $dir 'runtime\git\usr\bin');$(Join-Path $dir 'runtime\python');$env:PATH"
+            $env:CYS_DEPT_DEFAULT_ACCOUNT = 'citest'   # 부서 계정격리 base 해석용(미설정 시 allocate fail-closed exit5)
             $r = Bx $bash @($deptTool,'allocate') 60000; Write-Host "cys-dept allocate: $($r.Out)"
             $name = (($r.Out -split "`n") | Where-Object { $_ -match '^dept-\d+' } | Select-Object -Last 1)
             if ($name) { $name = $name.Trim() }
@@ -232,6 +234,6 @@ jobs:
           $results.GetEnumerator() | Sort-Object Name | ForEach-Object { Write-Host ("  T3-{0}: {1}" -f $_.Key, ($(if($_.Value){'PASS'}else{'FAIL'}))) }
           Get-Process cys,cysd -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
           $crit = @('1','2','1b','pipe','13')
-          $failed = $crit | Where-Object { -not $results[$_] }
+          $failed = $crit | Where-Object { -not $results["$_"] }
           if ($failed) { throw ("크리티컬 T3 행 실패: " + ($failed -join ',')) }
           Write-Host "OK: T3 크리티컬 스모크 통과 (나머지 행은 집계 로그로 승격 판독)"
