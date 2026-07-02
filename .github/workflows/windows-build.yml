@@ -292,7 +292,8 @@ jobs:
           # ①' 실장애 재현(2026-07-02 msys-2.0.dll Can't write → Abort): 라이브 bash가 runtime DLL을
           # 로드한 상태로 재설치한다 — T4 초판은 PowerShell 셸이라 이 잠금을 재현 못 해 놓쳤다.
           $bash = Join-Path $dir 'runtime\git\usr\bin\bash.exe'
-          $bp = Start-Process -FilePath $bash -ArgumentList '-c','sleep 600' -PassThru -WindowStyle Hidden
+          # ArgumentList 배열은 공백 인자 quoting을 잃는다(PS Start-Process 고질) → 단일 문자열로 전달
+          $bp = Start-Process -FilePath $bash -ArgumentList '-c "sleep 600"' -PassThru -WindowStyle Hidden
           Start-Sleep 2
           if ($bp.HasExited) { throw "T4: bash 잠금 프로세스 기동 실패" }
           Write-Host "T4 사전상태: daemon pid=$pidBefore, master surface 생성됨, bash(msys DLL 잠금) pid=$($bp.Id)"
