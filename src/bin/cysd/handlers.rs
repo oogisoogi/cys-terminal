@@ -451,6 +451,9 @@ fn derive_node_state(scrollback: &std::collections::VecDeque<String>, idle_secs:
         .join("\n")
         .to_lowercase();
     if recent.trim().is_empty() {
+        // 낙관 기본값(의도적, C-7 검토 유지): 출력 없는 신생 노드를 "idle"로 판정하면
+        // reinject 게이트(§7-②)가 idle을 주입 신호로 삼아 기동 직후 지침을 조기 주입한다 —
+        // 60초 내 "working" 표시는 그 보호 창이다(잠깐의 오표시가 조기 주입보다 안전).
         return if idle_secs > 60 { "idle" } else { "working" };
     }
     if LIVE.iter().any(|k| recent.contains(k)) {
@@ -469,6 +472,28 @@ fn derive_node_state(scrollback: &std::collections::VecDeque<String>, idle_secs:
 /// RSI 학습 상태 디렉터리 — ★엔진(javis_learn)의 CYS_ROUND_DIR/learn 규약과 일치시켜
 /// 격리/테스트 정합을 보장한다(codex REVISE). 미설정 시 canonical = pack_dir()/round/learn
 /// (pack_dir은 CYS_PACK_DIR 환경변수 우선). 데몬↔엔진이 동일 경로를 보게 한다.
+/// 툴 실행시간 도출 — (session, tool) 키로 PRE_TOOL 시각을 기억했다가 POST_TOOL에서 경과를
+/// 반환한다(B-9). 동일 툴 중첩 호출은 마지막 PRE 기준 근사. 짝 잃은 PRE는 1h 후 청소.
+fn tool_duration(session: &str, tool: &str, event_type: &str, now: f64) -> Option<i64> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static PRE_TS: OnceLock<Mutex<HashMap<(String, String), f64>>> = OnceLock::new();
+    let m = PRE_TS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut g = m.lock().unwrap();
+    if g.len() > 512 {
+        g.retain(|_, t| now - *t < 3600.0);
+    }
+    let key = (session.to_string(), tool.to_string());
+    match event_type {
+        "PRE_TOOL" => {
+            g.insert(key, now);
+            None
+        }
+        "POST_TOOL" => g.remove(&key).map(|t0| ((now - t0) * 1000.0).max(0.0) as i64),
+        _ => None,
+    }
+}
+
 fn learn_state_dir() -> std::path::PathBuf {
     if let Some(r) = cys::env_compat("CYS_ROUND_DIR") {
         return std::path::PathBuf::from(r).join("learn");
@@ -2231,11 +2256,15 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 .map(|(a, _)| a.clone())
                 .unwrap_or_default();
             let role = surface.role.lock().unwrap().clone().unwrap_or_default();
+            // B-9: PRE→POST 시각 페어링으로 duration_ms 산출 — hook 원본엔 실행시간이 없어
+            // 데몬이 도출한다(구 구현은 duration_ms 항상 NULL → skills p50 산출 불가였다).
+            let ev_now = crate::state::now_epoch();
+            let duration_ms = tool_duration(&session, &tool_name, &event_type, ev_now);
             if let Some(conn) = daemon.analytics.lock().unwrap().as_ref() {
                 crate::analytics::record_event(
                     conn, &session, &role, &agent, &event_type, &tool_name, is_skill,
                     skill_name.as_deref(), is_agent, agent_type.as_deref(), agent_id.as_deref(),
-                    exit_code, crate::state::now_epoch(),
+                    exit_code, duration_ms, ev_now,
                 );
             }
             // ── agent.hook 이벤트 발행 (P1-3) — SQLite 적재에 더해 이벤트 버스로 push.
@@ -2393,15 +2422,9 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
         // 시스템 CPU/MEM·소비통계·12h 스파크라인. cys-app UI가 5초 폴링해 Control Center 패널을 그린다.
         "control.dashboard" => {
             let now = crate::state::now_epoch();
-            // 시스템 CPU/MEM — cpu_usage는 두 refresh 사이 측정이라 짧은 간격 샘플(0 방지).
-            let (cpu_pct, mem_used, mem_total) = {
-                let mut sys = sysinfo::System::new();
-                sys.refresh_memory();
-                sys.refresh_cpu_usage();
-                std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
-                sys.refresh_cpu_usage();
-                (sys.global_cpu_usage(), sys.used_memory(), sys.total_memory())
-            };
+            // 시스템 CPU/MEM — hwmon 지속 System 공유(A-5/B-14: 콜마다 System::new+200ms
+            // 블로킹 sleep을 쓰던 구 패턴은 tokio 워커를 상시 점유했다. 폴링 간격=측정 창).
+            let (cpu_pct, mem_used, mem_total) = crate::hwmon::cpu_mem();
             // 최근 health 에러(노드 state=error 판정) — 30초 창
             let err_surfaces: std::collections::HashSet<u64> = daemon
                 .recent_health
@@ -2443,15 +2466,18 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             fleet.sort_by_key(|v| v["surface_id"].as_u64().unwrap_or(0));
             let (today_tokens, today_input, today_msgs, session_count, last_1h, spark, today_cost, model_mix) = {
                 let c = daemon.consumption.lock().unwrap();
+                // B-1: today 카운터는 새 메시지 도착 때만 리셋되므로(record_message), 자정 직후
+                // 첫 메시지 전까지 어제 누계가 "오늘"로 표시됐다 — 읽기 쪽에서 날짜 가드.
+                let fresh = c.today_date == chrono::Local::now().format("%Y-%m-%d").to_string();
                 (
-                    c.today_tokens,
-                    c.today_input,
-                    c.today_msgs,
-                    c.sessions.len() as u64,
+                    if fresh { c.today_tokens } else { 0 },
+                    if fresh { c.today_input } else { 0 },
+                    if fresh { c.today_msgs } else { 0 },
+                    if fresh { c.sessions.len() as u64 } else { 0 },
                     c.recent_tokens(now, 3600.0),
                     c.sparkline(now, 24, 43_200.0),
-                    c.today_cost_usd,
-                    c.model_tokens.clone(),
+                    if fresh { c.today_cost_usd } else { 0.0 },
+                    if fresh { c.model_tokens.clone() } else { Default::default() },
                 )
             };
             Reply::Single(ok_response(
@@ -2623,13 +2649,21 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             let Some(sid) = param_str(&params, "session_id") else {
                 return Reply::Single(err_response(&id, "invalid_params", "missing session_id"));
             };
-            let detail = {
+            let mut detail = {
                 let guard = daemon.analytics.lock().unwrap();
                 match guard.as_ref() {
                     Some(conn) => crate::analytics::session_detail(conn, &sid),
                     None => json!({ "session_id": sid, "timeline": [], "summary": {} }),
                 }
             };
+            // E9 RBAC 대칭(B-8): sessions와 동일 기준으로 detail도 가린다 — 구 구현은
+            // detail만 raw session_id(경로 PII)·전사를 그대로 노출했다.
+            let redact = params.get("redact").and_then(|v| v.as_bool()).unwrap_or(false)
+                || std::env::var("CYS_CONTROL_REDACT").map(|v| v == "1").unwrap_or(false);
+            if redact {
+                detail["session_id"] = json!(crate::analytics::redact_session_id(&sid));
+                detail["transcript"] = json!([]);
+            }
             Reply::Single(ok_response(&id, detail))
         }
 

@@ -276,7 +276,8 @@ html, body {
 .cc-spark-label { font-size: 11px; color: #64748b; }
 .cc-spark-bars { flex: 1; display: flex; align-items: flex-end; gap: 2px; height: 48px; }
 .cc-spark-bar { flex: 1; background: linear-gradient(180deg, #00d4ff, #00A8FF); border-radius: 2px 2px 0 0; min-height: 2px; opacity: .85; }
-#cc-footer { text-align: center; font-size: 11px; color: #475569; padding: 4px 0 12px; font-variant-numeric: tabular-nums; }
+#cc-footer { text-align: center; font-size: 11px; color: #6e7681; padding: 4px 0 12px; font-variant-numeric: tabular-nums; }
+#cc-footer.stale { color: #f59e0b; font-weight: 600; }
 /* E2 비용·효율 탭 */
 #cc-tabs { position: sticky; top: 49px; z-index: 2; display: flex; flex-wrap: wrap; gap: 4px; padding: 8px 20px 0;
   background: rgba(10,10,10,.85); backdrop-filter: blur(16px); border-bottom: 1px solid rgba(255,255,255,.10); }
@@ -295,7 +296,7 @@ html, body {
 .cc-leg { display: flex; align-items: center; gap: 5px; }
 .cc-leg-dot { width: 9px; height: 9px; border-radius: 2px; flex: none; }
 .cc-leg-pct { color: #e2e8f0; font-variant-numeric: tabular-nums; }
-.cc-empty { font-size: 12px; color: #475569; text-align: center; padding: 8px 0; }
+.cc-empty { font-size: 12px; color: #6e7681; text-align: center; padding: 8px 0; }
 /* E3 스킬·에이전트 탭 */
 .cc-call-n { color: #e2e8f0; font-variant-numeric: tabular-nums; min-width: 28px; text-align: right; font-size: 12px; }
 .cc-fail-badge { font-size: 11px; font-weight: 700; padding: 1px 7px; border-radius: 9px; font-variant-numeric: tabular-nums;
@@ -328,7 +329,16 @@ html, body {
 .cc-ribbon { display: inline-flex; gap: 1px; height: 8px; flex: 0 0 auto; }
 .cc-ribbon-cell { width: 3px; height: 8px; background: #00d4ff; border-radius: 1px; }
 .cc-sess-detail-kpi { font-size: 13px; color: #e2e8f0; font-variant-numeric: tabular-nums; margin-bottom: 4px; }
-.cc-sess-note { font-size: 11px; color: #475569; margin-bottom: 10px; }
+.cc-sess-note { font-size: 11px; color: #6e7681; margin-bottom: 10px; }
+/* B-9 전사 발췌 — 세션 상세 하단, user/assistant 턴 구분 */
+.cc-tx-row { display: flex; gap: 8px; padding: 6px 8px; margin-bottom: 4px; border-radius: 6px; font-size: 12px; background: rgba(255,255,255,.03); }
+.cc-tx-row.user { border-left: 2px solid #58a6ff; }
+.cc-tx-row.asst { border-left: 2px solid #22c55e; }
+.cc-tx-role { flex: none; }
+.cc-tx-text { white-space: pre-wrap; word-break: break-word; color: #cbd5e1; }
+/* B-4 단가 미상 마커 — Sonnet 폴백 추정 표시 */
+.cc-price-unk { margin-left: 6px; padding: 0 5px; border-radius: 6px; font-size: 10px;
+  background: rgba(245,158,11,.15); border: 1px solid rgba(245,158,11,.4); color: #f59e0b; }
 .cc-timeline { display: flex; flex-direction: column; gap: 2px; max-height: 360px; overflow-y: auto; }
 .cc-tl-row { display: flex; align-items: center; gap: 9px; padding: 4px 8px; font-size: 12px; border-radius: 5px; background: rgba(255,255,255,.02); }
 .cc-tl-row.crit { background: rgba(239,68,68,.10); }
@@ -486,12 +496,13 @@ body.pane-dragging .pane .pane-title { cursor: grabbing; }
 .cc-dim { color: #64748b; font-size: 11px; }
 
 /* ───────── HUD-5 글랜서블 모드 (body.cc-glance) — 자산 0폐기 재배치(숨기기+키우기만) ───────── */
-/* 1) 탭 바·분석 전용 위젯 숨김 — Live의 큰 정보만 남긴다 */
+/* 1) 탭 바·분석 전용 위젯 숨김 — Live의 큰 정보만 남긴다.
+   ★#cc-hw(하드웨어)는 숨기지 않는다(A-6): glance Live면의 목적이 "시스템부하"인데
+   구 규칙(#cc-sys 시절 관성)이 정작 CPU/GPU/MEM 위젯을 감추는 모순이 있었다. */
 body.cc-glance #cc-tabs { display: none; }
 body.cc-glance #cc-view-live .cc-spark,
 body.cc-glance #cc-view-live .cc-mix,
-body.cc-glance #cc-view-live .cc-token-stats,
-body.cc-glance #cc-view-live #cc-hw { display: none; }
+body.cc-glance #cc-view-live .cc-token-stats { display: none; }
 /* 2) 큰 글씨·한국어 가독성(비기술자) — 다크 유지하되 본문 대비 상향. 레이아웃/크기/가시성만 변경 */
 body.cc-glance #cc-body { max-width: 920px; }
 body.cc-glance .cc-card-val { font-size: 40px; }

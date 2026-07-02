@@ -225,21 +225,34 @@ stale 마커(정의 변경 시 재계산). 보존 정책(기본 60일·`retentio
 
 ### E9 — (선택) 팀/멀티머신 확장
 - RBAC 4단(VIEWER=집계만·PII 차단) · 보존/redaction · self-host 다머신 집계(`--api-url`·중앙 cysd). **큰 결정**(로컬 우선 철학과 trade-off).
+- **잔여 현황(2026-07-03)**: redact는 sessions·session_detail 대칭 적용 완료(로컬 부분). retention 자동삭제는 eval-driven "삭제 reward-hack 차단" 원칙과 상충해 보류. 멀티머신 중앙 cysd는 로컬우선 철학 위배 소지 — 오너 명시 결정 대기.
 
 ---
 
-## 4. RPC 계약 (신규/확장)
-- `control.dashboard`(확장): 기존 + 비용$·캐시절감·모델믹스·생산성.
-- `control.analytics {from,to,group_by}`: 일/주 롤업(추세·드릴다운).
-- `control.skills {from,to}`: 스킬/에이전트 TOP·실패율·p50·미사용·분포.
-- `control.sessions {filter}` / `control.session_detail {session_id}`: 목록·전사.
-- `control.weekly {week}`: WoW·리더·인사이트.
-- `control.alerts` + `usage.alert` 이벤트(push).
+## 4. RPC 계약 (신규/확장) — 2026-07-03 현행화
+- `control.dashboard`(확장): 기존 + 비용$·캐시절감·모델믹스·생산성. today 카운터는 읽기 시 날짜 가드(자정 직후 어제 누계 표시 방지).
+- `control.hw`: 하드웨어 모니터링 — CPU 코어수(P/E)·코어별/전체 활용률·MEM(전 플랫폼, sysinfo 지속 인스턴스·무sleep) + GPU 코어수/활용률(macOS ioreg) + NPU 코어수/전력W(macOS IOReport 무sudo — 활용률%는 공개 API 부재라 null 고정). UI Live 탭이 2초 폴링.
+- `control.analytics {window: today|7d|all}`: 비용·효율 롤업. `cache_roi_x`는 폐기(전 클로드 모델 캐시단가=입력의 10% → 항상 0.9인 무정보 상수였음) — `cache_efficiency`·`cache_savings_usd`만 제공. by_model 행에 `pricing_known`(false=단가표 미등재 → Sonnet 폴백 추정) 포함. 비용류는 반올림(round4).
+- `control.skills {window}`: 스킬/에이전트 TOP·실패율·by_tool `p50_ms`(데몬 PRE→POST 페어링 산출). slash UNION은 미배선(UserPromptSubmit hook 채널 자체가 없음 — 배선 시 events.is_slash 소비 예정).
+- `control.cost_baseline {window=7d}`: D3 eval baseline — by_tier+rework+캐시 지표 합본.
+- `control.sessions {window, redact}` / `control.session_detail {session_id, redact}`: 목록(⭐note 포함)·상세. 상세는 이벤트 타임라인 + **전사 발췌**(세션 파일 꼬리 64KB 온디맨드·최근 30턴·턴당 400자 — messages 테이블 적재 없음). redact는 두 RPC 대칭 적용(session_id 해시·전사 생략).
+- `control.session_star {session_id, starred, note}`: ⭐ 토글+노트(재스타 시 starred_at 갱신).
+- `control.weekly`: WoW·리더·인사이트.
+- `control.alerts` + `alert.<kind>` 이벤트(경보는 이벤트+UI 배지로 정합화 — E5/E6의 "master push" 원안은 governance 교리상 채택하지 않음).
+- `learn.status`: 학습 탭 데이터 — `{pack}/round/learn/state.json`(또는 $CYS_ROUND_DIR/learn). javis_rsi.py가 `_round/rsi/state.json` 저장 시 이 위치로 rounds/discovery를 미러링한다.
 - Tauri 커맨드 동형 노출(`src-tauri/main.rs`).
 
-## 5. UI 정보구조 (Control Center 탭)
-`Live`(현 T6) · `비용·효율`(E2) · `스킬·에이전트`(E3) · `세션`(E4) · `추세·주간`(E5) · 상단 경보 배지(E6).
+### 소비 수집 경계 (usage.rs — 2026-07-03 현행화)
+- pane 수집: claude(트랜스크립트)·**codex(rollout token_count의 last_token_usage + turn_context 모델 귀속)** 소비 적재. statusline 신선 시에도 소비 적재는 계속(관측 스냅샷만 statusline 우선).
+- 외부(비-pane) 세션: `~/.claude*/projects` 15초 스윕, role=`external[:프로필]`.
+- tail 오프셋은 analytics `tail_offsets`에 영속 — 재시작 시 정확 재개(재파싱 중복 INSERT 근절).
+- 미수집(알려진 한계): gemini(agy)=쿼터만(토큰 소비 로컬 파일 부재·Phase 2-B), grok=수집기 없음. 데몬 기동 이전 외부 세션 히스토리는 소급 안 함(설계).
+
+## 5. UI 정보구조 (Control Center 탭) — 2026-07-03 현행화 (9탭)
+`Live`(T6+하드웨어 섹션) · `비용·효율`(E2) · `스킬·에이전트`(E3) · `세션`(E4) · `추세·주간`(E5) · `학습`(E7 편입 — RSI 라운드 타임라인·retention·발견·자율추천 대기. 데이터=learn.status) · `스킬 보드`(D5 — 클릭=일회용 워커 task-prompt 실행. 실행 경계는 make_ticket 무계약 차단+gate:hitl 미리보기) · `작업`(부서×노드 현재업무 — 이벤트 드리븐+5초 reconcile) · `승인 Feed` + 상단 경보 배지(E6).
 바닐라 TS·차트 라이브러리 무의존(현 스파크라인·바·도넛 자체 SVG 확장).
+갱신 주기: 대시보드 5초(Live 본문은 live 탭 표시 중에만 재렌더) · 하드웨어 2초 · 시계 1초 · 전 탭 5초 주기 재조회(sessions·weekly 포함). 데몬 3틱 연속 무응답이면 footer가 stale 경고로 전환.
+glance("한눈에") 모드: 분석 위젯은 숨기되 **하드웨어 섹션은 유지**(Live면 목적=시스템부하).
 
 ---
 

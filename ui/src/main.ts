@@ -249,9 +249,12 @@ async function refreshControlCenter() {
   if (!ccOpen) return;
   try {
     renderControlCenter(await invoke("control_dashboard"));
+    ccFailStreak = 0;
   } catch {
-    /* 데몬 일시 부재 — 다음 틱 재시도 */
+    // 데몬 일시 부재 — 다음 틱 재시도. 연속 실패는 stale 배너로 표면화(B-11).
+    ccFailStreak++;
   }
+  updateCcStale();
   try {
     renderAlerts((await invoke("control_alerts")) as any);
   } catch {
@@ -259,10 +262,26 @@ async function refreshControlCenter() {
   }
   if (ccTab === "eff") refreshEfficiency();
   if (ccTab === "skills") refreshSkills();
+  // B-7: sessions·weekly도 동일 5초 주기 — 구 구현은 탭 진입 1회 로드 후 정지였다.
+  if (ccTab === "sessions") refreshSessions();
+  if (ccTab === "weekly") refreshWeekly();
   if (ccTab === "learn") refreshLearn();
   // Tasks 안전망 reconcile: 이벤트 누락·부서 신규 기동을 5초 폴링으로 보정(평시는 이벤트 드리븐).
   if (ccTab === "tasks") refreshTasks();
   if (ccTab === "feed") refreshFeed();
+}
+
+// B-11: 연속 실패 표면화 — 3틱(15초) 연속 실패면 footer를 경고로 전환(조용한 stale 오인 차단)
+let ccFailStreak = 0;
+function updateCcStale() {
+  const f = document.getElementById("cc-footer");
+  if (!f) return;
+  if (ccFailStreak >= 3) {
+    f.textContent = "⚠ 데몬 응답 없음 — 표시 중인 값은 마지막 성공 시점 기준(자동 재시도 중)";
+    f.classList.add("stale");
+  } else {
+    f.classList.remove("stale");
+  }
 }
 
 // E6 경보 — 헤더 배지(개수) + Live 뷰 상단 스트립. severity: warn(주황)/crit(빨강).
@@ -327,7 +346,10 @@ function setCcTab(view: "live" | "eff" | "skills" | "sessions" | "weekly" | "lea
   document.querySelectorAll("#cc-tabs .cc-tab").forEach((b) =>
     b.classList.toggle("active", (b as HTMLElement).dataset.view === view),
   );
-  if (view === "live") refreshHw();
+  if (view === "live") {
+    refreshHw();
+    refreshControlCenter(); // 탭 복귀 즉시 본문 갱신(B-6 가드로 이탈 중엔 재생성 안 했으므로)
+  }
   if (view === "eff") refreshEfficiency();
   if (view === "skills") refreshSkills();
   if (view === "sessions") refreshSessions();
@@ -447,8 +469,14 @@ function renderTasks(fleet: any) {
     host.innerHTML = `<div class="cc-empty">부서 정보 없음 — 데몬 응답 대기</div>`;
     return;
   }
+  // B-6: 재생성 전 펼침 상태 보존 — 구 구현은 이벤트 도착마다 전체 innerHTML 재생성으로
+  // 펼쳐둔 task 전문이 즉시 접혔다(긴 업무 읽기 방해).
+  const expanded = new Set(
+    Array.from(host.querySelectorAll<HTMLElement>(".cc-task-row.expanded")).map((r) => r.dataset.key ?? ""),
+  );
   host.innerHTML = depts
     .map((d) => {
+      const deptKey = String(d.socket_slug ?? d.name ?? "");
       const surfaces: any[] = (d.surfaces ?? []).slice();
       surfaces.sort((a, b) => (a.surface_id ?? 0) - (b.surface_id ?? 0));
       const working = surfaces.filter(
@@ -466,17 +494,18 @@ function renderTasks(fleet: any) {
         ? `<div class="cc-empty">${d.error === "timeout" ? "부서 데몬 응답 없음(2초 초과)" : "부서 데몬 연결 실패 — 다운/기동 중"}</div>`
         : surfaces.length === 0
           ? `<div class="cc-empty">노드 없음</div>`
-          : surfaces.map((s) => taskRow(s)).join("");
+          : surfaces.map((s) => taskRow(s, deptKey)).join("");
       return `<div class="cc-section cc-tasks-dept">${head}${rows}</div>`;
     })
     .join("");
-  // 행 클릭 → task 전문 펼치기(요약금지·읽기전용·PTY주입 0)
-  host.querySelectorAll<HTMLElement>(".cc-task-row").forEach((row) =>
-    row.addEventListener("click", () => row.classList.toggle("expanded")),
-  );
+  // 행 클릭 → task 전문 펼치기(요약금지·읽기전용·PTY주입 0) + 보존된 펼침 복원
+  host.querySelectorAll<HTMLElement>(".cc-task-row").forEach((row) => {
+    if (expanded.has(row.dataset.key ?? "")) row.classList.add("expanded");
+    row.addEventListener("click", () => row.classList.toggle("expanded"));
+  });
 }
 
-function taskRow(s: any): string {
+function taskRow(s: any, deptKey: string): string {
   const role = String(s.role ?? "?");
   const color = CC_ROLE_COLOR[role] ?? "#64748b";
   const st = s.status; // 자기보고 {state, context_pct, task, age_secs} | null
@@ -495,8 +524,8 @@ function taskRow(s: any): string {
     label = idle > 60 ? "대기" : "활동";
   }
   const trust = selfReport
-    ? `<span class="cc-trust-badge self">📍자기보고</span>`
-    : `<span class="cc-trust-badge derived">⚙파생</span>`;
+    ? `<span class="cc-trust-badge self" title="노드가 cys set-status로 직접 보고한 상태">📍자기보고</span>`
+    : `<span class="cc-trust-badge derived" title="출력 활동에서 데몬이 추정한 상태(자기보고 없음)">⚙파생</span>`;
   const task = selfReport && st.task ? String(st.task) : "(업무 미보고)";
   const ctx =
     selfReport && st.context_pct != null
@@ -505,7 +534,7 @@ function taskRow(s: any): string {
   const age = selfReport ? ccAge(st.age_secs ?? 0) : `idle ${s.idle_secs ?? 0}s`;
   const stale = selfReport && (st.age_secs ?? 0) > 120 ? " stale" : "";
   return (
-    `<div class="cc-task-row${stale}" title="${ccEsc(task)}">` +
+    `<div class="cc-task-row${stale}" data-key="${ccEsc(deptKey)}:${s.surface_id ?? "?"}" title="${ccEsc(task)}">` +
     `<span class="cc-dot ${cls}"></span>` +
     `<span class="cc-task-role" style="color:${color}">${ccEsc(role)}</span>` +
     `<span class="cc-task-text">${ccEsc(task)}</span>` +
@@ -616,12 +645,12 @@ async function refreshLearn() {
           return `<div class="cc-learn-row"><span class="cc-learn-round">${ccEsc(k)}</span><span class="cc-learn-verdict" style="color:${vColor[v] ?? "inherit"}">${ccEsc(v)}</span><span class="cc-learn-meta">저장 ${r?.stored?.length ?? 0} · harness ${r?.harness?.length ?? 0}</span></div>`;
         })
         .join("")
-    : `<div class="cc-empty">학습 라운드 없음</div>`;
+    : `<div class="cc-empty">학습 라운드 기록 없음 — RSI 라운드(javis_rsi.py checkpoint)가 기록을 남기면 여기 표시됩니다</div>`;
 
   const ribbons: string[] = [];
   for (const k of keys) for (const h of rounds[k]?.harness ?? []) ribbons.push(`${k}: ${h.retention ?? "?"}`);
   document.getElementById("cc-learn-retention")!.innerHTML = ribbons.length
-    ? ribbons.map((t) => `<span class="cc-learn-ribbon ${t.includes("keep") ? "keep" : "rollback"}">${ccEsc(t)}</span>`).join("")
+    ? ribbons.map((t) => `<span class="cc-learn-ribbon ${t.includes("keep") ? "keep" : "rollback"}" title="retention: keep=개선 채택 유지 / rollback=회귀로 되돌림">${ccEsc(t)}</span>`).join("")
     : `<div class="cc-empty">채택/롤백 기록 없음</div>`;
 
   document.getElementById("cc-learn-discovery")!.innerHTML = (
@@ -653,11 +682,13 @@ function renderEfficiency(a: any) {
   const prod = s.productivity ?? {};
   const winLab = a?.window === "7d" ? "최근 7일" : a?.window === "all" ? "전체" : "오늘";
 
+  // A-3: "캐시 ROI"(cache_roi_x) 폐기 — 클로드 전 모델 캐시단가=입력의 10%라 항상 0.9인
+  // 무정보 상수였다. 재사용율(cache_efficiency)로 대체. B-12: 절감액도 "추정" 명시.
   document.getElementById("cc-eff-kpi")!.innerHTML = (
     [
-      ["총 비용", ccMoney(t.cost_usd ?? 0), winLab],
-      ["🔥캐시 절감", ccMoney(s.cache_savings_usd ?? 0), "재사용 할인"],
-      ["캐시 ROI", `${(s.cache_roi_x ?? 0).toFixed(2)}×`, `재사용율 ${Math.round((s.cache_efficiency ?? 0) * 100)}%`],
+      ["총 비용", ccMoney(t.cost_usd ?? 0), `${winLab} · 추정`],
+      ["🔥캐시 절감", ccMoney(s.cache_savings_usd ?? 0), "재사용 할인 · 추정"],
+      ["캐시 재사용율", `${Math.round((s.cache_efficiency ?? 0) * 100)}%`, "입력 중 캐시 히트"],
       ["메시지", String(t.msgs ?? 0), `세션 ${t.sessions ?? 0}`],
       ["토큰", ccFmtTokens(t.tokens ?? 0), "4분해 합"],
     ] as [string, string, string][]
@@ -690,7 +721,9 @@ function renderEfficiency(a: any) {
           .map((m) => {
             const short = (m.model || "?").replace(/^claude-/, "").replace(/\[1m\]$/, "");
             const pct = ((m.cost_usd ?? 0) / costMax) * 100;
-            return `<div class="cc-mix-row"><span class="cc-mix-name" title="${ccEsc(m.model ?? "")}">${ccEsc(short || "?")}</span><span class="cc-tbar-track"><span class="cc-tbar-fill cc-mix-fill" style="width:${pct}%"></span></span><span class="cc-mix-pct">${ccMoney(m.cost_usd ?? 0)}</span></div>`;
+            // B-4: 단가표 미적중 모델은 Sonnet 폴백 추정 — 조용히 숨기지 않고 표시
+            const unk = m.pricing_known === false ? `<span class="cc-price-unk" title="단가표 미등재 모델 — Sonnet 단가로 추정된 비용">단가미상</span>` : "";
+            return `<div class="cc-mix-row"><span class="cc-mix-name" title="${ccEsc(m.model ?? "")}">${ccEsc(short || "?")}${unk}</span><span class="cc-tbar-track"><span class="cc-tbar-fill cc-mix-fill" style="width:${pct}%"></span></span><span class="cc-mix-pct">${ccMoney(m.cost_usd ?? 0)}</span></div>`;
           })
           .join("");
 
@@ -750,7 +783,7 @@ function renderSkills(a: any) {
 
   document.getElementById("cc-skills-kpi")!.innerHTML = (
     [
-      ["툴 호출", String(t.tool_calls ?? 0), "PRE_TOOL"],
+      ["툴 호출", String(t.tool_calls ?? 0), "실행 시도 기준"],
       ["스킬 호출", String(t.skill_calls ?? 0), "Skill 툴"],
       ["위임", String(t.agent_calls ?? 0), "서브에이전트"],
       ["🔥실패율", `${Math.round((t.fail_rate ?? 0) * 100)}%`, `✗ ${t.fail_calls ?? 0}건`],
@@ -840,9 +873,11 @@ function renderSessions(a: any) {
         const star = s.starred ? "★" : "☆";
         const skill = s.top_skill ? `· ${ccEsc(s.top_skill)}` : "";
         const sel = s.session_id === ccSessionSelected ? " sel" : "";
+        // B-8: ⭐노트 표시 — note가 있으면 별 툴팁으로 노출(구 구현은 write-only 데드 컬럼)
+        const starTip = s.star_note ? `즐겨찾기 노트: ${s.star_note}` : "즐겨찾기";
         return (
           `<div class="cc-sess-row${sel}" data-sid="${ccEsc(s.session_id)}" style="--rc:${color}">` +
-          `<button class="cc-star" data-sid="${ccEsc(s.session_id)}" data-on="${s.starred ? 1 : 0}" title="즐겨찾기">${star}</button>` +
+          `<button class="cc-star" data-sid="${ccEsc(s.session_id)}" data-on="${s.starred ? 1 : 0}" title="${ccEsc(starTip)}">${star}</button>` +
           `<span class="cc-sess-when">${ccShortTime(s.ended_at ?? 0)}</span>` +
           `<span class="cc-sess-role">${ccEsc(role)}·${ccEsc(s.agent || "?")}</span>` +
           ccRibbon(s.ribbon ?? []) +
@@ -890,8 +925,7 @@ async function openSessionDetail(sid: string) {
   const tl: any[] = d?.timeline ?? [];
   const head =
     `<div class="cc-h">세션 상세 · ${ccEsc(sid.split("/").pop() || sid)} ${ccSourceBadge("control.session_detail")}</div>` +
-    `<div class="cc-sess-detail-kpi">${ccFmtTokens(t.tokens ?? 0)} 토큰 · ${ccMoney(t.cost_usd ?? 0)} · ${t.msgs ?? 0}턴 · 이벤트 ${tl.length}</div>` +
-    `<div class="cc-sess-note">전사 원문은 미수집(이벤트 타임라인으로 대체)</div>`;
+    `<div class="cc-sess-detail-kpi">${ccFmtTokens(t.tokens ?? 0)} 토큰 · ${ccMoney(t.cost_usd ?? 0)} · ${t.msgs ?? 0}턴 · 이벤트 ${tl.length}</div>`;
   const rows =
     tl.length === 0
       ? `<div class="cc-empty">이벤트 없음</div>`
@@ -909,7 +943,15 @@ async function openSessionDetail(sid: string) {
               `</div>`;
           })
           .join("");
-  el.innerHTML = head + `<div class="cc-timeline">${rows}</div>`;
+  // B-9(E4 최소구현): 전사 발췌 — 데몬이 세션 파일 꼬리를 온디맨드로 읽어 제공(DB 적재 0)
+  const tx: any[] = d?.transcript ?? [];
+  const txHtml = tx.length
+    ? `<div class="cc-h" style="margin-top:12px">전사 발췌 · 최근 ${tx.length}턴 (턴당 400자)</div>` +
+      tx
+        .map((m) => `<div class="cc-tx-row ${m.role === "user" ? "user" : "asst"}"><span class="cc-tx-role">${m.role === "user" ? "👤" : "🤖"}</span><span class="cc-tx-text">${ccEsc(String(m.text ?? ""))}</span></div>`)
+        .join("")
+    : `<div class="cc-sess-note">전사 발췌 없음(구 세션이거나 파일 접근 불가 — 이벤트 타임라인 참조)</div>`;
+  el.innerHTML = head + `<div class="cc-timeline">${rows}</div>` + txHtml;
   // HUD-2: 근거 행 클릭 위임 — innerHTML 재생성마다 재바인딩(producer≠evaluator UI)
   el.querySelectorAll<HTMLElement>(".cc-tl-row.cc-evidence").forEach((row) =>
     row.addEventListener("click", () => jumpEvidence(row.dataset.evidence!)),
@@ -1019,18 +1061,29 @@ function renderControlCenter(d: any) {
   radar.classList.toggle("active", live);
   document.getElementById("cc-radar-val")!.textContent = `${ratio}%`;
   document.getElementById("cc-radar-sub")!.textContent = `${active.length}/${online.length} 활성`;
-  (radar as HTMLElement).style.setProperty("--ratio", String(ratio));
 
   ccUptimeBase = d.uptime_secs ?? 0;
   ccUptimeFetchedAt = Date.now() / 1000;
 
+  // B-6: Live 뷰 본문은 live 탭이 보일 때만 재생성 — 구 구현은 어느 탭에서든 5초마다
+  // 숨겨진 Live DOM 전체를 다시 그렸다(불필요 재생성). 헤더(배지·레이더·업타임)는 항상 갱신.
+  if (ccTab === "live") {
+    renderLiveBody(d, fleet);
+  }
+
+  document.getElementById("cc-footer")!.textContent =
+    `cys Control Center · v${d.version ?? ""} · 대시보드 5초 · 하드웨어 2초 갱신`;
+}
+
+function renderLiveBody(d: any, fleet: any[]) {
   const agg = ccAggRate(fleet);
   document.getElementById("cc-kpi")!.innerHTML = ["5h", "7d"]
     .map((lab) => {
       const w = agg[lab];
       const used = w ? Math.round(w.used) : 0;
       const name = lab === "5h" ? "세션 (5h)" : "주간 (7d)";
-      return `<div class="cc-card ${sevClass(used, 60, 80)}"><div class="cc-card-val">${used}%</div><div class="cc-card-reset">${w ? ccReset(lab, w.reset) : ""}</div><div class="cc-card-name">${name}</div></div>`;
+      const tip = lab === "5h" ? "최근 5시간 rate limit 사용률 (전 노드 최대값)" : "최근 7일 rate limit 사용률 (전 노드 최대값)";
+      return `<div class="cc-card ${sevClass(used, 60, 80)}" title="${tip}"><div class="cc-card-val">${used}%</div><div class="cc-card-reset">${w ? ccReset(lab, w.reset) : ""}</div><div class="cc-card-name">${name}</div></div>`;
     })
     .join("");
 
@@ -1039,7 +1092,7 @@ function renderControlCenter(d: any) {
       const role = f.role ?? "?";
       const color = CC_ROLE_COLOR[role] ?? "#64748b";
       const st = CC_STATE[f.state] ?? CC_STATE.idle;
-      const ctx = f.usage?.ctx_pct != null ? `CTX ${f.usage.ctx_pct}%` : "";
+      const ctx = f.usage?.ctx_pct != null ? `<span title="컨텍스트 사용률 — 모델 컨텍스트 창 대비">CTX ${f.usage.ctx_pct}%</span>` : "";
       return `<div class="cc-fleet-row" style="--rc:${color}"><span class="cc-fleet-name">${ccEsc(role)}</span><span class="cc-fleet-agent">${ccEsc(f.agent ?? "")}</span><span class="cc-fleet-ctx">${ctx}</span><span class="cc-dot ${st.cls}"></span><span class="cc-fleet-state">${st.label}</span></div>`;
     })
     .join("");
@@ -1056,9 +1109,11 @@ function renderControlCenter(d: any) {
   const c = d.consumption ?? {};
   document.getElementById("cc-token-stats")!.innerHTML = (
     [
-      ["오늘 비용", `$${(c.today_cost_usd ?? 0).toFixed(2)}`, "추정"],
+      // B-12: ccMoney 통일 — toFixed(2)는 $1 미만 소액을 "$0.00"으로 소실시켰다
+      ["오늘 비용", ccMoney(c.today_cost_usd ?? 0), "추정"],
       ["최근 1시간", ccFmtTokens(c.last_1h_tokens ?? 0), "토큰"],
-      ["오늘 소비", ccFmtTokens(c.today_tokens ?? 0), `입력 ${ccFmtTokens(c.today_input ?? 0)}`],
+      // C-5: today_input은 input+cache_creation 합 — "입력"으로만 쓰면 오독
+      ["오늘 소비", ccFmtTokens(c.today_tokens ?? 0), `입력+캐시생성 ${ccFmtTokens(c.today_input ?? 0)}`],
       ["세션 수", String(c.session_count ?? 0), `메시지 ${c.today_msgs ?? 0}`],
     ] as [string, string, string][]
   )
@@ -1084,11 +1139,9 @@ function renderControlCenter(d: any) {
   const spark: number[] = d.sparkline ?? [];
   const max = Math.max(1, ...spark);
   document.getElementById("cc-spark")!.innerHTML =
-    `<div class="cc-spark-label">12h</div><div class="cc-spark-bars">` +
+    `<div class="cc-spark-label" title="최근 12시간 토큰 소비 추이(30분 단위)">12h</div><div class="cc-spark-bars">` +
     spark.map((v) => `<span class="cc-spark-bar" style="height:${Math.max(2, Math.round((v / max) * 100))}%" title="${ccFmtTokens(v)}"></span>`).join("") +
     `</div>`;
-
-  document.getElementById("cc-footer")!.textContent = `cys Control Center · v${d.version ?? ""} · 5초 새로고침`;
 }
 
 // 하드웨어 모니터링 — control.hw 2초 폴링 (CPU 코어별·GPU·NPU·MEM 실시간)
@@ -3407,11 +3460,12 @@ document.getElementById("btn-install-cli")?.addEventListener("click", async () =
     const r = (await invoke("install_cli_to_path")) as {
       cys_link: string; cysd_link: string; shadowed_by: string | null; warnings: string[];
     };
-    let msg = `설치 완료:\n  ${r.cys_link}\n  ${r.cysd_link}\n\n새 터미널을 열면 'cys'를 바로 쓸 수 있습니다.`;
-    if (r.warnings?.length) msg += `\n\n⚠ ${r.warnings.join("\n⚠ ")}`;
-    alert(msg);
+    // B-11: alert()는 WKWebView에서 억제될 수 있음(confirm() 무동작 실측과 동계열) — toast로 통일
+    let msg = `${r.cys_link} · ${r.cysd_link} — 새 터미널에서 'cys' 사용 가능`;
+    if (r.warnings?.length) msg += ` ⚠ ${r.warnings.join(" ⚠ ")}`;
+    toast("system", "셸 설치 완료", msg);
   } catch (e) {
-    alert(`설치 실패: ${e}`);
+    toast("watchdog", "셸 설치 실패", String(e));
   }
 });
 document.querySelectorAll("#cc-tabs .cc-tab").forEach((b) =>

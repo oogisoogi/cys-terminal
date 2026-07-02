@@ -4,16 +4,38 @@
 // 미지원 플랫폼·측정 불가 항목은 null 반환(UI가 "—" 표기).
 
 use serde_json::{json, Value};
+use std::sync::{Mutex, OnceLock};
+
+// 지속 System — cpu_usage는 직전 refresh와의 델타로 측정된다. 콜마다 System::new+200ms
+// 블로킹 sleep을 쓰던 구 패턴은 tokio 워커를 상시 점유했다(전수조사 A-5/B-14 교정).
+// 폴링(2~5초) 간격 자체가 측정 창이 되므로 sleep이 불필요하다(부트 후 첫 콜만 0%).
+static SYS: OnceLock<Mutex<sysinfo::System>> = OnceLock::new();
+
+fn sys() -> &'static Mutex<sysinfo::System> {
+    SYS.get_or_init(|| Mutex::new(sysinfo::System::new()))
+}
+
+/// 전체 CPU%·메모리 (control.dashboard 시스템 표시용 — snapshot과 같은 지속 System 공유)
+pub fn cpu_mem() -> (f32, u64, u64) {
+    let mut s = sys().lock().unwrap();
+    s.refresh_memory();
+    s.refresh_cpu_usage();
+    (s.global_cpu_usage(), s.used_memory(), s.total_memory())
+}
 
 pub fn snapshot() -> Value {
-    // control.dashboard와 동일 패턴 — cpu_usage는 두 refresh 사이 측정(짧은 간격, 0% 방지)
-    let mut sys = sysinfo::System::new();
-    sys.refresh_memory();
-    sys.refresh_cpu_usage();
-    std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
-    sys.refresh_cpu_usage();
-    let per_core: Vec<f32> = sys.cpus().iter().map(|c| c.cpu_usage()).collect();
-    let brand = sys.cpus().first().map(|c| c.brand().trim().to_string()).unwrap_or_default();
+    let (per_core, brand, total_pct, mem_used, mem_total) = {
+        let mut s = sys().lock().unwrap();
+        s.refresh_memory();
+        s.refresh_cpu_usage();
+        (
+            s.cpus().iter().map(|c| c.cpu_usage()).collect::<Vec<f32>>(),
+            s.cpus().first().map(|c| c.brand().trim().to_string()).unwrap_or_default(),
+            s.global_cpu_usage(),
+            s.used_memory(),
+            s.total_memory(),
+        )
+    };
     let (perf, eff) = perf_eff_cores();
     json!({
         "cpu": {
@@ -21,10 +43,10 @@ pub fn snapshot() -> Value {
             "perf_cores": perf,
             "eff_cores": eff,
             "brand": brand,
-            "total_pct": sys.global_cpu_usage(),
+            "total_pct": total_pct,
             "per_core_pct": per_core,
         },
-        "mem": { "total": sys.total_memory(), "used": sys.used_memory() },
+        "mem": { "total": mem_total, "used": mem_used },
         "gpu": { "cores": gpu_cores(), "pct": gpu_pct() },
         // NPU 활용률(%)은 macOS 공개 API 부재(powermetrics=sudo 전용) — 무권한 실측 가능한
         // 유일 신호인 ANE 전력(W)을 제공하고 pct는 null 고정(환각 지표 생성 금지).

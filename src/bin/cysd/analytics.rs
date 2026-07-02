@@ -40,6 +40,10 @@ pub fn open(socket_path: &Path) -> Option<Connection> {
          CREATE TABLE IF NOT EXISTS daily_rollups(
             date TEXT PRIMARY KEY, payload TEXT, computed_at REAL);
          CREATE TABLE IF NOT EXISTS stars(session_id TEXT PRIMARY KEY, note TEXT, starred_at REAL);
+         -- A-4: tail 오프셋 영속 — 재시작 시 마지막 256KB 재파싱→usage_records 중복 INSERT
+         -- (UNIQUE 부재라 영구 잔존·리플레이 복리 부풀림)를 원천 차단하는 정확 재개점.
+         CREATE TABLE IF NOT EXISTS tail_offsets(
+            session_file TEXT PRIMARY KEY, off INTEGER, updated REAL);
          -- T2-3: append-only change-log + 단조 revn(낙관적 동시성) — ADDITIVE.
          -- SESSION_STATE.md 산문 복원 경로는 불변(이건 그 위에 얹는 결정론 change-replay 능력).
          -- penpot files_update.clj(:184-190 revn-conflict / :176-182 vern-conflict / :409 revn inc)의
@@ -252,15 +256,17 @@ pub fn record_event(
     agent_type: Option<&str>,
     agent_id: Option<&str>,
     exit_code: Option<i64>,
+    duration_ms: Option<i64>,
     ts: f64,
 ) {
     let _ = conn.execute(
         "INSERT INTO events(session_id, role, agent, event_type, tool_name, is_skill, skill_name,
-            is_slash, is_agent, agent_type, agent_id, exit_code, ts)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,0,?8,?9,?10,?11,?12)",
+            is_slash, is_agent, agent_type, agent_id, exit_code, duration_ms, ts)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,0,?8,?9,?10,?11,?12,?13)",
         rusqlite::params![
             session, role, agent, event_type, tool_name,
-            is_skill as i64, skill_name, is_agent as i64, agent_type, agent_id, exit_code, ts
+            is_skill as i64, skill_name, is_agent as i64, agent_type, agent_id, exit_code,
+            duration_ms, ts
         ],
     );
 }
@@ -312,13 +318,32 @@ fn replay(rows: &[UsageRow], c: &mut Consumption) {
     }
 }
 
-/// 부트 시 1회 — 최근 12h usage_records로 in-memory Consumption을 재구성한다.
+/// tail 재개 오프셋 조회 — 없으면 None(호출부가 EOF−256KB 폴백).
+pub fn load_offset(conn: &Connection, file: &str) -> Option<u64> {
+    conn.query_row("SELECT off FROM tail_offsets WHERE session_file=?1", [file], |r| r.get::<_, i64>(0))
+        .ok()
+        .map(|v| v.max(0) as u64)
+}
+
+/// tail 오프셋 영속 — 소비 적재가 완료된 지점까지 기록(실패는 무해).
+pub fn save_offset(conn: &Connection, file: &str, off: u64, now: f64) {
+    let _ = conn.execute(
+        "INSERT INTO tail_offsets(session_file, off, updated) VALUES(?1,?2,?3)
+         ON CONFLICT(session_file) DO UPDATE SET off=?2, updated=?3",
+        rusqlite::params![file, off as i64, now],
+    );
+}
+
+/// 부트 시 1회 — usage_records로 in-memory Consumption을 재구성한다.
+/// 창 = 로컬 자정과 12h 전 중 더 이른 쪽 — 구 12h 고정은 늦은 시각 재시작 때
+/// 그날 오전분을 누락시켜 대시보드 today를 과소시켰다(전수조사 B-2 교정).
 pub fn seed_consumption(daemon: &Daemon) {
     let now = crate::state::now_epoch();
+    let since = window_since(now, "today").min(now - SPARK_SPAN_SECS);
     let rows = {
         let guard = daemon.analytics.lock().unwrap();
         match guard.as_ref() {
-            Some(conn) => load_recent(conn, now - SPARK_SPAN_SECS),
+            Some(conn) => load_recent(conn, since),
             None => return,
         }
     };
@@ -388,7 +413,6 @@ pub fn summarize(rows: &[SummaryRow]) -> serde_json::Value {
     use std::collections::HashMap;
     let (mut t_in, mut t_out, mut t_cc, mut t_cr) = (0u64, 0u64, 0u64, 0u64);
     let (mut t_cost, mut savings) = (0.0f64, 0.0f64);
-    let mut full_input_cost = 0.0f64; // Σ cache_read × input단가 — 캐시 없었을 때 풀가격(cache_roi_x 분모)
     let mut models: HashMap<String, [f64; 6]> = HashMap::new(); // [in,out,cc,cr,cost,msgs]
     let mut agents: HashMap<String, [f64; 3]> = HashMap::new(); // [tokens,cost,msgs]
     let mut tiers: HashMap<String, [f64; 3]> = HashMap::new(); // role(조직 tier)별 [tokens,cost,msgs] (D3)
@@ -401,7 +425,6 @@ pub fn summarize(rows: &[SummaryRow]) -> serde_json::Value {
         t_cost += cost;
         let p = crate::cost::pricing_for(model);
         savings += (*cr as f64 / 1_000_000.0) * (p.input_per_m - p.cache_read_per_m);
-        full_input_cost += (*cr as f64 / 1_000_000.0) * p.input_per_m; // 풀가격(캐시 미사용 가정)
         let tokens = input + output + cc + cr;
         let m = models.entry(model.clone()).or_insert([0.0; 6]);
         m[0] += *input as f64;
@@ -439,7 +462,9 @@ pub fn summarize(rows: &[SummaryRow]) -> serde_json::Value {
             json!({
                 "model": model, "input": v[0] as u64, "output": v[1] as u64,
                 "cache_creation": v[2] as u64, "cache_read": v[3] as u64,
-                "tokens": (v[0] + v[1] + v[2] + v[3]) as u64, "cost_usd": v[4], "msgs": v[5] as u64,
+                "tokens": (v[0] + v[1] + v[2] + v[3]) as u64, "cost_usd": round4(v[4]), "msgs": v[5] as u64,
+                // B-4: 단가표 미적중 = DEFAULT(Sonnet) 폴백 사용 — UI가 "단가 미상" 표시
+                "pricing_known": crate::cost::has_pricing(&model),
             })
         })
         .collect();
@@ -451,7 +476,7 @@ pub fn summarize(rows: &[SummaryRow]) -> serde_json::Value {
     });
     let mut by_agent: Vec<Value> = agents
         .into_iter()
-        .map(|(agent, v)| json!({"agent": agent, "tokens": v[0] as u64, "cost_usd": v[1], "msgs": v[2] as u64}))
+        .map(|(agent, v)| json!({"agent": agent, "tokens": v[0] as u64, "cost_usd": round4(v[1]), "msgs": v[2] as u64}))
         .collect();
     by_agent.sort_by(|a, b| {
         b["tokens"].as_u64().unwrap_or(0).cmp(&a["tokens"].as_u64().unwrap_or(0))
@@ -461,8 +486,8 @@ pub fn summarize(rows: &[SummaryRow]) -> serde_json::Value {
     let mut by_tier: Vec<Value> = tiers
         .into_iter()
         .map(|(tier, v)| json!({
-            "tier": tier, "tokens": v[0] as u64, "cost_usd": v[1], "msgs": v[2] as u64,
-            "cost_per_msg": div(v[1], v[2]),
+            "tier": tier, "tokens": v[0] as u64, "cost_usd": round4(v[1]), "msgs": v[2] as u64,
+            "cost_per_msg": round4(div(v[1], v[2])),
         }))
         .collect();
     by_tier.sort_by(|a, b| {
@@ -471,24 +496,35 @@ pub fn summarize(rows: &[SummaryRow]) -> serde_json::Value {
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a["tier"].as_str().unwrap_or("").cmp(b["tier"].as_str().unwrap_or("")))
     });
+    // A-3: cache_roi_x 폐기 — savings/full = (입력단가−캐시단가)/입력단가로, 클로드 전 모델의
+    // 캐시단가가 입력의 정확히 10%라 사용 패턴과 무관하게 항상 0.9가 나오는 무정보 지표였다.
+    // 비용류는 round4/round2로 부동소수 원값 노출(0.9000000000000045류)도 함께 차단.
     json!({
         "totals": {
             "input": t_in, "output": t_out, "cache_creation": t_cc, "cache_read": t_cr,
-            "tokens": tokens_total as u64, "cost_usd": t_cost, "msgs": msgs as u64, "sessions": nsess as u64,
+            "tokens": tokens_total as u64, "cost_usd": round4(t_cost), "msgs": msgs as u64, "sessions": nsess as u64,
         },
-        "cache_savings_usd": savings,
-        "cache_efficiency": div(t_cr as f64, (t_in + t_cc + t_cr) as f64),
-        "cache_roi_x": div(savings, full_input_cost),
+        "cache_savings_usd": round4(savings),
+        "cache_efficiency": round4(div(t_cr as f64, (t_in + t_cc + t_cr) as f64)),
         "by_model": by_model,
         "by_agent": by_agent,
         "by_tier": by_tier,
         "productivity": {
-            "turns_per_session": div(msgs, nsess),
-            "tokens_per_turn": div(tokens_total, msgs),
-            "cost_per_session": div(t_cost, nsess),
-            "avg_session_duration_secs": div(dur_sum, nsess),
+            "turns_per_session": round2(div(msgs, nsess)),
+            "tokens_per_turn": round2(div(tokens_total, msgs)),
+            "cost_per_session": round4(div(t_cost, nsess)),
+            "avg_session_duration_secs": round2(div(dur_sum, nsess)),
         },
     })
+}
+
+/// 부동소수 노출 차단용 반올림(표시 정밀도) — 소액 비용 보존을 위해 비용은 4자리.
+fn round4(v: f64) -> f64 {
+    (v * 10_000.0).round() / 10_000.0
+}
+
+fn round2(v: f64) -> f64 {
+    (v * 100.0).round() / 100.0
 }
 
 /// control.analytics 본체 — since 이후 usage_records를 롤업. conn 없으면 호출부가 빈 summarize 사용.
@@ -498,13 +534,13 @@ pub fn analytics_summary(conn: &Connection, since: f64) -> serde_json::Value {
 
 // ───────────────────────── E3 스킬·에이전트 집계 (control.skills) ─────────────────────────
 
-/// (event_type, role, tool_name, is_skill, skill_name, is_agent, agent_type, exit_code, ts)
-pub type EventRow = (String, String, String, bool, String, bool, String, Option<i64>, f64);
+/// (event_type, role, tool_name, is_skill, skill_name, is_agent, agent_type, exit_code, ts, duration_ms)
+pub type EventRow = (String, String, String, bool, String, bool, String, Option<i64>, f64, Option<i64>);
 
 /// since 이후 툴 events 전 행. 실패는 빈 벡터.
 fn load_event_rows(conn: &Connection, since: f64) -> Vec<EventRow> {
     let mut stmt = match conn.prepare(
-        "SELECT event_type, role, tool_name, is_skill, skill_name, is_agent, agent_type, exit_code, ts
+        "SELECT event_type, role, tool_name, is_skill, skill_name, is_agent, agent_type, exit_code, ts, duration_ms
          FROM events WHERE ts >= ?1 AND event_type IN ('PRE_TOOL','POST_TOOL')",
     ) {
         Ok(s) => s,
@@ -521,6 +557,7 @@ fn load_event_rows(conn: &Connection, since: f64) -> Vec<EventRow> {
             r.get::<_, Option<String>>(6)?.unwrap_or_default(),
             r.get::<_, Option<i64>>(7)?,
             r.get::<_, f64>(8)?,
+            r.get::<_, Option<i64>>(9)?,
         ))
     });
     match rows {
@@ -529,9 +566,9 @@ fn load_event_rows(conn: &Connection, since: f64) -> Vec<EventRow> {
     }
 }
 
-/// 이벤트 행을 스킬·툴·에이전트 호출 TOP과 🔥실패율로 롤업(순수 — 테스트 가능).
+/// 이벤트 행을 스킬·툴·에이전트 호출 TOP과 🔥실패율·p50 실행시간으로 롤업(순수 — 테스트 가능).
 /// calls = PRE_TOOL(호출 시도) 기준 · fail = POST_TOOL exit_code≠0 기준(둘은 PRE/POST 쌍으로 근사 정합).
-/// duration p50·미사용 4주 diff는 현재 미수집(events.duration_ms NULL·축적 필요) — 후속.
+/// duration_ms는 데몬 PRE→POST 페어링 산출값(B-9) — 미축적 행은 null이라 p50은 축적분부터 반영.
 pub fn summarize_skills(rows: &[EventRow]) -> serde_json::Value {
     use serde_json::{json, Value};
     use std::collections::HashMap;
@@ -541,8 +578,9 @@ pub fn summarize_skills(rows: &[EventRow]) -> serde_json::Value {
     let mut skill_roles: HashMap<String, HashMap<String, u64>> = HashMap::new();
     let mut agents: HashMap<String, u64> = HashMap::new();
     let mut agent_roles: HashMap<String, HashMap<String, u64>> = HashMap::new();
+    let mut tool_durs: HashMap<String, Vec<i64>> = HashMap::new();
     let (mut tool_calls, mut skill_calls, mut agent_calls, mut fail_calls) = (0u64, 0u64, 0u64, 0u64);
-    for (etype, role, tool, is_skill, skill, is_agent, atype, exit, _ts) in rows {
+    for (etype, role, tool, is_skill, skill, is_agent, atype, exit, _ts, dur) in rows {
         let role_key = if role.is_empty() { "?".to_string() } else { role.clone() };
         if etype == "PRE_TOOL" {
             if !tool.is_empty() {
@@ -559,16 +597,33 @@ pub fn summarize_skills(rows: &[EventRow]) -> serde_json::Value {
                 *agent_roles.entry(atype.clone()).or_default().entry(role_key).or_insert(0) += 1;
                 agent_calls += 1;
             }
-        } else if etype == "POST_TOOL" && matches!(exit, Some(c) if *c != 0) {
-            if !tool.is_empty() {
-                tools.entry(tool.clone()).or_insert([0, 0])[1] += 1;
+        } else if etype == "POST_TOOL" {
+            if let Some(d) = dur {
+                if !tool.is_empty() && *d >= 0 {
+                    tool_durs.entry(tool.clone()).or_default().push(*d);
+                }
             }
-            if *is_skill && !skill.is_empty() {
-                skills.entry(skill.clone()).or_insert([0, 0])[1] += 1;
+            if matches!(exit, Some(c) if *c != 0) {
+                if !tool.is_empty() {
+                    tools.entry(tool.clone()).or_insert([0, 0])[1] += 1;
+                }
+                if *is_skill && !skill.is_empty() {
+                    skills.entry(skill.clone()).or_insert([0, 0])[1] += 1;
+                }
+                fail_calls += 1;
             }
-            fail_calls += 1;
         }
     }
+    let p50 = |name: &str| -> Value {
+        match tool_durs.get(name) {
+            Some(v) if !v.is_empty() => {
+                let mut s = v.clone();
+                s.sort_unstable();
+                json!(s[s.len() / 2])
+            }
+            _ => Value::Null,
+        }
+    };
     let rate = |fail: u64, calls: u64| if calls > 0 { fail as f64 / calls as f64 } else { 0.0 };
     let roles_val = |m: Option<&HashMap<String, u64>>| -> Value {
         match m {
@@ -597,7 +652,7 @@ pub fn summarize_skills(rows: &[EventRow]) -> serde_json::Value {
     sort_by_calls(&mut by_skill);
     let mut by_tool: Vec<Value> = tools
         .iter()
-        .map(|(name, v)| json!({"name": name, "calls": v[0], "fail": v[1], "fail_rate": rate(v[1], v[0])}))
+        .map(|(name, v)| json!({"name": name, "calls": v[0], "fail": v[1], "fail_rate": rate(v[1], v[0]), "p50_ms": p50(name)}))
         .collect();
     sort_by_calls(&mut by_tool);
     let mut by_agent: Vec<Value> = agents
@@ -828,12 +883,26 @@ pub fn starred_set(conn: &Connection) -> std::collections::HashSet<String> {
     out
 }
 
+/// ⭐ 노트 맵 — session_id → note (B-8: note가 write-only였던 절반 구현을 완결).
+pub fn starred_notes(conn: &Connection) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    if let Ok(mut stmt) = conn.prepare("SELECT session_id, note FROM stars WHERE note != ''") {
+        if let Ok(it) =
+            stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        {
+            out.extend(it.filter_map(|x| x.ok()));
+        }
+    }
+    out
+}
+
 /// ⭐ 토글 — starred=true면 upsert, false면 삭제. 실패는 무해히 무시.
+/// 재스타 시 starred_at도 갱신한다(B-8: 구 구현은 최초 시각에 고정).
 pub fn set_star(conn: &Connection, session_id: &str, starred: bool, note: &str, ts: f64) {
     if starred {
         let _ = conn.execute(
             "INSERT INTO stars(session_id, note, starred_at) VALUES(?1,?2,?3)
-             ON CONFLICT(session_id) DO UPDATE SET note=?2",
+             ON CONFLICT(session_id) DO UPDATE SET note=?2, starred_at=?3",
             rusqlite::params![session_id, note, ts],
         );
     } else {
@@ -841,11 +910,23 @@ pub fn set_star(conn: &Connection, session_id: &str, starred: bool, note: &str, 
     }
 }
 
-/// control.sessions 본체 — since 이후 세션 목록.
+/// control.sessions 본체 — since 이후 세션 목록 (+⭐노트 부착).
 pub fn session_list(conn: &Connection, since: f64) -> serde_json::Value {
     let usage = load_session_usage(conn, since);
     let events = load_session_events(conn, since);
-    summarize_sessions(&usage, &events, &starred_set(conn))
+    let mut out = summarize_sessions(&usage, &events, &starred_set(conn));
+    let notes = starred_notes(conn);
+    if !notes.is_empty() {
+        if let Some(list) = out.get_mut("sessions").and_then(|v| v.as_array_mut()) {
+            for row in list {
+                let sid = row["session_id"].as_str().unwrap_or("").to_string();
+                if let Some(n) = notes.get(&sid) {
+                    row["star_note"] = serde_json::json!(n);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// control.session_detail 본체 — 단일 세션의 이벤트 타임라인 + 토큰/비용/모델 요약.
@@ -881,7 +962,70 @@ pub fn session_detail(conn: &Connection, session_id: &str) -> serde_json::Value 
         "session_id": session_id,
         "timeline": timeline,
         "summary": summary,
+        // B-9(E4 최소구현): 전사 발췌 — DB 적재 대신 온디맨드 파일 꼬리 읽기(저장 비용 0)
+        "transcript": transcript_excerpt(session_id),
     })
+}
+
+/// 전사 발췌 — session_id가 실제 트랜스크립트 경로면 꼬리 64KB에서 최근 30턴의
+/// user/assistant 텍스트(턴당 400자)를 추출한다. 파일이 아니면 빈 배열(구 세션 호환).
+fn transcript_excerpt(session_id: &str) -> Vec<serde_json::Value> {
+    use serde_json::json;
+    use std::io::{Read, Seek, SeekFrom};
+    let p = std::path::Path::new(session_id);
+    if !p.is_file() {
+        return Vec::new();
+    }
+    let Ok(mut f) = std::fs::File::open(p) else {
+        return Vec::new();
+    };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let start = len.saturating_sub(64 * 1024);
+    if f.seek(SeekFrom::Start(start)).is_err() {
+        return Vec::new();
+    }
+    let mut buf = Vec::new();
+    if f.take(64 * 1024).read_to_end(&mut buf).is_err() {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&buf);
+    let mut turns: Vec<serde_json::Value> = Vec::new();
+    // start>0이면 첫 줄은 절단 가능성 — 스킵
+    for line in text.lines().skip(if start > 0 { 1 } else { 0 }) {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        let ty = v["type"].as_str().unwrap_or("");
+        if (ty != "user" && ty != "assistant") || v["isSidechain"].as_bool() == Some(true) {
+            continue;
+        }
+        let content = &v["message"]["content"];
+        let mut body = String::new();
+        if let Some(s) = content.as_str() {
+            body = s.to_string();
+        } else if let Some(arr) = content.as_array() {
+            for c in arr {
+                if c["type"].as_str() == Some("text") {
+                    if !body.is_empty() {
+                        body.push('\n');
+                    }
+                    body.push_str(c["text"].as_str().unwrap_or(""));
+                }
+            }
+        }
+        if body.trim().is_empty() {
+            continue;
+        }
+        let mut t: String = body.chars().take(400).collect();
+        if body.chars().count() > 400 {
+            t.push('…');
+        }
+        turns.push(json!({"role": ty, "text": t, "ts": v["timestamp"].as_str().unwrap_or("")}));
+    }
+    let n = turns.len();
+    if n > 30 {
+        turns.split_off(n - 30)
+    } else {
+        turns
+    }
 }
 
 /// 단일 세션의 usage_records를 summarize 입력 형태로 로드.
@@ -1139,7 +1283,7 @@ pub fn summarize_rework(rows: &[EventRow]) -> serde_json::Value {
     use std::collections::HashMap;
     let mut tiers: HashMap<String, [u64; 2]> = HashMap::new(); // role → [calls, fail]
     let (mut total_calls, mut total_fail) = (0u64, 0u64);
-    for (etype, role, tool, _is_skill, _skill, _is_agent, _atype, exit, _ts) in rows {
+    for (etype, role, tool, _is_skill, _skill, _is_agent, _atype, exit, _ts, _dur) in rows {
         let key = if role.is_empty() { "unattributed".to_string() } else { role.clone() };
         if etype == "PRE_TOOL" && !tool.is_empty() {
             tiers.entry(key).or_insert([0, 0])[0] += 1;
@@ -1238,8 +1382,12 @@ mod tests {
              is_agent INTEGER, agent_type TEXT, agent_id TEXT, exit_code INTEGER, duration_ms INTEGER, ts REAL);",
         )
         .unwrap();
-        record_event(&conn, "/s/a", "worker", "claude", "PRE_TOOL", "Skill", true, Some("commit"), false, None, None, None, 1000.0);
-        record_event(&conn, "/s/a", "worker", "claude", "POST_TOOL", "Bash", false, None, false, None, None, Some(1), 1001.0);
+        record_event(&conn, "/s/a", "worker", "claude", "PRE_TOOL", "Skill", true, Some("commit"), false, None, None, None, None, 1000.0);
+        record_event(&conn, "/s/a", "worker", "claude", "POST_TOOL", "Bash", false, None, false, None, None, Some(1), Some(850), 1001.0);
+        let dur: i64 = conn
+            .query_row("SELECT duration_ms FROM events WHERE event_type='POST_TOOL'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(dur, 850, "duration_ms가 적재되어야 skills p50 성립(B-9)");
         let skills: i64 = conn.query_row("SELECT COUNT(*) FROM events WHERE is_skill=1", [], |r| r.get(0)).unwrap();
         assert_eq!(skills, 1, "스킬 호출 1건");
         let fails: i64 = conn.query_row("SELECT COUNT(*) FROM events WHERE exit_code!=0", [], |r| r.get(0)).unwrap();
@@ -1300,8 +1448,23 @@ mod tests {
     }
 
     #[test]
-    fn summarize_by_tier_and_cache_roi() {
-        // master(opus) 2건·worker(haiku) 1건. cache_read 50000(opus)로 cache_roi_x>0.
+    fn tail_offset_roundtrip() {
+        // A-4: 오프셋 영속 — 재시작 시 정확 재개점(중복 INSERT 근절)의 토대
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE tail_offsets(session_file TEXT PRIMARY KEY, off INTEGER, updated REAL);",
+        )
+        .unwrap();
+        assert_eq!(load_offset(&conn, "/s/a.jsonl"), None);
+        save_offset(&conn, "/s/a.jsonl", 12345, 1000.0);
+        assert_eq!(load_offset(&conn, "/s/a.jsonl"), Some(12345));
+        save_offset(&conn, "/s/a.jsonl", 99999, 1001.0); // upsert 갱신
+        assert_eq!(load_offset(&conn, "/s/a.jsonl"), Some(99999));
+    }
+
+    #[test]
+    fn summarize_by_tier_and_cache() {
+        // master(opus) 2건·worker(haiku) 1건. cache_read 50000(opus)로 절감$ 산출.
         let rows: Vec<SummaryRow> = vec![
             ("claude".into(), "master".into(), "claude-opus-4-8".into(), 1000, 300, 2000, 50000, 0.05, "/s/a".into(), 1000.0),
             ("claude".into(), "master".into(), "claude-opus-4-8".into(), 500, 200, 0, 0, 0.01, "/s/a".into(), 1100.0),
@@ -1314,25 +1477,33 @@ mod tests {
         assert_eq!(bt[0]["msgs"], 2);
         assert!((bt[0]["cost_usd"].as_f64().unwrap() - 0.06).abs() < 1e-9);
         assert_eq!(bt[1]["tier"], "worker");
-        // cache_roi_x = savings/full_input_cost. opus: savings=0.225, full=50000/1e6*5=0.25 → 0.9
-        assert!((s["cache_roi_x"].as_f64().unwrap() - 0.9).abs() < 1e-6, "{}", s["cache_roi_x"]);
-        // cache_efficiency = cr/(in+cc+cr) = 50000/(1600+2000+50000)
-        let exp_eff = 50000.0 / (1600.0 + 2000.0 + 50000.0);
-        assert!((s["cache_efficiency"].as_f64().unwrap() - exp_eff).abs() < 1e-9);
+        // A-3: cache_roi_x는 폐기(전 클로드 모델 캐시단가=입력의 10%라 항상 0.9 — 무정보 상수)
+        assert!(s.get("cache_roi_x").is_none(), "cache_roi_x는 제거되어야 한다");
+        // 절감$ = 50000/1e6 × (5 − 0.5) = 0.225 (round4 보존)
+        assert!((s["cache_savings_usd"].as_f64().unwrap() - 0.225).abs() < 1e-9);
+        // cache_efficiency = cr/(in+cc+cr) = 50000/53600 → round4 = 0.9328
+        assert!((s["cache_efficiency"].as_f64().unwrap() - 0.9328).abs() < 1e-9);
+        // B-4: 단가표 적중 모델은 pricing_known=true
+        assert_eq!(s["by_model"][0]["pricing_known"], true);
         // 빈 role → unattributed
         let r2: Vec<SummaryRow> = vec![
             ("claude".into(), "".into(), "claude-opus-4-8".into(), 10, 5, 0, 0, 0.01, "/s/c".into(), 1.0),
         ];
         assert_eq!(summarize(&r2)["by_tier"][0]["tier"], "unattributed");
         // 빈 입력 0-division 안전
-        assert_eq!(summarize(&[])["cache_roi_x"], 0.0);
+        assert_eq!(summarize(&[])["cache_savings_usd"], 0.0);
+        // B-4: 미상 모델은 pricing_known=false (Sonnet 폴백 추정 표시)
+        let r3: Vec<SummaryRow> = vec![
+            ("claude".into(), "w".into(), "future-model-9".into(), 10, 5, 0, 0, 0.01, "/s/d".into(), 1.0),
+        ];
+        assert_eq!(summarize(&r3)["by_model"][0]["pricing_known"], false);
     }
 
     #[test]
     fn summarize_rework_failrate() {
         // fail 정의=POST exit≠0 / calls=PRE(!tool.is_empty) — summarize_skills 동형(producer≠evaluator).
         let ev = |t: &str, role: &str, tool: &str, ex: Option<i64>| -> EventRow {
-            (t.into(), role.into(), tool.into(), false, String::new(), false, String::new(), ex, 0.0)
+            (t.into(), role.into(), tool.into(), false, String::new(), false, String::new(), ex, 0.0, None)
         };
         let rows: Vec<EventRow> = vec![
             ev("PRE_TOOL", "worker", "Bash", None),
@@ -1360,7 +1531,7 @@ mod tests {
     fn summarize_skills_calls_and_failrate() {
         // Bash 2호출 1실패, Skill(commit) 1호출 PRE+POST 성공, Task→Explore 위임 1.
         let ev = |t: &str, role: &str, tool: &str, sk: bool, skn: &str, ag: bool, at: &str, ex: Option<i64>| -> EventRow {
-            (t.into(), role.into(), tool.into(), sk, skn.into(), ag, at.into(), ex, 1000.0)
+            (t.into(), role.into(), tool.into(), sk, skn.into(), ag, at.into(), ex, 1000.0, if t == "POST_TOOL" { Some(500) } else { None })
         };
         let rows: Vec<EventRow> = vec![
             ev("PRE_TOOL", "worker", "Bash", false, "", false, "", None),

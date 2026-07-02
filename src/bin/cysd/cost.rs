@@ -81,6 +81,13 @@ pub fn pricing_for(model: &str) -> Pricing {
     DEFAULT_PRICING
 }
 
+/// 단가표 적중 여부 — false면 DEFAULT(Sonnet) 폴백으로 계산된 추정치라는 뜻.
+/// UI가 "단가 미상" 표시에 쓴다(전수조사 B-4 — 폴백 왜곡을 조용히 숨기지 않는다).
+pub fn has_pricing(model: &str) -> bool {
+    let n = normalize(model);
+    TABLE.iter().any(|(prefix, _)| n.starts_with(prefix))
+}
+
 /// 4-팩터 비용 공식(USD). cache_read는 컨텍스트 재사용 할인 단가.
 pub fn calculate_cost(
     input_tokens: u64,

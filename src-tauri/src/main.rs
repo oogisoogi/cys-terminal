@@ -346,8 +346,8 @@ async fn control_session_detail(session_id: String) -> Result<Value, String> {
 }
 
 #[tauri::command]
-async fn control_session_star(session_id: String, starred: bool) -> Result<Value, String> {
-    rpc("control.session_star", json!({ "session_id": session_id, "starred": starred })).await
+async fn control_session_star(session_id: String, starred: bool, note: Option<String>) -> Result<Value, String> {
+    rpc("control.session_star", json!({ "session_id": session_id, "starred": starred, "note": note })).await
 }
 
 #[tauri::command]

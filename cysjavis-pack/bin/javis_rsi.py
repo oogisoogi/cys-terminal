@@ -115,6 +115,33 @@ def _load_state():
         return {"rounds": {}}
 
 
+def _learn_state_dir():
+    """cysd learn.status가 읽는 위치(handlers.rs learn_state_dir와 동일 규칙) —
+    CC 학습 탭 미러링용(B-10: 프로젝트 _round/rsi와 데몬 읽기 경로의 단절 해소)."""
+    root = os.environ.get("CYS_ROUND_DIR")
+    if root:
+        return os.path.join(root, "learn")
+    pack = os.environ.get("CYS_PACK_DIR") or os.path.expanduser("~/.cys/pack")
+    return os.path.join(pack, "round", "learn")
+
+
+def _mirror_learn_state(state):
+    """rounds/discovery를 데몬 가독 위치로 미러(best-effort) — 실패는 RSI 판정에 불간섭."""
+    try:
+        d = _learn_state_dir()
+        os.makedirs(d, exist_ok=True)
+        payload = {
+            "rounds": state.get("rounds", {}),
+            "discovery": state.get("discovery", {"capability": 0, "perspective": 0, "knowledge": 0}),
+        }
+        p = os.path.join(d, "state.json")
+        tmp = p + ".tmp"
+        open(tmp, "w", encoding="utf-8").write(json.dumps(payload, ensure_ascii=False, indent=2))
+        os.replace(tmp, p)
+    except Exception:
+        pass
+
+
 def _save_state(state):
     d = rsi_dir()
     os.makedirs(d, exist_ok=True)
@@ -122,6 +149,7 @@ def _save_state(state):
     tmp = p + ".tmp"
     open(tmp, "w", encoding="utf-8").write(json.dumps(state, ensure_ascii=False, indent=2))
     os.replace(tmp, p)
+    _mirror_learn_state(state)  # CC 학습 탭 배선(B-10)
 
 
 def _append_ledger(entry):

@@ -34,7 +34,7 @@
       <div id="cc-header">
         <span class="cc-pulse"></span>
         <span class="cc-title">JARVIS Control Center</span>
-        <span id="cc-livebadge" class="cc-badge idle">IDLE</span>
+        <span id="cc-livebadge" class="cc-badge idle" title="LIVE = 작업 중 노드 1개 이상 / IDLE = 전체 대기">IDLE</span>
         <span id="cc-alertbadge" class="cc-alert-badge" hidden></span>
         <button id="btn-cc-density" title="한눈에 보기 / 상세 보기 전환 (⌘G)">👁 한눈에</button>
         <button id="btn-cc-glance-face" title="한눈에 면 전환: Live ↔ 작업">📋 작업</button>
@@ -57,7 +57,7 @@
         <div id="cc-view-live">
           <div id="cc-alerts" class="cc-alerts"></div>
           <div class="cc-gauges">
-            <div class="cc-radar" id="cc-radar">
+            <div class="cc-radar" id="cc-radar" title="활성 노드 비율 = 작업중 노드 / 온라인 노드">
               <span class="cc-radar-sweep"></span>
               <span class="cc-radar-val" id="cc-radar-val">0%</span>
               <span class="cc-radar-sub" id="cc-radar-sub">0/0 활성</span>

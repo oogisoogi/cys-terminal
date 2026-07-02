@@ -63,7 +63,9 @@ pub struct ObservedUsage {
     pub ctx_window: Option<u64>,
     pub ctx_pct: Option<u8>,
     pub rate: Vec<RateWindow>,
-    pub source: String, // "transcript" | "transcript:heuristic" | "rollout" | "rollout:heuristic"
+    /// "transcript[:heuristic]"(claude tail) | "rollout[:heuristic]"(codex tail) |
+    /// "statusline"(usage.report 서버 진실 — 신선하면 tail 관측보다 우선)
+    pub source: String,
     pub session_file: String,
     pub updated_at: f64,
 }
@@ -76,6 +78,30 @@ struct TailState {
     /// 휴리스틱 매핑 여부 — true면 REDISCOVER_SECS마다 재발견 (등록 매핑은 고정)
     heuristic: bool,
     last_discovery: f64,
+    /// statusline이 준 서버 진실 컨텍스트 창 — statusline이 끊긴 뒤 트랜스크립트 폴백의
+    /// 200k 하드코딩 추정(1M 세션 5배 과대→임계 조기오발)을 교정한다(전수조사 B-5).
+    server_ctx_window: Option<u64>,
+    /// codex rollout의 turn_context가 준 모델명 — token_count 소비 귀속용(전수조사 A-2)
+    codex_model: Option<String>,
+}
+
+impl TailState {
+    /// 새 tail — 영속 오프셋(analytics tail_offsets)이 있으면 거기서 정확 재개해
+    /// 재시작 시 마지막 256KB 재파싱→DB 중복 INSERT(전수조사 A-4)를 근절한다.
+    fn attach(daemon: &Arc<Daemon>, path: PathBuf, heuristic: bool, now: f64) -> Self {
+        let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let stored = daemon
+            .analytics
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|c| crate::analytics::load_offset(c, &path.to_string_lossy()));
+        let offset = match stored {
+            Some(o) if o <= len => o,
+            _ => len.saturating_sub(FIRST_ATTACH_TAIL),
+        };
+        TailState { path, offset, carry: String::new(), heuristic, last_discovery: now, server_ctx_window: None, codex_model: None }
+    }
 }
 
 fn poll_secs() -> u64 {
@@ -152,15 +178,13 @@ fn collect_for(
     let now = now_epoch();
 
     // T5 Phase 2-A 우선순위 병합 — claude는 statusline 보고(rate limit + 서버 진실 ctx)가
-    // 신선하면 트랜스크립트 tail이 ctx만 덮어써 rate를 유실시키지 않도록 수집을 건너뛴다.
-    // statusline이 끊기면(age > STATUSLINE_FRESH_SECS) 트랜스크립트로 graceful 폴백.
-    if agent == "claude" {
-        if let Some(prev) = s.observed_usage.lock().unwrap().as_ref() {
-            if prev.source == "statusline" && now - prev.updated_at < STATUSLINE_FRESH_SECS {
-                return;
-            }
-        }
-    }
+    // 신선하면 트랜스크립트 tail이 ctx만 덮어써 rate를 유실시키지 않도록 **관측 스냅샷만** 건너뛴다.
+    // ★소비 적재(record_message/record_usage)는 statusline과 무관하게 계속 돈다 — 과거엔 여기서
+    // 함수 전체를 return해 statusline 가동 pane의 비용 통계가 전면 누락됐다(전수조사 A-1 교정).
+    let statusline_fresh = agent == "claude"
+        && s.observed_usage.lock().unwrap().as_ref().is_some_and(|prev| {
+            prev.source == "statusline" && now - prev.updated_at < STATUSLINE_FRESH_SECS
+        });
 
     // ── 세션 파일 결정 (등록 > lsof > 휴리스틱) ──
     let desired: Option<(PathBuf, bool)> = if let Some(reg) = registered {
@@ -179,11 +203,14 @@ fn collect_for(
                 .map(|t| (t.path.clone(), t.heuristic))
         };
         if need_discovery {
-            // 발견 백오프: 실패가 반복돼도 전수 프로세스 refresh·lsof는 REDISCOVER_SECS에
-            // 1회만 (자원 거버넌스 — 트랜스크립트가 아직 없는 pane이 틱마다 비용 유발 금지)
+            // 발견 백오프: 실패가 반복돼도 전수 프로세스 refresh·lsof는 주기당 1회만
+            // (자원 거버넌스 — 트랜스크립트가 아직 없는 pane이 틱마다 비용 유발 금지).
+            // 신생 pane(1분 미만)은 트랜스크립트 지연 생성이 흔해 5초로 단축(전수조사 C-9 —
+            // 구 30초 고정은 세션 초반 최대 30초 미수집 창을 만들었다).
+            let backoff = if now - s.created_at < 60.0 { 5.0 } else { REDISCOVER_SECS };
             let recently = attempts
                 .get(&s.id)
-                .map(|t| now - *t < REDISCOVER_SECS)
+                .map(|t| now - *t < backoff)
                 .unwrap_or(false);
             if recently {
                 existing()
@@ -210,20 +237,10 @@ fn collect_for(
         }
     }
 
-    // tail 상태 초기화/전환: 경로가 바뀌었으면 파일 끝 창에서 새로 시작
+    // tail 상태 초기화/전환: 경로가 바뀌었으면 영속 오프셋(없으면 파일 끝 창)에서 새로 시작
     let need_reset = tails.get(&s.id).map(|t| t.path != path).unwrap_or(true);
     if need_reset {
-        let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-        tails.insert(
-            s.id,
-            TailState {
-                path: path.clone(),
-                offset: len.saturating_sub(FIRST_ATTACH_TAIL),
-                carry: String::new(),
-                heuristic,
-                last_discovery: now,
-            },
-        );
+        tails.insert(s.id, TailState::attach(daemon, path.clone(), heuristic, now));
         // 새 세션 파일 = 새 세션 — 에지 게이트 재무장. 직전 세션이 임계 위에서 끝났어도
         // 새 세션이 곧장 임계 이상으로 시작하면(거대 지침 재주입) 발화해야 한다.
         s.ctx_threshold_armed.store(true, Ordering::Relaxed);
@@ -243,12 +260,19 @@ fn collect_for(
         return;
     }
     let prev = s.observed_usage.lock().unwrap().clone();
+    // 서버 진실 컨텍스트 창 기억 — statusline이 살아있는 동안 준 ctx_window를 보관해
+    // 폴백 시 200k 하드코딩 대신 사용(B-5). 한 번 잡히면 세션 내 고정.
+    if let Some(p) = prev.as_ref() {
+        if p.source == "statusline" && p.ctx_window.is_some() {
+            state.server_ctx_window = p.ctx_window;
+        }
+    }
     let mut next: Option<ObservedUsage> = None;
     for line in &lines {
         match agent {
             "claude" => {
                 if let Some((ctx_tokens, model)) = parse_claude_line(line) {
-                    let window = claude_ctx_window(&model);
+                    let window = state.server_ctx_window.unwrap_or_else(|| claude_ctx_window(&model));
                     next = Some(ObservedUsage {
                         agent: agent.into(),
                         ctx_tokens: Some(ctx_tokens),
@@ -293,38 +317,64 @@ fn collect_for(
         }
     }
 
-    // T6 Control Center 소비 누적 — claude 새 메시지의 (input, output)을 데몬 트래커에 적재.
-    // tail은 새 라인을 1회만 읽으므로 이중계수 없음(첫 attach 창만 경미한 초기 중복 가능).
-    if agent == "claude" {
-        let msgs: Vec<MsgCost> = lines
-            .iter()
-            .filter_map(|l| parse_claude_message_cost(l))
-            .collect();
-        if !msgs.is_empty() {
-            let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-            let sess = path.to_string_lossy().into_owned();
-            // D3: role(조직 단위 tier) 캐싱 — consumption/analytics 락 잡기 전에 1회(데드락 회피).
-            // s.role은 Option<String> — None(미부여 노드)은 ""로 환원, summarize가 "unattributed"로 정규화.
-            let role = s.role.lock().unwrap().clone().unwrap_or_default();
-            let mut c = daemon.consumption.lock().unwrap();
-            let alog = daemon.analytics.lock().unwrap(); // 일관 락 순서: consumption→analytics
-            for m in msgs {
-                let cost = crate::cost::calculate_cost(
-                    m.input_tokens, m.output, m.cache_creation, m.cache_read, &m.model,
-                );
-                // 소비 토큰 = input + cache_creation(+output) — cache_read(재사용)는 제외.
-                c.record_message(
-                    &sess, m.input_tokens + m.cache_creation, m.output, cost, &m.model, now, &today,
-                );
-                // T7 E1-3: 영속 — 재시작에도 보존(부트 시 리플레이). 실패는 무해.
-                if let Some(conn) = alog.as_ref() {
-                    crate::analytics::record_usage(
-                        conn, &sess, &role, agent, &m.model, m.input_tokens, m.output,
-                        m.cache_creation, m.cache_read, cost, now,
-                    );
+    // T6 Control Center 소비 누적 — claude/codex 새 메시지(턴)의 소비를 데몬 트래커에 적재.
+    // tail은 새 라인을 1회만 읽고 오프셋을 영속하므로 재시작에도 이중계수 없음(A-4).
+    let msgs: Vec<MsgCost> = match agent {
+        "claude" => lines.iter().filter_map(|l| parse_claude_message_cost(l)).collect(),
+        // codex rollout: turn_context의 model(gpt-5.5 등)을 기억했다가 token_count의
+        // last_token_usage(턴 소비)에 귀속한다(전수조사 A-2 — codex 비용 가시화).
+        "codex" => {
+            for l in &lines {
+                if let Some(m) = parse_codex_model(l) {
+                    state.codex_model = Some(m);
                 }
             }
+            let model = state.codex_model.clone().unwrap_or_default();
+            lines
+                .iter()
+                .filter_map(|l| parse_codex_message_cost(l))
+                .map(|mut m| {
+                    m.model = model.clone();
+                    m
+                })
+                .collect()
         }
+        _ => Vec::new(),
+    };
+    if !msgs.is_empty() {
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let sess = path.to_string_lossy().into_owned();
+        // D3: role(조직 단위 tier) 캐싱 — consumption/analytics 락 잡기 전에 1회(데드락 회피).
+        // s.role은 Option<String> — None(미부여 노드)은 ""로 환원, summarize가 "unattributed"로 정규화.
+        let role = s.role.lock().unwrap().clone().unwrap_or_default();
+        let mut c = daemon.consumption.lock().unwrap();
+        let alog = daemon.analytics.lock().unwrap(); // 일관 락 순서: consumption→analytics
+        for m in msgs {
+            let cost = crate::cost::calculate_cost(
+                m.input_tokens, m.output, m.cache_creation, m.cache_read, &m.model,
+            );
+            // 소비 토큰 = input + cache_creation(+output) — cache_read(재사용)는 제외.
+            c.record_message(
+                &sess, m.input_tokens + m.cache_creation, m.output, cost, &m.model, now, &today,
+            );
+            // T7 E1-3: 영속 — 재시작에도 보존(부트 시 리플레이). 실패는 무해.
+            if let Some(conn) = alog.as_ref() {
+                crate::analytics::record_usage(
+                    conn, &sess, &role, agent, &m.model, m.input_tokens, m.output,
+                    m.cache_creation, m.cache_read, cost, now,
+                );
+            }
+        }
+        // 오프셋 영속 — 여기까지의 라인은 DB에 반영 완료. 재시작 시 이 지점에서 정확 재개(A-4).
+        if let Some(conn) = alog.as_ref() {
+            crate::analytics::save_offset(conn, &sess, state.offset, now);
+        }
+    }
+
+    // statusline이 신선하면 관측 스냅샷·이벤트·임계발화는 statusline 경로가 진실원 — 여기서 종료
+    // (소비 적재는 위에서 이미 완료). 끊기면(60s+) 아래 트랜스크립트 관측으로 graceful 폴백.
+    if statusline_fresh {
+        return;
     }
 
     let Some(new) = next else {
@@ -412,12 +462,15 @@ fn collect_external(
     }
     // 미등록 claude pane의 휴리스틱 후보 가드 — (munged cwd, created_at). 이 조합에 걸리는
     // 파일은 pane 수집이 나중에 집어갈 수 있으므로 외부로 세지 않는다(이중계수·오귀속 방지).
+    // B-3: pane이 이미 자기 파일을 잡았으면(tail 보유) 가드에서 제외 — 구 구현은 잡은 뒤에도
+    // 같은 cwd의 다른 외부 세션들을 영구 배제했다(가드는 "아직 못 잡은" pane만 필요).
     let guards: Vec<(String, f64)> = surfaces
         .iter()
         .filter(|s| !s.exited.load(Ordering::Relaxed))
         .filter(|s| {
             s.agent_meta.lock().unwrap().as_ref().map(|(a, _)| a == "claude").unwrap_or(false)
                 && s.registered_transcript.lock().unwrap().is_none()
+                && !pane_tails.contains_key(&s.id)
         })
         .map(|s| (claude_project_component(&s.cwd), s.created_at))
         .collect();
@@ -453,17 +506,7 @@ fn collect_external(
                     if !external_eligible(now, mt, &comp, &guards) {
                         continue;
                     }
-                    let len = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
-                    ext.tails.insert(
-                        p.clone(),
-                        TailState {
-                            path: p,
-                            offset: len.saturating_sub(FIRST_ATTACH_TAIL),
-                            carry: String::new(),
-                            heuristic: false,
-                            last_discovery: now,
-                        },
-                    );
+                    ext.tails.insert(p.clone(), TailState::attach(daemon, p, false, now));
                 }
             }
         }
@@ -497,6 +540,10 @@ fn collect_external(
                     m.cache_creation, m.cache_read, cost, now,
                 );
             }
+        }
+        // 오프셋 영속 — 재시작 시 정확 재개(A-4, pane 경로와 동형)
+        if let Some(conn) = alog.as_ref() {
+            crate::analytics::save_offset(conn, &sess, state.offset, now);
         }
     }
 }
@@ -835,6 +882,49 @@ pub fn parse_claude_message_cost(line: &str) -> Option<MsgCost> {
         return None;
     }
     Some(m)
+}
+
+/// codex rollout token_count 이벤트 → 턴 소비. last_token_usage가 턴 단위이며
+/// input_tokens는 cached 포함이라 (input−cached, cache_read=cached)로 분해한다.
+/// model은 이 이벤트에 없어 호출측이 turn_context에서 기억한 값을 채운다(전수조사 A-2).
+pub fn parse_codex_message_cost(line: &str) -> Option<MsgCost> {
+    if !line.contains("token_count") || !line.contains("last_token_usage") {
+        return None;
+    }
+    let v: Value = serde_json::from_str(line).ok()?;
+    if v["payload"]["type"].as_str() != Some("token_count") {
+        return None;
+    }
+    let u = &v["payload"]["info"]["last_token_usage"];
+    if !u.is_object() {
+        return None;
+    }
+    let g = |k: &str| u[k].as_u64().unwrap_or(0);
+    let input = g("input_tokens");
+    let cached = g("cached_input_tokens").min(input);
+    let m = MsgCost {
+        input_tokens: input - cached,
+        output: g("output_tokens"),
+        cache_creation: 0,
+        cache_read: cached,
+        model: String::new(),
+    };
+    if m.input_tokens == 0 && m.output == 0 && m.cache_read == 0 {
+        return None;
+    }
+    Some(m)
+}
+
+/// codex rollout turn_context 라인의 모델명 (`payload.model` = "gpt-5.5" 등)
+pub fn parse_codex_model(line: &str) -> Option<String> {
+    if !line.contains("turn_context") || !line.contains("\"model\"") {
+        return None;
+    }
+    let v: Value = serde_json::from_str(line).ok()?;
+    if v["type"].as_str() != Some("turn_context") {
+        return None;
+    }
+    v["payload"]["model"].as_str().map(|s| s.to_string())
 }
 
 /// claude 컨텍스트 윈도우 추정: 기본 200k, 1M 모델([1m])은 1M. CYS_CLAUDE_CTX_WINDOW로
@@ -1191,6 +1281,26 @@ mod tests {
         assert!(external_eligible(now, now - 1.0, "-b", &guards));
     }
 
+    // ── codex 소비 파서: 실측 스키마(2026-07-02 rollout, codex-tui 0.142.5) 핀 ──
+
+    #[test]
+    fn codex_token_count_cost_and_model() {
+        // input_tokens는 cached 포함 → (input−cached, cache_read=cached)로 분해(A-2)
+        let tc = r#"{"timestamp":"t","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":19797,"cached_input_tokens":18304,"output_tokens":748,"reasoning_output_tokens":397,"total_tokens":20545},"model_context_window":258400}}}"#;
+        let m = parse_codex_message_cost(tc).unwrap();
+        assert_eq!(m.input_tokens, 19797 - 18304);
+        assert_eq!(m.cache_read, 18304);
+        assert_eq!(m.output, 748);
+        assert_eq!(m.cache_creation, 0);
+        // turn_context에서 모델 캡처 → gpt-5.5 → 정규화 gpt-5-5 → 단가표 적중
+        let ctx = r#"{"timestamp":"t","type":"turn_context","payload":{"model":"gpt-5.5","cwd":"/x"}}"#;
+        assert_eq!(parse_codex_model(ctx).unwrap(), "gpt-5.5");
+        assert!(crate::cost::has_pricing("gpt-5.5"), "gpt-5.5 단가표 적중 필요");
+        // 비대상 라인은 None
+        assert!(parse_codex_message_cost(r#"{"type":"event_msg","payload":{"type":"agent_message"}}"#).is_none());
+        assert!(parse_codex_model(r#"{"type":"session_meta","payload":{}}"#).is_none());
+    }
+
     // ── claude 파서: 실측 스키마(2026-06-13, CLI 2.1.176) 핀 ──
 
     fn claude_line(extra: &str, usage: &str) -> String {
@@ -1351,6 +1461,8 @@ mod tests {
             carry: String::new(),
             heuristic: false,
             last_discovery: 0.0,
+            server_ctx_window: None,
+            codex_model: None,
         };
         let lines = read_new_lines(&mut st);
         assert_eq!(lines, vec!["line1".to_string(), "line2".to_string()]);

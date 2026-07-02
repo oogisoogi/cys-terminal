@@ -251,3 +251,10 @@ pane별 배지(Phase 1)는 "지금 이 작업"용. 대시보드는 **전 계정 
 3. `pgrep -x cysd`로 정확한 pid kill → `cys ping` 자동 재기동 → `cys boot`.
 4. ★데몬 재기동 전 `cys status --json`으로 전 노드 idle 확인 — 워커 장기 턴 중 강행 금지.
 5. preflight READY · 라이브 배지 실측 · SESSION_STATE 갱신.
+
+---
+## 현황 주석 (2026-07-03 · CC 전수조사 후속)
+- Phase 2-A(statusline 우선 병합): 가동 — 단 **소비 적재는 statusline과 무관하게 항상 수행**하도록 교정(구현이 관측 skip에 소비까지 말려들던 결함 수정, usage.rs collect_for).
+- Phase 2-B(agy 쿼터 RPC): 미착수 — agy는 rate 쿼터만 수집, 토큰 소비는 로컬 데이터원 부재로 미적재(알려진 한계로 명문화).
+- codex: rollout `token_count`(last_token_usage)+`turn_context`(model) 기반 소비 적재 **완료** — by_agent에 codex 등장.
+- 컨텍스트 창: statusline이 준 서버 진실 ctx_window를 세션 내 기억해 트랜스크립트 폴백의 200k 하드코딩을 교정(1M 세션 조기 임계 오발 방지).
