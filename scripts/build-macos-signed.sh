@@ -55,20 +55,35 @@ while IFS= read -r -d '' lib; do
   codesign --force --timestamp --options runtime --sign "$APPLE_SIGNING_IDENTITY" "$lib"
   SIGN_N=$((SIGN_N+1))
 done < <(find src-tauri/runtime \( -name '*.dylib' -o -name '*.so' -o -name '*.node' \) -type f -print0)
-# 2) Mach-O 실행 바이너리(라이브러리 제외) — 인터프리터 JIT/라이브러리검증 entitlements 적용
+# 2) Mach-O 실행 바이너리(라이브러리 제외) — ★최소권한(codex T6b.1): 인터프리터(python·node V8 JIT)만
+#    entitlements 적용, git/uv는 entitlements 없이 runtime 서명(경로 기반 분류·불필요 권한 확산 방지).
 while IFS= read -r -d '' exe; do
   if file "$exe" | grep -q 'Mach-O'; then
-    codesign --force --timestamp --options runtime --entitlements "$ENT" --sign "$APPLE_SIGNING_IDENTITY" "$exe"
+    case "$exe" in
+      src-tauri/runtime/python/*|src-tauri/runtime/node/*)
+        codesign --force --timestamp --options runtime --entitlements "$ENT" --sign "$APPLE_SIGNING_IDENTITY" "$exe" ;;
+      *)  # git·uv 등 — JIT/라이브러리검증 완화 불요 → entitlements 없이 hardened 서명
+        codesign --force --timestamp --options runtime --sign "$APPLE_SIGNING_IDENTITY" "$exe" ;;
+    esac
     SIGN_N=$((SIGN_N+1))
   fi
 done < <(find src-tauri/runtime -type f -perm +111 ! -name '*.dylib' ! -name '*.so' ! -name '*.node' -print0)
-echo "  ✓ runtime Mach-O $SIGN_N개 재서명 (검증은 tauri build 후 app 전체 codesign -vvv --strict)"
+echo "  ✓ runtime Mach-O $SIGN_N개 재서명 (python/node=entitlements·git/uv=무 entitlements)"
 
 echo "== Apple 공증 빌드 v$VERSION (Tauri 자동 codesign[hardened]+notarize+staple) =="
 bun x @tauri-apps/cli build
 
 APP="target/release/bundle/macos/cys.app"
 DMG="target/release/bundle/dmg/cys_${VERSION}_aarch64.dmg"
+
+# ★동봉 Mach-O 포함 앱 전체 서명 무결성 검증 (codex T6b.1) — 공증 제출 전 중첩 바이너리 서명 결손 조기 검출.
+# --deep는 *검증 전용*으로만 사용(D-4 규칙 유지 — 서명은 위 inside-out 개별, 검증은 --deep 허용).
+echo "== 동봉 서명 검증: codesign --verify --deep --strict (제출 전) =="
+if codesign --verify --deep --strict --verbose=4 "$APP" 2>&1; then
+  echo "  ✓ codesign --verify --deep --strict 통과 (중첩 runtime Mach-O 서명 무결)"
+else
+  echo "  ✗ 서명 검증 실패 — 중첩 바이너리 서명 결손. 위 로그의 offender 재서명 필요"; exit 1
+fi
 
 echo "== 검증: Gatekeeper(spctl) + 공증 티켓(stapler) =="
 if spctl -a -vv "$APP" 2>&1 | grep -qi "accepted"; then
