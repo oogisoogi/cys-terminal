@@ -16,6 +16,7 @@
   ; ① GUI만 종료(세션은 데몬 소유 — 무손실). updater 경로면 이미 종료 중이라 멱등.
   nsExec::Exec 'taskkill /F /T /IM cys-app.exe'
 
+
   ; ② cysd.exe rename-swap (데몬 무사망)
   IfFileExists "$INSTDIR\cysd.exe" 0 cysd_done
   Delete "$INSTDIR\cysd.prev.exe"          ; 잔해 청소 시도(구 lame-duck 점유 시 실패해도 무시)
@@ -49,6 +50,25 @@ cysd_done:
   IfErrors 0 cys_done
   nsExec::Exec 'taskkill /F /T /IM cys.exe'
 cys_done:
+  ; ★잠금 스윕 일반화(2026-07-02 실장애: msys-2.0.dll Can't write → Installation Aborted).
+  ; 라이브 세션 셸(claude의 bash 훅 등)이 로드한 runtime 이미지(.exe/.dll)는 '덮어쓰기'가 잠기지만
+  ; 'rename'은 허용된다(로드된 PE 이미지의 Windows 특성 — cysd rename-swap과 동일 원리의 전수 일반화).
+  ; 설치 트리 전체에서 잠긴 이미지 파일만 <이름>.prev<rand>로 밀어 이름을 비운다 → 추출이 전부 성공.
+  ; 잔해(*.prev*)는 새 cysd 기동이 재귀 청소(P1b 확장). 스크립트는 $PLUGINSDIR에 생성(따옴표 지옥 회피).
+  FileOpen $0 "$PLUGINSDIR\unlock-sweep.ps1" w
+  FileWrite $0 'param([string]$$Root)$\r$\n'
+  FileWrite $0 '$$ErrorActionPreference = "SilentlyContinue"$\r$\n'
+  FileWrite $0 'Get-ChildItem -LiteralPath $$Root -Recurse -File | Where-Object { ($$_.Extension -eq ".exe" -or $$_.Extension -eq ".dll") -and ($$_.Name -notlike "*.prev*") } | ForEach-Object {$\r$\n'
+  FileWrite $0 '  $$f = $$_.FullName$\r$\n'
+  FileWrite $0 '  try { $$s = [IO.File]::Open($$f, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None); $$s.Close() }$\r$\n'
+  FileWrite $0 '  catch { try { [IO.File]::Move($$f, $$f + ".prev" + (Get-Random -Maximum 99999)) } catch {} }$\r$\n'
+  FileWrite $0 '}$\r$\n'
+  FileClose $0
+  nsExec::ExecToLog 'powershell -NoProfile -ExecutionPolicy Bypass -File "$PLUGINSDIR\unlock-sweep.ps1" "$INSTDIR"'
+
+  ; 벨트-앤-브레이스: 스윕이 못 민 잔여 잠금 파일은 스킵하고 설치를 계속한다(Abort 금지).
+  ; runtime은 버전 핀 고정(PortableGit·Python·uv·node)이라 스킵=동일 내용이 사실상 전부다.
+  SetOverwrite try
   ClearErrors                                 ; 훅 종료 시 에러 플래그 잔류로 설치기 오판 방지
   Sleep 500
 !macroend
@@ -71,5 +91,8 @@ cys_done:
   Delete "$INSTDIR\cys.prev.exe"
   Delete "$INSTDIR\cys.prev2.exe"
   Delete "$INSTDIR\cys.prev3.exe"
+  ; 잠금 스윕 잔해(*.prev<rand> — 언인스톨러 미추적 파일)까지 정리해 빈 폴더 잔존을 막는다.
+  ; 프로세스는 위에서 전부 종료됐으므로 삭제 가능. runtime은 전량 우리 소유 트리다.
+  RMDir /r "$INSTDIR\runtime"
   ClearErrors
 !macroend

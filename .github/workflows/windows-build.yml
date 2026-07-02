@@ -289,7 +289,13 @@ jobs:
           (Bx $cys @('new-surface','--role','master') 30000).Out | Out-Host
           $before = (Bx $cys @('list') 15000).Out
           if ($before -notmatch 'role=master') { throw "T4: 사전 세션 생성 실패: $before" }
-          Write-Host "T4 사전상태: daemon pid=$pidBefore, master surface 생성됨"
+          # ①' 실장애 재현(2026-07-02 msys-2.0.dll Can't write → Abort): 라이브 bash가 runtime DLL을
+          # 로드한 상태로 재설치한다 — T4 초판은 PowerShell 셸이라 이 잠금을 재현 못 해 놓쳤다.
+          $bash = Join-Path $dir 'runtime\git\usr\bin\bash.exe'
+          $bp = Start-Process -FilePath $bash -ArgumentList '-c','sleep 600' -PassThru -WindowStyle Hidden
+          Start-Sleep 2
+          if ($bp.HasExited) { throw "T4: bash 잠금 프로세스 기동 실패" }
+          Write-Host "T4 사전상태: daemon pid=$pidBefore, master surface 생성됨, bash(msys DLL 잠금) pid=$($bp.Id)"
 
           # ② 라이브 상태 그대로 silent 재설치 (rename-swap 경로)
           $ri = Start-Process -FilePath $setup.FullName -ArgumentList '/S' -PassThru -Wait
@@ -307,16 +313,23 @@ jobs:
           Write-Host ("T4-4 RESULT: {0}  cysd.prev.exe 존재(rename 증거)" -f ($(if($prevOk){'PASS'}else{'FAIL'})))
           $newOk = Test-Path $cysd
           Write-Host ("T4-5 RESULT: {0}  새 cysd.exe 존재" -f ($(if($newOk){'PASS'}else{'FAIL'})))
-          if (-not ($alive -and $sessOk -and $prevOk -and $newOk)) { Write-Host "== after list =="; Write-Host $after.Out; throw "T4: 무중단 재설치 assert 실패" }
+          $bashAlive = -not $bp.HasExited
+          Write-Host ("T4-7 RESULT: {0}  잠금 bash 생존(무사망)" -f ($(if($bashAlive){'PASS'}else{'FAIL'})))
+          $msysOk = Test-Path (Join-Path $dir 'runtime\git\usr\bin\msys-2.0.dll')
+          Write-Host ("T4-8 RESULT: {0}  msys-2.0.dll 신본 추출(잠금 스윕 검증)" -f ($(if($msysOk){'PASS'}else{'FAIL'})))
+          if (-not ($alive -and $sessOk -and $prevOk -and $newOk -and $bashAlive -and $msysOk)) { Write-Host "== after list =="; Write-Host $after.Out; throw "T4: 무중단 재설치 assert 실패" }
 
-          # ④ P1b: 구 데몬 종료 → 새 cysd 기동 → prev 잔해 자가청소 assert
+          # ④ P1b: 잠금 해제(bash 종료) → 구 데몬 종료 → 새 cysd 기동 → prev 잔해 재귀 자가청소 assert
+          try { $bp.Kill($true) } catch {}
           Stop-Process -Id $pidBefore -Force; Start-Sleep 2
           Start-Process -FilePath $cysd -WindowStyle Hidden
           $r2 = $null; foreach($i in 1..20){ Start-Sleep 1; $r2 = Bx $cys @('list') 15000; if($r2.Code -eq 0){ break } }
           if ($r2.Code -ne 0) { throw "T4: 새 데몬 기동 실패" }
           Start-Sleep 2
-          $cleaned = -not (Test-Path (Join-Path $dir 'cysd.prev.exe'))
-          Write-Host ("T4-6 RESULT: {0}  새 cysd 기동 후 prev 잔해 청소(P1b)" -f ($(if($cleaned){'PASS'}else{'FAIL'})))
+          $rootPrev = Test-Path (Join-Path $dir 'cysd.prev.exe')
+          $rtPrev = @(Get-ChildItem (Join-Path $dir 'runtime') -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '*.prev*' }).Count
+          $cleaned = (-not $rootPrev) -and ($rtPrev -eq 0)
+          Write-Host ("T4-6 RESULT: {0}  새 cysd 기동 후 prev 잔해 재귀 청소(P1b — root+runtime, 잔존 {1}개)" -f ($(if($cleaned){'PASS'}else{'FAIL'})), $rtPrev)
           Get-Process cys,cysd -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
           if (-not $cleaned) { throw "T4-6: prev 잔해 미청소" }
           Write-Host "OK: T4 무중단 재설치 스모크 전행 통과 — 업데이트 중 데몬·세션 무사망 실증"

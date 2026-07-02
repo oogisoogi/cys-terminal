@@ -59,21 +59,36 @@ fn scrub_claude_session_env() {
 #[tokio::main]
 async fn main() {
     scrub_claude_session_env();
-    // ★무중단 rename-swap 잔해 청소(nsis-hooks.nsh의 짝): 업데이트가 구 데몬을 죽이지 않고
-    // cysd.exe→cysd.prev*.exe 로 밀어두므로, 새 cysd 기동 시 형제 .prev*.exe 를 best-effort
-    // 삭제한다. 구 lame-duck 데몬이 아직 점유 중이면 삭제가 실패하는데 그게 정상 — 조용히
-    // 스킵하고 다음 기동이 마저 청소한다(fail-open · 세션 보존 우선).
+    // ★무중단 rename-swap 잔해 청소(nsis-hooks.nsh의 짝): 업데이트가 잠긴 파일을 죽이는 대신
+    // <이름>.prev*(cysd/cys 고정 체인 + unlock-sweep의 <이름>.prev<rand> — msys-2.0.dll 등 세션이
+    // 로드한 runtime 이미지)로 밀어두므로, 새 cysd 기동 시 설치 트리를 재귀 순회하며 이름에
+    // ".prev"가 든 파일을 best-effort 삭제한다. lame-duck이 아직 점유 중이면 실패가 정상 —
+    // 조용히 스킵하고 다음 기동이 마저 청소한다(fail-open · 세션 보존 우선). 깊이 상한 12.
     #[cfg(windows)]
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            for base in ["cysd", "cys"] {
-                for suffix in ["prev", "prev2", "prev3"] {
-                    let p = dir.join(format!("{base}.{suffix}.exe"));
-                    if p.is_file() && std::fs::remove_file(&p).is_ok() {
+            fn sweep_prev(dir: &std::path::Path, depth: u8) {
+                if depth == 0 {
+                    return;
+                }
+                let Ok(entries) = std::fs::read_dir(dir) else {
+                    return;
+                };
+                for e in entries.flatten() {
+                    let p = e.path();
+                    if p.is_dir() {
+                        sweep_prev(&p, depth - 1);
+                    } else if p
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.contains(".prev"))
+                        && std::fs::remove_file(&p).is_ok()
+                    {
                         eprintln!("[cysd] stale update leftover removed: {}", p.display());
                     }
                 }
             }
+            sweep_prev(dir, 12);
         }
     }
     // crash recovery(§7-⑤): 직전 pack-update가 apply 도중 죽어 남긴 orphan 저널을 install(false)
