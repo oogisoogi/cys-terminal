@@ -152,83 +152,85 @@ jobs:
       # ─────────────────────────────────────────────────────────────────────────
       - name: T3 기능 스모크 (온보딩·hook·env주입·부서·python3)
         shell: pwsh
+        timeout-minutes: 12   # ★백스톱: 어떤 하위 호출이 hang해도 12분에 스텝 종료(6h 방지)
         run: |
           $inst = Get-ChildItem "$env:LOCALAPPDATA" -Recurse -Filter cysd.exe -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $inst) { throw "설치된 cysd.exe 미발견" }
           $dir = $inst.Directory.FullName
           $cys = Join-Path $dir 'cys.exe'
           $results = @{}
-          function Rec($id,$ok,$note){ $results[$id] = $ok; Write-Host ("T3-{0} RESULT: {1}  {2}" -f $id, ($(if($ok){'PASS'}else{'FAIL'})), $note) }
           $userHome = $env:USERPROFILE
+          function Rec($id,$ok,$note){ $results[$id] = $ok; Write-Host ("T3-{0} RESULT: {1}  {2}" -f $id, ($(if($ok){'PASS'}else{'FAIL'})), $note) }
+          # ★바운드 실행: 외부 exe가 hang해도 스텝이 멈추지 않게 timeout kill. @{Code;Out} 반환(Code=-1=timeout).
+          function Bx($exe,$argv,$ms){
+            $o=[System.IO.Path]::GetTempFileName(); $e=[System.IO.Path]::GetTempFileName()
+            try {
+              $p=Start-Process -FilePath $exe -ArgumentList $argv -NoNewWindow -PassThru -RedirectStandardOutput $o -RedirectStandardError $e
+              if(-not $p.WaitForExit($ms)){ try{$p.Kill($true)}catch{}; Write-Host ("  [timeout {0}ms] {1} {2}" -f $ms,$exe,($argv -join ' ')); return @{Code=-1;Out=''} }
+              $out=Get-Content $o -Raw -ErrorAction SilentlyContinue
+              $er=Get-Content $e -Raw -ErrorAction SilentlyContinue
+              return @{Code=$p.ExitCode;Out="$out$er"}
+            } finally { Remove-Item $o,$e -Force -ErrorAction SilentlyContinue }
+          }
 
           # ── T3-1/T3-2: 온보딩(init-pack) + hook 등록·내용(RC-1·RC-2) ──
           try {
-            & $cys init-pack 2>&1 | Out-Host
+            (Bx $cys @('init-pack') 60000).Out | Out-Host
             $packOk = Test-Path (Join-Path $userHome '.cys\pack\agents.json')
-            # hook: ~/.cys/claude/settings.json 또는 ~/.claude*/settings.json 중 SessionStart command 확인
             $settings = @(Get-ChildItem (Join-Path $userHome '.cys\claude\settings.json'),(Join-Path $userHome '.claude\settings.json') -ErrorAction SilentlyContinue)
             $hookCmd = ''
             foreach ($s in $settings) { try { $j=Get-Content $s.FullName -Raw|ConvertFrom-Json; $c=$j.hooks.SessionStart.hooks.command; if($c){$hookCmd="$c"} } catch {} }
             Rec 1 ($packOk) "pack=$packOk"
-            # RC-2: hook command가 bash로(sh 아님)·경로 quote 시작
             Rec 2 ($hookCmd -match '^bash "') "hookCmd=$hookCmd"
           } catch { Rec 1 $false "$_"; Rec 2 $false "$_" }
 
-          # ── T3-1(autostart) daemon install → schtasks 등록(RC-1) ──
-          try { & $cys daemon install 2>&1 | Out-Host; $q = (schtasks /Query /TN cysd 2>&1); Rec '1b' ($LASTEXITCODE -eq 0) "schtasks cysd" } catch { Rec '1b' $false "$_" }
+          # ── T3-1b(autostart) daemon install → schtasks 등록(RC-1) ──
+          try { (Bx $cys @('daemon','install') 30000).Out | Out-Host; $q=(schtasks /Query /TN cysd 2>&1); Rec '1b' ($LASTEXITCODE -eq 0) "schtasks cysd" } catch { Rec '1b' $false "$_" }
 
-          # ── 데몬 기동(named pipe 바인드·RC-4 기본) ──
-          & $cys list 2>&1 | Out-Null; if ($LASTEXITCODE -ne 0) { Start-Sleep 3; & $cys list 2>&1 | Out-Null }
-          Rec 'pipe' ($LASTEXITCODE -eq 0) "named pipe \\.\pipe\cys bind"
+          # ── 데몬 기동(named pipe 바인드·RC-4 기본) — 바운드 ──
+          $r = Bx $cys @('list') 30000; if ($r.Code -ne 0) { Start-Sleep 3; $r = Bx $cys @('list') 30000 }
+          Rec 'pipe' ($r.Code -eq 0) "named pipe bind (code=$($r.Code))"
 
           # ── T3-13: python3 해소(RC-12) — 동봉 runtime python3.exe 실재+실행 ──
-          try { $py = Join-Path $dir 'runtime\python\python3.exe'; & $py -c "print('PYOK')" | Out-Host; Rec 13 ($LASTEXITCODE -eq 0 -and (Test-Path $py)) "python3=$py" } catch { Rec 13 $false "$_" }
+          try { $py = Join-Path $dir 'runtime\python\python3.exe'; $rp = Bx $py @('-c','print(1)') 15000; Rec 13 ($rp.Code -eq 0 -and (Test-Path $py)) "python3=$py code=$($rp.Code)" } catch { Rec 13 $false "$_" }
 
-          # ── T3-3/T3-4(env주입 메커니즘·스텁): claude 실로그인 불가 → 스텁 에이전트로 env 주입만 검증 ──
-          # 설치된 agents.json에 stub 에이전트 추가(JSON 쓰기는 bundled python3로 견고하게). 스텁 cmd는
-          # powershell이 CLAUDE_CONFIG_DIR을 echo + prompt=STUBREADY>(ready_marker). env 맵의
-          # ${CYS_ACCOUNT_DIR:-ENVINJECT_OK}는 CYS_ACCOUNT_DIR 미설정→"ENVINJECT_OK"로 해소·pane env 주입.
+          # ── T3-3(env주입 메커니즘·스텁): claude 실로그인 불가 → 스텁 에이전트로 env 주입만 검증(전부 바운드) ──
           try {
             $py = Join-Path $dir 'runtime\python\python3.exe'
             $aj = Join-Path $userHome '.cys\pack\agents.json'
-            # 한 줄 python(-c) — YAML/pwsh here-string 충돌 회피(닫는 @'는 column0 필요). pwsh 단일따옴표라
-            # 내부 \" 는 python에 그대로 전달(escaped double-quote). python 내 single-quote 없음(안전).
             $pyprog = 'import json,sys; aj=sys.argv[1]; d=json.load(open(aj,encoding="utf-8")); d["stubenv"]={"cmd":"Write-Host CCDPROOF=$env:CLAUDE_CONFIG_DIR","env":{"CLAUDE_CONFIG_DIR":"${CYS_ACCOUNT_DIR:-ENVINJECT_OK}"},"inject_delay_secs":3,"ready_marker":"CCDPROOF=","clear_cmd":"/clear"}; json.dump(d,open(aj,"w",encoding="utf-8"),ensure_ascii=False,indent=2); print("stubenv OK")'
-            & $py -c $pyprog $aj | Out-Host
-            & $cys launch-agent --role worker --agent stubenv 2>&1 | Out-Host
-            # env 주입 증거(견고): launch-agent가 세운 worker pane(env_injected)에 fresh probe를 보내
-            # 출력을 읽는다(디렉티브 주입 스크롤백 회피). CI pwsh 단일따옴표라 $env:는 리터럴 전송→pane 확장.
-            & $cys send --to worker 'Write-Host CCDFRESH=$env:CLAUDE_CONFIG_DIR' 2>&1 | Out-Null
-            & $cys send-key --to worker Return 2>&1 | Out-Null
-            $envProof = $false; $scr=''
-            $deadline=(Get-Date).AddSeconds(45)
-            while((Get-Date) -lt $deadline){ Start-Sleep 3; $scr=(& $cys read-screen --to worker 2>&1) -join "`n"; if($scr -match 'CCDFRESH=ENVINJECT_OK'){$envProof=$true;break} }
+            (Bx $py @('-c',$pyprog,$aj) 15000).Out | Out-Host
+            (Bx $cys @('launch-agent','--role','worker','--agent','stubenv') 90000).Out | Out-Host
+            (Bx $cys @('send','--to','worker','Write-Host CCDFRESH=$env:CLAUDE_CONFIG_DIR') 15000) | Out-Null
+            (Bx $cys @('send-key','--to','worker','Return') 15000) | Out-Null
+            $envProof=$false; $scr=''
+            $deadline=(Get-Date).AddSeconds(40)
+            while((Get-Date) -lt $deadline){ Start-Sleep 3; $scr=(Bx $cys @('read-screen','--to','worker') 15000).Out; if($scr -match 'CCDFRESH=ENVINJECT_OK'){$envProof=$true;break} }
             if (-not $envProof) { Write-Host "== stub screen =="; Write-Host $scr }
             Rec 3 $envProof "env주입 스텁 CCDFRESH=ENVINJECT_OK (해소+주입 E2E · claude 실발동은 박사님 실기 마커)"
           } catch { Rec 3 $false "$_" }
 
-          # ── T3-7/T3-9/T3-10/T3-6: 부서 스폰·격리(RC-5/6/15/13·단일부서만·RC-13 후) ──
+          # ── T3-7/T3-10: 부서 스폰·로그(RC-5/6/15·단일부서·전부 바운드) ──
           try {
             $bash = Join-Path $dir 'runtime\git\usr\bin\bash.exe'
             $deptTool = Join-Path $userHome '.cys\pack\bin\cys-dept'
             $env:PATH = "$dir;$(Join-Path $dir 'runtime\git\usr\bin');$(Join-Path $dir 'runtime\python');$env:PATH"
-            $out = & $bash $deptTool allocate 2>&1; Write-Host "cys-dept allocate: $out"
-            $name = ($out | Select-Object -Last 1).Trim()
-            $deptOk = $name -match '^dept-\d+$'
-            # RC-15: dept_logdir = %LOCALAPPDATA%\cys\cys-dept-<name> 생성·cysd.log
+            $r = Bx $bash @($deptTool,'allocate') 60000; Write-Host "cys-dept allocate: $($r.Out)"
+            $name = (($r.Out -split "`n") | Where-Object { $_ -match '^dept-\d+' } | Select-Object -Last 1)
+            if ($name) { $name = $name.Trim() }
+            $deptOk = ($r.Code -eq 0 -and $name -match '^dept-\d+$')
             $logdir = Join-Path $env:LOCALAPPDATA "cys\cys-dept-$name"
             Start-Sleep 3
-            $logOk = Test-Path (Join-Path $logdir 'cysd.log')
-            Rec 7 $deptOk "cys-dept allocate → $name"
+            $logOk = ($deptOk -and (Test-Path (Join-Path $logdir 'cysd.log')))
+            Rec 7 $deptOk "cys-dept allocate → $name (code=$($r.Code))"
             Rec 10 $logOk "dept_logdir cysd.log @ $logdir"
-            if ($deptOk) { & $bash $deptTool down $name 2>&1 | Out-Host }
+            if ($deptOk) { (Bx $bash @($deptTool,'down',$name) 30000) | Out-Null }
           } catch { Rec 7 $false "$_"; Rec 10 $false "$_" }
 
           # ── 집계 + 크리티컬 게이트 ──
           Write-Host "== T3 SMOKE 집계 =="
           $results.GetEnumerator() | Sort-Object Name | ForEach-Object { Write-Host ("  T3-{0}: {1}" -f $_.Key, ($(if($_.Value){'PASS'}else{'FAIL'}))) }
           Get-Process cys,cysd -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-          # 크리티컬(온보딩·hook·pipe·python3)만 hard gate — 나머지는 로그로 승격 판독.
           $crit = @('1','2','1b','pipe','13')
           $failed = $crit | Where-Object { -not $results[$_] }
           if ($failed) { throw ("크리티컬 T3 행 실패: " + ($failed -join ',')) }
