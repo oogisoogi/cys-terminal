@@ -599,9 +599,12 @@ async function runSkillButton(s: any) {
       to: "worker",
     })) as string;
     await invoke("run_skill", { name: s.name, ticket, agent: "claude", closeAfter: null });
-    toast("system", "skill.launched", `${s.label ?? s.name} — 일회용 워커 실행(검수 전 라벨 부착)`);
+    // 일회용 워커 pane은 CC 오버레이(z-index 1500) **아래** 작업공간에 뜬다 — CC를 닫아야
+    // 보인다(오너 실증 2026-07-03: "CC를 종료해야 나타난다"). 실행 성공 시 자동으로 닫는다.
+    setCcOpen(false);
+    toast("system", "skill.launched", `${s.label ?? s.name} — 일회용 워커 pane이 열렸습니다`);
   } catch (e) {
-    toast("watchdog", "skill.failed", String(e));
+    toast("watchdog", "skill.failed", `${s.label ?? s.name} 실행 실패: ${e}`);
   }
 }
 
