@@ -352,6 +352,9 @@ body.pane-dragging { cursor: grabbing; -webkit-user-select: none; user-select: n
 body.pane-dragging .pane .pane-title { cursor: grabbing; }
 .pane.focused .pane-title { color: var(--accent); }
 .pane .term-host { flex: 1; min-height: 0; padding: 2px; }
+/* 터미널 뷰포트 스크롤바 숨김 — 마우스 휠 스크롤은 그대로 동작(overflow 유지, 시각 스크롤바만 제거). */
+.xterm-viewport::-webkit-scrollbar { width: 0; height: 0; }
+.xterm-viewport { scrollbar-width: none; -ms-overflow-style: none; }
 .pane.focused { outline: 1px solid var(--accent); outline-offset: -1px; }
 
 #ft-panel {

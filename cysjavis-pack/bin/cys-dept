@@ -398,8 +398,10 @@ PY
     # ★계정격리(Fix1'): 기본계정 base 해석 → 부서별 fork dir(<base>-<name>). base 해석불가=fail-closed.
     # 기본계정은 CYS_DEPT_DEFAULT_ACCOUNT로 명시 지정한다(공개 배포본에 특정 오너 핸들을 박지 않는다 —
     # 운영자가 한 번 설정: export CYS_DEPT_DEFAULT_ACCOUNT=<account>).
-    acct="${CYS_DEPT_DEFAULT_ACCOUNT:-}"
-    [ -n "$acct" ] || { echo "[cys-dept] allocate: 기본계정 미지정 — 'export CYS_DEPT_DEFAULT_ACCOUNT=<account>'로 지정하세요(부서별 격리 base 해석에 필요) — fail-closed" >&2; exit 5; }
+    # 기본계정 미지정 시 fail-close 대신 일반 네임스페이스 'default'로 폴백 → +부서 버튼이 즉시 동작한다.
+    # 부서는 여전히 <base>-<name>(각 부서 고유 dir)로 개별 격리되고, 'default'는 특정 오너 핸들이 아니므로
+    # "공개 배포본에 오너 핸들 미주입" 설계 취지도 유지된다. 명시 격리는 export CYS_DEPT_DEFAULT_ACCOUNT=<account>(우선).
+    acct="${CYS_DEPT_DEFAULT_ACCOUNT:-default}"
     base="$(resolve_default_base "$acct")" || { echo "[cys-dept] allocate: 기본계정 base 해석 불가($acct) — fail-closed" >&2; exit 5; }
     [ -n "$base" ] || { echo "[cys-dept] allocate: 기본계정 base 빈값($acct) — fail-closed" >&2; exit 5; }
     acctdir="${base%/}-$name"; mkdir -p "$acctdir"
