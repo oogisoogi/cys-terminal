@@ -365,10 +365,12 @@ async fn create_surface(
 #[tauri::command]
 fn log_ime(line: String) {
     use std::io::Write;
+    // RC-10: /tmp 하드코딩 → OS중립 temp_dir(Windows엔 /tmp 없어 디버그 로그 무음 유실이던 것 수정).
+    let log_path = std::env::temp_dir().join("cys-ime.log");
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open("/tmp/cys-ime.log")
+        .open(&log_path)
     {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

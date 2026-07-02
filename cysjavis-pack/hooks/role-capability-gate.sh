@@ -63,7 +63,7 @@ else
 fi
 
 exec python3 - <<'PYEOF'
-import json, os, shlex, sys
+import json, os, shlex, sys, tempfile
 
 # 변형(mutation) 도구 — reviewer/planner에게 deny.
 MUTATION_TOOLS = {"Edit", "Write", "NotebookEdit", "MultiEdit"}
@@ -101,7 +101,12 @@ def is_separator(tok):
 def path_is_allowed(p):
     if not p:
         return False
-    ap = os.path.abspath(p)
+    # RC-10: 백슬래시 정규화(Windows 경로 C:\...\Temp → 슬래시 비교 가능) + OS temp 동적 허용
+    # (Windows %TEMP%는 /tmp/ 접두와 안 맞아 reviewer temp write가 과도차단되던 것 수정).
+    ap = os.path.abspath(p).replace("\\", "/")
+    tmp = tempfile.gettempdir().replace("\\", "/").rstrip("/") + "/"
+    if ap.startswith(tmp):
+        return True
     if any(ap.startswith(pre) for pre in ALLOW_PATH_PREFIXES):
         return True
     return any(s in ap for s in ALLOW_PATH_SUBSTRS)

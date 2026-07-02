@@ -589,7 +589,9 @@ fn read_new_lines(state: &mut TailState) -> Vec<String> {
         }
         // 상한 초과 미완성 라인은 폐기 — 다음 개행부터 재동기화
     }
-    parts.iter().map(|s| s.to_string()).collect()
+    // RC-10: CRLF 정규화 — Windows 네이티브 프로세스가 쓴 JSONL은 CRLF라 split('\n') 후 각 라인 끝에
+    // '\r' 잔류→JSON 파싱 오염. 라인별 trailing '\r' 제거(LF-only는 무영향).
+    parts.iter().map(|s| s.trim_end_matches('\r').to_string()).collect()
 }
 
 // ───────────────────────── 파서 (순수함수 — 테스트 핀) ─────────────────────────
