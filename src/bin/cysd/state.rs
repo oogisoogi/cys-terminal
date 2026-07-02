@@ -1554,25 +1554,38 @@ fn default_shell() -> String {
     }
 }
 
-/// D8(RC-19·mac): 로그인셸 `-lc` 명령 앞에 붙일 `export PATH="<runtime bin dirs>:$PATH"; ` 프리픽스.
-/// 로그인 프로파일(path_helper)이 동봉 runtime을 PATH 뒤로 강등한 뒤 실행되는 -c 명령에서 재선두주입해
-/// 동봉 git/python3/uv/node가 /usr/bin CLT-shim을 이기게 한다. runtime 부재(개발/비동봉)면 None(no-op).
-/// dir는 셸 안전 큰따옴표. cysd 자기 exe_dir(Contents/MacOS) 기준 runtime_bin_dirs와 단일화.
+/// POSIX 셸 single-quote 이스케이프(경로의 `$`·백틱·`$()`·공백·특수문자를 리터럴화).
+/// 큰따옴표는 `$`·백틱·`$()`가 여전히 확장돼 취약(codex T6b.1) → 단일따옴표로 리터럴 고정하고
+/// 내부 `'`만 `'\''`로 닫고-이스케이프-열기. cys 경로에 특수문자가 있어도 명령 주입 불가.
 #[cfg(target_os = "macos")]
-fn mac_runtime_lc_prefix() -> Option<String> {
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()))?;
-    let dirs = cys::runtime_bin_dirs(&exe_dir);
+fn sh_squote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// D8(RC-19·mac): runtime bin dirs → `-lc` 명령 앞에 붙일 `export PATH='<dir>':…:"$PATH"; ` 프리픽스.
+/// dir는 POSIX single-quote(확장 취약 제거)·`$PATH`만 큰따옴표로 확장. dirs 비면 None. 순수 fn(테스트용).
+#[cfg(target_os = "macos")]
+fn mac_lc_path_prefix(dirs: &[std::path::PathBuf]) -> Option<String> {
     if dirs.is_empty() {
         return None;
     }
     let joined = dirs
         .iter()
-        .map(|d| format!("\"{}\"", d.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"")))
+        .map(|d| sh_squote(&d.to_string_lossy()))
         .collect::<Vec<_>>()
         .join(":");
     Some(format!("export PATH={joined}:\"$PATH\"; "))
+}
+
+/// 로그인 프로파일(path_helper)이 동봉 runtime을 PATH 뒤로 강등한 뒤 실행되는 -c 명령에서 재선두주입해
+/// 동봉 git/python3/uv/node가 /usr/bin CLT-shim을 이기게 한다. runtime 부재(개발/비동봉)면 None(no-op).
+/// cysd 자기 exe_dir(Contents/MacOS) 기준 runtime_bin_dirs와 단일화.
+#[cfg(target_os = "macos")]
+fn mac_runtime_lc_prefix() -> Option<String> {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))?;
+    mac_lc_path_prefix(&cys::runtime_bin_dirs(&exe_dir))
 }
 
 /// 오너 완화책 ① 기본 내장 룰: 로그인 만료·401·토큰 만료를 즉시 감지한다.
@@ -1613,6 +1626,28 @@ fn default_health_rules() -> Vec<HealthRule> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── T6b.1 회귀 핀(codex): mac -lc PATH 프리픽스는 POSIX single-quote로 특수문자 리터럴화 ──
+    // 버그: 큰따옴표 quoting은 경로의 $·백틱·$()가 셸 확장돼 명령 주입/오해석 취약.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_lc_path_prefix_single_quotes_special_chars() {
+        use std::path::PathBuf;
+        let dirs = vec![
+            PathBuf::from("/Apps/cys.app/Contents/Resources/runtime/python/bin"),
+            PathBuf::from("/weird/$HOME `whoami` $(id)/git/bin"), // $·백틱·$()·공백
+            PathBuf::from("/quote'd/uv"),                         // 내부 작은따옴표
+        ];
+        let p = mac_lc_path_prefix(&dirs).expect("dirs 비지 않음");
+        assert!(p.starts_with("export PATH="), "형식: {p}");
+        assert!(p.ends_with(":\"$PATH\"; "), "말미 $PATH 확장 보존: {p}");
+        // 특수문자 경로 전체가 single-quote 리터럴 — 확장 토큰이 따옴표 밖에 노출되지 않는다.
+        assert!(p.contains("'/weird/$HOME `whoami` $(id)/git/bin'"), "특수문자 단일따옴표 리터럴: {p}");
+        // 내부 작은따옴표는 '\'' 로 닫고-이스케이프-열기.
+        assert!(p.contains("'/quote'\\''d/uv'"), "내부 따옴표 이스케이프: {p}");
+        // dirs 비면 None(no-op).
+        assert_eq!(mac_lc_path_prefix(&[]), None, "빈 dirs → None");
+    }
 
     // ── RC-13 회귀 핀(agy 요구): Windows 부서 상태 격리 슬러그 ──
     // 버그: state_dir Windows 분기가 socket_path를 폐기하고 %LOCALAPPDATA%\cys 고정 → 모든 부서가
