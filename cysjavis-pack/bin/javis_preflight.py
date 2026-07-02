@@ -347,6 +347,32 @@ def is_dept_pack():
         return False
 
 
+def _path_under_tempdir(p):
+    """p 가 임시 디렉터리(/tmp·/private/tmp·$TMPDIR·/var/folders·/private/var/folders) 아래인가.
+    임시 pack 예방 가드(discover_claude_settings)와 C57 temp-훅 청소기의 공용 술어.
+    symlink 정규화 위해 양변 realpath 비교(macOS /tmp→/private/tmp·/var→/private/var)."""
+    try:
+        rp = os.path.realpath(p)
+    except OSError:
+        return False
+    roots = ["/tmp", "/private/tmp", "/var/folders", "/private/var/folders",
+             os.environ.get("TMPDIR")]
+    try:
+        roots.append(tempfile.gettempdir())
+    except Exception:
+        pass
+    for r in roots:
+        if not r:
+            continue
+        try:
+            rr = os.path.realpath(r).rstrip("/")
+        except OSError:
+            rr = r.rstrip("/")
+        if rp == rr or rp.startswith(rr + os.sep):
+            return True
+    return False
+
+
 def discover_claude_settings():
     """$HOME 직하 .claude*/settings.json 전부(존재 파일만·사전순) + cys 계정 config dir.
 
@@ -372,6 +398,12 @@ def discover_claude_settings():
         if _acct and os.path.isdir(_acct):
             return [os.path.join(_acct, "settings.json")]
         return []  # account_dir 미상 시: 글로벌 등록 절대 금지(누수방지 우선·부서 settings는 cys-dept가 생성)
+    # 2026-07-02 근본복원(temp-pack 누수): grill embed/스냅샷 하네스가 CYS_PACK_DIR=/tmp/snap_grill_* 로
+    # preflight --fix 를 돌리면 home-glob을 타고 실 글로벌 settings에 /tmp 세션훅을 등록 → temp가 비거나
+    # 사라지며 "No such file" 무한재발. dept 가드(_pack_is_dept)의 짝: 임시 pack은 실 config에 절대
+    # 등록 금지(스냅샷/테스트 부작용 0). 이미 등록된 잔해 청소는 C57.
+    if _path_under_tempdir(pack_dir()):
+        return []
     try:
         names = os.listdir(home)
     except OSError:
@@ -1021,6 +1053,117 @@ class Preflight:
                          % (total, ", ".join(done)))
         else:
             self.add(cid, FAIL, "글로벌 settings dept 훅 누수 %d개 탐지: %s (--fix로 청소)"
+                     % (total, summary))
+
+    # ── C57 temp-pack hook 누수 invariant (C56 dept 누수의 짝 — 2026-07-02 근본복원) ──
+    # invariant: 어떤 settings(hooks)에도 command 경로가 임시 디렉터리(/tmp·$TMPDIR·/var/folders)인
+    # hook은 0이어야 한다. grill embed/스냅샷 하네스가 temp pack으로 preflight를 돌려 실 config에 등록한
+    # /tmp 세션훅이 temp dir이 비거나 사라지며 SessionStart "No such file" 무한재발한 계열의 코드화 청소.
+    # 예방(discover_claude_settings temp 가드)의 짝 — 이미 누수된 잔해를 제거한다. report=FAIL·fix=청소.
+    def _temp_hooks_in(self, settings_path):
+        """결정론: settings.json hooks command 의 sh|bash 스크립트 경로가 temp dir 아래인 (event,bi,hi)."""
+        try:
+            with open(settings_path) as f:
+                data = json.load(f)
+        except Exception:
+            return []
+        hroot = data.get("hooks")
+        if not isinstance(hroot, dict):
+            return []
+        out = []
+        for ev, blocks in hroot.items():
+            if not isinstance(blocks, list):
+                continue
+            for bi, blk in enumerate(blocks):
+                hooks = blk.get("hooks", []) if isinstance(blk, dict) else []
+                for hi, h in enumerate(hooks):
+                    cmd = h.get("command", "") if isinstance(h, dict) else ""
+                    m = re.search(r"(?:sh|bash)\s+(\S+)", cmd)
+                    if m and _path_under_tempdir(os.path.expanduser(m.group(1))):
+                        out.append((ev, bi, hi))
+        return out
+
+    def _strip_temp_hooks(self, settings_path):
+        """백업 후 temp 훅 제거(비-temp 보존·빈 블록 제거·원자적). 반환 (removed, err)."""
+        try:
+            with open(settings_path) as f:
+                data = json.load(f)
+        except Exception as e:
+            return (0, str(e))
+        H = data.get("hooks")
+        if not isinstance(H, dict):
+            return (0, "hooks 루트가 객체 아님")
+
+        def _is_temp(h):
+            cmd = h.get("command", "") if isinstance(h, dict) else ""
+            m = re.search(r"(?:sh|bash)\s+(\S+)", cmd)
+            return bool(m and _path_under_tempdir(os.path.expanduser(m.group(1))))
+
+        removed = 0
+        for ev in list(H.keys()):
+            blocks = H[ev] if isinstance(H[ev], list) else []
+            nb = []
+            for blk in blocks:
+                hooks = blk.get("hooks", []) if isinstance(blk, dict) else []
+                kept = [h for h in hooks if not _is_temp(h)]
+                removed += len(hooks) - len(kept)
+                if kept:
+                    b2 = dict(blk)
+                    b2["hooks"] = kept
+                    nb.append(b2)
+            H[ev] = nb
+        if removed:
+            try:
+                bak = settings_path + ".bak-temphook"
+                if not os.path.exists(bak):
+                    shutil.copy(settings_path, bak)
+                fd, tmp = tempfile.mkstemp(dir=os.path.dirname(settings_path) or ".",
+                                           prefix=".temphook.", suffix=".tmp")
+                try:
+                    with os.fdopen(fd, "w") as f:
+                        json.dump(data, f, indent=2, ensure_ascii=False)
+                    shutil.copystat(settings_path, tmp)
+                    os.replace(tmp, settings_path)
+                except Exception:
+                    if os.path.exists(tmp):
+                        os.unlink(tmp)
+                    raise
+            except Exception as e:
+                return (0, str(e))
+        return (removed, "")
+
+    def c57_temp_hook_leak(self):
+        cid = "C57.temp-hook-leak"
+        if self.skipped(cid):
+            return
+        targets = discover_claude_settings()
+        if not targets:
+            self.add(cid, WARN, "~/.claude*/settings.json 미발견(temp-pack 컨텍스트면 정상)")
+            return
+        leaks = {t: self._temp_hooks_in(t) for t in targets}
+        leaks = {t: v for t, v in leaks.items() if v}
+        if not leaks:
+            self.add(cid, PASS, "%d개 settings에 temp 훅 누수 0 (invariant 충족)" % len(targets))
+            return
+        total = sum(len(v) for v in leaks.values())
+        summary = ", ".join("%s:%d" % (os.path.basename(os.path.dirname(t)), len(v))
+                            for t, v in leaks.items())
+        if self.fix:
+            done, errs = [], []
+            for t in leaks:
+                n, err = self._strip_temp_hooks(t)
+                if err:
+                    errs.append("%s: %s" % (os.path.basename(os.path.dirname(t)), err))
+                else:
+                    done.append("%s(-%d)" % (os.path.basename(os.path.dirname(t)), n))
+            if errs:
+                self.add(cid, WARN, "일부 청소 실패: %s | 성공: %s"
+                         % ("; ".join(errs), ", ".join(done)))
+            else:
+                self.add(cid, FIXED, "temp 훅 누수 %d개 제거(비-temp 보존·백업): %s — ★claude 재시작 후 적용"
+                         % (total, ", ".join(done)))
+        else:
+            self.add(cid, FAIL, "글로벌 settings temp 훅 누수 %d개 탐지: %s (--fix로 청소)"
                      % (total, summary))
 
     # ── C09 round 핵심 문서 ──
@@ -2985,6 +3128,7 @@ class Preflight:
         self.c54_loc_cap()
         self.c55_grill_gate()
         self.c56_dept_hook_leak()
+        self.c57_temp_hook_leak()
         return self.results
 
 
