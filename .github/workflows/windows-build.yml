@@ -159,14 +159,14 @@ jobs:
           $cys = Join-Path $dir 'cys.exe'
           $results = @{}
           function Rec($id,$ok,$note){ $results[$id] = $ok; Write-Host ("T3-{0} RESULT: {1}  {2}" -f $id, ($(if($ok){'PASS'}else{'FAIL'})), $note) }
-          $home = $env:USERPROFILE
+          $userHome = $env:USERPROFILE
 
           # ── T3-1/T3-2: 온보딩(init-pack) + hook 등록·내용(RC-1·RC-2) ──
           try {
             & $cys init-pack 2>&1 | Out-Host
-            $packOk = Test-Path (Join-Path $home '.cys\pack\agents.json')
+            $packOk = Test-Path (Join-Path $userHome '.cys\pack\agents.json')
             # hook: ~/.cys/claude/settings.json 또는 ~/.claude*/settings.json 중 SessionStart command 확인
-            $settings = @(Get-ChildItem (Join-Path $home '.cys\claude\settings.json'),(Join-Path $home '.claude\settings.json') -ErrorAction SilentlyContinue)
+            $settings = @(Get-ChildItem (Join-Path $userHome '.cys\claude\settings.json'),(Join-Path $userHome '.claude\settings.json') -ErrorAction SilentlyContinue)
             $hookCmd = ''
             foreach ($s in $settings) { try { $j=Get-Content $s.FullName -Raw|ConvertFrom-Json; $c=$j.hooks.SessionStart.hooks.command; if($c){$hookCmd="$c"} } catch {} }
             Rec 1 ($packOk) "pack=$packOk"
@@ -190,7 +190,7 @@ jobs:
           # ${CYS_ACCOUNT_DIR:-ENVINJECT_OK}는 CYS_ACCOUNT_DIR 미설정→"ENVINJECT_OK"로 해소·pane env 주입.
           try {
             $py = Join-Path $dir 'runtime\python\python3.exe'
-            $aj = Join-Path $home '.cys\pack\agents.json'
+            $aj = Join-Path $userHome '.cys\pack\agents.json'
             # 한 줄 python(-c) — YAML/pwsh here-string 충돌 회피(닫는 @'는 column0 필요). pwsh 단일따옴표라
             # 내부 \" 는 python에 그대로 전달(escaped double-quote). python 내 single-quote 없음(안전).
             $pyprog = 'import json,sys; aj=sys.argv[1]; d=json.load(open(aj,encoding="utf-8")); d["stubenv"]={"cmd":"Write-Host CCDPROOF=$env:CLAUDE_CONFIG_DIR","env":{"CLAUDE_CONFIG_DIR":"${CYS_ACCOUNT_DIR:-ENVINJECT_OK}"},"inject_delay_secs":3,"ready_marker":"CCDPROOF=","clear_cmd":"/clear"}; json.dump(d,open(aj,"w",encoding="utf-8"),ensure_ascii=False,indent=2); print("stubenv OK")'
@@ -210,7 +210,7 @@ jobs:
           # ── T3-7/T3-9/T3-10/T3-6: 부서 스폰·격리(RC-5/6/15/13·단일부서만·RC-13 후) ──
           try {
             $bash = Join-Path $dir 'runtime\git\usr\bin\bash.exe'
-            $deptTool = Join-Path $home '.cys\pack\bin\cys-dept'
+            $deptTool = Join-Path $userHome '.cys\pack\bin\cys-dept'
             $env:PATH = "$dir;$(Join-Path $dir 'runtime\git\usr\bin');$(Join-Path $dir 'runtime\python');$env:PATH"
             $out = & $bash $deptTool allocate 2>&1; Write-Host "cys-dept allocate: $out"
             $name = ($out | Select-Object -Last 1).Trim()
