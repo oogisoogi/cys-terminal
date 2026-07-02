@@ -408,8 +408,11 @@ fn effective_close_ttl(job: &Job) -> Option<u64> {
 /// 결정론 환원: 진행% 같은 도구 출력을 데몬이 직접 만들어 master 앞에 놓는다.
 /// 30초 타임아웃·빈 출력·비정상 종료는 에러 — 잘못된 보고가 무음 전달되지 않는다.
 async fn run_text_command(cmd: &str) -> Result<String, String> {
-    let fut = tokio::process::Command::new("sh")
-        .arg("-c")
+    // RC-11: OS별 셸 — Windows는 sh 부재라 heartbeat/report text_command job이 전부 실패했다.
+    // fire_command와 동일하게 command_shell()((cmd,/C) on windows) 사용으로 통일.
+    let (sh, flag) = command_shell();
+    let fut = tokio::process::Command::new(sh)
+        .arg(flag)
         .arg(cmd)
         .hide_console()
         .output();
