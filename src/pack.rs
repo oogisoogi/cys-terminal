@@ -44,6 +44,22 @@ pub fn pack_dir() -> PathBuf {
         .join(".cys/pack")
 }
 
+/// SessionStart hook 등록 명령을 OS별로 조립하는 **공용 함수**(RC-2 · 순수 함수·회귀 핀).
+/// Windows: 바닐라 셸(cmd/PowerShell)은 `.sh`를 인터프리터 없이 못 실행하고 "open with" 대화상자를
+///   띄운다(anthropics/claude-code #21847·#24097). Claude Code가 Windows에서 찾는 인터프리터는
+///   Git Bash의 `bash`이므로 `bash`로 명시 호출한다(맨 이름 `sh`는 Git Bash가 `bash.exe`만 보장 → 회피).
+/// Unix: 기존과 동일 `sh <path>`(제로 회귀).
+/// cys.rs::hook_command(init-pack 경로)와 setup_isolated_config_dir(격리 config dir 경로)가 **둘 다**
+/// 이 함수를 써서 두 경로의 인터프리터가 일치한다(구: 격리 경로만 `sh` 하드코딩 → Windows 불일치).
+pub fn session_start_hook_command(pack_dir: &Path) -> String {
+    let script = pack_dir.join("hooks/session-start.sh");
+    if cfg!(windows) {
+        format!("bash {}", script.display())
+    } else {
+        format!("sh {}", script.display())
+    }
+}
+
 /// cys 전용 CLAUDE_CONFIG_DIR — 사용자 ~/.claude(외부 터미널 체계·구 지침 오염 가능)와 **격리**한다.
 /// cys가 띄우는 claude는 이 디렉터리만 읽으므로, 사용자 프로필이 오염돼 있어도 영향받지 않고
 /// 사용자 프로필을 건드리지도(읽지도·지우지도) 않는다. macOS 인증은 계정 단위 Keychain이라
@@ -76,10 +92,9 @@ fn setup_isolated_config_dir() {
     // hook: <cfg>/settings.json 에 SessionStart → session-start.sh (없을 때만)
     let settings = cfg.join("settings.json");
     if !settings.exists() {
-        let hook = format!(
-            "sh {}",
-            pack_dir().join("hooks/session-start.sh").display()
-        );
+        // RC-2: OS-aware 공용 함수 사용 — Windows는 bash(Git Bash가 bash.exe만 보장·cmd/PowerShell은
+        // .sh를 인터프리터 없이 못 실행). 구 `sh` 하드코딩 제거(격리 config dir·init-pack 경로 일치).
+        let hook = session_start_hook_command(&pack_dir());
         let json = serde_json::json!({
             "hooks": { "SessionStart": [ { "hooks": [ { "type": "command", "command": hook } ] } ] }
         });
@@ -637,6 +652,22 @@ mod tests {
         // master는 정확 일치만 — 'masterful' 같은 변형은 매핑 없음
         assert_eq!(dir_file("master").as_deref(), Some("MASTER_DIRECTIVE.md"));
         assert_eq!(dir_file("masterful"), None);
+    }
+
+    #[test]
+    fn session_start_hook_command_is_os_aware_shared() {
+        // RC-2 회귀 핀: 격리 config dir·init-pack 두 경로가 공유하는 공용 함수.
+        let cmd = session_start_hook_command(Path::new("/pack"));
+        assert!(
+            cmd.contains("hooks/session-start.sh") || cmd.contains("hooks\\session-start.sh"),
+            "must target bundled hook: {cmd:?}"
+        );
+        let interp = cmd.split_whitespace().next().unwrap_or("");
+        assert!(interp == "sh" || interp == "bash", "shell interpreter only: {interp:?}");
+        #[cfg(unix)]
+        assert_eq!(cmd, "sh /pack/hooks/session-start.sh", "unix 제로 회귀");
+        #[cfg(windows)]
+        assert!(cmd.starts_with("bash "), "windows must use bash: {cmd:?}");
     }
 
     #[test]

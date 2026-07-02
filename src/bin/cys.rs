@@ -2400,12 +2400,9 @@ fn discover_claude_settings() -> Vec<String> {
 ///   `bash` 명령으로 명시 호출한다(맨 이름 `sh`는 Git Bash가 `bash.exe`만 보장하므로 회피).
 ///   `/clear` 후 SessionStart 자동 재주입(autopilot 축2)이 Windows에서도 발동하게 하는 핵심.
 fn hook_command(pack_dir: &std::path::Path) -> String {
-    let script = pack_dir.join("hooks/session-start.sh");
-    if cfg!(windows) {
-        format!("bash {}", script.display())
-    } else {
-        format!("sh {}", script.display())
-    }
+    // RC-2: 공용 함수로 위임 — 격리 config dir(pack.rs setup_isolated_config_dir)과 init-pack이
+    // 동일 OS 분기를 쓰게 단일화(중복 제거·불일치 차단).
+    cys::pack::session_start_hook_command(pack_dir)
 }
 
 /// Claude Code settings.json에 SessionStart hook을 등록한다 (백업 생성, 중복 등록 방지).
