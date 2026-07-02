@@ -58,9 +58,15 @@ jobs:
           curl -fL -o uv.zip "https://github.com/astral-sh/uv/releases/download/0.11.26/uv-x86_64-pc-windows-msvc.zip"
           7z x uv.zip -o"$RT/python" -y >/dev/null
           ls -la "$RT/python/uv.exe" "$RT/python/uvx.exe"
+          # ── node + npm/npx 동봉 (mac 0.7.0 파리티 — 순정 Windows엔 node 부재. runtime/node는 cysd가 PATH 주입) ──
+          echo "== Node.js 22.17.1 (npm/npx — win-x64, mac과 동일 핀) =="
+          curl -fL -o node.zip "https://nodejs.org/dist/v22.17.1/node-v22.17.1-win-x64.zip"
+          7z x node.zip -o"$RT" -y >/dev/null
+          mv "$RT/node-v22.17.1-win-x64" "$RT/node"
+          ls -la "$RT/node/node.exe" "$RT/node/npm.cmd"
           # 라이선스 고지(동봉 재배포 의무).
           mkdir -p "$RT/LICENSES"
-          printf 'Bundled runtimes and their licenses:\n- Git for Windows (git): GPLv2 (https://github.com/git-for-windows/git)\n- MSYS2 bash + GNU coreutils: GPLv3\n- CPython (embeddable): PSF License (https://www.python.org)\n- pip (get-pip bootstrap): MIT\n- uv (astral-sh): Apache-2.0 OR MIT (https://github.com/astral-sh/uv)\nWritten offer for corresponding source: contact the distributor.\n' > "$RT/LICENSES/BUNDLED-RUNTIMES.txt"
+          printf 'Bundled runtimes and their licenses:\n- Git for Windows (git): GPLv2 (https://github.com/git-for-windows/git)\n- MSYS2 bash + GNU coreutils: GPLv3\n- CPython (embeddable): PSF License (https://www.python.org)\n- pip (get-pip bootstrap): MIT\n- uv (astral-sh): Apache-2.0 OR MIT (https://github.com/astral-sh/uv)\n- Node.js (+npm/npx): MIT (https://nodejs.org)\nWritten offer for corresponding source: contact the distributor.\n' > "$RT/LICENSES/BUNDLED-RUNTIMES.txt"
           echo "== 확인 =="
           ls -la "$RT/git/usr/bin/bash.exe" "$RT/git/cmd/git.exe" "$RT/python/python3.exe"
           du -sh "$RT" "$RT/git" "$RT/python" || true

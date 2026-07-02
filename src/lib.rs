@@ -90,6 +90,7 @@ pub fn runtime_bin_dirs(exe_dir: &Path) -> Vec<PathBuf> {
             rt.join("python"),
             rt.join("git").join("cmd"),
             rt.join("git").join("usr").join("bin"),
+            rt.join("node"), // ★T6b 파리티: node.exe·npm·npx (mac runtime/node/bin 대칭 — win은 top-level)
         ] {
             if d.is_dir() {
                 dirs.push(d);
