@@ -57,7 +57,10 @@ pub fn session_start_hook_command(pack_dir: &Path) -> String {
         // RC-2 잔여(T2.1·codex CONFIRMED): 공백 포함 경로(C:\Users\John Doe\.cys\pack\...) 대응 — Windows만
         // quote로 감싼다. unix는 **무변경**(기존 install에 등록된 미quote 문자열과 install_claude_hook의
         // already-매칭이 유지돼야 중복 등록이 안 생긴다 — quote 추가 시 불일치→매 기동 중복 append 회귀).
-        format!("bash \"{}\"", script.display())
+        // ★역슬래시→정슬래시 정규화(RC-3): git-bash가 C:\ 역슬래시를 escape/미해석해 경로를 파괴하는
+        // 것(C:\Users\...→C:Users...→No such file) 방지. javis_preflight._cys_hook_cmd 의 Windows 형태와
+        // **동일 문자열**을 방출 → 두 writer 간 중복 등록 0(matcher 일치).
+        format!("bash \"{}\"", script.display().to_string().replace('\\', "/"))
     } else {
         format!("sh {}", script.display())
     }
@@ -670,7 +673,10 @@ mod tests {
         #[cfg(unix)]
         assert_eq!(cmd, "sh /pack/hooks/session-start.sh", "unix 제로 회귀");
         #[cfg(windows)]
-        assert!(cmd.starts_with("bash \""), "windows must use quoted bash: {cmd:?}");
+        {
+            assert!(cmd.starts_with("bash \""), "windows must use quoted bash: {cmd:?}");
+            assert!(!cmd.contains('\\'), "windows 경로 정슬래시 정규화(RC-3 회귀 핀): {cmd:?}");
+        }
     }
 
     #[test]

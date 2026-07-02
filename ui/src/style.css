@@ -140,7 +140,8 @@ html, body {
 .split.col { flex-direction: column; }
 .split > * { min-width: 0; min-height: 0; }
 .divider {
-  flex: 0 0 1px; background: var(--hairline);
+  /* 평시 배경과 동일색 → 구분선 거의 비가시. hover/drag 시에만 accent로 드러나 리사이즈 조작성 유지. */
+  flex: 0 0 1px; background: var(--bg);
   position: relative; z-index: 5;
 }
 /* 시각은 1px, 잡는 영역은 ±3px — 보이지 않는 히트존으로 리사이즈 조작성 보존 */

@@ -1437,7 +1437,14 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
     sendRaw(data);
   });
 
-  {
+  // ★F 수정: 위 IME 조합 상태 머신은 macOS WKWebView 전용 우회다. Windows WebView2 등 Chromium
+  // 계열은 xterm.js 네이티브 composition이 완성 음절을 onData로 정확히 1회 발화하므로, 이 우회를
+  // 함께 켜면 input 핸들러가 pendingHangul에 버퍼한 글자를 onData의 flushPending이 보내고
+  // sendRaw(data)가 다시 보내 **이중 전송**된다("너"→"너너" 전 글자 중복 — Windows 실측).
+  // ∴ WKWebView(AppleWebKit·비-Chromium)에서만 상태 머신을 붙인다(macOS 회귀0).
+  const _ua = navigator.userAgent;
+  const isWKWebView = /AppleWebKit/.test(_ua) && !/Chrome|Chromium|Edg\//.test(_ua);
+  if (isWKWebView) {
     const ta = term.textarea;
     if (ta) {
       ta.addEventListener("input", (e) => {

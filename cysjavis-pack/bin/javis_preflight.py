@@ -318,6 +318,38 @@ def pack_dir():
     return os.path.join(os.path.expanduser("~"), ".cys/pack")
 
 
+def _cys_hook_cmd(script_name):
+    """Claude settings.json hook 명령 문자열(단일 진실 — 모든 등록부 공용).
+    Windows: git-bash `bash`로 명시 호출 + **정슬래시 + 따옴표**. 미따옴표 역슬래시 경로는 bash가
+    escape로 먹어 경로가 파괴되고(C:\\Users\\...\\hooks\\cys-hook.sh → C:Userscys.cys/packhookscys-hook.sh
+    → No such file), 따옴표 없이는 공백·역슬래시가 깨진다(실측 회귀 — 전 hook No such file 폭주).
+    Unix: 기존 `sh <abs>` 무변경(회귀0 — 기존 install 문자열·matcher 그대로 유지)."""
+    script = os.path.join(pack_dir(), "hooks", script_name)
+    if os.name == "nt":
+        return 'bash "%s"' % script.replace("\\", "/")
+    return "sh " + script
+
+
+def _prune_stale_hook_entries(arr, script_name, desired):
+    """event hook 배열에서 script_name(우리 팩 hook basename)을 참조하되 desired와 다른(구·파손)
+    엔트리를 제거한다. return (정리된 리스트, desired 존재 여부). 비-cys 엔트리·타 스크립트·정상
+    엔트리는 보존 → in-place 업그레이드 시 파손 항목만 교체(중복 append·잔존 파손 동시 차단)."""
+    kept, have = [], False
+    for entry in arr:
+        if not isinstance(entry, dict):
+            kept.append(entry)
+            continue
+        cmds = [h.get("command", "") for h in entry.get("hooks", []) if isinstance(h, dict)]
+        ours = any(script_name in c and "hooks" in c for c in cmds)
+        if not ours:
+            kept.append(entry)
+        elif desired in cmds:
+            kept.append(entry)
+            have = True
+        # else: 우리 hook이나 desired와 불일치(구·파손 역슬래시·미따옴표) → 제거(교체 유도)
+    return kept, have
+
+
 def _utf8_env(extra=None):
     """자식 프로세스 텍스트 I/O를 UTF-8로 고정한 env (AgentReach utf8_subprocess 계약 클린룸 포트).
 
@@ -734,11 +766,12 @@ class Preflight:
             data = json.load(open(settings_path, encoding="utf-8"))
         except (OSError, ValueError):
             return False
-        marker = os.path.join("hooks", "session-start.sh")
+        # 정확히 desired 형태(정슬래시+따옴표)만 '등록됨'으로 인정 — 구·파손(역슬래시·미따옴표)
+        # 엔트리는 미등록으로 보아 _register_hook 이 교체하게 한다(멱등: 재실행 시 True).
+        desired = _cys_hook_cmd("session-start.sh")
         for entry in data.get("hooks", {}).get("SessionStart", []):
             for h in entry.get("hooks", []):
-                cmd = h.get("command", "")
-                if marker in cmd and "pack" in cmd:
+                if h.get("command", "") == desired:
                     return True
         return False
 
@@ -750,8 +783,7 @@ class Preflight:
         """
         if os.path.islink(settings_path):
             return "symlink 거부(실파일만 허용): %s" % settings_path
-        script = os.path.join(pack_dir(), "hooks", "session-start.sh")
-        cmd = ("bash " if os.name == "nt" else "sh ") + script
+        cmd = _cys_hook_cmd("session-start.sh")
         if os.path.isfile(settings_path):
             try:
                 data = json.load(open(settings_path, encoding="utf-8"))
@@ -770,7 +802,11 @@ class Preflight:
             if d:
                 os.makedirs(d, exist_ok=True)
         arr = data.setdefault("hooks", {}).setdefault("SessionStart", [])
-        arr.append({"hooks": [{"type": "command", "command": cmd}]})
+        # reconcile: 구·파손 엔트리 제거 후 desired 하나만 보장(중복·잔존 파손 차단).
+        kept, have = _prune_stale_hook_entries(arr, "session-start.sh", cmd)
+        if not have:
+            kept.append({"hooks": [{"type": "command", "command": cmd}]})
+        arr[:] = kept
         # 원자적 쓰기(tmp+replace) — truncate-write 중 크래시가 settings.json을
         # 파손시키면 다음 실행이 파싱 거부로 수리 불능에 빠진다(전수조사 발견).
         tmp = settings_path + ".tmp"
@@ -826,7 +862,10 @@ class Preflight:
         except (OSError, ValueError):
             return False
         sl = data.get("statusLine")
-        return isinstance(sl, dict) and "cys-statusline.sh" in sl.get("command", "")
+        if not (isinstance(sl, dict) and "cys-statusline.sh" in sl.get("command", "")):
+            return False
+        # Windows 구 파손 형태(역슬래시 경로)는 미등록으로 보아 재등록(statusLine은 단일 overwrite라 중복 없음).
+        return not (os.name == "nt" and "\\" in sl.get("command", ""))
 
     def _register_statusline(self, settings_path):
         """statusLine 등록. 성공=None, 실패=사유 문자열. 기존 statusLine은 CYS_PREV_STATUSLINE로
@@ -834,8 +873,7 @@ class Preflight:
         백업·원자적 쓰기 철학."""
         if os.path.islink(settings_path):
             return "symlink 거부(실파일만 허용): %s" % settings_path
-        script = os.path.join(pack_dir(), "hooks", "cys-statusline.sh")
-        runner = "bash " if os.name == "nt" else "sh "
+        base = _cys_hook_cmd("cys-statusline.sh")   # 정슬래시+따옴표(Windows) / sh <abs>(unix)
         if os.path.isfile(settings_path):
             try:
                 data = json.load(open(settings_path, encoding="utf-8"))
@@ -856,9 +894,9 @@ class Preflight:
         prev = data.get("statusLine")
         prev_cmd = prev.get("command", "") if isinstance(prev, dict) else ""
         if prev_cmd and "cys-statusline.sh" not in prev_cmd:
-            cmd = "CYS_PREV_STATUSLINE=%s %s%s" % (shlex.quote(prev_cmd), runner, script)
+            cmd = "CYS_PREV_STATUSLINE=%s %s" % (shlex.quote(prev_cmd), base)
         else:
-            cmd = runner + script
+            cmd = base
         data["statusLine"] = {"type": "command", "command": cmd}
         tmp = settings_path + ".tmp"
         open(tmp, "w", encoding="utf-8").write(
@@ -2617,9 +2655,10 @@ class Preflight:
             return False
         if not isinstance(data, dict):
             return False
+        desired = _cys_hook_cmd(APPBUILD_HOOK)
         for entry in data.get("hooks", {}).get("PreToolUse", []):
             for h in entry.get("hooks", []):
-                if APPBUILD_HOOK in h.get("command", ""):
+                if h.get("command", "") == desired:
                     return True
         return False
 
@@ -2627,8 +2666,7 @@ class Preflight:
         """PreToolUse(Edit|Write|NotebookEdit)로 게이트 hook 등록. 성공=None, 실패=사유."""
         if os.path.islink(settings_path):
             return "symlink 거부: %s" % settings_path
-        script = os.path.join(pack_dir(), "hooks", APPBUILD_HOOK)
-        cmd = ("bash " if os.name == "nt" else "sh ") + script
+        cmd = _cys_hook_cmd(APPBUILD_HOOK)
         data = {}
         if os.path.isfile(settings_path):
             try:
@@ -2645,8 +2683,11 @@ class Preflight:
             if d:
                 os.makedirs(d, exist_ok=True)
         arr = data.setdefault("hooks", {}).setdefault("PreToolUse", [])
-        arr.append({"matcher": "Edit|Write|NotebookEdit",
-                    "hooks": [{"type": "command", "command": cmd}]})
+        kept, have = _prune_stale_hook_entries(arr, APPBUILD_HOOK, cmd)
+        if not have:
+            kept.append({"matcher": "Edit|Write|NotebookEdit",
+                         "hooks": [{"type": "command", "command": cmd}]})
+        arr[:] = kept
         tmp = settings_path + ".tmp"
         open(tmp, "w", encoding="utf-8").write(
             json.dumps(data, ensure_ascii=False, indent=2))
@@ -2663,11 +2704,10 @@ class Preflight:
             return False
         if not isinstance(data, dict):
             return False
-        pd = pack_dir()
+        desired = _cys_hook_cmd(script_name)
         for entry in data.get("hooks", {}).get(event, []):
             for h in entry.get("hooks", []):
-                cmd = h.get("command", "")
-                if script_name in cmd and pd in cmd:
+                if h.get("command", "") == desired:
                     return True
         return False
 
@@ -2676,8 +2716,7 @@ class Preflight:
         _register_appbuild_hook 과 동일 규약(symlink 거부·파싱실패 거부·백업·원자적)."""
         if os.path.islink(settings_path):
             return "symlink 거부: %s" % settings_path
-        script = os.path.join(pack_dir(), "hooks", script_name)
-        cmd = ("bash " if os.name == "nt" else "sh ") + script
+        cmd = _cys_hook_cmd(script_name)
         data = {}
         if os.path.isfile(settings_path):
             try:
@@ -2693,10 +2732,14 @@ class Preflight:
             d = os.path.dirname(settings_path)
             if d:
                 os.makedirs(d, exist_ok=True)
-        entry = {"hooks": [{"type": "command", "command": cmd}]}
-        if matcher is not None:
-            entry["matcher"] = matcher
-        data.setdefault("hooks", {}).setdefault(event, []).append(entry)
+        arr = data.setdefault("hooks", {}).setdefault(event, [])
+        kept, have = _prune_stale_hook_entries(arr, script_name, cmd)
+        if not have:
+            entry = {"hooks": [{"type": "command", "command": cmd}]}
+            if matcher is not None:
+                entry["matcher"] = matcher
+            kept.append(entry)
+        arr[:] = kept
         tmp = settings_path + ".tmp"
         open(tmp, "w", encoding="utf-8").write(
             json.dumps(data, ensure_ascii=False, indent=2))

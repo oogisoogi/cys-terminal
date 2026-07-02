@@ -48,9 +48,19 @@ jobs:
           cp "$RT/python/python.exe" "$RT/python/python3.exe"
           # embeddable ._pth: 스크립트 dir(.) + site 활성화(형제 import·표준 경로 계산 존중).
           printf 'python312.zip\n.\nimport site\n' > "$RT/python/python312._pth"
+          # ── pip 부트스트랩 (embeddable은 pip 미포함 → 'No module named pip' 방지) ──
+          echo "== get-pip (embeddable python pip 부트스트랩) =="
+          curl -fL -o "$RT/python/get-pip.py" "https://bootstrap.pypa.io/get-pip.py"
+          "$RT/python/python.exe" "$RT/python/get-pip.py" --no-warn-script-location
+          rm -f "$RT/python/get-pip.py"
+          # ── uv/uvx 동봉 (serena·nlm-mcp-cli가 uvx 전제 → C20/C43 FAIL 방지). runtime/python은 cysd가 PATH 주입. ──
+          echo "== uv 0.11.26 (x86_64-pc-windows-msvc) 동봉 =="
+          curl -fL -o uv.zip "https://github.com/astral-sh/uv/releases/download/0.11.26/uv-x86_64-pc-windows-msvc.zip"
+          7z x uv.zip -o"$RT/python" -y >/dev/null
+          ls -la "$RT/python/uv.exe" "$RT/python/uvx.exe"
           # 라이선스 고지(동봉 재배포 의무).
           mkdir -p "$RT/LICENSES"
-          printf 'Bundled runtimes and their licenses:\n- Git for Windows (git): GPLv2 (https://github.com/git-for-windows/git)\n- MSYS2 bash + GNU coreutils: GPLv3\n- CPython (embeddable): PSF License (https://www.python.org)\nWritten offer for corresponding source: contact the distributor.\n' > "$RT/LICENSES/BUNDLED-RUNTIMES.txt"
+          printf 'Bundled runtimes and their licenses:\n- Git for Windows (git): GPLv2 (https://github.com/git-for-windows/git)\n- MSYS2 bash + GNU coreutils: GPLv3\n- CPython (embeddable): PSF License (https://www.python.org)\n- pip (get-pip bootstrap): MIT\n- uv (astral-sh): Apache-2.0 OR MIT (https://github.com/astral-sh/uv)\nWritten offer for corresponding source: contact the distributor.\n' > "$RT/LICENSES/BUNDLED-RUNTIMES.txt"
           echo "== 확인 =="
           ls -la "$RT/git/usr/bin/bash.exe" "$RT/git/cmd/git.exe" "$RT/python/python3.exe"
           du -sh "$RT" "$RT/git" "$RT/python" || true
