@@ -2425,11 +2425,6 @@ fn install_claude_hook(settings_path: &str, pack_dir: &std::path::Path) -> Resul
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => json!({}),
         Err(e) => return Err(format!("settings read error: {e}")),
     };
-    // backup
-    if std::path::Path::new(settings_path).exists() {
-        let backup = format!("{settings_path}.bak-cys");
-        std::fs::copy(settings_path, &backup).map_err(|e| e.to_string())?;
-    }
     let hooks = root
         .as_object_mut()
         .ok_or("settings root is not an object")?
@@ -2454,6 +2449,13 @@ fn install_claude_hook(settings_path: &str, pack_dir: &std::path::Path) -> Resul
     });
     if already {
         return Ok("hook already installed (skipped)".into());
+    }
+    // backup — RC-1(D2 master 조건): 실제 write가 발생할 때만 백업한다. `already` 체크 앞에서
+    // 백업하면 온보딩이 매 기동 init-pack을 호출할 때(멱등) 정상 상태 .bak-cys가 매번 클로버돼
+    // "정상 백업"이 소실된다(적대검증 serious). already→skip 경로는 백업을 건드리지 않는다.
+    if std::path::Path::new(settings_path).exists() {
+        let backup = format!("{settings_path}.bak-cys");
+        std::fs::copy(settings_path, &backup).map_err(|e| e.to_string())?;
     }
     arr.push(json!({"hooks": [{"type": "command", "command": hook_cmd}]}));
     std::fs::write(settings_path, serde_json::to_string_pretty(&root).unwrap())
@@ -6041,6 +6043,35 @@ mod tests {
             // Claude Code가 Windows에서 `.sh` 해석에 찾는 인터프리터와 일치
             assert!(cmd.starts_with("bash "), "windows must use bash: {cmd:?}");
         }
+    }
+
+    #[test]
+    fn install_claude_hook_skips_backup_when_already_installed() {
+        // RC-1 회귀 핀(D2 master 조건): 온보딩이 매 기동 init-pack을 호출(멱등)해도,
+        // hook이 이미 있으면 `.bak-cys` 정상 백업이 클로버되면 안 된다(백업은 실제 write 시에만).
+        let base =
+            std::env::temp_dir().join(format!("cys-hookbak-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let pack = base.join("pack");
+        let settings = base.join("settings.json");
+        let settings_path = settings.to_string_lossy().to_string();
+        let backup = format!("{settings_path}.bak-cys");
+
+        // 1) 최초 설치: hook 없음 → 등록 성공 + write 발생(기존 "{}" 존재하므로 이때 backup 1회 생성).
+        std::fs::write(&settings, "{}").unwrap();
+        let r1 = install_claude_hook(&settings_path, &pack).unwrap();
+        assert!(r1.contains("registered"), "first install must register: {r1}");
+
+        // 2) 재실행(멱등): hook 이미 존재 → skip. 이 경로는 backup을 절대 만들지 않아야 한다.
+        let _ = std::fs::remove_file(&backup); // 백업 삭제 후 재호출이 다시 만들지 않음을 검증
+        let r2 = install_claude_hook(&settings_path, &pack).unwrap();
+        assert!(r2.contains("already"), "second call must skip: {r2}");
+        assert!(
+            !std::path::Path::new(&backup).exists(),
+            "already-installed skip must NOT create/clobber .bak-cys"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// 기동 화면의 평탄화(공백 제거)를 테스트에서 동일하게 재현하는 헬퍼.

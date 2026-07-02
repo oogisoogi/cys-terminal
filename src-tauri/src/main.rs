@@ -697,7 +697,7 @@ fn maybe_apply_pending_update(app: &AppHandle) {
         return;
     }
     // ① 새 팩(새 기능) 반영 — 성공 여부를 검사한다(침묵 실패 차단).
-    let mut init_cmd = std::process::Command::new(resolve_sidecar("cys"));
+    let mut init_cmd = std::process::Command::new(resolve_sidecar(if cfg!(windows) { "cys.exe" } else { "cys" }));
     init_cmd.arg("init-pack").arg("--no-install-hook");
     no_console(&mut init_cmd);
     let pack_ok = init_cmd
@@ -715,7 +715,7 @@ fn maybe_apply_pending_update(app: &AppHandle) {
     }
     // 성공 후에만 마커 제거 + 자동복귀.
     let _ = std::fs::remove_file(&marker);
-    let mut restore_cmd = std::process::Command::new(resolve_sidecar("cys"));
+    let mut restore_cmd = std::process::Command::new(resolve_sidecar(if cfg!(windows) { "cys.exe" } else { "cys" }));
     restore_cmd.arg("restore").arg("--include-master");
     no_console(&mut restore_cmd);
     let _ = restore_cmd.spawn();
@@ -980,6 +980,35 @@ async fn maybe_autoregister_launchd() -> bool {
             eprintln!("[cys-app] launchd autoregister skipped: {e}");
             false
         }
+    }
+}
+
+/// Windows 첫 기동 온보딩 — macOS `maybe_autoregister_launchd`의 대칭(RC-1).
+/// macOS는 launchd 자동등록이 부수효과로 팩·hook 온보딩을 발동하나 Windows엔 그 경로가 없어
+/// "너는 마스터다" 부트스트랩(SessionStart hook)이 미발동했다(T1 증상①·RC-1).
+/// ① `cys init-pack`: 팩 파일 + Claude SessionStart hook 등록(install은 preserve, hook은 중복 dedup — 멱등).
+/// ② `cys daemon install`: 기존 schtasks ONLOGON 자동기동 등록 재사용(cys.rs:3139·/F 멱등).
+/// 둘 다 멱등이라 매 기동 실행해도 안전(팩 삭제 시 자가치유). best-effort — 실패해도 세션 진행.
+#[cfg(windows)]
+fn maybe_windows_onboard() {
+    let cys = resolve_sidecar("cys.exe");
+    // ① 팩 + Claude hook 등록 (init-pack = preserve+dedup 멱등)
+    let mut init = std::process::Command::new(&cys);
+    init.arg("init-pack");
+    no_console(&mut init);
+    match init.status() {
+        Ok(s) if s.success() => eprintln!("[cys-app] windows onboarding: init-pack ok"),
+        Ok(s) => eprintln!("[cys-app] windows onboarding: init-pack exited {s}"),
+        Err(e) => eprintln!("[cys-app] windows onboarding: init-pack spawn failed: {e}"),
+    }
+    // ② autostart 등록 (기존 cys daemon install = schtasks ONLOGON 재사용, /F 멱등)
+    let mut reg = std::process::Command::new(&cys);
+    reg.arg("daemon").arg("install");
+    no_console(&mut reg);
+    match reg.status() {
+        Ok(s) if s.success() => eprintln!("[cys-app] windows onboarding: daemon install (schtasks) ok"),
+        Ok(s) => eprintln!("[cys-app] windows onboarding: daemon install exited {s}"),
+        Err(e) => eprintln!("[cys-app] windows onboarding: daemon install spawn failed: {e}"),
     }
 }
 
@@ -1427,7 +1456,7 @@ async fn install_update(app: AppHandle, force: bool) -> Result<(), String> {
     // 자체 watchdog(12s)로 hang 시에도 종료되므로 별도 timeout 없이 await해도 업데이트가 멈추지 않는다.
     let _ = app.emit("update-progress", json!({"phase": "drain"}));
     let _ = tokio::task::spawn_blocking(|| {
-        let mut cmd = std::process::Command::new(resolve_sidecar("cys"));
+        let mut cmd = std::process::Command::new(resolve_sidecar(if cfg!(windows) { "cys.exe" } else { "cys" }));
         cmd.arg("drain");
         no_console(&mut cmd);
         cmd.status()
@@ -1677,6 +1706,9 @@ fn main() {
                 let _ = handle.emit("daemon-ready", ());
                 // event-forwarder를 먼저 띄워 init-pack 블로킹이 양방향 이벤트 파이프를 막지 않게 한다(반쪽 부팅 방지).
                 spawn_event_forwarder(handle.clone(), default_socket());
+                // RC-1: Windows 첫 기동 온보딩(팩+hook+autostart) — macOS launchd 대칭. 멱등.
+                #[cfg(windows)]
+                maybe_windows_onboard();
                 // 업데이트 재시작 시: 새 팩(새 기능) 반영 + 노드 자동복귀(마커가 있을 때만).
                 maybe_apply_pending_update(&handle);
             });
