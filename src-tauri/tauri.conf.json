@@ -33,7 +33,8 @@
     ],
     "resources": {
       "resources/pack.tar.gz": "./",
-      "resources/pack-manifest.json": "./"
+      "resources/pack-manifest.json": "./",
+      "runtime/": "runtime/"
     },
     "icon": [
       "icons/icon.icns",
