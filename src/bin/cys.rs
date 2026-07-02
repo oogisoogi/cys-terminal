@@ -6198,13 +6198,18 @@ mod tests {
         let r1 = install_claude_hook(&settings_path, &pack).unwrap();
         assert!(r1.contains("registered"), "first install must register: {r1}");
 
-        // 2) 재실행(멱등): hook 이미 존재 → skip. 이 경로는 backup을 절대 만들지 않아야 한다.
-        let _ = std::fs::remove_file(&backup); // 백업 삭제 후 재호출이 다시 만들지 않음을 검증
+        // 2) 정상 백업 sentinel을 심는다 — 매 기동 멱등 재실행이 이 "정상 상태 백업"을 클로버하면
+        //    안 된다(D2 master 조건: 기존 hook 존재 시 .bak-cys 무변경). mtime보다 견고한 내용 비교.
+        let sentinel = "{\"_sentinel\":\"good-backup-must-survive\"}";
+        std::fs::write(&backup, sentinel).unwrap();
+
+        // 3) 재실행(멱등): hook 이미 존재 → skip. backup 블록에 도달하지 않아야 sentinel이 보존된다.
         let r2 = install_claude_hook(&settings_path, &pack).unwrap();
         assert!(r2.contains("already"), "second call must skip: {r2}");
-        assert!(
-            !std::path::Path::new(&backup).exists(),
-            "already-installed skip must NOT create/clobber .bak-cys"
+        assert_eq!(
+            std::fs::read_to_string(&backup).unwrap(),
+            sentinel,
+            "already-installed skip must NOT clobber existing .bak-cys (정상 백업 무변경)"
         );
         let _ = std::fs::remove_dir_all(&base);
     }
