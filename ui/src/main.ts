@@ -2674,6 +2674,7 @@ async function checkForUpdate(silent: boolean) {
     // 바이너리 우선 — 재시작이 팩도 함께 반영(DESIGN '둘 다 → 바이너리 우선').
     badge.hidden = false;
     badge.textContent = "!";
+    badge.classList.remove("ok");
     badge.title = `새 버전 ${updateAvailable.version} (재시작 필요)`;
     if (!silent) promptInstall();
     else toast("feed", "🔄 업데이트 있음", `새 버전 ${updateAvailable.version} — 상단 Update(재시작)`);
@@ -2681,6 +2682,7 @@ async function checkForUpdate(silent: boolean) {
     // 팩만 변경 + 바이너리 호환 → 무중단 가능(세션·데몬 생존).
     badge.hidden = false;
     badge.textContent = "↻";
+    badge.classList.remove("ok");
     badge.title = `팩 ${packUpdateAvailable.pack_version} (무중단·세션 유지)`;
     if (!silent) promptPackInstall();
     else
@@ -2689,14 +2691,22 @@ async function checkForUpdate(silent: boolean) {
     // 팩은 있으나 min_binary_version > 설치 바이너리 → 무중단 불가, 바이너리 업데이트 필요.
     badge.hidden = false;
     badge.textContent = "!";
+    badge.classList.remove("ok");
     badge.title = `팩 ${packUpdateAvailable.pack_version}: 바이너리 업데이트 필요`;
     const msg = `새 팩 ${packUpdateAvailable.pack_version}은 더 새로운 바이너리를 요구합니다 — 바이너리 업데이트(재시작) 후 적용됩니다.`;
     if (!silent) toast("health", "바이너리 업데이트 필요", msg);
     else toast("feed", "⚠ 업데이트 있음", msg);
   } else {
-    // ★fail-safe: 양쪽 체크가 모두 성공적으로 '없음'을 확인했을 때만 배지를 해제한다. 장애(체크 실패)
-    // 시엔 마지막 검증 상태(배지)를 유지한다 — 일시 장애로 배지가 사라지지 않게.
-    if (!binCheckFailed && !packCheckFailed) badge.hidden = true;
+    // ★fail-safe: 양쪽 체크가 모두 성공적으로 '없음'을 확인했을 때만 상태를 갱신한다. 장애(체크 실패)
+    // 시엔 마지막 검증 상태(배지)를 유지한다 — 일시 장애로 "최신" 오단정하지 않게.
+    if (!binCheckFailed && !packCheckFailed) {
+      // 오너 지시(2026-07-03): 최신 확인 시 숨김 대신 "0" 표시 — "확인이 끝났고 대기 업데이트
+      // 0건"을 명시(숨김은 '아직 확인 전'과 구별 불가였다). 중립 스타일(.ok)로 경고색 회피.
+      badge.hidden = false;
+      badge.textContent = "0";
+      badge.classList.add("ok");
+      badge.title = "최신 버전 — 대기 중인 업데이트 없음";
+    }
     // 어느 한쪽이라도 체크 실패면 상태 불명 — '이미 최신' 단정 금지(바이너리·팩 둘 다 성공 확인 시에만).
     if (!silent && !binCheckFailed && !packCheckFailed) toast("watchdog", "✅ 최신 버전", "최신 버전입니다. 추가 업데이트가 없습니다.");
   }

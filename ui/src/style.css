@@ -42,6 +42,8 @@ html, body {
   border-radius: 8px; background: var(--error); color: #fff;
   font-size: 10px; text-align: center;
 }
+/* 업데이트 배지 "0"(최신 확인) — 경고색 대신 중립(확인 완료·대기 0건의 안심 신호) */
+.badge.ok { background: #21262d; color: #8b949e; border: 1px solid var(--border); }
 
 /* workspace sidebar — 좌측 별도 섹션·항목 가독성(제목 bold + 서브라인 dim) */
 #wsbar {
