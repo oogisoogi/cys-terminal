@@ -986,24 +986,30 @@ async fn maybe_autoregister_launchd() -> bool {
     }
 }
 
-/// Windows 첫 기동 온보딩 — macOS `maybe_autoregister_launchd`의 대칭(RC-1).
-/// macOS는 launchd 자동등록이 부수효과로 팩·hook 온보딩을 발동하나 Windows엔 그 경로가 없어
-/// "너는 마스터다" 부트스트랩(SessionStart hook)이 미발동했다(T1 증상①·RC-1).
-/// ① `cys init-pack`: 팩 파일 + Claude SessionStart hook 등록(install은 preserve, hook은 중복 dedup — 멱등).
-/// ② `cys daemon install`: 기존 schtasks ONLOGON 자동기동 등록 재사용(cys.rs:3139·/F 멱등).
-/// 둘 다 멱등이라 매 기동 실행해도 안전(팩 삭제 시 자가치유). best-effort — 실패해도 세션 진행.
-#[cfg(windows)]
-fn maybe_windows_onboard() {
-    let cys = resolve_sidecar("cys.exe");
-    // ① 팩 + Claude hook 등록 (init-pack = preserve+dedup 멱등)
-    let mut init = std::process::Command::new(&cys);
+/// 첫 기동 온보딩 공용 단계 — `cys init-pack`으로 팩 파일 + Claude SessionStart hook 등록.
+/// install은 preserve, hook은 중복 dedup(already→skip·.bak-cys 무변경)이라 **멱등** — 매 기동
+/// 실행해도 안전(팩 삭제 시 자가치유). Windows·macOS 온보딩이 공유한다(autostart는 OS별로 분리:
+/// Windows=schtasks·macOS=launchd). best-effort — 실패해도 세션은 진행.
+#[cfg(any(windows, target_os = "macos"))]
+fn onboard_init_pack(cys: &std::path::Path) {
+    let mut init = std::process::Command::new(cys);
     init.arg("init-pack");
     no_console(&mut init);
     match init.status() {
-        Ok(s) if s.success() => eprintln!("[cys-app] windows onboarding: init-pack ok"),
-        Ok(s) => eprintln!("[cys-app] windows onboarding: init-pack exited {s}"),
-        Err(e) => eprintln!("[cys-app] windows onboarding: init-pack spawn failed: {e}"),
+        Ok(s) if s.success() => eprintln!("[cys-app] onboarding: init-pack ok"),
+        Ok(s) => eprintln!("[cys-app] onboarding: init-pack exited {s}"),
+        Err(e) => eprintln!("[cys-app] onboarding: init-pack spawn failed: {e}"),
     }
+}
+
+/// Windows 첫 기동 온보딩(RC-1) — 순정 Windows엔 hook 자동등록 경로가 없어 "너는 마스터다"
+/// 부트스트랩(SessionStart hook)이 미발동했다(T1 증상①).
+/// ① `onboard_init_pack`: 팩 + Claude hook 등록(멱등).
+/// ② `cys daemon install`: 기존 schtasks ONLOGON 자동기동 등록 재사용(cys.rs:3139·/F 멱등).
+#[cfg(windows)]
+fn maybe_windows_onboard() {
+    let cys = resolve_sidecar("cys.exe");
+    onboard_init_pack(&cys);
     // ② autostart 등록 (기존 cys daemon install = schtasks ONLOGON 재사용, /F 멱등)
     let mut reg = std::process::Command::new(&cys);
     reg.arg("daemon").arg("install");
@@ -1013,6 +1019,16 @@ fn maybe_windows_onboard() {
         Ok(s) => eprintln!("[cys-app] windows onboarding: daemon install exited {s}"),
         Err(e) => eprintln!("[cys-app] windows onboarding: daemon install spawn failed: {e}"),
     }
+}
+
+/// macOS 첫 기동 온보딩 — Windows 온보딩의 대칭(RC-17·T5). macOS DMG 소비자는 launchd
+/// 자동시작(maybe_autoregister_launchd)만 있고 hook 자동등록 경로가 없어 "너는 마스터다"
+/// 부트스트랩이 미발동했다. autostart는 launchd가 담당하므로 여기서는 Windows와 대칭으로
+/// 팩+Claude hook만 등록한다. init-pack 멱등 — 기존 사용자에 재실행돼도 무해(already→skip·.bak-cys 불변).
+#[cfg(target_os = "macos")]
+fn maybe_macos_onboard() {
+    let cys = resolve_sidecar("cys");
+    onboard_init_pack(&cys);
 }
 
 /// Windows: GUI(windows_subsystem)가 콘솔 바이너리(cys/cysd/python3)를 스폰할 때 콘솔 창이
@@ -1727,9 +1743,12 @@ fn main() {
                 let _ = handle.emit("daemon-ready", ());
                 // event-forwarder를 먼저 띄워 init-pack 블로킹이 양방향 이벤트 파이프를 막지 않게 한다(반쪽 부팅 방지).
                 spawn_event_forwarder(handle.clone(), default_socket());
-                // RC-1: Windows 첫 기동 온보딩(팩+hook+autostart) — macOS launchd 대칭. 멱등.
+                // RC-1: Windows 첫 기동 온보딩(팩+hook+autostart schtasks). 멱등.
                 #[cfg(windows)]
                 maybe_windows_onboard();
+                // RC-17(T5): macOS 첫 기동 온보딩(팩+hook) — Windows 대칭. autostart는 위 launchd. 멱등.
+                #[cfg(target_os = "macos")]
+                maybe_macos_onboard();
                 // 업데이트 재시작 시: 새 팩(새 기능) 반영 + 노드 자동복귀(마커가 있을 때만).
                 maybe_apply_pending_update(&handle);
             });
