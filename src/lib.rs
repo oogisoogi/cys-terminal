@@ -75,11 +75,14 @@ pub fn socket_path() -> PathBuf {
 /// 중 **실재하는** 디렉토리를 `current_path` 앞에 (중복 제거) 얹은 새 PATH를 반환. 얹을 게 없으면
 /// None(기존 동작 무변경). current_path를 인자로 받아 순수 함수(테스트 가능·env 비의존).
 /// 근거: GUI(Finder/Explorer) 기동 프로세스는 PATH가 빈곤해 bash/python3 lookup 실패(RC-5 ＋부서 무반응).
-pub fn runtime_prefixed_path(exe_dir: &Path, current_path: &str) -> Option<String> {
-    let sep = if cfg!(windows) { ';' } else { ':' };
-    // non-windows에선 아래 windows push 블록이 컴파일 제외되어 mut 미사용 → cfg 조건부 allow.
-    #[cfg_attr(not(windows), allow(unused_mut))]
-    let mut prefixes: Vec<String> = vec![exe_dir.to_string_lossy().into_owned()];
+/// 동봉 runtime의 bin 디렉토리들(디스크에 실재하는 것만) — OS별 레이아웃. 반환 순서 = PATH 선두 우선순위.
+/// Windows(RC-5): exe 형제 `runtime/`(python·git/cmd·git/usr/bin).
+/// macOS(RC-18·T6b): 앱 번들은 실행바이너리=Contents/MacOS·리소스(runtime/)=Contents/Resources →
+///   `exe_dir/../Resources/runtime`(python/bin·git/bin·uv·node/bin). 개발 빌드(exe 형제 runtime/)도 폴백.
+/// runtime_prefixed_path(PATH 선두주입)와 state.rs `-lc` 재선두주입(D8 — 로그인셸 path_helper 강등 회피)이 공유.
+pub fn runtime_bin_dirs(exe_dir: &Path) -> Vec<PathBuf> {
+    #[cfg_attr(not(any(windows, target_os = "macos")), allow(unused_mut))]
+    let mut dirs: Vec<PathBuf> = Vec::new();
     #[cfg(windows)]
     {
         let rt = exe_dir.join("runtime");
@@ -89,9 +92,46 @@ pub fn runtime_prefixed_path(exe_dir: &Path, current_path: &str) -> Option<Strin
             rt.join("git").join("usr").join("bin"),
         ] {
             if d.is_dir() {
-                prefixes.push(d.to_string_lossy().into_owned());
+                dirs.push(d);
             }
         }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // 앱 번들 리소스 경로 우선, 개발 빌드(형제 runtime/) 폴백. 첫 유효 루트만 사용.
+        let roots = [
+            exe_dir.parent().map(|p| p.join("Resources").join("runtime")),
+            Some(exe_dir.join("runtime")),
+        ];
+        for rt in roots.into_iter().flatten() {
+            if !rt.is_dir() {
+                continue;
+            }
+            for d in [
+                rt.join("python").join("bin"),
+                rt.join("git").join("bin"),
+                rt.join("uv"),
+                rt.join("node").join("bin"),
+            ] {
+                if d.is_dir() {
+                    dirs.push(d);
+                }
+            }
+            break;
+        }
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = exe_dir;
+    }
+    dirs
+}
+
+pub fn runtime_prefixed_path(exe_dir: &Path, current_path: &str) -> Option<String> {
+    let sep = if cfg!(windows) { ';' } else { ':' };
+    let mut prefixes: Vec<String> = vec![exe_dir.to_string_lossy().into_owned()];
+    for d in runtime_bin_dirs(exe_dir) {
+        prefixes.push(d.to_string_lossy().into_owned());
     }
     let add: Vec<String> = prefixes
         .into_iter()
@@ -241,6 +281,37 @@ mod tests {
         // 실재하면 Some일 수 있으나 이 합성 경로엔 없음.)
         let already = format!("/opt/cysapp/bin{sep}/usr/bin");
         assert_eq!(runtime_prefixed_path(exe, &already), None, "중복이면 무변경");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn runtime_bin_dirs_macos_resolves_bundle_resources_layout() {
+        // RC-18(T6b) 회귀 핀: mac 번들 레이아웃(Contents/MacOS·Contents/Resources/runtime)에서
+        // python/bin·git/bin·uv·node/bin을 선두 우선순위로 잡는다. 실재 디렉토리만 계상.
+        use std::fs;
+        let base = std::env::temp_dir().join(format!("cysrt-t6b-{}", std::process::id()));
+        let macos = base.join("Contents").join("MacOS");
+        let rt = base.join("Contents").join("Resources").join("runtime");
+        for d in ["python/bin", "git/bin", "uv", "node/bin"] {
+            fs::create_dir_all(rt.join(d)).unwrap();
+        }
+        fs::create_dir_all(&macos).unwrap();
+        let dirs = runtime_bin_dirs(&macos);
+        let got: Vec<String> = dirs.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        assert_eq!(got.len(), 4, "4개 runtime bin dir: {got:?}");
+        assert!(got[0].ends_with("Resources/runtime/python/bin"), "python 선두: {got:?}");
+        assert!(got[1].ends_with("Resources/runtime/git/bin"), "git 2순위: {got:?}");
+        assert!(got[2].ends_with("Resources/runtime/uv"), "uv 3순위: {got:?}");
+        assert!(got[3].ends_with("Resources/runtime/node/bin"), "node 4순위: {got:?}");
+        // PATH 선두주입: runtime dir들이 exe_dir 뒤·기존 PATH 앞.
+        let p = runtime_prefixed_path(&macos, "/usr/bin:/bin").expect("Some");
+        let py_idx = p.find("Resources/runtime/python/bin").unwrap();
+        let usrbin_idx = p.find("/usr/bin").unwrap();
+        assert!(py_idx < usrbin_idx, "runtime python이 /usr/bin보다 앞(env 레벨): {p}");
+        // 부재 dir는 계상 안 함: uv 제거 후 3개.
+        fs::remove_dir_all(rt.join("uv")).unwrap();
+        assert_eq!(runtime_bin_dirs(&macos).len(), 3, "uv 부재 시 3개");
+        fs::remove_dir_all(&base).ok();
     }
 
     #[test]
