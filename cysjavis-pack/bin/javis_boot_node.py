@@ -92,6 +92,16 @@ def run(args, timeout=15):
         return 255, "", str(e)
 
 
+def _kill(pid, force=False):
+    """OS중립 프로세스 종료(RC-6) — unix=`kill [-9] <pid>`, Windows=`taskkill /PID <pid> /T [/F]`.
+    Windows엔 kill.exe가 PATH에 없어(구: FileNotFoundError로 회수 경로 붕괴) taskkill로 분기한다."""
+    if os.name == "nt":
+        args = ["taskkill", "/PID", str(pid), "/T"] + (["/F"] if force else [])
+    else:
+        args = ["kill"] + (["-9"] if force else []) + [str(pid)]
+    return run(args, timeout=5)
+
+
 def cys_status():
     rc, out, _ = run(["cys", "status", "--json"], timeout=12)
     if rc != 0:
@@ -167,6 +177,10 @@ def process_present(pid, agent):
     """surface 루트 pid 자손에 agent 고유 프로세스가 살아있으면 True.
     ★recovery/생존추정 보조 전용 — 각성/READY 의 단독 근거로 쓰지 않는다(codex R1 결함1·5)."""
     if not pid or not AGENT_COMM.get(agent or ""):
+        return False
+    # RC-6: pgrep/ps는 unix 전용 — Windows엔 부재. 이 함수는 보조 생존추정이라(단독 근거 아님)
+    # Windows에선 child-scan을 건너뛰고 False로 degrade한다(READY 판정은 화면 marker 등 타 근거 사용).
+    if os.name != "posix":
         return False
     seen, frontier = set(), [pid]
     while frontier:
@@ -290,10 +304,10 @@ def reclaim(role, emit):
     if _pid_for_surface_ref(ref) != pid or not pid:
         emit("reclaim", "%s pid 불일치/부재 — 회수 보류(잘못된 종료 방지)" % ref)
         return 1
-    rc, _, _ = run(["kill", str(pid)], timeout=5)
+    rc, _, _ = _kill(pid)
     time.sleep(1.5)
     if role_surface_row(role) is not None and _pid_for_surface_ref(ref) == pid:
-        run(["kill", "-9", str(pid)], timeout=5)
+        _kill(pid, force=True)
         time.sleep(1.5)
     if role_surface_row(role) is None:
         emit("reclaim", "%s(pid=%s·exp_agent=%s) 종료·role 해제 완료 — 헬퍼로 재기동 가능"

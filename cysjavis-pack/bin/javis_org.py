@@ -4,7 +4,22 @@
 하우스스타일: javis_manifest.py (--self-test 밀폐 검증)
 exit: 0=성공 1=위반/실패 2=입출력 3=권한(CSO아님) 4=대상없음
 """
-import argparse, json, os, sys, hashlib, fcntl, subprocess, tempfile, tarfile, time
+import argparse, json, os, sys, hashlib, subprocess, tempfile, tarfile, time, shutil
+
+# RC-6: OS중립 파일락 — unix는 fcntl.flock(제로 회귀·파일 닫힐 때 자동 해제), Windows는 fcntl
+# 부재라 msvcrt 바이트락으로 폴백(과거 top-level `import fcntl`이 Windows에서 즉시 ModuleNotFoundError로
+# javis_org 전체 불능이던 P0 차단). 락 실패해도 최종 원자교체(os.replace)가 일관성 보장 → best-effort.
+try:
+    import fcntl as _fcntl
+    def _flock(f):
+        _fcntl.flock(f, _fcntl.LOCK_EX)
+except ImportError:  # Windows
+    import msvcrt as _msvcrt
+    def _flock(f):
+        try:
+            _msvcrt.locking(f.fileno(), _msvcrt.LK_LOCK, 1)
+        except OSError:
+            pass
 
 HOME = os.path.expanduser("~")
 CATALOG = os.environ.get("CYS_DEPT_CATALOG", f"{HOME}/.cys/dept-catalog.json")
@@ -64,7 +79,7 @@ def catalog_upsert(catalog_path, dept):
     """catalog 전용 .lock으로 직렬화 + 원자교체. mission_key=key 규약."""
     lock = catalog_path + ".lock"
     with open(lock, "w") as lf:
-        fcntl.flock(lf, fcntl.LOCK_EX)
+        _flock(lf)
         cat = load_json(catalog_path, {"version":1,"accounts":{},"departments":{}})
         cat.setdefault("departments", {})[dept["key"]] = {
             "display": dept["display"], "account": dept["account"],
@@ -87,7 +102,7 @@ def backfill_mission_key(depts_path, key, mission_key, display=None):
     정확일치라 suffix-bleed(R1 BLOCK-1) 회귀 없음. expand()로 $HOME 토큰 정규화."""
     lock = depts_path + ".lock"
     with open(lock, "w") as lf:
-        fcntl.flock(lf, fcntl.LOCK_EX)
+        _flock(lf)
         reg = load_json(depts_path, {"depts":{}})
         for name, e in reg.get("depts", {}).items():
             cwd_base = os.path.basename(expand(e.get("cwd","")).rstrip("/"))
@@ -276,12 +291,12 @@ def destroy_dept(name, mission_key, purge=False, purge_workdir=False):
     if purge:
         pack = f"{HOME}/.cys/pack-dept-{name}"
         if os.path.isdir(pack):
-            subprocess.run(["rm", "-rf", pack]); actions.append(("rm_pack", pack))
+            shutil.rmtree(pack, ignore_errors=True); actions.append(("rm_pack", pack))
     if purge_workdir:
         reg = load_json(DEPTS, {"depts":{}}); e = reg["depts"].get(name, {})
         wd = expand(e.get("cwd",""))
         if wd and os.path.isdir(wd):
-            subprocess.run(["rm", "-rf", wd]); actions.append(("rm_workdir", wd))
+            shutil.rmtree(wd, ignore_errors=True); actions.append(("rm_workdir", wd))
     return actions
 
 def cmd_destroy(args):

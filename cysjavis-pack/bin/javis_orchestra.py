@@ -710,6 +710,9 @@ def cmd_round_log(args):
     # 전사(轉寫)를 거치지 않는 producer≠evaluator 경로.
     if getattr(args, "from_cmd", None):
         try:
+            # RC-6(D6): shell=True는 OS 기본 셸(unix=/bin/sh·Windows=cmd.exe)로 실행 — from_cmd는
+            # OS중립 기계검증 명령(빌드·테스트) 전제다. bash 전용 문법을 넣으면 Windows cmd.exe에서
+            # 실패하므로 RSI machine-eval 티켓은 OS중립 명령을 쓴다(저 consumer 영향·T3 실측 후 재판단).
             r = subprocess.run(args.from_cmd, shell=True, capture_output=True, timeout=1800)
             verdict = ("PASS(exit 0)" if r.returncode == 0
                        else "FAIL(exit %d)" % r.returncode)

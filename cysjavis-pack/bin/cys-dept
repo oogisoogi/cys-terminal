@@ -19,8 +19,10 @@ export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin${PATH:+:$PATH}"
 
 REG="${CYS_DEPTS_JSON:-$HOME/.cys/depts.json}"
 PACK_DEFAULT="$HOME/.cys/pack"
-CYSD="$(command -v cysd || echo /opt/homebrew/bin/cysd)"
-CYS="$(command -v cys || echo /opt/homebrew/bin/cys)"
+# RC-6: 폴백 경로 가드 — command -v 우선(Windows는 RC-5 runtime PATH로 cysd.exe/cys.exe 해소).
+# /opt/homebrew는 macOS 전용이라 존재할 때만 폴백(Windows서 유령 경로 방지), 최종 폴백=bare 이름.
+CYSD="$(command -v cysd || { [ -x /opt/homebrew/bin/cysd ] && echo /opt/homebrew/bin/cysd; } || echo cysd)"
+CYS="$(command -v cys || { [ -x /opt/homebrew/bin/cys ] && echo /opt/homebrew/bin/cys; } || echo cys)"
 
 # RC-4: 부서 소켓 규약 — Windows(MSYS/Git-Bash)는 named pipe `\\.\pipe\cys-dept-<n>`
 # (cysd가 CYS_SOCKET을 named pipe로 바인드·Rust cys::dept_socket_path와 정합), 그 외는 unix .sock.
@@ -32,15 +34,39 @@ dept_sock(){
 }
 dept_pack(){ echo "$HOME/.cys/pack-dept-$1"; }
 
+# RC-6: OS중립 graceful kill — unix=SIGTERM→대기→SIGKILL, Windows(MSYS/Git-Bash)=taskkill(트리·강제).
+# Windows 프로세스는 unix 시그널을 안 받으므로 kill/kill -9가 무효 → taskkill //PID //T //F로 분기
+# (MSYS는 `/PID`를 경로로 변환하므로 `//PID` 형식 사용).
+graceful_kill(){
+  local pid="$1"
+  case "$(uname -s 2>/dev/null)" in
+    MINGW*|MSYS*|CYGWIN*) taskkill //PID "$pid" //T //F >/dev/null 2>&1 || true ;;
+    *)
+      kill "$pid" 2>/dev/null || true
+      for _i in 1 2 3 4 5 6; do kill -0 "$pid" 2>/dev/null || break; sleep 0.3; done
+      kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true ;;
+  esac
+}
+
 reg_init(){ [ -f "$REG" ] || { mkdir -p "$(dirname "$REG")"; printf '{"depts":{}}\n' > "$REG"; }; }
 reg_count(){ reg_init; python3 -c "import json;print(len(json.load(open('$REG'))['depts']))"; }
 reg_names(){ reg_init; python3 -c "import json;[print(k) for k in json.load(open('$REG'))['depts']]"; }
 # reg_upsert/reg_remove: 동시 부서 운용 시 lost-update 방지 — fcntl.flock으로 RMW 직렬화 +
 # temp+os.replace 원자 교체(읽는 쪽이 부분 파일을 보지 않음). macOS엔 flock(1) CLI가 없어 python fcntl 사용.
 reg_upsert(){ reg_init; python3 - "$REG" "$1" "$2" "$3" <<'PY'
-import json,sys,os,fcntl
+import json,sys,os
+try:
+    import fcntl
+    def _lk(f): fcntl.flock(f, fcntl.LOCK_EX)
+    def _ulk(f): fcntl.flock(f, fcntl.LOCK_UN)
+except ImportError:  # RC-6 Windows: fcntl 부재 → msvcrt 바이트락(파일 닫힘 시 해제·_ulk no-op 안전)
+    import msvcrt
+    def _lk(f):
+        try: msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+        except OSError: pass
+    def _ulk(f): pass
 p,n,s,k=sys.argv[1:5]
-lf=open(p+'.lock','w'); fcntl.flock(lf,fcntl.LOCK_EX)
+lf=open(p+'.lock','w'); _lk(lf)
 try:
     try: d=json.load(open(p))
     except Exception: d={'depts':{}}
@@ -51,13 +77,23 @@ try:
     tmp=p+'.tmp.%d'%os.getpid()
     with open(tmp,'w') as f: json.dump(d,f,ensure_ascii=False,indent=2); f.flush(); os.fsync(f.fileno())
     os.replace(tmp,p)
-finally: fcntl.flock(lf,fcntl.LOCK_UN)
+finally: _ulk(lf)
 PY
 }
 reg_remove(){ reg_init; python3 - "$REG" "$1" <<'PY'
-import json,sys,os,fcntl
+import json,sys,os
+try:
+    import fcntl
+    def _lk(f): fcntl.flock(f, fcntl.LOCK_EX)
+    def _ulk(f): fcntl.flock(f, fcntl.LOCK_UN)
+except ImportError:  # RC-6 Windows: fcntl 부재 → msvcrt 바이트락(파일 닫힘 시 해제·_ulk no-op 안전)
+    import msvcrt
+    def _lk(f):
+        try: msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+        except OSError: pass
+    def _ulk(f): pass
 p,n=sys.argv[1:3]
-lf=open(p+'.lock','w'); fcntl.flock(lf,fcntl.LOCK_EX)
+lf=open(p+'.lock','w'); _lk(lf)
 try:
     try: d=json.load(open(p))
     except Exception: d={'depts':{}}
@@ -65,15 +101,25 @@ try:
     tmp=p+'.tmp.%d'%os.getpid()
     with open(tmp,'w') as f: json.dump(d,f,ensure_ascii=False,indent=2); f.flush(); os.fsync(f.fileno())
     os.replace(tmp,p)
-finally: fcntl.flock(lf,fcntl.LOCK_UN)
+finally: _ulk(lf)
 PY
 }
 # reg_set_meta: 기존 엔트리에 display_name·account·mission_key 를 merge(socket/pack_dir/role 보존).
 # reg_upsert 시그니처 불변(launch 회귀0) — ＋부서 자동화(cys-dept create)용 신설. flock RMW·원자교체.
 reg_set_meta(){ reg_init; python3 - "$REG" "$1" "$2" "$3" <<'PY'
-import json,sys,os,fcntl
+import json,sys,os
+try:
+    import fcntl
+    def _lk(f): fcntl.flock(f, fcntl.LOCK_EX)
+    def _ulk(f): fcntl.flock(f, fcntl.LOCK_UN)
+except ImportError:  # RC-6 Windows: fcntl 부재 → msvcrt 바이트락(파일 닫힘 시 해제·_ulk no-op 안전)
+    import msvcrt
+    def _lk(f):
+        try: msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+        except OSError: pass
+    def _ulk(f): pass
 p,n,disp,acct=sys.argv[1:5]
-lf=open(p+'.lock','w'); fcntl.flock(lf,fcntl.LOCK_EX)
+lf=open(p+'.lock','w'); _lk(lf)
 try:
     try: d=json.load(open(p))
     except Exception: d={'depts':{}}
@@ -84,7 +130,7 @@ try:
     tmp=p+'.tmp.%d'%os.getpid()
     with open(tmp,'w') as f: json.dump(d,f,ensure_ascii=False,indent=2); f.flush(); os.fsync(f.fileno())
     os.replace(tmp,p)
-finally: fcntl.flock(lf,fcntl.LOCK_UN)
+finally: _ulk(lf)
 PY
 }
 
@@ -180,16 +226,8 @@ dept_has_master(){
   grep -qx "master" <<<"$roles"
 }
 
-# 소켓 생존 probe(connect). exit 0=alive.
-sock_alive(){ python3 - "$1" <<'PY'
-import sys,os,socket as S
-sk=sys.argv[1]
-if not sk or not os.path.exists(sk): sys.exit(1)
-try:
-    c=S.socket(S.AF_UNIX); c.settimeout(0.3); c.connect(sk); c.close(); sys.exit(0)
-except Exception: sys.exit(1)
-PY
-}
+# 소켓 생존 probe → cys ping(RC-6: unix 소켓·Windows named pipe 양쪽 OS중립·AF_UNIX 제거). exit 0=alive.
+sock_alive(){ CYS_SOCKET="$1" "$CYS" ping >/dev/null 2>&1; }
 
 # ★reaper 유휴 판정(read-only): stdout="IDLE" | "ACTIVE:<이유>".
 #   유휴 = live(미exited) master surface 부재 AND (agent-backed·비-cso/리뷰어) live surface 부재.
@@ -285,40 +323,51 @@ case "$cmd" in
     # 번호계산+예약을 단일 flock 블록에 묶어 TOCTOU 제거 — lowest-unused dept-N을 발급·예약(원자).
     # 시나리오2: 레지스트리엔 빠졌어도 소켓을 점유 중인(죽어가는) 데몬 번호는 alive() probe로 skip.
     name=$(reg_init; python3 - "$REG" <<'PY'
-import json,sys,os,fcntl,re,socket as S
+import json,sys,os,re,socket as S
+try:
+    import fcntl
+    def _lk(f): fcntl.flock(f, fcntl.LOCK_EX)
+    def _ulk(f): fcntl.flock(f, fcntl.LOCK_UN)
+except ImportError:  # RC-6 Windows: fcntl 부재 → msvcrt 바이트락(파일 닫힘 시 해제·_ulk no-op 안전)
+    import msvcrt
+    def _lk(f):
+        try: msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+        except OSError: pass
+    def _ulk(f): pass
 p=sys.argv[1]
-lf=open(p+'.lock','w'); fcntl.flock(lf,fcntl.LOCK_EX)
+lf=open(p+'.lock','w'); _lk(lf)
 try:
     try: d=json.load(open(p))
     except Exception: d={'depts':{}}
     depts=d.setdefault('depts',{})
     home=os.path.expanduser('~')
     # ★[2] hard cap(reserve flock 안 — 동시성·원자성 유지): 죽은(미reap) 등록은 빼고 ★살아있는 데몬만 카운트.
+    # RC-6: AF_UNIX→cys ping(OS중립·named pipe 대응). os.path.exists는 named pipe에 False라 제거.
+    import subprocess
     def _alive_sk(sk):
-        if not sk or not os.path.exists(sk): return False
-        try: c=S.socket(S.AF_UNIX); c.settimeout(0.2); c.connect(sk); c.close(); return True
+        if not sk: return False
+        try: return subprocess.run(["cys","ping"], env={**os.environ,"CYS_SOCKET":sk},
+                                   capture_output=True, timeout=3).returncode==0
         except Exception: return False
     CAP=int(os.environ.get("CYS_DEPT_CAP","8"))
     live=sum(1 for e in depts.values() if _alive_sk(e.get('socket','')))
     if live>=CAP:
         sys.stderr.write("[cys-dept] allocate 거부: live 부서 수 %d ≥ CYS_DEPT_CAP=%d (hard cap·죽은등록 제외)\n"%(live,CAP)); sys.exit(8)
     used={int(m.group(1)) for k in depts if (m:=re.match(r'^dept-(\d+)$',k))}
+    def _dept_sk(n):  # RC-6: OS별 부서 소켓(dept_sock 규약 미러) — Windows named pipe·unix .sock
+        return (r"\\.\pipe\cys-dept-dept-%d"%n) if os.name=="nt" else f"{home}/.local/state/cys-dept-dept-{n}/cys.sock"
     def alive(n):  # 시나리오2: 레지스트리엔 빠졌어도 소켓 점유(죽어가는 데몬)면 그 번호 재사용 금지
-        sk=f"{home}/.local/state/cys-dept-dept-{n}/cys.sock"
-        if not os.path.exists(sk): return False
-        try:
-            c=S.socket(S.AF_UNIX); c.settimeout(0.2); c.connect(sk); c.close(); return True
-        except Exception: return False
+        return _alive_sk(_dept_sk(n))
     N=1
     while N in used or alive(N): N+=1
     name=f"dept-{N}"
-    depts[name]={'socket':f"{home}/.local/state/cys-dept-{name}/cys.sock",
+    depts[name]={'socket':_dept_sk(N),  # RC-6: OS별 소켓 규약(Windows named pipe·unix .sock)
                  'pack_dir':f"{home}/.cys/pack-dept-{name}",'role':'dept-master'}
     tmp=p+'.tmp.%d'%os.getpid()
     with open(tmp,'w') as f: json.dump(d,f,ensure_ascii=False,indent=2); f.flush(); os.fsync(f.fileno())
     os.replace(tmp,p)
     print(name)
-finally: fcntl.flock(lf,fcntl.LOCK_UN)
+finally: _ulk(lf)
 PY
 ) || exit $?   # ★cap 거부(exit 8)·예약 실패 코드 그대로 전파
     [ -n "$name" ] || { echo "[cys-dept] allocate: 번호 발급 실패" >&2; exit 1; }
@@ -394,14 +443,28 @@ PY
     #   호출부가 ensure-ready). 신규는 lowest-unused 예약 + ★엔트리에 mission_key 기록(동시/부팅중 다른
     #   create가 즉시 발견 — codex: NEW 엔트리에 mission_key 누락 TOCTOU 해소).
     res=$(reg_init; CYS_GRACE="${CYS_DEPT_RESERVE_GRACE:-25}" python3 - "$REG" "$mkey" "$cwd" "$acctdir" <<'PY'
-import json,sys,os,fcntl,re,time,socket as S
+import json,sys,os,re,time,socket as S
+try:
+    import fcntl
+    def _lk(f): fcntl.flock(f, fcntl.LOCK_EX)
+    def _ulk(f): fcntl.flock(f, fcntl.LOCK_UN)
+except ImportError:  # RC-6 Windows: fcntl 부재 → msvcrt 바이트락(파일 닫힘 시 해제·_ulk no-op 안전)
+    import msvcrt
+    def _lk(f):
+        try: msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+        except OSError: pass
+    def _ulk(f): pass
 p,mkey,cwd,acctdir=sys.argv[1:5]
 home=os.path.expanduser('~'); GRACE=float(os.environ.get("CYS_GRACE","25"))
-def alive_sock(sk):
-    if not sk or not os.path.exists(sk): return False
-    try: c=S.socket(S.AF_UNIX); c.settimeout(0.2); c.connect(sk); c.close(); return True
+import subprocess
+def _sk_named(nm):  # RC-6: OS별 부서 소켓(bash dept_sock 규약 미러) — Windows named pipe·unix .sock
+    return (r"\\.\pipe\cys-dept-%s"%nm) if os.name=="nt" else f"{home}/.local/state/cys-dept-{nm}/cys.sock"
+def alive_sock(sk):  # RC-6: AF_UNIX→cys ping(named pipe 대응·os.path.exists는 pipe에 False라 제거)
+    if not sk: return False
+    try: return subprocess.run(["cys","ping"], env={**os.environ,"CYS_SOCKET":sk},
+                               capture_output=True, timeout=3).returncode==0
     except Exception: return False
-lf=open(p+'.lock','w'); fcntl.flock(lf,fcntl.LOCK_EX)
+lf=open(p+'.lock','w'); _lk(lf)
 try:
     try: d=json.load(open(p))
     except Exception: d={'depts':{}}
@@ -429,16 +492,16 @@ try:
     # 신규 예약(lowest-unused·소켓 점유 번호 skip) — mission_key+reserved_at+메타 즉시 원자기록
     used={int(m.group(1)) for k in depts if (m:=re.match(r'^dept-(\d+)$',k))}
     N=1
-    while N in used or alive_sock(f"{home}/.local/state/cys-dept-dept-{N}/cys.sock"): N+=1
+    while N in used or alive_sock(_sk_named("dept-%d"%N)): N+=1
     name=f"dept-{N}"
-    depts[name]={'socket':f"{home}/.local/state/cys-dept-{name}/cys.sock",
+    depts[name]={'socket':_sk_named(name),
                  'pack_dir':f"{home}/.cys/pack-dept-{name}",'role':'dept-master',
                  'mission_key':mkey,'cwd':cwd,'account_dir':acctdir,'reserved_at':now}
     tmp=p+'.tmp.%d'%os.getpid()
     with open(tmp,'w') as f: json.dump(d,f,ensure_ascii=False,indent=2); f.flush(); os.fsync(f.fileno())
     os.replace(tmp,p)
     print("NEW "+name)
-finally: fcntl.flock(lf,fcntl.LOCK_UN)
+finally: _ulk(lf)
 PY
 ) || exit $?   # ★cap 거부(exit 8) 등 예약 실패 코드 그대로 전파
     verb="${res%% *}"; name="${res#* }"
@@ -500,9 +563,7 @@ PY
     pid=$(CYS_SOCKET="$sock" "$CYS" identify 2>/dev/null | python3 -c "import json,sys;print(json.load(sys.stdin).get('daemon_pid',''))" 2>/dev/null || true)
     # orphan 방지(박사님 ③): kill 후 데몬 사망 확인·잔존 시 SIGKILL(down이 데몬 살린 채 reg_remove→orphan 재발 차단).
     if [ -n "${pid:-}" ]; then
-      kill "$pid" 2>/dev/null || true
-      for _i in 1 2 3 4 5 6; do kill -0 "$pid" 2>/dev/null || break; sleep 0.3; done
-      kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+      graceful_kill "$pid"
     fi
     rm -f "$sock" "$sock.lock" 2>/dev/null || true
     reg_remove "$name"
@@ -522,9 +583,7 @@ PY
 )
     pid=$(CYS_SOCKET="$sock" "$CYS" identify 2>/dev/null | python3 -c "import json,sys;print(json.load(sys.stdin).get('daemon_pid',''))" 2>/dev/null || true)
     if [ -n "${pid:-}" ]; then
-      kill "$pid" 2>/dev/null || true
-      for _i in 1 2 3 4 5 6; do kill -0 "$pid" 2>/dev/null || break; sleep 0.3; done
-      kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+      graceful_kill "$pid"
     fi
     rm -f "$sock" "$sock.lock" 2>/dev/null || true
     [ -n "$name" ] && reg_remove "$name" || true
@@ -540,15 +599,25 @@ PY
     reg_init
     # Phase 1 — flock 직렬화 스냅샷: 레지스트리(name·socket·reserved_at) 일관 덤프(read-only·짧은 락).
     snap=$(python3 - "$REG" <<'PY'
-import json,sys,fcntl
+import json,sys
+try:
+    import fcntl
+    def _lk(f): fcntl.flock(f, fcntl.LOCK_EX)
+    def _ulk(f): fcntl.flock(f, fcntl.LOCK_UN)
+except ImportError:  # RC-6 Windows: fcntl 부재 → msvcrt 바이트락(파일 닫힘 시 해제·_ulk no-op 안전)
+    import msvcrt
+    def _lk(f):
+        try: msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+        except OSError: pass
+    def _ulk(f): pass
 p=sys.argv[1]
-lf=open(p+'.lock','w'); fcntl.flock(lf,fcntl.LOCK_EX)
+lf=open(p+'.lock','w'); _lk(lf)
 try:
     try: d=json.load(open(p))
     except Exception: d={'depts':{}}
     for n,e in d.get('depts',{}).items():
         print("%s\t%s\t%s"%(n, e.get('socket',''), e.get('reserved_at',0) or 0))
-finally: fcntl.flock(lf,fcntl.LOCK_UN)
+finally: _ulk(lf)
 PY
 ) || { echo "[cys-dept] reap: 스냅샷 실패" >&2; exit 1; }
     # 분류+집행(flock 밖·probe). reg_remove/down-sock는 각자 자체 flock·원자. 현재 셸 루프(카운터 보존).
