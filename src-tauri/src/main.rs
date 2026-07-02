@@ -764,6 +764,7 @@ fn make_ticket(task: String, scope: String, success: String, to: String) -> Resu
         scope.clone()
     };
     let mut orch_cmd = std::process::Command::new("python3");
+    inject_runtime_path(&mut orch_cmd); // RC-5: 동봉 runtime(python3.exe) PATH 주입
     orch_cmd
         .arg(&script)
         .arg("task-prompt")
@@ -1027,6 +1028,22 @@ fn no_console(cmd: &mut std::process::Command) {
     }
 }
 
+/// RC-5: GUI 직스폰(bash/python3)에 동봉 runtime PATH 주입. GUI(Explorer/Finder) 프로세스 PATH엔
+/// runtime이 없어 순정 Windows서 bash/python3 lookup 실패 → ＋부서·티켓 무반응이었다(cysd PTY 자식만
+/// 주입 수혜). cysd와 동일한 공용 로직(cys::runtime_prefixed_path) 사용 — 중복 구현 금지.
+/// 타 OS는 exe_dir만 얹혀 사실상 무영향(제거 없음).
+fn inject_runtime_path(cmd: &mut std::process::Command) {
+    if let Some(exe_dir) = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+    {
+        let cur = std::env::var("PATH").unwrap_or_default();
+        if let Some(newp) = cys::runtime_prefixed_path(&exe_dir, &cur) {
+            cmd.env("PATH", newp);
+        }
+    }
+}
+
 /// Ensure aitermd is running: try to connect, otherwise spawn the bundled/sibling binary.
 async fn ensure_daemon() -> Result<(), String> {
     if connect().await.is_ok() {
@@ -1145,6 +1162,7 @@ async fn launch_dept_daemon(app: AppHandle, name: String) -> Result<Value, Strin
     let n = name.clone();
     let out = tokio::task::spawn_blocking(move || {
         let mut cmd = std::process::Command::new("bash");
+        inject_runtime_path(&mut cmd); // RC-5: 동봉 runtime(bash.exe) PATH 주입
         cmd.arg(&tool).arg("launch").arg(&n);
         no_console(&mut cmd);
         cmd.output()
@@ -1175,6 +1193,7 @@ async fn allocate_dept_daemon(app: AppHandle, catalog_key: Option<String>) -> Re
     let ck = catalog_key.clone();
     let out = tokio::task::spawn_blocking(move || {
         let mut cmd = std::process::Command::new("bash");
+        inject_runtime_path(&mut cmd); // RC-5: 동봉 runtime(bash.exe) PATH 주입
         cmd.arg(&tool);
         match &ck {
             Some(k) => {
@@ -1235,6 +1254,7 @@ async fn stop_dept_daemon(name: String) -> Result<(), String> {
     let tool = dept_tool();
     let _ = tokio::task::spawn_blocking(move || {
         let mut cmd = std::process::Command::new("bash");
+        inject_runtime_path(&mut cmd); // RC-5: 동봉 runtime(bash.exe) PATH 주입
         cmd.arg(&tool).arg("down").arg(&name);
         no_console(&mut cmd);
         cmd.output()
@@ -1298,6 +1318,7 @@ async fn stop_dept_daemon_by_socket(socket: String) -> Result<(), String> {
     let tool = dept_tool();
     let _ = tokio::task::spawn_blocking(move || {
         let mut cmd = std::process::Command::new("bash");
+        inject_runtime_path(&mut cmd); // RC-5: 동봉 runtime(bash.exe) PATH 주입
         cmd.arg(&tool).arg("down-sock").arg(&socket);
         no_console(&mut cmd);
         cmd.output()

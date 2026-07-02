@@ -825,40 +825,16 @@ impl Daemon {
         builder.cwd(&cwd_str);
         builder.env("TERM", "xterm-256color");
         builder.env("LANG", &self.config.lang);
-        // 온보딩①: 데몬 옆에 동봉된 cys CLI가 pane 안에서 항상 보이게 PATH 선두 주입 —
-        // 신규 머신(심링크 없음)에서도 pane 속 AI가 `cys identify`를 즉시 쓸 수 있다.
+        // 온보딩①: 데몬 옆 동봉 cys CLI + (Windows)동봉 runtime을 pane PATH 선두 주입 —
+        // 신규 머신(심링크 없음)에서도 pane 속 AI가 `cys identify`·python3·bash를 즉시 쓴다.
+        // RC-5: GUI 직스폰과 공유하는 공용 fn(cys::runtime_prefixed_path) 사용 — 중복 구현 금지.
         if let Some(bin_dir) = std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         {
-            let sep = if cfg!(windows) { ';' } else { ':' };
             let cur = std::env::var("PATH").unwrap_or_default();
-            // 선두 주입 후보 ① 데몬 폴더(동봉 cys CLI가 pane에서 늘 보이게).
-            let mut prefixes: Vec<String> = Vec::new();
-            prefixes.push(bin_dir.to_string_lossy().into_owned());
-            // ② Windows 자기완결 설치 시 <install>\runtime\ 에 동봉된 python(+python3 심)·bash(+coreutils)·git.
-            //    팩의 .sh 훅/.py 빈이 순정 Windows(Git·Python 미설치)에서도 구동되게 PATH 선두에 얹는다
-            //    ("설치≠작동" 해소). 런타임 미동봉(엔진만 빌드)이면 dir 부재로 자동 skip → 기존 동작 무변경.
-            #[cfg(windows)]
-            {
-                let rt = bin_dir.join("runtime");
-                for d in [
-                    rt.join("python"),
-                    rt.join("git").join("cmd"),
-                    rt.join("git").join("usr").join("bin"),
-                ] {
-                    if d.is_dir() {
-                        prefixes.push(d.to_string_lossy().into_owned());
-                    }
-                }
-            }
-            let add: Vec<String> = prefixes
-                .into_iter()
-                .filter(|p| !cur.split(sep).any(|e| e == p.as_str()))
-                .collect();
-            if !add.is_empty() {
-                let head = add.join(&sep.to_string());
-                builder.env("PATH", format!("{head}{sep}{cur}"));
+            if let Some(newp) = cys::runtime_prefixed_path(&bin_dir, &cur) {
+                builder.env("PATH", newp);
             }
         }
         builder.env(cys::ENV_SOCKET, self.socket_path.to_string_lossy().as_ref());

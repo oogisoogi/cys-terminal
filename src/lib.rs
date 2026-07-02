@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub mod action_catalog;
 pub mod directive_compose;
@@ -68,6 +68,39 @@ pub fn socket_path() -> PathBuf {
         };
         dir.join("cys.sock")
     }
+}
+
+/// 동봉 runtime PATH 선두 주입(RC-5 · 공용 — cysd PTY 자식·GUI 직스폰이 공유, 중복 구현 금지).
+/// `exe_dir`(바이너리 폴더) + Windows 자기완결 설치의 `<install>\runtime\{python, git\cmd, git\usr\bin}`
+/// 중 **실재하는** 디렉토리를 `current_path` 앞에 (중복 제거) 얹은 새 PATH를 반환. 얹을 게 없으면
+/// None(기존 동작 무변경). current_path를 인자로 받아 순수 함수(테스트 가능·env 비의존).
+/// 근거: GUI(Finder/Explorer) 기동 프로세스는 PATH가 빈곤해 bash/python3 lookup 실패(RC-5 ＋부서 무반응).
+pub fn runtime_prefixed_path(exe_dir: &Path, current_path: &str) -> Option<String> {
+    let sep = if cfg!(windows) { ';' } else { ':' };
+    // non-windows에선 아래 windows push 블록이 컴파일 제외되어 mut 미사용 → cfg 조건부 allow.
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut prefixes: Vec<String> = vec![exe_dir.to_string_lossy().into_owned()];
+    #[cfg(windows)]
+    {
+        let rt = exe_dir.join("runtime");
+        for d in [
+            rt.join("python"),
+            rt.join("git").join("cmd"),
+            rt.join("git").join("usr").join("bin"),
+        ] {
+            if d.is_dir() {
+                prefixes.push(d.to_string_lossy().into_owned());
+            }
+        }
+    }
+    let add: Vec<String> = prefixes
+        .into_iter()
+        .filter(|p| !current_path.split(sep).any(|e| e == p.as_str()))
+        .collect();
+    if add.is_empty() {
+        return None;
+    }
+    Some(format!("{}{}{}", add.join(&sep.to_string()), sep, current_path))
 }
 
 /// Parse a surface reference: "surface:31", "31", or 31 → 31.
@@ -153,6 +186,21 @@ mod tests {
         assert_eq!(parse_surface_ref("surface:31"), Some(31));
         assert_eq!(parse_surface_ref("31"), Some(31));
         assert_eq!(parse_surface_ref("x"), None);
+    }
+
+    #[test]
+    fn runtime_prefixed_path_prepends_exe_dir_and_dedups() {
+        // RC-5 회귀 핀(양 OS 공통 로직): exe_dir가 PATH에 없으면 선두에 얹는다.
+        let sep = if cfg!(windows) { ';' } else { ':' };
+        let exe = Path::new("/opt/cysapp/bin");
+        let cur = format!("/usr/bin{sep}/bin");
+        let got = runtime_prefixed_path(exe, &cur).expect("exe_dir 미포함이면 Some");
+        assert!(got.starts_with("/opt/cysapp/bin"), "exe_dir 선두 주입: {got}");
+        assert!(got.ends_with(&cur), "기존 PATH 보존(제거 없음): {got}");
+        // 이미 PATH에 있으면(중복) 얹지 않는다 → None(무변경). (windows는 runtime 하위 dir가
+        // 실재하면 Some일 수 있으나 이 합성 경로엔 없음.)
+        let already = format!("/opt/cysapp/bin{sep}/usr/bin");
+        assert_eq!(runtime_prefixed_path(exe, &already), None, "중복이면 무변경");
     }
 
     #[test]
