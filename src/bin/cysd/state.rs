@@ -829,6 +829,10 @@ impl Daemon {
         builder.cwd(&cwd_str);
         builder.env("TERM", "xterm-256color");
         builder.env("LANG", &self.config.lang);
+        // RC-6(T3 발견): Windows 번들 embeddable Python은 open() 기본 인코딩이 cp1252라 UTF-8(한글)
+        // 팩 파일 읽기가 UnicodeDecodeError로 크래시. pane에서 도는 python(hooks·javis_*.py)이 UTF-8을
+        // 기본으로 쓰게 PYTHONUTF8=1 주입(unix 무영향·이미 UTF-8). cys-dept는 자체 export로 보강.
+        builder.env("PYTHONUTF8", "1");
         // 온보딩①: 데몬 옆 동봉 cys CLI + (Windows)동봉 runtime을 pane PATH 선두 주입 —
         // 신규 머신(심링크 없음)에서도 pane 속 AI가 `cys identify`·python3·bash를 즉시 쓴다.
         // RC-5: GUI 직스폰과 공유하는 공용 fn(cys::runtime_prefixed_path) 사용 — 중복 구현 금지.

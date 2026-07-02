@@ -26,6 +26,10 @@ CYS="$(command -v cys || { [ -x /opt/homebrew/bin/cys ] && echo /opt/homebrew/bi
 # RC-6(codex R3.1 nit): 인라인 python heredoc이 cys를 literal이 아니라 **해소된 경로**로 실행하도록
 # CYS_BIN을 env로 전파(heredoc은 프로세스 env 상속). dept_classify_idle·alive_sock 등 subprocess가 사용.
 export CYS_BIN="$CYS"
+# RC-6(T3 발견): Windows 번들 embeddable Python은 open() 기본 인코딩이 cp1252(charmap)라 UTF-8(한글)
+# agents.json·directives 읽기가 UnicodeDecodeError로 크래시(부서 seed 실패 등). PYTHONUTF8=1로 전 python
+# heredoc·자식 python을 UTF-8 기본으로 강제(unix 무영향). 개별 open(encoding=) 누락도 이걸로 방어.
+export PYTHONUTF8=1
 
 # RC-4: 부서 소켓 규약 — Windows(MSYS/Git-Bash)는 named pipe `\\.\pipe\cys-dept-<n>`
 # (cysd가 CYS_SOCKET을 named pipe로 바인드·Rust cys::dept_socket_path와 정합), 그 외는 unix .sock.
@@ -176,7 +180,7 @@ seed_agents_account(){
   python3 - "$src" "$pk/agents.json" "$acct_dir" <<'PY'
 import json,sys,os,re
 src,dst,acct=sys.argv[1:4]
-d=json.load(open(src))                                  # 디코드된 문자열
+d=json.load(open(src,encoding="utf-8"))                 # RC-6(T3): Windows cp1252 기본 회피(한글 UTF-8)
 claude=d.get("claude") or {}
 env=claude.get("env")
 # RC-3 파급 수정: agents.json이 cmd+env 구조가 되면서 CLAUDE_CONFIG_DIR이 cmd 리터럴→env 맵으로 이동했다.
