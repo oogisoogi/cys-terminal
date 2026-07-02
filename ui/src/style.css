@@ -146,8 +146,10 @@ html, body {
 .split.col { flex-direction: column; }
 .split > * { min-width: 0; min-height: 0; }
 .divider {
-  /* 평시 배경과 동일색 → 구분선 거의 비가시. hover/drag 시에만 accent로 드러나 리사이즈 조작성 유지. */
-  flex: 0 0 1px; background: var(--bg);
+  /* 아주 옅은 실선(#151a21 — bg #0d1117과 구 hairline #1c2128의 중간) → 시각 구별은 되되
+     거슬리지 않게. hover/drag 시 accent로 드러나 리사이즈 조작성 유지. (오너 2026-07-02: 완전
+     비가시에서 한 단계 올림 — "아주 옅은 실선을 넣어서 시각적 구별은 가능하게") */
+  flex: 0 0 1px; background: #151a21;
   position: relative; z-index: 5;
 }
 /* 시각은 1px, 잡는 영역은 ±3px — 보이지 않는 히트존으로 리사이즈 조작성 보존 */
