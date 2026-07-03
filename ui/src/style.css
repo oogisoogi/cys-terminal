@@ -101,6 +101,10 @@ html, body {
 .ws-tab:hover .ws-close { opacity: .55; }
 .ws-tab .ws-close:hover { opacity: 1; color: var(--error); }
 .ws-tab.active .ws-close:hover { color: #fff; }
+/* 2-click 삭제 확인 armed 상태 — 위험색 유지(active 탭 hover의 #fff보다 우선), 2.5초 내 hover 이탈해도 노출 유지 */
+.ws-tab .ws-close.close-armed, .ws-tab.active .ws-close.close-armed:hover { opacity: 1; color: var(--error); }
+/* svg가 클릭 target이 되면 mousedown 가드(e.target 비교)가 깨진다 — 이벤트는 span이 받게 */
+.close-armed svg { width: 11px; height: 11px; fill: currentColor; vertical-align: -1.5px; pointer-events: none; }
 #btn-ws-new {
   background: none; border: none; color: #8b949e; cursor: pointer; font-size: 14px;
   padding: 0 2px;
@@ -367,6 +371,7 @@ html, body {
 .cc-empty-inline { font-size: 11px; color: #475569; }
 .pane .pane-close { opacity: .5; cursor: pointer; }
 .pane .pane-close:hover { opacity: 1; color: var(--error); }
+.pane .pane-close.close-armed { opacity: 1; color: var(--error); }
 .pane .pane-title { cursor: grab; }
 
 #drag-ghost {

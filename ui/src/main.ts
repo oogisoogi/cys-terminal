@@ -1393,6 +1393,10 @@ async function refreshPaneTitles() {
 }
 setInterval(refreshPaneTitles, 3000);
 
+// 2-click 삭제 확인의 armed 상태 아이콘 — 이모지(🗑)는 컬러 글리프라 CSS 틴트 불가, 인라인 SVG 사용
+const TRASH_SVG =
+  '<svg viewBox="0 0 24 24"><path d="M9 3h6l1 1h4v2H4V4h4l1-1zM6 8h12l-1 13a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2L6 8z"/></svg>';
+
 async function makePane(sid: number, title: string, socket?: string): Promise<PaneRuntime> {
   // 멱등 보장 — 같은 (소켓,surface)에 pane 런타임·리스너가 이중 생성되지 않게
   const existing = panes.get(paneKey(sid, socket));
@@ -1422,10 +1426,14 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
     // WKWebView에서 confirm()은 무동작 — ws 탭과 동일한 2-click 확인 패턴
     if (closeBtn.dataset.arm !== "1") {
       closeBtn.dataset.arm = "1";
-      closeBtn.textContent = "정말?";
+      closeBtn.innerHTML = TRASH_SVG;
+      closeBtn.classList.add("close-armed");
+      closeBtn.title = "한 번 더 누르면 삭제";
       setTimeout(() => {
         closeBtn.dataset.arm = "";
         closeBtn.textContent = "×";
+        closeBtn.classList.remove("close-armed");
+        closeBtn.title = "surface 닫기 (셸 종료)";
       }, 2500);
       return;
     }
@@ -2041,10 +2049,14 @@ function buildTab(ws: Workspace): HTMLElement {
     // WKWebView에서 confirm()은 무동작 — 2-click 확인 패턴 사용
     if (close.dataset.arm !== "1") {
       close.dataset.arm = "1";
-      close.textContent = "정말?";
+      close.innerHTML = TRASH_SVG;
+      close.classList.add("close-armed");
+      close.title = "한 번 더 누르면 삭제";
       setTimeout(() => {
         close.dataset.arm = "";
         close.textContent = "×";
+        close.classList.remove("close-armed");
+        close.title = "워크스페이스 닫기 (surface 전부 종료)";
       }, 2500);
       return;
     }
