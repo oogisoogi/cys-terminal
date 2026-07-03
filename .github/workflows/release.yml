@@ -1,13 +1,14 @@
 name: release
 
-# 옵션 A — 소스는 비공개 repo에서 빌드·서명하고, 산출물만 공개 repo로 내보낸다.
-#   build    : tag(vX.Y.Z) push → macOS 앱 빌드 → minisign 서명 → 이 비공개 repo에 릴리스 생성
-#   relocate : 산출물(.dmg/.app.tar.gz/.sig/latest.json)을 공개 repo(cys-terminal-releases)로 복사,
-#              latest.json의 다운로드 URL을 공개 repo로 치환 → 공개 repo에 릴리스 자동 발행(--latest)
-#              (P0: 종전 --draft 는 수동 Publish 누락 시 채널이 옛 버전에 영구 정지 → updater 먹통. 자동발행으로 교정.)
-# 사용: 버전 5곳 범프 후  git tag v0.2.3 && git push origin v0.2.3
+# Phase 2 릴리스 통합(2026-07-03) — 소스 repo가 public: 이 repo의 릴리스가 곧 공개 배포다.
+#   build    : tag(vX.Y.Z) push → 앱 빌드·서명 → **이 repo에 public 릴리스 발행**(updater 대상)
+#   relocate : ★전환기 미러(1~2버전 한정·이후 제거+구repo Archive) — 구 updater 엔드포인트
+#              (cys-terminal-releases)를 바라보는 기존 설치본의 마지막 이주 경로.
+#              latest.json URL은 치환하지 않는다(자산은 이 repo에서 받게 → 받는 순간 신 엔드포인트로 이주).
+#              (P0 이력: --draft 는 수동 Publish 누락 시 채널 영구 정지 → 자동 발행 유지.)
+# 사용: 버전 6곳 범프(scripts/version-check.sh) 후  git tag vX.Y.Z && git push origin vX.Y.Z
 #       (수동 실행도 가능 — Actions 탭 Run workflow)
-# 활성 조건(시크릿):  TAURI_SIGNING_PRIVATE_KEY · RELEASES_REPO_TOKEN  (키 암호는 무암호 → 아래 빈 문자열로 처리)
+# 활성 조건(시크릿):  TAURI_SIGNING_PRIVATE_KEY · RELEASES_REPO_TOKEN(전환기 미러용 — 미러 제거 시 불필요)
 
 on:
   push:
@@ -19,8 +20,8 @@ permissions:
   contents: write          # 비공개 repo에 릴리스 생성·자산 업로드(+ relocate 단계 다운로드)에 필요
 
 env:
-  SRC_REPO: idoforgod/cys-terminal              # 비공개 소스 repo (빌드·1차 릴리스)
-  DST_REPO: idoforgod/cys-terminal-releases     # 공개 배포 repo (사용자 다운로드·updater 대상)
+  SRC_REPO: idoforgod/cys-terminal              # 공개 소스 repo = 공개 배포 원본 (updater 대상)
+  DST_REPO: idoforgod/cys-terminal-releases     # 구 배포 repo — 전환기 미러 전용(이후 Archive)
 
 jobs:
   build:
@@ -120,9 +121,10 @@ jobs:
           #   인증서가 없는 동안에는 APPLE_* 를 아예 전달하지 않는다(=미서명 빌드 → Gatekeeper 경고 감수).
         with:
           tagName: ${{ github.ref_name }}
-          releaseName: 'cys ${{ github.ref_name }} (internal)'
-          releaseBody: '비공개 빌드 산출물 — 공개 배포는 cys-terminal-releases 참조.'
-          releaseDraft: false     # 실태그 발행(비공개 repo) → relocate에서 gh release download 안정 동작
+          # Phase 2(릴리스 통합·2026-07-03): 소스 repo가 public이 되면서 이 릴리스가 곧 공개 배포다.
+          releaseName: 'cys ${{ github.ref_name }}'
+          releaseBody: 'cys 터미널 ${{ github.ref_name }}. macOS는 .dmg, Windows는 -setup.exe를 내려받아 설치하세요. 기존 사용자는 앱 내 Update 버튼으로 자동 갱신됩니다.'
+          releaseDraft: false     # 실태그 자동 발행 — updater가 releases/latest를 즉시 인식
           prerelease: false
           args: --target ${{ matrix.target }}
 
@@ -332,7 +334,7 @@ jobs:
           echo "✅ 실서명 아티팩트가 실검증기를 통과(서명+신선도+파일+커버리지) — 폐포 확인"
 
       # 비공개 릴리스(build 잡이 생성)에 팩 자산 업로드 → relocate가 공개 repo로 옮긴다.
-      - name: Upload pack artifacts to private release
+      - name: Upload pack artifacts to source release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -340,44 +342,39 @@ jobs:
           gh release upload "${{ github.ref_name }}" \
             pack.tar.gz pack-manifest.json pack-manifest.json.minisig \
             -R "$SRC_REPO" --clobber
-          echo "✅ 팩 아티팩트 업로드 완료(pack.tar.gz·pack-manifest.json·.minisig)"
+          # Phase 2: 소스 repo 릴리스가 updater 엔드포인트(releases/latest) — latest 마킹을 결정론 강제
+          gh release edit "${{ github.ref_name }}" -R "$SRC_REPO" --latest --draft=false
+          echo "✅ 팩 아티팩트 업로드 + latest 마킹 완료"
 
+  # ── Phase 2 전환기 미러 (1~2버전 한정 — 이후 이 잡 제거 + 구 repo Archive) ──
+  # 구 엔드포인트(cys-terminal-releases/latest.json)를 바라보는 기존 설치본의 마지막 이주 경로.
+  # latest.json URL을 치환하지 않는다 — 자산 URL이 소스 repo(public)를 가리키므로,
+  # 구 설치본이 이 미러로 업데이트를 받는 순간 새 바이너리(신 엔드포인트 내장)로 이주 완료된다.
   relocate:
     needs: [build, pack-artifacts]
     runs-on: ubuntu-latest
     steps:
-      # 1) 비공개 repo 릴리스에서 산출물 회수 (자기 repo이므로 기본 GITHUB_TOKEN으로 충분)
-      - name: Download artifacts from private release
+      # 1) 소스 repo 릴리스에서 산출물 회수
+      - name: Download artifacts from source release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           mkdir -p dist
           gh release download "${{ github.ref_name }}" -R "$SRC_REPO" -D dist
-          echo "── 회수한 산출물 ──"; ls -la dist
-
-      # 2) latest.json의 다운로드 URL을 공개 repo로 치환 (소스 repo URL → 배포 repo URL)
-      - name: Rewrite latest.json URLs to public repo
-        run: |
-          set -euo pipefail
           test -f dist/latest.json || { echo "::error::latest.json 없음 — 서명 시크릿이 설정됐는지 확인"; exit 1; }
-          sed -i "s#${SRC_REPO}/releases/download#${DST_REPO}/releases/download#g" dist/latest.json
-          echo "── 치환 후 latest.json ──"; cat dist/latest.json
+          echo "── 미러할 산출물(latest.json URL은 소스 repo 그대로) ──"; ls -la dist
 
-      # 3) 공개 repo에 릴리스 자동 발행 + 자산 업로드 (updater가 즉시 latest로 인식 → Update 버튼 활성)
-      - name: Publish to public releases repo
+      # 2) 구 repo에 미러 발행 (--latest: 구 엔드포인트가 이 태그를 가리키게)
+      - name: Mirror to legacy releases repo (transition only)
         env:
           GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
         run: |
           set -euo pipefail
           # 재실행 안전: 기존 동일 태그 릴리스가 있으면 정리
           gh release delete "${{ github.ref_name }}" -R "$DST_REPO" --yes --cleanup-tag 2>/dev/null || true
-          # ★P0(2026-07-02): 종전 --draft 는 사람이 수동 Publish 안 하면 공개 채널이 옛 버전에 영구 정지된다
-          #   (0.6.2·0.6.3이 draft로 방치돼 updater가 0.6.1에 고정됐던 근본원인 — "Update 눌러도 안 올라감").
-          #   이 잡은 build·pack-artifacts가 전부 성공(needs)한 뒤에만 도므로 자동 발행이 안전하다.
-          #   --latest 로 /releases/latest(=updater 엔드포인트)가 이 태그를 가리키게 강제한다.
           gh release create "${{ github.ref_name }}" -R "$DST_REPO" dist/* \
-            --title "cys ${{ github.ref_name }}" \
-            --notes "cys 터미널 ${{ github.ref_name }}. 아래 .dmg를 내려받아 설치하세요. 기존 사용자는 앱 내 Update 버튼으로 자동 갱신됩니다." \
+            --title "cys ${{ github.ref_name }} (mirror)" \
+            --notes "이 저장소는 구버전 자동 업데이트를 위한 전환기 미러입니다. 새 배포 원본: https://github.com/idoforgod/cys-terminal/releases" \
             --latest
-          echo "✅ 공개 repo 릴리스 자동 발행됨 — updater가 즉시 ${{ github.ref_name }}을 latest로 인식합니다."
+          echo "✅ 전환기 미러 발행 — 구 설치본이 이 경로로 마지막 업데이트를 받으면 신 엔드포인트로 이주됩니다."

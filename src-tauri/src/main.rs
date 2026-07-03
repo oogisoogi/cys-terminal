@@ -1397,7 +1397,8 @@ async fn check_update(app: AppHandle) -> Result<Option<Value>, String> {
 /// 기본 원격 pack-manifest.json URL — tauri.conf updater endpoint(latest.json)와 같은
 /// release 'latest' 자산에 동봉된다(release.yml이 함께 업로드, DESIGN §5 파일맵).
 fn default_pack_manifest_url() -> String {
-    "https://github.com/idoforgod/cys-terminal-releases/releases/latest/download/pack-manifest.json"
+    // Phase 2 릴리스 통합(2026-07-03): 배포 원본 = 공개 소스 repo. 구 repo는 전환기 미러.
+    "https://github.com/idoforgod/cys-terminal/releases/latest/download/pack-manifest.json"
         .to_string()
 }
 
