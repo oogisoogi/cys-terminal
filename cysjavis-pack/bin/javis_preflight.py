@@ -3120,6 +3120,153 @@ class Preflight:
             self.add(cid, PASS, "grill-gate 인프라 건재(엔진 self-test·hook·"
                      "PreToolUse 등록·SKILL 핀 pack+메인)")
 
+    # ── C58 트러스트 하드닝 (개인 alias 프로필 config가 cysjavis 워크스페이스를 자동 신뢰) ──
+    # 배경(실측): 개인 alias(claude-ysfuture 등·config=~/.claude-ysfuture)로 Claude 기동 시
+    #   그 config의 .claude.json에서 cysjavis 워크스페이스 hasTrustDialogAccepted=False/부재면
+    #   시작 시 "Ignoring N permissions.allow entries … workspace has not been trusted" 경고가
+    #   flash하고 permissions.allow가 무시된다. 패키지 표준 경로(launch-agent→~/.cys/claude)는
+    #   신뢰 프롬프트 자동확인이라 무경고지만, 개인 alias config는 독립 보장이 없어 갭 발생.
+    #   C43 serena의 _enable_mcp_server(set_trust=)는 MCP 활성 시에만 조건부라 이 갭을 못 메운다.
+    # ★보안 스코프(절대·티켓 §②): cysjavis가 관리하는 워크스페이스에만 신뢰 세팅 — 임의
+    #   워크스페이스 blanket 신뢰 금지(신뢰 다이얼로그는 악성 .claude/settings.local.json 방어
+    #   장치라 남용 시 보안구멍). 2중 스코프: ①대상 config = cysjavis 배선 프로필(우리 hook
+    #   등록)의 .claude.json만 ②대상 워크스페이스 = 결정론 cysjavis 마커(_round/ 시스템 폴더 +
+    #   CLAUDE.md의 cys 마커 토큰) 보유 project 항목만. 마커 없는 항목·stale 경로는 무변경.
+    # C43과 독립(MCP 활성 무관). trust는 가역 로컬 변경이라 may_mutate(비가역 외부설치) 게이트가
+    # 아니라 self.fix 게이트로 집행(dry/safe에선 self.fix=False → 탐지만). C57 다음 free id = C58.
+    CYSJAVIS_WS_CLAUDEMD_MARKERS = ("cys ", "CYSjavis", "cysjavis", "claim-role")
+
+    def _is_cysjavis_workspace(self, path):
+        """결정론 판정 — 이 워크스페이스 경로가 cysjavis 관리 대상인가.
+        마커: ①_round/ 시스템 폴더 존재 AND ②CLAUDE.md 존재 + cys 마커 토큰 포함.
+        존재하지 않는 stale 항목·마커 부재는 False(blanket 신뢰 차단 · 티켓 §②)."""
+        try:
+            if not os.path.isdir(path):
+                return False
+            if not os.path.isdir(os.path.join(path, "_round")):
+                return False
+            cmd = os.path.join(path, "CLAUDE.md")
+            if not os.path.isfile(cmd):
+                return False
+            text = open(cmd, encoding="utf-8", errors="replace").read()
+            return any(m in text for m in self.CYSJAVIS_WS_CLAUDEMD_MARKERS)
+        except OSError:
+            return False
+
+    def _trust_gap_workspaces(self, config_path):
+        """읽기전용 탐지 — .claude.json 미변경. 신뢰 갭(cysjavis 워크스페이스인데
+        hasTrustDialogAccepted가 True 아님) 워크스페이스 경로 리스트."""
+        try:
+            data = json.load(open(config_path, encoding="utf-8"))
+        except (OSError, ValueError):
+            return []
+        gaps = []
+        for ws, ent in (data.get("projects", {}) or {}).items():
+            if not isinstance(ent, dict):
+                continue
+            if not self._is_cysjavis_workspace(ws):
+                continue
+            if not ent.get("hasTrustDialogAccepted"):
+                gaps.append(ws)
+        return gaps
+
+    def _set_workspace_trust(self, config_path, workspaces):
+        """denylist write — 지정 cysjavis 워크스페이스 항목의 hasTrustDialogAccepted만 True.
+        None=ok/no-change, str=사유. 원자 쓰기·다른 필드 무변경·멱등·낙관적 동시성 가드."""
+        if os.path.islink(config_path):
+            return "symlink 거부: %s" % config_path
+        try:
+            with open(config_path, "rb") as f:
+                raw = f.read()
+        except OSError as e:
+            return "읽기 실패 — 거부: %s" % e
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as e:
+            return "파싱 실패 — 거부: %s" % e
+        if not isinstance(data, dict):
+            return "최상위 비-object — 거부"
+        projs = data.get("projects")
+        if not isinstance(projs, dict):
+            return "projects 부재/비-object — 거부"
+        changed = False
+        for ws in workspaces:
+            ent = projs.get(ws)
+            if not isinstance(ent, dict):
+                continue
+            # 세팅 직전 마커 재검증(TOCTOU·blanket 신뢰 2차 차단): 갭 목록 산출 이후
+            # 마커가 사라진 항목은 손대지 않는다.
+            if not self._is_cysjavis_workspace(ws):
+                continue
+            if not ent.get("hasTrustDialogAccepted"):
+                ent["hasTrustDialogAccepted"] = True
+                changed = True
+        if not changed:
+            return None  # 멱등: 이미 전부 True → 무동작
+        # 낙관적 동시성 가드(티켓 §④): 우리가 읽은 이후 라이브 세션이 config를 갱신했으면
+        # os.replace로 그 갱신을 clobber하지 않도록 건너뛰고 보고한다(감지·경고).
+        try:
+            with open(config_path, "rb") as f:
+                if f.read() != raw:
+                    return "동시 변경 감지(라이브 세션?) — clobber 방지 위해 건너뜀"
+        except OSError as e:
+            return "재확인 실패 — 거부: %s" % e
+        backup = config_path + ".bak-preflight"
+        if not os.path.exists(backup):
+            shutil.copy2(config_path, backup)
+        tmp = config_path + ".tmp"
+        # 라이브 config는 indent=2 pretty(실측) — 동일 포맷 유지로 다른 필드 텍스트 churn 0.
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(json.dumps(data, ensure_ascii=False, indent=2))
+        os.replace(tmp, config_path)
+        return None
+
+    def c58_trust_harden(self):
+        cid = "C58.trust-harden"
+        if self.skipped(cid):
+            return
+        # 대상 config = cysjavis 배선 프로필(우리 hook 등록)의 .claude.json만(스코프 ①).
+        targets = []
+        for settings_path in discover_claude_settings():
+            if not self._hook_registered(settings_path):
+                continue
+            cfg = os.path.join(os.path.dirname(settings_path), ".claude.json")
+            if os.path.isfile(cfg):
+                targets.append(cfg)
+        if not targets:
+            self.add(cid, PASS, "cysjavis 배선 프로필 .claude.json 없음 — 트러스트 대상 없음")
+            return
+        set_lines = []
+        gap_lines = []
+        for cfg in targets:
+            gaps = self._trust_gap_workspaces(cfg)
+            if not gaps:
+                continue
+            if self.fix:
+                err = self._set_workspace_trust(cfg, gaps)
+                if err:
+                    gap_lines.append("%s: 세팅 보류 — %s" % (cfg, err))
+                    continue
+                remain = self._trust_gap_workspaces(cfg)   # 재탐지(멱등 검증)
+                for ws in gaps:
+                    if ws not in remain:
+                        set_lines.append("trust set: %s / %s" % (cfg, ws))
+                for ws in remain:
+                    gap_lines.append("%s / %s: 세팅 후 갭 잔존" % (cfg, ws))
+            else:
+                for ws in gaps:
+                    gap_lines.append("trust gap: %s / %s (--fix로 세팅)" % (cfg, ws))
+        if set_lines:
+            detail = "cysjavis 워크스페이스 트러스트 세팅 — " + " | ".join(set_lines)
+            if gap_lines:
+                detail += " · 잔존: " + " | ".join(gap_lines)
+            self.add(cid, FIXED if not gap_lines else WARN, detail)
+        elif gap_lines:
+            self.add(cid, WARN, "트러스트 갭 — " + " | ".join(gap_lines))
+        else:
+            self.add(cid, PASS,
+                     "cysjavis 워크스페이스 트러스트 OK(갭 없음 · %d config 점검)" % len(targets))
+
     def run(self):
         self.c01_pack_dir()
         self.c02_directives()
@@ -3181,6 +3328,7 @@ class Preflight:
         self.c55_grill_gate()
         self.c56_dept_hook_leak()
         self.c57_temp_hook_leak()
+        self.c58_trust_harden()
         return self.results
 
 
