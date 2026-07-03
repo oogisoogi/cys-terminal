@@ -1,120 +1,110 @@
-# cys-terminal — CYSJavis Dedicated Terminal (core daemon + CLI + CYSJavis Pack)
+# cys-terminal
 
-> Independently written **from scratch** — bidirectional sockets and resource governance as first-class features. Cross-platform: macOS & Windows.
+**An orchestration terminal for commanding fleets of AI agents.** Cross-platform: macOS & Windows.
+
+A terminal multiplexer, a local daemon, and a mission-control dashboard in one body.
+Run multiple CLI agents (Claude Code, Codex, …) in parallel under distinct roles
+(master / worker / reviewer), let them talk to each other over sockets, and monitor
+cost, context, and hardware in real time.
+
+> Most of this codebase was **written by AI agents under human direction** — the
+> `Co-Authored-By` chain in the commit log is the record of that process. The
+> repository itself is a working proof that AI-fleet orchestration is real.
+
+*한국어 문서(전체 레퍼런스 포함)는 [README.md](README.md)를 보세요.*
+
+## Why
+
+Existing terminals and multiplexers are built for humans typing commands. Run several
+AI agents in them and you hit three walls fast: panes cannot talk to each other, orphan
+servers left by agents pile up until the machine chokes, and nobody can see who is
+spending what. cys-terminal is an independent, from-scratch implementation that makes
+those three problems first-class features.
 
 ## Design Principles (ABSOLUTE)
 
 1. **Bidirectional socket communication** — no one-way send + capture polling.
-   Every pane on the same socket is an **equal node** that can actively push to any other pane by surface ID.
-   `cys send --surface surface:31 "..."` + `send-key Return` → injected directly into the target pane's **PTY stdin** → arrives as a new user turn.
-   Server→client direction is the `cys events` push stream (sequence numbers, resume on reconnect).
-2. **Resource governance as a first-class feature** — built-in mitigation for orphan server accumulation (→ load explosion → 401/hang).
-3. **Core/UI separation** — the daemon (cysd) runs independently of any UI. Even if the UI hangs, the socket control channel stays alive (out-of-band recovery).
+   Every pane on the same socket is an **equal node** that can actively push to any
+   other pane by surface ID (`cys send` → injected directly into the target PTY stdin
+   → arrives as a new user turn). Server→client is the `cys events` push stream
+   (sequence numbers, resume on reconnect).
+2. **Resource governance as a first-class feature** — built-in mitigation for orphan
+   server accumulation (→ load explosion → 401/hang): process ledger, watchdog,
+   scoped execution with lifecycle-enforced teardown.
+3. **Core/UI separation** — the daemon (`cysd`) runs independently of any UI. Even if
+   the UI hangs, the socket control channel stays alive (out-of-band recovery).
 
-## Architecture
+## Highlights
 
-```
-cysd  headless core daemon: NDJSON socket server (UDS / Windows named pipe), PTY (portable-pty:
-         macOS openpty, Windows ConPTY), vt100 screen reconstruction, event bus, watchdog, process ledger
-cys   CLI: the equal-node client used by the AI inside each pane
-```
+- **Agent fleet orchestration** — `cys launch-agent --role worker --agent claude`
+  boots role-based nodes (directives auto-injected); route messages by role address
+  (`--to worker`); department-level daemon isolation for parallel projects.
+- **Control Center** — fleet state, tokens/cost (per model, per org tier), session
+  timelines with transcript excerpts, skill/tool stats with failure rates and p50
+  durations, real-time hardware (per-core CPU, GPU, NPU, memory), approval feed.
+- **Signed pack system** — skills/directives/tools ship as a minisign-signed pack;
+  zero-downtime pack updates (sessions and daemon survive) are separate from app
+  binary updates (Tauri updater), both fail-closed on signature verification.
+- **Jarvis-native operations** — self-reported agent status, context-cycle executor,
+  agent-death detection and recovery, directive drift detection/reinjection,
+  transcript hash-chain attestation, kill-switch, one-shot timers, typing guards.
 
-Every pane process gets `CYS_SURFACE_ID`, `CYS_SURFACE_REF`, `CYS_SOCKET` injected automatically — the AI inside a pane learns its own address instantly via `cys identify`.
+## Install
 
-## Installing git (needed for source build / contributing)
+Grab the latest from [Releases](https://github.com/idoforgod/cys-terminal-releases/releases/latest).
+No separate daemon setup — the app boots it and installs the pack automatically.
 
-The GUI app (DMG/MSI) needs no git. But **cloning/building from source, contributing**,
-harness-creator toolchain auto-install, and RSI self-improvement require git (the boot
-preflight `C30.git` checks for it deterministically).
+- **macOS**: `cys_<version>_aarch64.dmg` (Apple Silicon) — drag to install, launch, done.
+- **Windows**: `cys_<version>_x64-setup.exe` — daemon, CLI, and runtime bundled (self-contained).
+- Optional 24/365 daemon: `cys daemon install` (launchd KeepAlive / Task Scheduler).
+- Use `cys` from external terminals: app Control Center → **"Install cys to shell"** (one click).
 
-```bash
-# macOS — Xcode Command Line Tools (recommended) or Homebrew
-xcode-select --install          # or: brew install git
-# Linux
-sudo apt install git            # Debian/Ubuntu
-sudo dnf install git            # Fedora/RHEL
-# Windows — official installer: https://git-scm.com/download/win
-git --version                   # verify
-
-git clone https://github.com/idoforgod/cys-terminal
-```
+Details: [docs/INSTALL.md](docs/INSTALL.md).
 
 ## Quick Start
 
 ```bash
-cargo build --release
-./target/release/cysd &                      # daemon (duplicate launch auto-rejected)
-
-cys new-surface --title worker1              # → surface:1
-cys send --surface surface:1 "echo hello"
-cys send-key --surface surface:1 Return
-cys read-screen --surface surface:1          # screen reconstructed exactly via vt100 (--lines 200 for scrollback tail)
-cys events --reconnect                       # push event stream (replaces polling)
-cys attach surface:1                         # output mirror (read-only)
+cys identify                                  # who am I (surface address)
+cys launch-agent --role worker --agent claude # boot a role node (directives auto-injected)
+cys send --to worker "status report, please"  # push by role address
+cys send-key --to worker Return               # confirm submission
+cys status --json                             # one-call fleet snapshot
+cys events --reconnect                        # push event stream (replaces polling)
+cys run --scoped -- python -m http.server     # lifecycle-managed scoped execution
 ```
 
-## Resource Governance (3 mitigations)
+## Architecture
 
-| Mitigation | Feature | Command / Event |
-|---|---|---|
-| ① Auth/health failure detection | Health rules matched against every output line (default: Not logged in, 401, token expired, rate limit) → push with 30s debounce | `health.alert` event · `cys add-health-rule <name> <regex>` |
-| ② Short work units | Idle detection (default: 300s of no output) → push so the master can decide to split or inspect | `pane.idle` event |
-| ③ Forced server lifecycle | **scoped run**: new process group + ledger registration, SIGKILL of the whole group on exit · **close-surface**: kills the pane's entire child tree · **watchdog**: detects loadavg / child count / duplicate commands (default 3+), auto-cleanup with `CYS_AUTOKILL_DUP=1` | `cys run -- <cmd>` · `cys ps` · `cys kill <pid>` · `watchdog.*` events |
-
-## Protocol (NDJSON, one JSON per line)
-
-Request `{"id":1,"method":"surface.send_text","params":{...}}` → Response `{"id":1,"ok":true,"result":{...}}` / `{"id":1,"ok":false,"error":{"code","message"}}`
-
-Methods: `system.ping` `system.identify` `surface.create/list/send_text/send_key/read_text/resize/close/attach` `events.stream` `ledger.register/deregister/list/kill` `health.add_rule/list_rules` `control.dashboard/analytics/skills/weekly/alerts/sessions/session_detail/session_star`
-
-Events: `surface.created/closed/exited/input_injected (sender tagged)` `health.alert` `watchdog.load_high/proc_count_high/duplicate_procs/duplicates_killed` `pane.idle` `ledger.registered/killed` `daemon.started`
-
-## Environment Variables
-
-`CYS_SOCKET` socket path (default `~/.local/state/cys/cys.sock`, Windows `\\.\pipe\cys`) · `CYS_SHELL` ·
-`CYS_LOAD_THRESHOLD` (default cores×2) · `CYS_PROC_THRESHOLD` (50) · `CYS_DUP_THRESHOLD` (3) · `CYS_AUTOKILL_DUP` (0/1) · `CYS_IDLE_SECONDS` (300) · `CYS_CONTROL_REDACT` (0/1, redact session PII in Control Center)
-
-## UI (Tauri 2 + xterm.js)
-
-```bash
-cd ui && sh build.sh          # frontend bundle (bun)
-cargo build -p cys-app     # dev run: ./target/debug/cys-app
-bun x @tauri-apps/cli build   # release: target/release/bundle/macos/cys.app
-# bundle daemon & CLI into the app: cp target/release/{cysd,cys} <app>/Contents/MacOS/
+```
+cys.app  Tauri desktop app: terminal UI (xterm.js) + Control Center — thin client of the daemon
+cysd     headless core daemon: NDJSON socket server (UDS / Windows named pipe),
+         PTY (portable-pty: openpty / ConPTY), vt100 screen reconstruction, event bus,
+         watchdog & process ledger, usage/cost collectors, persistent analytics (SQLite)
+cys      CLI: the equal-node client used by the AI inside each pane
+pack     cysjavis-pack/: skills, directives, hooks, tools (embedded at build, signed at distribution)
 ```
 
-- **Core/UI separation**: the UI is just a socket client. Sessions (PTYs) are owned by the daemon — they survive UI restarts and app reinstalls (re-attach).
-- Workspace tabs (add / rename / close) · split panes (⌘T, ⌘D, ⌘⇧D, ⌘W) · draggable divider resize.
-- health/watchdog/feed push events → toasts. Note: rebuild the app after editing ui/ (frontend is embedded in the binary).
-- **Control Center full panel**: real-time ops + persistent analytics, 5 tabs + alert badge (separate section below).
+Every pane process gets `CYS_SURFACE_ID`, `CYS_SURFACE_REF`, `CYS_SOCKET` injected
+automatically — the AI inside a pane learns its own address instantly via `cys identify`.
 
-## Control Center (real-time ops + persistent analytics)
+## Security model
 
-A dedicated full panel in the cys-app UI — cysd serves fleet/usage/system in a single RPC
-(no external dashboard), and persistent analytics accumulate in cysd's embedded SQLite
-(`analytics.db`, separate from recall's transcripts.db · graceful degrade if it fails to open).
-Philosophy: **local-first** (data never leaves the machine) · zero extra infrastructure · 0ms agent latency (hooks are fire-and-forget).
+- No network listener — user-owned Unix socket (macOS) / DACL-sealed named pipe (Windows).
+- Dual-signed updates — app binaries via Tauri updater signatures, packs via minisign
+  (public key pinned in the binary).
+- External URL opening is gated by a hard host allowlist (extendable only via local
+  config `~/.cys/url-allow-hosts`). Approvals are human-in-the-loop; nothing auto-answers.
+- Pre-publish secret/PII gate: `scripts/secret-scan.sh --all` (fail-closed).
 
-| Tab | RPC | Contents |
-|---|---|---|
-| **Live** | `control.dashboard` | node fleet (role·agent·state·idle·observed usage) · system CPU/MEM · today tokens/cost$/model mix · last 1h · usage sparkline · uptime |
-| **Cost/Efficiency** | `control.analytics {window}` | persistent aggregates — 4-way token split · per-model cost ($) · efficiency metrics |
-| **Skills/Agents** | `control.skills {window}` | skill/agent call counts · 🔥failure rate (exit_code≠0) · duration |
-| **Sessions** | `control.sessions {window}` · `control.session_detail` · `control.session_star` | session timeline · activity ribbon · transcript viewer · ⭐starred sessions |
-| **Trends/Weekly** | `control.weekly` | weekly WoW% deltas · efficiency leaders · skill assets (new/dormant) |
-| Alert badge | `control.alerts` | token/cost thresholds · anomaly detection · repeated failures — same evaluator as watchdog, + UI badge |
+Report vulnerabilities per [SECURITY.md](SECURITY.md).
 
-- **Event capture**: SessionStart/PreToolUse/PostToolUse/Stop/SubagentStop hooks record tool/skill/agent calls, exit_code and duration into the `events` table — fire-and-forget (0 agent latency).
-- **RBAC PII redaction**: `CYS_CONTROL_REDACT=1` (or the `redact` param on the sessions RPC) masks the path PII in session_id while preserving aggregates. UI sessions tab has a 🔒 toggle.
-- **Refresh**: UI polls every 5s. Tauri commands `control_*` expose the same RPCs. Alert thresholds in `~/.cys/pack/alerts-config.json`.
-- Detailed design: docs/CONTROL_CENTER_DESIGN.md
+## Full reference
 
-## Approval Feed (centralized worker approval requests)
+Protocol methods/events, environment variables, governance tables, the 19 Jarvis-native
+features, approval feed, in-flight queue semantics, and source-build instructions are
+documented in the Korean [README.md](README.md) (the canonical reference).
 
-```bash
-cys feed push --wait --title "approve git push" --body "..."   # blocks until decided (exit 0=allow, 2=deny, 3=timeout)
-cys feed list --status pending                                 # list pending requests
-cys feed reply <request_id> allow                              # master, or UI Allow/Deny buttons
-```
+## Contributing · License
 
-`feed.push wait=true` → the daemon blocks the connection via a oneshot channel (default 120s) until `feed.reply` releases it. Agent hook example (Claude Code PreToolUse): the hook script calls `cys feed push --wait ...` and maps the exit code to the decision.
+See [CONTRIBUTING.md](CONTRIBUTING.md) and [NOTICE.md](NOTICE.md) (third-party attributions).
+MIT License ([LICENSE](LICENSE)) · Contact: **cysinsight@gmail.com**
