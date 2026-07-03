@@ -19,5 +19,9 @@
   <!-- 자식 프로세스가 부모 entitlements를 상속(데몬 spawn) -->
   <key>com.apple.security.inherit</key>
   <true/>
+
+  <!-- 마이크 입력(voice-jarvis) — hardened runtime 공증 빌드에서 마이크 접근에 필수 -->
+  <key>com.apple.security.device.audio-input</key>
+  <true/>
 </dict>
 </plist>
