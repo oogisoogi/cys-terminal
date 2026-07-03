@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# secret-scan.sh — PUBLIC repo 발행 전 시크릿/개인정보 fail-closed 게이트 (박사님 2026-06-14).
+# secret-scan.sh — PUBLIC repo 발행 전 시크릿/개인정보 fail-closed 게이트 (오너 2026-06-14).
 # '전부 올리기'를 안전하게 유지하는 가드레일. 제네릭화 회귀(개인경로·계정·프로필·토큰·이메일)를 차단한다.
 # deny-by-default: 의심 패턴이 하나라도 걸리면 비-0으로 차단한다(통과 입증 책임은 산출물에 있다).
 #
@@ -30,8 +30,8 @@ esac
 skip_re='\.(lock|png|jpe?g|gif|ico|svg|woff2?|ttf|wasm|pdf|zip|dmg|msi|exe)$|(^|/)Cargo\.lock$|(^|/)LICENSE$|(^|/)secret-scan\.sh$'
 # 더미 username(제네릭화된 테스트 픽스처) — 그 외 /Users/<name>은 개인경로로 차단
 dummy_user_re='/Users/(user|x|youruser|USERNAME|runner|home)(/|"|$)'
-# 이메일 허용(공개 연락처가 의도적으로 박힌 배포 문서만)
-email_allow_re='^(README\.md|README\.en\.md)$'
+# 이메일 허용(공개 연락처가 의도적으로 박힌 배포 문서만 — SECURITY.md 취약점 신고 연락처 포함)
+email_allow_re='^(README\.md|README\.en\.md|SECURITY\.md)$'
 email_fp_re='example\.(com|org|net)|noreply|@types/|@google/|@tauri|@scope|user@host|you@'
 
 findings="$(mktemp)"; trap 'rm -f "$findings"' EXIT

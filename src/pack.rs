@@ -392,7 +392,7 @@ pub fn install_from_iter<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
     if !transactional {
         let _ = write_atomic(&dir.join(PACK_VERSION_FILE), target_version.as_bytes());
     }
-    // cys 전용 CLAUDE_CONFIG_DIR 격리 셋업(박사님 2026-06-15) — 사용자 ~/.claude 오염으로부터
+    // cys 전용 CLAUDE_CONFIG_DIR 격리 셋업(오너 2026-06-15) — 사용자 ~/.claude 오염으로부터
     // cys 마스터를 분리한다. best-effort·보존 모드라 깨끗한 환경에서도 회귀 0.
     setup_isolated_config_dir();
     #[cfg(unix)]
@@ -416,7 +416,7 @@ pub fn install_from_iter<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 무중단 pack-update 적용 트랜잭션(§7-⑤ 옵션 b — 박사님 결정 ⑤ 확정: 심링크 마이그레이션 안 함).
+// 무중단 pack-update 적용 트랜잭션(§7-⑤ 옵션 b — 오너 결정 ⑤ 확정: 심링크 마이그레이션 안 함).
 // backup journal + rollback + `.pack-version` = 마지막 hard commit marker로 전체 팩 적용에
 // all-or-nothing(부분적용 0)을 부여한다. ★install()/cysd 자동설치·init-pack 경로는 이 트랜잭션을
 // 거치지 않는다(install_from_iter를 transactional=false로 직접 호출 — 외부 동작 불변).
@@ -840,7 +840,7 @@ mod tests {
         let (written, kept) = result.expect("install 실패");
         assert_eq!(kept, 0, "빈 디렉터리인데 kept>0");
         assert_eq!(written, PACK_ALL.len(), "임베드 전수 설치 아님");
-        // ★격리 config dir 셋업(박사님 2026-06-15): cys 라우터+hook이 전용 dir에 설치되고,
+        // ★격리 config dir 셋업(오너 2026-06-15): cys 라우터+hook이 전용 dir에 설치되고,
         // 사용자 ~/.claude 와 분리된다. 라우터는 ~/.cys/pack 디렉티브로 라우팅해야 한다.
         let router = std::fs::read_to_string(cfgdir.join("CLAUDE.md")).expect("격리 CLAUDE.md 미설치");
         assert!(router.contains("~/.cys/pack/directives"), "격리 라우터가 pack 디렉티브로 안 보냄");

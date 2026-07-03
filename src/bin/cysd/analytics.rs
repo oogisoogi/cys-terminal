@@ -1658,7 +1658,7 @@ mod tests {
 
     #[test]
     fn redact_session_id_stable_and_pii_free() {
-        let p = "/Users/cys/.claude/projects/secret-proj/abc-123.jsonl";
+        let p = "/Users/user/.claude/projects/secret-proj/abc-123.jsonl";
         let r = redact_session_id(p);
         assert!(r.starts_with("sess-") && r.len() == 13, "{r}");
         assert!(!r.contains("cys") && !r.contains("secret") && !r.contains("/"), "PII 노출: {r}");

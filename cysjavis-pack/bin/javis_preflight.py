@@ -419,7 +419,7 @@ def discover_claude_settings():
     found = []
     # 축A 근본복원(2026-06-30): 부서 데몬 컨텍스트(CYS_ACCOUNT_DIR이 부서 전용 dir·basename에
     # 'dept-')에서는 home-glob을 생략하고 자기 account_dir settings.json에만 hook을 등록한다.
-    # home-glob을 그대로 두면 부서 preflight가 CEO(~/.claude-ysfuture)·타부서 config에까지
+    # home-glob을 그대로 두면 부서 preflight가 CEO(CEO 프로필 config)·타부서 config에까지
     # hook을 append해 dept-3·dept-4처럼 무한 재발한다(부서장 config 공유와 무관한 절차 버그).
     _acct = os.environ.get("CYS_ACCOUNT_DIR")
     _acct_is_dept = bool(_acct and "dept-" in os.path.basename(os.path.normpath(_acct)))
@@ -1733,8 +1733,17 @@ class Preflight:
     # 기계는 gap을 탐지해 WARN만 내고, _serena_enable_approved() 토큰이 있을 때만 write한다.
     @staticmethod
     def _serena_nodes():
+        # 워커 프로필 디렉터리 외부화(공개 배포에서 개인 프로필명 제거):
+        # $CYS_WORKER_PROFILE_DIR → ~/.cys/worker-profile-dir 파일(1줄) → ~/.claude-worker 기본
+        wp = os.environ.get("CYS_WORKER_PROFILE_DIR", "")
+        if not wp:
+            try:
+                wp = open(os.path.expanduser("~/.cys/worker-profile-dir"), encoding="utf-8").read().strip()
+            except OSError:
+                wp = ""
+        wp = os.path.expanduser(wp or "~/.claude-worker")
         return [("master", os.path.expanduser("~/.cys/claude/.claude.json"), False),
-                ("worker", os.path.expanduser("~/.claude-cysinsight/.claude.json"), True)]
+                ("worker", os.path.join(wp, ".claude.json"), True)]
 
     @staticmethod
     def _mcp_enabled(config_path, project_root, name):
@@ -2129,9 +2138,9 @@ class Preflight:
             self.add(cid, PASS, "%s self-test OK (벤더링 5상태 분류·1바이트 변이→DRIFTED 자기공격·"
                      "snapshot owner 승인게이트 박제)" % p)
 
-    # ── C52 THIRD_PARTY/NOTICE 라이선스 추적 게이트 (AGENTREACH OPP-20 — AGPL copyleft 박사님 승인) ──
+    # ── C52 THIRD_PARTY/NOTICE 라이선스 추적 게이트 (AGENTREACH OPP-20 — AGPL copyleft 오너 승인) ──
     # 동일 javis_cleanroom.py self-test 가 라이선스 변이검증(MIT vendored=ACCEPT·AGPL embed=
-    # ESCALATE·unknown SPDX=BLOCK·SPDX 정규화)을 박제하나만 검증. AGPL 은 박사님 승인됨 →
+    # ESCALATE·unknown SPDX=BLOCK·SPDX 정규화)을 박제하나만 검증. AGPL 은 오너 승인됨 →
     # copyleft 추적·ESCALATE 큐잉(부트 비차단). C51 과 동일 도구라 self-test 1회로 양쪽 보증.
     def c52_license_gate(self):
         cid = "C52.license-gate"
@@ -2143,7 +2152,7 @@ class Preflight:
             return
         # C51 이 이미 self-test 를 돌렸으므로 여기선 존재만 재확인(중복 subprocess 회피·외과적).
         self.add(cid, PASS, "javis_cleanroom.py license self-test 박제 OK (MIT=ACCEPT·AGPL embed="
-                 "ESCALATE·unknown SPDX=BLOCK·정규화) — AGPL copyleft 추적(박사님 승인·ESCALATE 큐잉)")
+                 "ESCALATE·unknown SPDX=BLOCK·정규화) — AGPL copyleft 추적(오너 승인·ESCALATE 큐잉)")
 
     # ── C53 관찰 명령 부작용 금지 멱등성 봉인 (AGENTREACH OPP-21) ──
     # javis_idempotency.py self-test 가 spy/AST 배터리를 결정론 실행: cmd_check 관찰멱등
@@ -2942,7 +2951,7 @@ class Preflight:
                      "Windows git-scm.org · Linux `apt/dnf install git`. "
                      "(일반 .dmg 사용자 기본기능엔 불필요 — 기능별 필수)")
 
-    # ── C31 config dir 격리 + 오염 감지 (박사님 2026-06-15) ──
+    # ── C31 config dir 격리 + 오염 감지 (오너 2026-06-15) ──
     # cys 마스터는 전용 CLAUDE_CONFIG_DIR(~/.cys/claude)로 격리 기동돼 사용자 ~/.claude 의
     # 외부 터미널 체계·구 지침 오염에 영향받지 않는다. 이 체크는 ①격리 라우터 설치 확인 ②사용자
     # 프로필 오염 감지(경고만 — 자동삭제 절대 안 함, 사용자 데이터 불가침)다.

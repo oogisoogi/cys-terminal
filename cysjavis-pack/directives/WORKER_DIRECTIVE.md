@@ -32,7 +32,7 @@
   상대경로 `round/`에 만들면 집계에서 빠질 수 있다).
 - **현재 업무 자기보고 필수 (Tasks Control Center 실시간 가시성)**: 작업에 착수하거나 다른 작업으로
   전환할 때 즉시 `cys set-status --task "<한 줄 업무>" --context <0-100>`로 현재 업무를 데몬에 신고한다
-  (state 기본=working; 완료·대기·막힘은 `--state done|waiting|blocked`로 갱신). 이 신고가 박사님·master의
+  (state 기본=working; 완료·대기·막힘은 `--state done|waiting|blocked`로 갱신). 이 신고가 오너·master의
   Tasks Control Center(부서×워커×현재업무)에 실시간 표시된다 — 빠뜨리면 네 셀이 "⚙파생"(활동 추론)으로만
   떠 정확도가 떨어진다.
 - 분해 → 설계 → 병렬 실행 → 자기검증 → 취합·보고의 루프를 능동으로 돌려라.

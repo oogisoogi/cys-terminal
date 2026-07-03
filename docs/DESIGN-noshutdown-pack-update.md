@@ -1,10 +1,10 @@
 # DESIGN — cys-terminal 무중단(재시작 0) 팩 업데이트 채널
 
-> **목표**: 박사님이 새 기능(디렉티브·스킬·스크립트·워크플로우 = "팩")을 개발하면, cys-terminal을
+> **목표**: 오너이 새 기능(디렉티브·스킬·스크립트·워크플로우 = "팩")을 개발하면, cys-terminal을
 > **끄지 않고·재시작 없이·24/365 가동 중에** 그 새 기능을 살아있는 노드에 적용한다.
 >
 > **R0 = 설계 전용.** 본 문서는 코드 0줄이다. 모든 단정은 코드 실측(file:line)에 근거하며,
-> repo = `/Users/cys/dev/cys-terminal`, 브랜치 = `feat/multi-master-formalization`.
+> repo = `~/dev/cys-terminal`, 브랜치 = `feat/multi-master-formalization`.
 >
 > **선행 문서**: `docs/DESIGN-seamless-update.md`(업데이트-버튼 = Tauri 재시작 모델)의 **보완 채널**이다.
 > 그 문서는 팩을 바이너리에 묶어 재시작으로 반영한다 — 본 설계는 **팩만의 변경을 재시작 없이** 푸는
@@ -227,9 +227,9 @@ cysd·cys-app·세션 프로세스는 **그 무엇도 종료/재시작되지 않
 
 ---
 
-## 6. 박사님 결정 사항 — ★확정(R2 구현 반영 완료)
+## 6. 오너 결정 사항 — ★확정(R2 구현 반영 완료)
 
-> 4자 수렴 ACCEPT 후 박사님 5건 확정. 아래는 결정 + as-built 반영(file:line).
+> 4자 수렴 ACCEPT 후 오너 5건 확정. 아래는 결정 + as-built 반영(file:line).
 
 1. **버전선 정책 → 단일 버전선**(태그 범프). min_binary: **embed≥standalone**(동일 태그 임베드 팩이 standalone과 동일). `cys pack-manifest`/version_gates(`src/bin/cys.rs`)·release.yml 동일성 게이트로 보장.
 2. **트리거 UX → ★처음 수동 트리거**: `cys pack-update` 명시 호출(자동 폴링 X). UI는 `install_pack_update` Tauri command(`src-tauri/src/main.rs`)가 사이드카 래핑·`pack-updated` emit. "검증 후 자동 전환"은 후속.
@@ -237,7 +237,7 @@ cysd·cys-app·세션 프로세스는 **그 무엇도 종료/재시작되지 않
 4. **★심링크 마이그레이션 → 안 함**. ⑤ apply-lock+epoch 폴백을 **최종 채택**(live `round/` 무접촉). `with_apply_lock`+`install_from_iter`(.pack-version=epoch 맨 마지막). ★한계 정직 문서화: 외부 동시 reader(compose_directive·read_board_catalog)에 대한 multi-file SET 일관성은 writer-side 배타로만 보장(sub-second·수동트리거라 노출 창 희소·reinject는 apply 후)(`src/bin/cys.rs:4193` 독스트링). 강화 옵션(reader shared-flock)은 가용성 트레이드오프로 보류·master 판단 시 추가.
 5. **서명 유효창 → 기존 Tauri 키 재사용**(신규키 X·`build.rs` embed 단일SOT key_id=39E60A702949D6C3). per-manifest `expires_at`=릴리스 CI 90일(`release.yml` EXPIRES_DAYS)·키 `not_after` 필수(`src/packsig.rs`).
 
-**구현 상태: R2 P1~P7 전부 완료**(11 tracked +1763/-17·신규 packsig.rs·trusted-keys.json·noshutdown_verify.py·격리 E2E PASS·미커밋). 발행(git push·gh release·cysd 재시작)은 박사님 승인 게이트.
+**구현 상태: R2 P1~P7 전부 완료**(11 tracked +1763/-17·신규 packsig.rs·trusted-keys.json·noshutdown_verify.py·격리 E2E PASS·미커밋). 발행(git push·gh release·cysd 재시작)은 오너 승인 게이트.
 
 ---
 
@@ -265,7 +265,7 @@ cysd·cys-app·세션 프로세스는 **그 무엇도 종료/재시작되지 않
 > ③의 **전체 atomic을 staging 디렉토리 일괄 스왑으로 격상**(master 지시 — per-file in-place rename 폐기,
 > reader 집합 혼재 0). `install_from_dir`→**`install_from_iter`**(embed/staged 공용 추출). prev 트리=rollback
 > 백업이라 codex BLOCK 백업바이트 요구가 더 견고히 해소. live `round/`(`cys.rs:3628-3643`) carve-out +
-> 심링크 1회 마이그레이션은 §6 박사님 결정(거부 시 apply-lock+epoch 폴백). ⑩에 **per-manifest 서명 만료
+> 심링크 1회 마이그레이션은 §6 오너 결정(거부 시 apply-lock+epoch 폴백). ⑩에 **per-manifest 서명 만료
 > `signed_at`/`expires_at` 추가(agy major — Replay Attack 차단**, 키 `not_after`와 층위 구분). ⑪ "세션 원장
 > 영속"으로 명문화(agy major). agy minor(백업 용량) → stale purge 명시. 본문 §2 흐름·§5 검증·R2 표를 전부 정합.
 >
@@ -400,7 +400,7 @@ cys-app/cysd 재시작을 요구하지 않는다(§5 무중단 불변).
 - **live 상태 carve-out(★필수)**: `round/`(노드 TODO·SESSION_STATE 실시간 기록 — cycle 저장 타깃
   `src/bin/cys.rs:3628-3643`)·사용자 오버라이드는 **스왑 트리에서 제외**(스왑이 라이브 쓰기를 덮지
   않게). → `round/`는 안정 실디렉토리로 두고 **콘텐츠 트리만 버전닝**. 이를 위해 pack_dir을 버전
-  심링크로 두는 **1회 마이그레이션** 필요 → §6 박사님 결정.
+  심링크로 두는 **1회 마이그레이션** 필요 → §6 오너 결정.
 - **시작 시 회수(순서 고정)**: cysd 기동 시 swap 저널 잔존이면 **cysd `install(false)`
   (`src/bin/cysd/main.rs:59`)보다 먼저** 포인터를 확정(half-swap 자가 치유).
 - **마이그레이션 거부 시 폴백**: 심링크 전환이 부담이면 **apply-lock(flock)+epoch+apply후 emit**(§7-⑧

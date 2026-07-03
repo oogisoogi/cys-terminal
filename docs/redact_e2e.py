@@ -20,7 +20,7 @@ SOCK = os.path.join(DIR, "cys.sock")
 CYSD = os.path.join(os.path.dirname(__file__), "..", "target", "debug", "cysd")
 ENV = dict(os.environ, CYS_SOCKET=SOCK, CYS_PACK_DIR=os.path.join(DIR, "pack"))
 DBP = os.path.join(DIR, "analytics.db")
-PII_PATH = "/Users/cys/.claude/projects/secret-project/abc-123.jsonl"
+PII_PATH = "/Users/user/.claude/projects/secret-project/abc-123.jsonl"
 FAIL = []
 
 

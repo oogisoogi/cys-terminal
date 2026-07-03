@@ -558,7 +558,7 @@ fn external_eligible(now: f64, mtime: f64, comp: &str, guards: &[(String, f64)])
 }
 
 /// 트랜스크립트 경로의 프로필 → 외부 귀속 role. ~/.claude → "external",
-/// ~/.claude-cysinsight → "external:cysinsight" (by_tier에 그대로 노출)
+/// ~/.claude-work → "external:work" (by_tier에 그대로 노출)
 fn external_role(path: &Path) -> String {
     for comp in path.components() {
         let s = comp.as_os_str().to_string_lossy();
@@ -1255,12 +1255,12 @@ mod tests {
         let p = |s: &str| PathBuf::from(s);
         assert_eq!(external_role(&p("/Users/x/.claude/projects/-a/s.jsonl")), "external");
         assert_eq!(
-            external_role(&p("/Users/x/.claude-cysinsight/projects/-a/s.jsonl")),
-            "external:cysinsight"
+            external_role(&p("/Users/x/.claude-alpha/projects/-a/s.jsonl")),
+            "external:alpha"
         );
         assert_eq!(
-            external_role(&p("/Users/x/.claude-ysfuture/projects/-a/s.jsonl")),
-            "external:ysfuture"
+            external_role(&p("/Users/x/.claude-beta/projects/-a/s.jsonl")),
+            "external:beta"
         );
         assert_eq!(external_role(&p("/tmp/other/s.jsonl")), "external");
     }

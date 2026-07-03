@@ -178,7 +178,7 @@ stale 마커(정의 변경 시 재계산). 보존 정책(기본 60일·`retentio
 > - 검증: cargo 217/217(신규 `redact_session_id_stable_and_pii_free`) · E2E 7/7(`docs/redact_e2e.py`).
 > - **★정직 분리(자율 구축 안 함)**: ▶보존(retention 자동삭제)=프로젝트 eval-driven "삭제 reward-hack 차단·
 >   retention hard gate" 원칙과 상충→미구현. ▶멀티머신 중앙 cysd·--api-url=네트워크/외부발행 경계+로컬우선
->   철학 정면위배+존재하지 않는 멀티유저 시나리오용 투기 인프라→박사님 명시 결정 전까지 미구축.
+>   철학 정면위배+존재하지 않는 멀티유저 시나리오용 투기 인프라→오너 명시 결정 전까지 미구축.
 >
 > **▣ T7 Control Center 9페이즈 전부 처리: E1-E6 완결·배포 · E7 RSI 도구 · E8 감사충족 · E9 RBAC(로컬부분).**
 

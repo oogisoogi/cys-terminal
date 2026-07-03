@@ -865,7 +865,7 @@ impl Daemon {
         );
         // 부서 계정 격리(＋부서 자동화): 데몬 자신의 CYS_ACCOUNT_DIR(cys-dept create 가 주입)을 자식
         // pane 에 전파. agents.json claude.cmd 의 ${CYS_ACCOUNT_DIR:-...} 가 이 값으로 해석된다
-        // (미설정=기본 ysfuture fail-safe). CYS_PACK_DIR 전파와 동형.
+        // (미설정=기본 계정 fail-safe). CYS_PACK_DIR 전파와 동형.
         if let Ok(acct) = std::env::var("CYS_ACCOUNT_DIR") {
             if !acct.is_empty() {
                 builder.env("CYS_ACCOUNT_DIR", acct);

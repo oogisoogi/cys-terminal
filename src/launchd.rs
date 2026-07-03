@@ -211,9 +211,9 @@ mod tests {
     #[test]
     fn render_plist_escapes_xml_special_chars_in_path() {
         // 사용자명·경로에 &,<,> 가 있어도 plist가 손상되지 않아야 한다.
-        let daemon = Path::new("/Users/a&b<c>/cys.app/Contents/MacOS/cysd");
+        let daemon = Path::new("/Users/x/a&b<c>/cys.app/Contents/MacOS/cysd");
         let plist = render_plist(daemon, Path::new("/tmp/l&g.log"));
-        assert!(plist.contains("/Users/a&amp;b&lt;c&gt;/cys.app/Contents/MacOS/cysd"));
+        assert!(plist.contains("/Users/x/a&amp;b&lt;c&gt;/cys.app/Contents/MacOS/cysd"));
         assert!(plist.contains("/tmp/l&amp;g.log"));
         // 원시(미이스케이프) 앰퍼샌드가 <string> 안에 남으면 안 된다.
         assert!(!plist.contains("a&b<c>"));
@@ -253,9 +253,9 @@ mod tests {
             Some("/Applications/cys.app/Contents/MacOS/cysd")
         );
         // 이스케이프 경로도 그대로(이스케이프된 형태로) 추출 — plist_path_matches는 동일 형태끼리 비교.
-        let weird = Path::new("/Users/a&b/MacOS/cysd");
+        let weird = Path::new("/Users/x/a&b/MacOS/cysd");
         let plist = render_plist(weird, Path::new("/tmp/cysd.log"));
-        assert_eq!(extract_program_path(&plist).as_deref(), Some("/Users/a&amp;b/MacOS/cysd"));
+        assert_eq!(extract_program_path(&plist).as_deref(), Some("/Users/x/a&amp;b/MacOS/cysd"));
         // 깨진 입력은 None.
         assert_eq!(extract_program_path("no program args here"), None);
     }

@@ -594,7 +594,7 @@ def self_test():
             "  originSessionId: abc-123\n---\n본문 [[link_b]] 와 [[nope-missing]] 참조\n")
         open(os.path.join(mdir, "feedback_link-b.md"), "w", encoding="utf-8").write(
             "---\nname: link-b\ndescription: 그래프 케이스 B\nmetadata:\n  type: feedback\n"
-            "  sources: [nlm:AI최윤식박사와대화]\n---\nx\n")
+            "  sources: [nlm:AI연구노트]\n---\nx\n")
         g = build_graph(mdir)
         # canon: [[link_b]](underscore)가 feedback_link-b.md로 해소돼야 false-dangling 아님
         if any(d["target"] == "link_b" for d in g["dangling"]):

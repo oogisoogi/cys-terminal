@@ -98,7 +98,7 @@ cys wire는 전부 문자열-키 JSON이라 정수 판별값 드리프트 표면
 ## 4. primitives-vs-domains 리프 규칙 — ★owner 승인·적용됨 (W2-6 · T1-P4 · 2026-06-24)
 
 OpenCut `notes/primitives-vs-domains.md`의 판정 규칙을 워커 디렉티브에 흡수. 디렉티브 변경은 owner
-토큰 게이트(autopilot denylist)였고, **박사님이 "1을 시행한다"로 승인하여 적용 완료** —
+토큰 게이트(autopilot denylist)였고, **오너이 "1을 시행한다"로 승인하여 적용 완료** —
 `cysjavis-pack/directives/WORKER_DIRECTIVE.md §5 외과적 변경`에 1줄 추가(빌드·배포로 서명 팩 반영).
 
 - 적용 문구(WORKER_DIRECTIVE §5): *"새 공유 로직은 cys 도메인 개념
@@ -112,4 +112,4 @@ OpenCut `notes/primitives-vs-domains.md`의 판정 규칙을 워커 디렉티브
 ## 상태
 - W2-5(본 §1·§2): **설계 완료·빌드 보류**(인-프로세스 편집기 착수 시 구현). 에이전트 편집은 W1-1로 충족 중.
 - W2-6 §3 ABI: 이미 충족·다음 변경 시 점진 적용(코드 변경 없음).
-- W2-6 §4 primitives-vs-domains: **owner 승인·적용 완료**(2026-06-24 박사님 승인 → WORKER_DIRECTIVE §5 1줄 추가·배포).
+- W2-6 §4 primitives-vs-domains: **owner 승인·적용 완료**(2026-06-24 오너 승인 → WORKER_DIRECTIVE §5 1줄 추가·배포).

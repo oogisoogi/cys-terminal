@@ -211,7 +211,7 @@ async fn rpc_oneshot(socket: &std::path::Path, method: &str, params: Value) -> R
 /// depts.json을 읽어 본부(기본 소켓)+각 부서 소켓에 org.status를 순회 호출하고, 부서 라벨을
 /// 호출자(여기)에서 주입한다(단일 데몬은 자기가 어느 부서인지 모름 — socket_slug 사상과 동일).
 /// 데몬은 outbound 클라이언트가 없어 집계는 이 Tauri 층(기존 rpc_on)에서 한다. 도달 실패 부서는
-/// 드롭하지 않고 error로 표기한다(박사님이 "부서가 죽었다"를 봐야 함). 부서 수가 적어(4~6) 순차
+/// 드롭하지 않고 error로 표기한다(오너이 "부서가 죽었다"를 봐야 함). 부서 수가 적어(4~6) 순차
 /// 호출이며 부서별 2초 timeout으로 hung 부서가 전체 함대를 막지 않는다.
 #[tauri::command]
 async fn org_fleet() -> Result<Value, String> {
@@ -441,20 +441,45 @@ fn open_path(path: String) -> Result<(), String> {
     r.map(|_| ()).map_err(|e| e.to_string())
 }
 
-/// HUD-2: 외부 URL HARD 화이트리스트 — https만·도메인 allowlist(코드 봉인). 통과 시 Ok(spawn 없음·테스트 가능).
+/// HUD-2: 외부 URL HARD 화이트리스트 — https만·도메인 allowlist. 통과 시 Ok(spawn 없음·테스트 가능).
 /// url crate 부재 → 수동 host 파싱(https:// strip → 첫 '/' 전 host, userinfo(@)·port(:) 제거 = 위장 host 차단).
+/// 기본 목록은 코드 봉인, 사용자 도메인은 로컬 설정으로 확장(공개 배포에서 기관 도메인 하드코딩 제거):
+/// ~/.cys/url-allow-hosts(줄당 1도메인 — GUI 경로) 또는 $CYS_URL_ALLOW_HOSTS(콤마 구분).
 fn url_host_allowed(url: &str) -> Result<(), String> {
-    const ALLOW: &[&str] = &["notebooklm.google.com", "github.com", "afhi.org"];
     let rest = url.strip_prefix("https://").ok_or_else(|| "https only".to_string())?;
     // authority는 첫 '/', '?'(query), '#'(fragment) 전까지(RFC 3986) — query/fragment 사칭 우회 차단.
     let authority = rest.split(|c: char| c == '/' || c == '?' || c == '#').next().unwrap_or("");
     let host = authority.rsplit('@').next().unwrap_or(authority); // userinfo(@) 제거 — 위장 host 차단
     let host = host.split(':').next().unwrap_or(host); // port 제거
-    if ALLOW.iter().any(|d| host == *d || host.ends_with(&format!(".{d}"))) {
+    let extras = user_allow_hosts();
+    if host_in_allowlist(host, &extras) {
         Ok(())
     } else {
         Err(format!("domain not allowed: {host}"))
     }
+}
+
+/// 순수 판정(테스트 핀) — 기본 allowlist + 사용자 확장 도메인, 정확일치 또는 서브도메인.
+fn host_in_allowlist(host: &str, extras: &[String]) -> bool {
+    const ALLOW: &[&str] = &["notebooklm.google.com", "github.com"];
+    ALLOW
+        .iter()
+        .map(|d| *d)
+        .chain(extras.iter().map(|s| s.as_str()))
+        .any(|d| !d.is_empty() && (host == d || host.ends_with(&format!(".{d}"))))
+}
+
+/// 사용자 확장 allowlist — 파일(~/.cys/url-allow-hosts, 줄당 1개) ∪ env(콤마 구분).
+/// 로컬 사용자 자신의 동의 하에 자기 머신에서만 확장된다(원격 주입 경로 없음).
+fn user_allow_hosts() -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if let Ok(s) = std::fs::read_to_string(cys::home_dir().join(".cys/url-allow-hosts")) {
+        out.extend(s.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty() && !l.starts_with('#')));
+    }
+    if let Ok(env) = std::env::var("CYS_URL_ALLOW_HOSTS") {
+        out.extend(env.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()));
+    }
+    out
 }
 
 /// HUD-2: SOT 근거 URL을 시스템 브라우저로 연다 — 화이트리스트 통과 https만(비가역 외부개방의 최후 게이트).
@@ -770,7 +795,7 @@ fn read_profile_audience() -> String {
 fn make_ticket(task: String, scope: String, success: String, to: String) -> Result<String, String> {
     let script = cys::pack::pack_dir().join("bin").join("javis_orchestra.py");
     let out_fmt = "산출물을 ~/.cys/_round/skill-out/<작업slug>/ (절대경로) 아래에 저장하라(결정론 회수 위치·SB-6). \
-                   산출물에 '🔒 AI 보조 생성 · 박사님 검수 전' 신뢰선 라벨을 부착하라(과대약속 금지).";
+                   산출물에 '🔒 AI 보조 생성 · 오너 검수 전' 신뢰선 라벨을 부착하라(과대약속 금지).";
     let audience = read_profile_audience();
     let scope_full = if audience != "custom" {
         format!("{scope} · 청중 프로파일: {audience}(이 청중 맞춤으로 산출·Implications Domain 질문 생략)")
@@ -1781,14 +1806,24 @@ mod tests {
     fn open_url_whitelist_blocks_spoofed_and_nonhttps() {
         assert!(url_host_allowed("https://notebooklm.google.com/notebook/abc").is_ok());
         assert!(url_host_allowed("https://github.com/cys/repo").is_ok());
-        assert!(url_host_allowed("https://docs.afhi.org/x").is_ok(), "서브도메인 허용");
         assert!(url_host_allowed("http://notebooklm.google.com/").is_err(), "http 차단");
         assert!(url_host_allowed("https://evil.com/notebooklm.google.com").is_err(), "경로 사칭 차단");
         assert!(url_host_allowed("https://notebooklm.google.com.evil.com/").is_err(), "서브도메인 사칭 차단");
-        assert!(url_host_allowed("https://notebooklm.google.com@evil.com/").is_err(), "userinfo 사칭 차단");
+        assert!(url_host_allowed("https://notebooklm.google.com@evil.example.com/").is_err(), "userinfo 사칭 차단");
         assert!(url_host_allowed("https://evil.com#.github.com/").is_err(), "fragment 사칭 차단");
         assert!(url_host_allowed("https://evil.com?.github.com").is_err(), "query 사칭 차단");
         assert!(url_host_allowed("https://evil.com?x=.github.com").is_err(), "query 파라미터 사칭 차단");
+    }
+
+    // 사용자 확장 allowlist(순수 판정) — 정확일치·서브도메인 허용, 사칭·빈 항목 차단.
+    #[test]
+    fn host_allowlist_user_extension() {
+        let extras = vec!["example-inst.org".to_string()];
+        assert!(host_in_allowlist("example-inst.org", &extras));
+        assert!(host_in_allowlist("docs.example-inst.org", &extras), "확장 도메인 서브도메인 허용");
+        assert!(!host_in_allowlist("example-inst.org.evil.com", &extras), "사칭 차단");
+        assert!(!host_in_allowlist("evil.com", &extras));
+        assert!(!host_in_allowlist("anything.com", &vec!["".to_string()]), "빈 확장 항목 무시");
     }
 
     // #3: 사이드카 stdout의 PACK_UPDATE_RESULT 토큰에서 reinject failed/deferred를 파싱해
@@ -1924,7 +1959,7 @@ mod tests {
     #[test]
     fn sh_squote_escapes_spaces_and_quotes() {
         assert_eq!(sh_squote("/usr/local/bin"), "'/usr/local/bin'");
-        assert_eq!(sh_squote("/Users/a b/cys.app"), "'/Users/a b/cys.app'");
+        assert_eq!(sh_squote("/Users/x/a b/cys.app"), "'/Users/x/a b/cys.app'");
         // 단일따옴표는 '\'' 시퀀스로 안전 이스케이프
         assert_eq!(sh_squote("a'b"), "'a'\\''b'");
     }

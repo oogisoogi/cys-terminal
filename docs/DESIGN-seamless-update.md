@@ -1,19 +1,19 @@
 # DESIGN — cysjavis·cys-terminal 자동 업데이트 ("업데이트 버튼 하나" 모델)
 
-> **목표**: 박사님이 cysjavis 팩(디렉티브·스킬·스크립트) 또는 cys-terminal 앱(cysd·cys·cys-app)에 **새 기능을 개발**하면, 사용자가 cys-terminal **업데이트 버튼**을 눌렀을 때 그 새 기능이 **자동 설치**되고, 그 과정에서 **작업이 끊기지 않는다(무손실)**. 박사님 본인 + 다른 사용자 공통.
+> **목표**: 오너이 cysjavis 팩(디렉티브·스킬·스크립트) 또는 cys-terminal 앱(cysd·cys·cys-app)에 **새 기능을 개발**하면, 사용자가 cys-terminal **업데이트 버튼**을 눌렀을 때 그 새 기능이 **자동 설치**되고, 그 과정에서 **작업이 끊기지 않는다(무손실)**. 오너 본인 + 다른 사용자 공통.
 >
 > **두 축**: ① 새 기능 자동 배포(주) ② 작업 무손실(부가, 당연 포함).
-> **상태**: 적대검증 2라운드 반영. 근거는 코드 실측(file:line). cys-terminal repo = `/Users/cys/dev/cys-terminal`.
+> **상태**: 적대검증 2라운드 반영. 근거는 코드 실측(file:line). cys-terminal repo = `~/dev/cys-terminal`.
 
 ---
 
 ## 1. 전체 파이프라인
 
 ```
-[개발]   박사님이 cysjavis-pack/(팩) 또는 src/(앱)에 새 기능 → git commit
+[개발]   오너이 cysjavis-pack/(팩) 또는 src/(앱)에 새 기능 → git commit
 [빌드]   pack.rs include_str! + build.rs(skills walk)가 팩을 cys 바이너리에 컴파일타임 embed
          bundle-prep.sh가 cys/cysd를 src-tauri/binaries로 → tauri externalBin 동봉(.app)
-[릴리스]  git tag vX.Y.Z → release.yml CI → 빌드·minisign 서명 → 공개 repo(cys-terminal-releases) draft → 박사님 Publish
+[릴리스]  git tag vX.Y.Z → release.yml CI → 빌드·minisign 서명 → 공개 repo(cys-terminal-releases) draft → 오너 Publish
 [배포]   사용자 앱이 시작+6h마다 latest.json 체크 → 업데이트 버튼 → Tauri updater download_and_install → .app 통째 교체
 [설치]   install_update가 pending-restore 마커 기록 → app.restart
 [반영]   새 cys-app setup → daemon-ready → spawn_event_forwarder(먼저) → maybe_apply_pending_update:
@@ -39,8 +39,8 @@
 
 | 항목 | 문제 | 해결 | 주체 |
 |---|---|---|---|
-| **fatal-1 버전 드리프트** | 원격 latest.json 0.2.4 < 설치본 plist(0.3.0)·번들 cys(0.4.1) → updater "이미 최신" → **업데이트 버튼 눌러도 전체 사슬 0 실행** | **0.4.1 발행** + 발행 전 3자(plist=cys --version=tauri.conf) 일치 결정론 게이트 (수동 cp 사이드카 금지) | 🔒 박사님 (비가역 외부발행) |
-| **fatal-3 prune 없음** | pack.rs install에 prune/delete 경로 전무 → 박사님이 기능(스킬·디렉티브) 삭제해도 사용자 디스크에 잔존, 폐기 기능 노드 노출 | install에 prune 단계: manifest에 있으나 embed에 없는 rel 중 **비수정(디스크해시=설치해시)만 remove**, *_DIRECTIVE.md·사용자 수정본 보존 | 신중 구현 (파일삭제 위험 → 박사님 확인 권장) |
+| **fatal-1 버전 드리프트** | 원격 latest.json 0.2.4 < 설치본 plist(0.3.0)·번들 cys(0.4.1) → updater "이미 최신" → **업데이트 버튼 눌러도 전체 사슬 0 실행** | **0.4.1 발행** + 발행 전 3자(plist=cys --version=tauri.conf) 일치 결정론 게이트 (수동 cp 사이드카 금지) | 🔒 오너 (비가역 외부발행) |
+| **fatal-3 prune 없음** | pack.rs install에 prune/delete 경로 전무 → 오너이 기능(스킬·디렉티브) 삭제해도 사용자 디스크에 잔존, 폐기 기능 노드 노출 | install에 prune 단계: manifest에 있으나 embed에 없는 rel 중 **비수정(디스크해시=설치해시)만 remove**, *_DIRECTIVE.md·사용자 수정본 보존 | 신중 구현 (파일삭제 위험 → 오너 확인 권장) |
 | **serious-7 pack_version 없음** | manifest는 rel→sha256만, 단조 비교 없음 → 구버전 cys 롤백 시 구 팩이 '신버전'으로 비수정 파일 후퇴 | manifest에 pack_version(env! CARGO_PKG_VERSION) + 디스크≥embed면 비강제 skip | 단계적 |
 | **#3 drain** | 재시작 직전 노드의 마지막 작업분 저장 — LLM 협조 의존이라 결정론 불가, best-effort | cys mark-saved RPC(노드 명시 마커) 또는 transcript mtime 관찰 + bounded timeout. timeout 강행 시 손실 명시 | 후속 |
 
@@ -58,15 +58,15 @@
 ## 5. 다른 사용자 이식 (제품화)
 
 - **일반 사용자** (`~/.cys/pack` 미수정): 새 팩 전부 갱신. 업데이트 버튼으로 새 기능 받음. ✅
-- **박사님/개발자** (`~/.cys/pack` 직접 수정): preserve-gate가 수정 파일 보존 → 그 파일의 새 기능 미반영(비대칭, 적대검증 serious-6). → **cysjavis-pack(정본)에서 개발하고 `sync-pack.sh`로 정본화** 권장. 직접 수정은 개인 커스터마이즈로 의도된 불가침.
+- **오너/개발자** (`~/.cys/pack` 직접 수정): preserve-gate가 수정 파일 보존 → 그 파일의 새 기능 미반영(비대칭, 적대검증 serious-6). → **cysjavis-pack(정본)에서 개발하고 `sync-pack.sh`로 정본화** 권장. 직접 수정은 개인 커스터마이즈로 의도된 불가침.
 - **발행 신뢰 경계**: minisign 서명(위조 차단·비활성화 불가). Developer ID 미취득 → Gatekeeper 경고(updater 무결성은 minisign으로 별도 보장).
 - **버전 단일 SOT**: `version-check.sh`로 6곳(Cargo×2·tauri.conf·ui/package.json·wxs×2) 일치 강제. release.yml build 첫 step 권장.
 
-## 6. 박사님 결정 사항
+## 6. 오너 결정 사항
 
 1. **발행** — `sh scripts/version-check.sh v0.4.1` 통과 후 `git tag v0.4.1 && git push` → CI draft → 공개 repo Publish. (비가역. 전제: feat 브랜치 main 머지 여부 + GitHub secrets TAURI_SIGNING_PRIVATE_KEY·RELEASES_REPO_TOKEN 설정 확인)
-2. **prune 구현** — 기능 제거 배포를 위한 install prune. 비수정 파일만 삭제라 안전하나, 파일 삭제이므로 박사님 확인 권장.
-3. **자동복귀 유지** — 박사님 "당연히 포함" 확인 → 유지.
+2. **prune 구현** — 기능 제거 배포를 위한 install prune. 비수정 파일만 삭제라 안전하나, 파일 삭제이므로 오너 확인 권장.
+3. **자동복귀 유지** — 오너 "당연히 포함" 확인 → 유지.
 4. **#3 drain 후속** — best-effort 추가 여부.
 
 ## 7. 검증 기준 (출시 전 end-to-end)

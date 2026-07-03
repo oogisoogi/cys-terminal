@@ -311,7 +311,7 @@ ceo_demote(){
 }
 
 cmd="${1:?usage: cys-dept launch|allocate|create|down|down-sock|reap|list|sock <name> | <name> -- <cmd>}"
-# ★단일소유 기술 강제(CEO 2026-06-22): 부서 lifecycle mutation은 CSO(CYS_ROLE=cso)·GUI(role 없음·박사님
+# ★단일소유 기술 강제(CEO 2026-06-22): 부서 lifecycle mutation은 CSO(CYS_ROLE=cso)·GUI(role 없음·오너
 # 직접)만 허용한다. roled 비-CSO 노드(부서장 master·워커·리뷰어·CEO)의 cys-dept create/down 직접 호출을
 # 차단해 다중주체 churn(빈 dept-N·중복·레이스)을 기술적으로 방지. (defense-in-depth — 의도적 unset 우회는
 # 거버넌스 영역이나, 정상 다중 노드 churn은 차단). 읽기 전용(list/sock/<name> --)은 무제한.
@@ -425,7 +425,7 @@ PY
       "$0" down "$name" >/dev/null 2>&1 || true; trap - EXIT; exit 6
     fi
     trap - EXIT   # 격리 확정 — 회수 취소
-    # ★박사님 지시(2026-06-29): 부서 생성 시 claude 자동연결 폐지 → role=master '빈 셸'만 띄운다.
+    # ★오너 지시(2026-06-29): 부서 생성 시 claude 자동연결 폐지 → role=master '빈 셸'만 띄운다.
     #   사용자가 그 터미널에서 직접 claude 를 실행해 부서장으로 연결한다(Decision A '부서장 자동각성'을
     #   allocate 경로에서 폐지). UI 자동입양은 role 있는 surface 만 받으므로(main.ts:1268 !s.role 가드)
     #   --role master 필수·--cmd 생략=기본 로그인 셸. CYS_DEPT_NO_MASTER=1=셸도 생략(빈 데몬). 이미 master면 멱등.
@@ -459,7 +459,7 @@ acct=dep['account']; acctdir=os.path.expandvars(d['accounts'][acct])
 print('\t'.join([dep['display'], acct, acctdir, dep['mission_key'], os.path.expandvars(dep['cwd'])]))
 PY
 ) || { echo "[cys-dept] 카탈로그 키 미정의/손상: $key" >&2; exit 4; }
-    # 부서별 config dir 분리(박사님 결정): ysfuture 공유 계정→부서별 dir(~/.cys/claude-<key>)로 config state 경합 완화.
+    # 부서별 config dir 분리(오너 결정): ysfuture 공유 계정→부서별 dir(~/.cys/claude-<key>)로 config state 경합 완화.
     # Max 계정 토큰은 macOS Keychain(계정단위)으로 공유 유지·dir만 분리. cysinsight(미래연구부)는 이미 단독이라 불변.
     if [ "$acctkey" = "ysfuture" ]; then acctdir="${acctdir%/}-$key"; mkdir -p "$acctdir"; fi
     [ -d "$acctdir" ] || { echo "[cys-dept] account dir 미존재(계정누수 차단): $acctdir" >&2; exit 5; }  # fail-closed
@@ -585,7 +585,7 @@ PY
     name="${2:?usage: cys-dept down <name>}"
     sock="$(dept_sock "$name")"
     pid=$(CYS_SOCKET="$sock" "$CYS" identify 2>/dev/null | python3 -c "import json,sys;print(json.load(sys.stdin).get('daemon_pid',''))" 2>/dev/null || true)
-    # orphan 방지(박사님 ③): kill 후 데몬 사망 확인·잔존 시 SIGKILL(down이 데몬 살린 채 reg_remove→orphan 재발 차단).
+    # orphan 방지(오너 ③): kill 후 데몬 사망 확인·잔존 시 SIGKILL(down이 데몬 살린 채 reg_remove→orphan 재발 차단).
     if [ -n "${pid:-}" ]; then
       graceful_kill "$pid"
     fi

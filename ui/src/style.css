@@ -567,7 +567,7 @@ body.cc-glance .cc-board-btn { font-size: 16px; padding: 12px 20px; }
   color: #cbd5e1; font-size: 11px; padding: 2px 8px; border-radius: 6px; cursor: pointer; }
 #btn-cc-glance-face:hover { background: rgba(255,255,255,.07); }
 body.cc-glance #btn-cc-glance-face { display: inline-block; }
-/* Glance: 작업 면 큰 글씨(박사님 한눈에) */
+/* Glance: 작업 면 큰 글씨(오너 한눈에) */
 body.cc-glance #cc-view-tasks .cc-task-text { font-size: 20px; white-space: normal; }
 body.cc-glance #cc-view-tasks .cc-task-role { font-size: 16px; min-width: 90px; }
 body.cc-glance #cc-view-tasks .cc-tasks-dept-name { font-size: 18px; }

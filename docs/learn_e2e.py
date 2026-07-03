@@ -4,7 +4,7 @@
 
 (1) 순수 로직(validate_candidates·validate_pattern·promotion_allowed·confidence_of·slugify),
 (2) 정상 경로(propose→search→extract→evaluate[→javis_rsi]→store[→javis_memory]→harness→status),
-(3) ★봉쇄 거부 케이스 — 박사님 절대명제(부분 통과 = 전체 중단)를 코드로 확인:
+(3) ★봉쇄 거부 케이스 — 오너 절대명제(부분 통과 = 전체 중단)를 코드로 확인:
     출처0 hard fail · pattern 정박 실패 · store 무승인/verdict非improved/fallback confirmed ·
     rsi-gate: 복구수단 불변 · 고위험 무서명 · fallback confirmed · 출처 fetch_log0 ·
     스냅샷 해시 위변조 · quote 부재(out-of-context) · 논리 JSON 파싱실패=FAIL/verdict FAIL ·

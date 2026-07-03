@@ -145,7 +145,7 @@ let ccSessionSelected: string | null = null;
 type CcDensity = "ops" | "glance";
 let ccDensity: CcDensity =
   (localStorage.getItem("cys-cc-density") as CcDensity) === "glance" ? "glance" : "ops";
-// Tasks Control Center: Glance 모드 안에서 보여줄 면(Live=시스템부하 ↔ tasks=부서 업무) — 박사님 선택.
+// Tasks Control Center: Glance 모드 안에서 보여줄 면(Live=시스템부하 ↔ tasks=부서 업무) — 오너 선택.
 let ccGlanceFace: "live" | "tasks" =
   localStorage.getItem("cys-cc-glance-face") === "tasks" ? "tasks" : "live";
 // 마지막 org_fleet 스냅샷 — 실시간 이벤트(task.changed/status.changed)가 셀 단위로 패치한다.
@@ -201,11 +201,11 @@ function applyCcDensity(mode: CcDensity) {
   localStorage.setItem("cys-cc-density", mode);
   const b = document.getElementById("btn-cc-density");
   if (b) b.textContent = mode === "glance" ? "🔍 상세보기" : "👁 한눈에";
-  // Glance는 단일 면 — 박사님 선택(Live=시스템부하 ↔ tasks=부서 업무)으로 전환. 분석 전용 탭이면 그 면으로.
+  // Glance는 단일 면 — 오너 선택(Live=시스템부하 ↔ tasks=부서 업무)으로 전환. 분석 전용 탭이면 그 면으로.
   if (mode === "glance") applyGlanceFace(ccGlanceFace);
 }
 
-// Glance 면 토글(박사님: Live↔작업, 선택된 면을 크게). 토글 버튼은 Glance에서만 보인다(CSS).
+// Glance 면 토글(오너: Live↔작업, 선택된 면을 크게). 토글 버튼은 Glance에서만 보인다(CSS).
 function applyGlanceFace(face: "live" | "tasks") {
   ccGlanceFace = face;
   localStorage.setItem("cys-cc-glance-face", face);
@@ -3080,7 +3080,7 @@ function inputModal(title: string, label: string, placeholder: string): Promise<
     ov.innerHTML =
       `<div class="modal"><h3></h3><p class="modal-label"></p>` +
       `<textarea class="modal-input" rows="8"></textarea>` +
-      `<div class="modal-trust">⚠ 산출물은 "AI 보조 생성 · 박사님 검수 전"입니다. 외부 공유 전 검수를 받으세요.</div>` +
+      `<div class="modal-trust">⚠ 산출물은 "AI 보조 생성 · 오너 검수 전"입니다. 외부 공유 전 검수를 받으세요.</div>` +
       `<div class="modal-btns"><button class="modal-no">취소</button>` +
       `<button class="modal-yes">진행</button></div></div>`;
     (ov.querySelector("h3") as HTMLElement).textContent = title;
@@ -3517,7 +3517,7 @@ document.getElementById("cc-sessions-redact")!.addEventListener("click", (e) => 
   refreshSessions();
 });
 document.getElementById("btn-update")!.addEventListener("click", () => onUpdateButton());
-// 역할 분리(박사님 2026-06-29 결정): "새 워크스페이스"(btn-ws-new) = 기본/현재 데몬의 일반 워크스페이스
+// 역할 분리(오너 2026-06-29 결정): "새 워크스페이스"(btn-ws-new) = 기본/현재 데몬의 일반 워크스페이스
 // (addWorkspace) — 부서가 아니다. 격리 부서 데몬 생성은 "+부서"(btn-ws-dept→addDeptWorkspace) 전담.
 // 새 ws를 master로 선언 시 공유 데몬 claim 충돌은 데몬 레벨 claim_denied(cysd handlers.rs·kill 없음)가
 // 비파괴 방어한다(생태계 죽지 않음·거부만). guard-master-claim(Fix2') 부트 자동발동 배선은 별건(헌법 토큰).

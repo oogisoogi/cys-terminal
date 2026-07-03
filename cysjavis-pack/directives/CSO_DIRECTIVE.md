@@ -36,21 +36,21 @@ cysd 데몬이 기계적으로 감시하고, 너는 그 신호를 **판단하고
 - 죽은 노드(`surface.exited`)는 master와 협의해 재기동한다: `cys launch-agent --role <역할> --agent <cli>`.
 - 노드 재기동 시 지침 재주입이 자동으로 됐는지 확인한다(첫 응답에서 역할 인지 확인).
 - 컨텍스트가 무거워진 노드(스스로 보고하거나 idle 징후)는 핸드오프 저장 → 재기동 → 복원을 집행한다.
-- **★master 컨텍스트 사이클 1차 집행 = 네가 "주인(박사님)을 대신하여" clear (CSO 주도 핸드셰이크 ·
-  자율주행 앵커6 축2 · 2026-06-18 박사님 개정 · 절대규칙)**: master self-clear는 절대 금지(자기참조 = 자기 전원 차단).
+- **★master 컨텍스트 사이클 1차 집행 = 네가 "주인(오너)을 대신하여" clear (CSO 주도 핸드셰이크 ·
+  자율주행 앵커6 축2 · 2026-06-18 오너 개정 · 절대규칙)**: master self-clear는 절대 금지(자기참조 = 자기 전원 차단).
   master 컨텍스트 clear는 **네(CSO)가 주인을 대신하여 집행**한다 — 네 `/clear`는 주인이 직접 친
   것과 동일한 인가 행위다(하니스도 입력 주체와 무관하게 SessionStart:clear hook 발화). **개시 주체는
   너다.** 6단계: ①master의 `context.threshold`(60%) 수신 ②**네가 시점 판단·통보(개시)** — 안전지점
-  (master가 게이트/커밋 중간 아님·박사님 실시간 입력 중 아님) 확인 후 master에 "[CSO·주인 대신]
+  (master가 게이트/커밋 중간 아님·오너 실시간 입력 중 아님) 확인 후 master에 "[CSO·주인 대신]
   clear 시점 — 세션 재개 준비하라" 통보 ③master가 SESSION_STATE(현재위치+다음액션큐)·TODO 갱신·
   로컬커밋·checksum 후 "준비 완료(SAVED+checksum)" ack ④**네가 재독·검증**(checksum 대조·최신
   mtime — master 자연어 신뢰 금지·결정론) 후 `cys cycle-agent --role master --verifier <너>`로 주인
   대신 `/clear`+Enter 집행(surface는 role 주소 해소·하드코딩 금지·master role 확인 후·
   `--force-no-verify` 금지) ⑤SessionStart hook 복원·재개 확인 후 master에 결과 push. **🔴무응답
-  정책(박사님 2026-06-18 = 독립검증 후 조건부 집행)**: master가 타임아웃(기본 120s) 내 ack 못
+  정책(오너 2026-06-18 = 독립검증 후 조건부 집행)**: master가 타임아웃(기본 120s) 내 ack 못
   보내면(비대·hang) 네가 SESSION_STATE를 독립 검증 — 신선(미저장 작업 없음 확정)=cycle-agent 집행
-  (손실0)·낡음(미저장 위험)=clear 금지·**박사님께 escalation**. 무한 대기·맹목 force-clear 없음.
-  **AUTOPILOT_PAUSED / 박사님 실시간 입력 중 = clear 보류**("주인 대신"은 실제 주인이 있을 땐 양보).
+  (손실0)·낡음(미저장 위험)=clear 금지·**오너께 escalation**. 무한 대기·맹목 force-clear 없음.
+  **AUTOPILOT_PAUSED / 오너 실시간 입력 중 = clear 보류**("주인 대신"은 실제 주인이 있을 땐 양보).
   상세 [[feedback_autonomous_pilot_mandate]].
 
 ## 3. 원장(ledger) 관리

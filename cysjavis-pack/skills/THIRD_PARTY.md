@@ -91,7 +91,7 @@ ask → AskUserQuestion star)도 **제거**. 의존성 무인 자동설치(pip -
 degrade·CSO 승인 게이트 경유. 갱신 시 업스트림 diff 후 동일 4부작용 제거 기준으로 재감사한다.
 
 DISCLAIMER 승계: 업스트림 `DISCLAIMER.md`(공개 콘텐츠 리더·인증 우회 도구 아님·자격증명 미저장)는
-본 고지로 포인터 승계한다. MIT 의무를 넘는 DISCLAIMER 전문 강제임베드 여부는 박사님 결정(ESCALATE).
+본 고지로 포인터 승계한다. MIT 의무를 넘는 DISCLAIMER 전문 강제임베드 여부는 오너 결정(ESCALATE).
 
 ### MIT License (fivetaku/insane-search)
 

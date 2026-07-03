@@ -206,11 +206,11 @@ def v_quote_binding(depts, doc_text, catalog, dept_level=True):
                 if want and acct != want:
                     errs.append(f"{tag}: account 오배정({acct}≠catalog {want})")
             else:
-                # 신규 key(catalog 미등록): account 유효성 + 박사님 승인 플래그 둘 다 필수 (R1 BLOCK-2)
+                # 신규 key(catalog 미등록): account 유효성 + 오너 승인 플래그 둘 다 필수 (R1 BLOCK-2)
                 if acct not in accounts:
                     errs.append(f"{tag}: 신규 key의 account '{acct}'가 승인 accounts에 없음")
                 if not d.get("new_dept_approved"):
-                    errs.append(f"{tag}: 신규 key '{key}'는 박사님 승인 플래그(new_dept_approved) 필요 — account 유효성만으로 통과 불가")
+                    errs.append(f"{tag}: 신규 key '{key}'는 오너 승인 플래그(new_dept_approved) 필요 — account 유효성만으로 통과 불가")
             # cwd 규약 경로
             cwd = d.get("cwd", "")
             if disp and not cwd.replace("\\", "/").endswith(f"Desktop/CYSjavis/{disp}"):

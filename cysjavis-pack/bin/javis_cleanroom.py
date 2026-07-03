@@ -154,7 +154,7 @@ def license_classify(manifest, skills_dir):
         # AGPL/GPL copyleft 추적: 임베드(코드사이닝 단일바이너리) 대상이면 정책 충돌 ESCALATE.
         if spdx in STRONG_COPYLEFT and src.get("embed") and src.get("kind") != "runtime_dep":
             policy.append({"id": sid, "spdx": spdx, "copyleft_class": klass,
-                           "reason": "strong_copyleft + PACK 임베드 = 코드사이닝 충돌(박사님 보유결정)"})
+                           "reason": "strong_copyleft + PACK 임베드 = 코드사이닝 충돌(오너 보유결정)"})
         if src.get("kind") == "runtime_dep":
             # 런타임 의존: SKILL.md 선언 존재만 확인(transitive 범위 밖).
             ok.append(sid)
@@ -186,7 +186,7 @@ def vendor_verdict(cls):
 
 
 def license_verdict(cls):
-    """OPP-20 verdict enum(score 금지). AGPL은 박사님 승인 전제로 ESCALATE 큐잉(BLOCK 아님)."""
+    """OPP-20 verdict enum(score 금지). AGPL은 오너 승인 전제로 ESCALATE 큐잉(BLOCK 아님)."""
     if cls["no_spdx"] or cls["missing_dir"] or cls["notice_missing"]:
         return "BLOCK", cls
     if cls["policy_escalate"]:
@@ -210,7 +210,7 @@ def cmd_vendor_check(skills_dir):
 
 def cmd_vendor_snapshot(skills_dir):
     if os.environ.get("CYS_VENDOR_SNAPSHOT_OWNER_APPROVED", "") not in ("1", "true", "yes"):
-        sys.stderr.write("[CLEANROOM] baseline 갱신 = 변조 정상승인 = 박사님/owner 승인 필요"
+        sys.stderr.write("[CLEANROOM] baseline 갱신 = 변조 정상승인 = 오너/owner 승인 필요"
                          "(denylist ②). CYS_VENDOR_SNAPSHOT_OWNER_APPROVED=1 후 재실행.\n")
         return 3
     m = load_manifest(skills_dir)
@@ -236,7 +236,7 @@ def cmd_license_check(skills_dir):
         return 0
     cls = license_classify(m, skills_dir)
     verdict, _ = license_verdict(cls)
-    ok = verdict in ("ACCEPT", "ESCALATE")  # ESCALATE(AGPL 박사님결정)는 부트 비차단.
+    ok = verdict in ("ACCEPT", "ESCALATE")  # ESCALATE(AGPL 오너결정)는 부트 비차단.
     print(json.dumps({"ok": ok, "verdict": verdict, **cls}, ensure_ascii=False))
     return 0 if ok else 1
 

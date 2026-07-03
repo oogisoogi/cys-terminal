@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """deploy_gate.py — cys/cysd 게이트 배포 (정석복구 ④ · 영구 재발방지).
 
-★실행 금지 — 박사님 승인 후 master 감독 하에서만 `--execute`로 실행한다.
+★실행 금지 — 오너 승인 후 master 감독 하에서만 `--execute`로 실행한다.
   scratch/deploy_*_swap.py(미서명 ad-hoc·빌드세대 스큐·Desktop SRC=iCloud 재발원)를 대체한다.
 
 게이트 체인(순서 고정):
@@ -407,6 +407,6 @@ if __name__ == "__main__":
         main()
     else:
         print(__doc__)
-        print("배포(박사님 승인 후): python3 scripts/deploy_gate.py --execute")
-        print("데몬 재시작(박사님 승인 후): python3 scripts/deploy_gate.py --restart")
+        print("배포(오너 승인 후): python3 scripts/deploy_gate.py --execute")
+        print("데몬 재시작(오너 승인 후): python3 scripts/deploy_gate.py --restart")
         sys.exit(2)

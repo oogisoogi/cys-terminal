@@ -1303,7 +1303,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 };
                 drop(mca);
                 // 승계 감사: master가 다른 surface로 바뀔 때만(이전 보유자≠새 보유자, 둘 다 Some이
-                // 아니어도 변화면 발행) 박사님·감사가 승계를 본다. 신규 등록(None→Some)도 포함.
+                // 아니어도 변화면 발행) 오너·감사가 승계를 본다. 신규 등록(None→Some)도 포함.
                 daemon.bus.publish(
                     "autopilot.master_changed",
                     "autopilot",

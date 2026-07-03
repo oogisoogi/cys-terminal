@@ -16,8 +16,8 @@
         },
         {
           "name": "cys-writingstyle",
-          "label": "박사님 문체로 글쓰기",
-          "scope": "주제 입력 → 박사님(최윤식) 문체 원고",
+          "label": "오너 문체로 글쓰기",
+          "scope": "주제 입력 → 오너 문체 원고",
           "success": "cys_style_validator 70점 게이트 통과 · 시그니처 7단 구조·5요소 인용",
           "acl": 1,
           "gate": "hitl"

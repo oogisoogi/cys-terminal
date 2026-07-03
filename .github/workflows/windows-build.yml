@@ -224,7 +224,7 @@ jobs:
             $deadline=(Get-Date).AddSeconds(40)
             while((Get-Date) -lt $deadline){ Start-Sleep 3; $scr=(Bx $cys @('read-screen','--to','worker') 15000).Out; if($scr -match 'CCDFRESH=ENVINJECT_OK'){$envProof=$true;break} }
             if (-not $envProof) { Write-Host "== stub screen =="; Write-Host $scr }
-            Rec 3 $envProof "env주입 스텁 CCDFRESH=ENVINJECT_OK (해소+주입 E2E · claude 실발동은 박사님 실기 마커)"
+            Rec 3 $envProof "env주입 스텁 CCDFRESH=ENVINJECT_OK (해소+주입 E2E · claude 실발동은 오너 실기 마커)"
           } catch { Rec 3 $false "$_" }
 
           # ── T3-7/T3-10: 부서 스폰·로그(RC-5/6/15·단일부서·전부 바운드) ──

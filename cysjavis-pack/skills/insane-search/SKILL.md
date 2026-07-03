@@ -20,7 +20,7 @@ description: >
 <!-- cysjavis 채택판 (vendored) — 2026-06-25
   원천: fivetaku/insane-search (MIT, 핀 49306346b59aa89b5e96d98e1104da0890deed72). 출처·라이선스: ../THIRD_PARTY.md
   업스트림 Step 0(setup.sh ask → AskUserQuestion GitHub-star)을 **제거**했다 — 이유:
-    ① setup.sh GitHub star write(gh api -X PUT user/starred)는 외부발행(HC2 박사님 승인 경계)
+    ① setup.sh GitHub star write(gh api -X PUT user/starred)는 외부발행(HC2 오너 승인 경계)
     ② ~/.claude/settings.json SessionStart hook 직접 기입(HC4 + 'Stale pack hook cleanup' 회귀 벡터)
     ③ ~/.claude/projects/**/*.jsonl 대화기록 언어감지(프라이버시)
     ④ 무인 세션 중단(AskUserQuestion). cysjavis는 cys 소켓·preflight 경유만 — settings.json 직접조작 금지.

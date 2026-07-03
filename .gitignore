@@ -50,7 +50,7 @@ scratch/
 # 제품 스크린샷 (개인 이메일 노출 — 마스킹본 교체 전까지 제외)
 cys-design-preview.png
 
-# 개인 장기기억 (PUBLIC 유출 차단 · 박사님 2026-06-14) — 색인·템플릿·예시만 allowlist.
+# 개인 장기기억 (PUBLIC 유출 차단 · 오너 2026-06-14) — 색인·템플릿·예시만 allowlist.
 # 'git add -A'로 배포본 memory(개인·계정·내부전략)가 통째 공개되는 전방 위험을 영구 차단한다.
 cysjavis-pack/memory/*
 !cysjavis-pack/memory/MEMORY.md
@@ -63,3 +63,4 @@ cysjavis-pack/memory/*
 
 # 설치 매니페스트 (생성 아티팩트 — 배포본 해시라 repo 제네릭 파일과 불일치)
 cysjavis-pack/.install-manifest.json
+src-tauri/runtime
