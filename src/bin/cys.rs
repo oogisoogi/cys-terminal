@@ -253,6 +253,10 @@ enum Command {
         names: Vec<String>,
         #[arg(long = "category")]
         categories: Vec<String>,
+        /// 이름 접두 필터(클라이언트측 뷰 필터) — 예: `--filter channel.` 로 채널 이벤트만 표시.
+        /// --name(정확 일치·서버측)과 달리 접두 매칭이라 `channel.outbound.*` 등 계열 구독에 쓴다.
+        #[arg(long = "filter")]
+        filter: Option<String>,
         /// Auto-reconnect on connection loss
         #[arg(long)]
         reconnect: bool,
@@ -445,6 +449,11 @@ enum Command {
         #[command(subcommand)]
         action: ApprovalAction,
     },
+    /// C0 채널 계층 — Slack·Discord 브리지 수명주기·인바운드·아웃바운드(브리지가 쓰는 thin RPC 래퍼, --json 출력)
+    Channel {
+        #[command(subcommand)]
+        action: ChannelAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -520,6 +529,89 @@ enum ApprovalAction {
         #[arg(long)]
         cwd: Option<String>,
     },
+}
+
+/// C0 채널 서브명령 — 전부 channel.* RPC의 thin wrapper. 결과는 JSON 한 줄로 출력(브리지 소비용).
+#[derive(Subcommand)]
+enum ChannelAction {
+    /// 브리지 스폰(cysd 자식·1회용 토큰) + desired-state enabled=1. 첫 기동엔 --cmd 필수.
+    Start {
+        channel: String,
+        /// 브리지 실행 명령(sh -c 로 스폰). 첫 start에 등록되면 이후 재사용·재스폰.
+        #[arg(long)]
+        cmd: Option<String>,
+    },
+    /// 브리지 정지 + enabled=0(desired-state).
+    Stop { channel: String },
+    /// 채널 상태 스냅샷(alive·enabled·registered·outcome 분포·inbox 카운트·allowlist 수).
+    Status,
+    /// 브리지 자기등록(토큰+pid 이중검증). 응답에 pending outbound 전량 동봉.
+    Register {
+        channel: String,
+        #[arg(long)]
+        token: String,
+        #[arg(long)]
+        caps: Option<String>,
+        #[arg(long = "bridge-ver")]
+        bridge_ver: Option<String>,
+    },
+    /// 인바운드 메시지 제출(브리지→cysd). inbox-first 퍼널 판정.
+    Inbound {
+        channel: String,
+        #[arg(long = "sender-id")]
+        sender_id: String,
+        #[arg(long = "sender-kind", default_value = "user")]
+        sender_kind: String,
+        #[arg(long)]
+        peer: Option<String>,
+        #[arg(long)]
+        text: String,
+        #[arg(long)]
+        ts: Option<f64>,
+        #[arg(long = "msg-ref")]
+        msg_ref: Option<String>,
+        /// 멱등 키: `<channel>:<플랫폼 msg id>` (Slack=ts·Discord=message id).
+        #[arg(long = "idempotency-key")]
+        idempotency_key: String,
+        #[arg(long = "body-hash")]
+        body_hash: Option<String>,
+    },
+    /// 아웃바운드 발신 요청(단조 상태기계·at-least-once). owner allowlist 대상만.
+    Outbound {
+        channel: String,
+        #[arg(long)]
+        target: String,
+        #[arg(long, default_value = "message")]
+        kind: String,
+        #[arg(long)]
+        body: String,
+        #[arg(long = "reply-to")]
+        reply_to: Option<String>,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: String,
+        #[arg(long = "retry-of")]
+        retry_of: Option<i64>,
+    },
+    /// 아웃바운드 receipt 보고(브리지→cysd). 단조 전이·terminal 후는 late_receipt 화해.
+    Receipt {
+        #[arg(long = "outbound-id")]
+        outbound_id: i64,
+        /// sent|suppressed|partial_failed|failed|unknown
+        #[arg(long)]
+        outcome: String,
+        #[arg(long = "platform-ref")]
+        platform_ref: Option<String>,
+        #[arg(long)]
+        detail: Option<String>,
+    },
+    /// inbox 항목 ack(master가 처리 후 호출). state=acked·본문 소거.
+    Ack { inbox_id: i64 },
+    /// owner allowlist에 sender 추가(fail-closed 게이트 통과 대상).
+    Allow { channel: String, sender_id: String },
+    /// owner allowlist에서 sender 제거(탈취 개별 철회).
+    Revoke { channel: String, sender_id: String },
+    /// 긴급 잠금 — 전 채널 브리지 즉시 정지·인바운드 전면 차단(터미널 1명령).
+    Lockdown,
 }
 
 #[derive(Subcommand)]
@@ -1509,8 +1601,8 @@ fn run(command: Command) -> i32 {
                 })
             }),
 
-        Command::Events { after_seq, names, categories, reconnect, cursor_file } => {
-            stream_events(after_seq, names, categories, reconnect, cursor_file)
+        Command::Events { after_seq, names, categories, filter, reconnect, cursor_file } => {
+            stream_events(after_seq, names, categories, filter, reconnect, cursor_file)
         }
 
         Command::Attach { surface } => parse_surface_ref(&surface)
@@ -1613,6 +1705,7 @@ fn run(command: Command) -> i32 {
 
         Command::Skill { action } => return run_skill(action),
         Command::Persona { action } => return run_persona(action),
+        Command::Channel { action } => return run_channel(action),
     };
 
     match result {
@@ -1717,6 +1810,7 @@ fn stream_events(
     after_seq: Option<u64>,
     names: Vec<String>,
     categories: Vec<String>,
+    filter: Option<String>,
     reconnect: bool,
     cursor_file: Option<String>,
 ) -> Result<(), String> {
@@ -1745,6 +1839,9 @@ fn stream_events(
                 // 재시도 게이트가 transient 판정을 거치게 한다. 출력 중복을 막으려 should_return
                 // 플래그를 세우고 println은 루프 말미 한 곳에서만 한다.
                 let mut should_return: Option<String> = None;
+                // --filter 접두 뷰 필터: 이벤트 이름이 접두와 안 맞으면 출력만 건너뛴다(커서는
+                // 전 이벤트에 대해 전진 — 뷰 필터라 replay/커서 단조성은 불변).
+                let mut suppress_print = false;
                 if let Ok(v) = serde_json::from_str::<Value>(&l) {
                     match v["type"].as_str() {
                         Some("event") => {
@@ -1752,6 +1849,12 @@ fn stream_events(
                                 last_seq = Some(seq);
                                 if let Some(cf) = &cursor_file {
                                     write_event_cursor(cf, seq)?; // (3) 매 이벤트 원자적 갱신
+                                }
+                            }
+                            if let Some(prefix) = filter.as_deref() {
+                                let name = v["name"].as_str().unwrap_or("");
+                                if !name.starts_with(prefix) {
+                                    suppress_print = true;
                                 }
                             }
                         }
@@ -1767,7 +1870,9 @@ fn stream_events(
                         _ => {}
                     }
                 }
-                println!("{l}");
+                if !suppress_print {
+                    println!("{l}");
+                }
                 if let Some(c) = should_return {
                     return Err(c);
                 }
@@ -1853,6 +1958,63 @@ fn chrono_fmt(epoch: i64) -> String {
     {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
         _ => format!("{:?}", dt),
+    }
+}
+
+/// C0 채널 서브명령 디스패처 — 전부 channel.* RPC의 thin wrapper. 결과 JSON을 한 줄로 출력
+/// (브리지가 파싱해 소비). 에러도 JSON({"ok":false,...})으로 stdout에 내보내되 exit는 비0.
+fn run_channel(action: ChannelAction) -> i32 {
+    let (method, params): (&str, Value) = match action {
+        ChannelAction::Start { channel, cmd } => (
+            "channel.start",
+            json!({"channel": channel, "cmd": cmd}),
+        ),
+        ChannelAction::Stop { channel } => ("channel.stop", json!({"channel": channel})),
+        ChannelAction::Status => ("channel.status", json!({})),
+        ChannelAction::Register { channel, token, caps, bridge_ver } => (
+            "channel.register",
+            json!({"channel": channel, "token": token, "caps": caps, "bridge_ver": bridge_ver}),
+        ),
+        ChannelAction::Inbound {
+            channel, sender_id, sender_kind, peer, text, ts, msg_ref, idempotency_key, body_hash,
+        } => (
+            "channel.inbound",
+            json!({"channel": channel, "sender_id": sender_id, "sender_kind": sender_kind,
+                   "peer": peer, "text": text, "ts": ts, "msg_ref": msg_ref,
+                   "idempotency_key": idempotency_key, "body_hash": body_hash}),
+        ),
+        ChannelAction::Outbound {
+            channel, target, kind, body, reply_to, idempotency_key, retry_of,
+        } => (
+            "channel.outbound",
+            json!({"channel": channel, "target": target, "kind": kind, "body": body,
+                   "reply_to": reply_to, "idempotency_key": idempotency_key, "retry_of": retry_of}),
+        ),
+        ChannelAction::Receipt { outbound_id, outcome, platform_ref, detail } => (
+            "channel.receipt",
+            json!({"outbound_id": outbound_id, "outcome": outcome,
+                   "platform_ref": platform_ref, "detail": detail}),
+        ),
+        ChannelAction::Ack { inbox_id } => ("channel.ack", json!({"inbox_id": inbox_id})),
+        ChannelAction::Allow { channel, sender_id } => (
+            "channel.allow",
+            json!({"channel": channel, "sender_id": sender_id}),
+        ),
+        ChannelAction::Revoke { channel, sender_id } => (
+            "channel.revoke",
+            json!({"channel": channel, "sender_id": sender_id}),
+        ),
+        ChannelAction::Lockdown => ("channel.lockdown", json!({})),
+    };
+    match request(method, params) {
+        Ok(r) => {
+            println!("{}", serde_json::to_string(&r).unwrap_or_default());
+            0
+        }
+        Err(e) => {
+            println!("{}", json!({"ok": false, "error": e}));
+            1
+        }
     }
 }
 
