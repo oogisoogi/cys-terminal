@@ -68,7 +68,7 @@ while IFS= read -r -d '' exe; do
     SIGN_N=$((SIGN_N+1))
   fi
 done < <(find src-tauri/runtime -type f -perm +111 ! -name '*.dylib' ! -name '*.so' ! -name '*.node' -print0)
-echo "  ✓ runtime Mach-O $SIGN_N개 재서명 (python/node=entitlements·git/uv=무 entitlements)"
+echo "  ✓ runtime Mach-O ${SIGN_N}개 재서명 (python/node=entitlements·git/uv=무 entitlements)"
 
 echo "== Apple 공증 빌드 v$VERSION (Tauri 자동 codesign[hardened]+notarize+staple) =="
 bun x @tauri-apps/cli build
