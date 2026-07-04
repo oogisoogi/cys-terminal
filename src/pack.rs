@@ -388,15 +388,16 @@ pub fn install(force: bool) -> Result<(usize, usize), String> {
 /// Err 반환해 apply_pack_transactional이 rollback_journal를 타게 한다 — 매니페스트가 손상/구상태로
 /// 남으면 다음 update preserve-gate가 새 파일을 사용자 수정본으로 오판(자동갱신·prune 차단)하는
 /// 부분커밋을 차단(R2CODE2 HIGH #1).
-pub fn install_from_iter<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
+pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
+    dir: PathBuf,
     items: I,
     force: bool,
     target_version: &str,
     transactional: bool,
+    setup_config: bool,
 ) -> Result<(usize, usize), String> {
     // items를 한 번 Vec로 고정 — 쓰기 루프·prune embedded-set·exec bit 루프 세 곳이 같은 집합을 본다.
     let items: Vec<(&str, &str)> = items.into_iter().collect();
-    let dir = pack_dir();
     // ★채널 가드(v6 §5 — 내장/비트랜잭션 경로만): state=pro·손상이면 쓰기+prune **전체 생략**
     // (내장 free 팩이 pro 팩을 파괴하는 R1 실증 재앙 차단). pack-update(transactional=true)는
     // 자체 채널·버전 게이트를 통과한 서명 팩이므로 이 가드를 타지 않는다.
@@ -570,7 +571,11 @@ pub fn install_from_iter<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
     }
     // cys 전용 CLAUDE_CONFIG_DIR 격리 셋업(오너 2026-06-15) — 사용자 ~/.claude 오염으로부터
     // cys 마스터를 분리한다. best-effort·보존 모드라 깨끗한 환경에서도 회귀 0.
-    setup_isolated_config_dir();
+    // ★staging 경로(install_staged)는 setup_config=false로 여기서 건너뛰고, atomic swap 후 실
+    // pack_dir에 대해 한 번 셋업한다(격리 config는 pack_dir 형제라 staging 대상이 아님).
+    if setup_config {
+        setup_isolated_config_dir();
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -588,6 +593,163 @@ pub fn install_from_iter<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
             }
         }
     }
+    Ok((written, kept))
+}
+
+/// install_into의 공개 얇은 래퍼 — 실 pack_dir() 대상, config 격리 셋업 포함(외부 동작 완전 불변).
+/// C/D/E 호출처(install·apply_pack_transactional)의 기존 시그니처를 보존한다(§3 하위호환).
+pub fn install_from_iter<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
+    items: I,
+    force: bool,
+    target_version: &str,
+    transactional: bool,
+) -> Result<(usize, usize), String> {
+    install_into(pack_dir(), items, force, target_version, transactional, true)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 팩 atomic swap (v3 §3.1) — init-pack의 파일별 in-place write(중단 시 반쯤 쓰인 팩 =
+// stale-packfile 버그 클래스)를 staging 전개→검증→원자 rename 교체로 대체한다.
+// ★pack-update는 이미 journal 트랜잭션(apply_pack_transactional)으로 all-or-nothing +
+// minisign·sha256 검증을 수행하므로 이 경로를 타지 않는다(중복 래핑=heavily-reviewed 트랜잭션
+// 재작성 위험 → 외과성 원칙 준수). run_init_pack(비원자 in-place write)만 이 경로로 승격한다.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// init-pack staging 디렉터리(pack_dir 형제·pid로 격리). pack-update의 고정 `.pack-staging`과
+/// 이름을 분리해 동시 실행 충돌을 피한다(doctor가 `.pack-staging*` 잔재를 정리한다).
+pub fn init_staging_dir(dir: &Path) -> PathBuf {
+    let parent = dir.parent().unwrap_or_else(|| Path::new("."));
+    parent.join(format!(".pack-staging-init-{}", std::process::id()))
+}
+
+/// 1세대 롤백 보존 디렉터리(pack_dir 형제 `<pack_dir>.prev` — 즉시 롤백 근거).
+pub fn pack_prev_dir(dir: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.prev", dir.display()))
+}
+
+/// 재귀 디렉터리 복사(파일=fs::copy로 권한 보존, 하위 dir 재귀). 팩엔 심링크가 없다(오너 결정 —
+/// 심링크 마이그레이션 안 함). staging 전량 복사로 상태파일·user-edit·비임베드·디렉티브를 보존한다.
+fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ft = entry.file_type()?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if ft.is_dir() {
+            copy_dir_all(&from, &to)?;
+        } else {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
+/// cross-device 대비 rename(§3.1-5) — 같은 볼륨이면 원자 rename, 실패 시 copy 후 원본 삭제
+/// fallback(EXDEV 등). staging은 pack_dir 형제라 정상 경로는 원자 rename이다(Windows도 동일 볼륨 전제).
+fn rename_dir_or_move(src: &Path, dst: &Path) -> std::io::Result<()> {
+    if std::fs::rename(src, dst).is_ok() {
+        return Ok(());
+    }
+    // rename 불가(cross-device 등) — copy 후 원본 삭제 fallback(src 부재면 여기서 loud Err).
+    copy_dir_all(src, dst)?;
+    std::fs::remove_dir_all(src)
+}
+
+/// 원자 교체(§3.1-3): pack_dir→pack_dir.prev, staging→pack_dir. 2번째 rename 실패 시 역rename으로
+/// pre-state 복구. pack_dir.prev는 1세대만 보존. 반환 Err = 교체 안 됨(기존 팩 온전).
+pub fn atomic_swap(dir: &Path, staging: &Path) -> Result<(), String> {
+    let prev = pack_prev_dir(dir);
+    // 직전 세대 정리(1세대 보존).
+    let _ = std::fs::remove_dir_all(&prev);
+    let had_old = dir.exists();
+    if had_old {
+        rename_dir_or_move(dir, &prev)
+            .map_err(|e| format!("pack_dir→prev rename 실패(교체 안 함): {e}"))?;
+    }
+    match rename_dir_or_move(staging, dir) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // 역rename 복구: (실패한 fallback이 만든 부분/빈 dir 정리 후) prev→pack_dir 복원.
+            if had_old {
+                let _ = std::fs::remove_dir_all(dir);
+                let _ = rename_dir_or_move(&prev, dir);
+            }
+            Err(format!("staging→pack_dir rename 실패(pre-state 복구 시도): {e}"))
+        }
+    }
+}
+
+/// staging 검증(§3.1-2): 임베드 전 파일이 staging에 실재하는가(파일 수·존재). pack-update의
+/// sha256·minisign 검증은 pack-update 경로(packsig)가 이미 수행하므로, init-pack staging은
+/// 존재·수 검증이다(디스크 오류로 반쯤 쓰인 staging을 교체 전에 차단하는 방어선).
+pub fn verify_staging(staging: &Path, items: &[(&str, &str)]) -> Result<(), String> {
+    let mut missing = 0usize;
+    let mut first: Option<String> = None;
+    for (rel, _) in items {
+        if !staging.join(rel).is_file() {
+            missing += 1;
+            if first.is_none() {
+                first = Some((*rel).to_string());
+            }
+        }
+    }
+    if missing == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "staging 검증 실패: 임베드 {}개 중 {}개 누락(예: {}) — 교체 중단",
+            items.len(),
+            missing,
+            first.unwrap_or_default()
+        ))
+    }
+}
+
+/// 원자 교체 기반 init-pack 설치(§3.1). 현재 pack_dir을 staging에 전량 복사→install_into로 임베드
+/// 반영(preserve-gate·prune·.pack-version)→검증→원자 rename 교체→실 pack_dir에 config 격리 셋업.
+/// 중단(카피·반영·검증 중 abort)은 기존 pack_dir을 건드리지 않는다(원자성). 반환: (written, kept).
+pub fn install_staged(force: bool) -> Result<(usize, usize), String> {
+    let dir = pack_dir();
+    let staging = init_staging_dir(&dir);
+    // 잔여 staging(같은 pid 재사용·직전 실패) 선정리.
+    let _ = std::fs::remove_dir_all(&staging);
+    // ① 기존 팩 전량을 staging에 복사(상태파일·user-edit·비임베드·디렉티브 전부 보존 — 완전 교체 대상).
+    if dir.exists() {
+        copy_dir_all(&dir, &staging)
+            .map_err(|e| format!("staging 복사 실패 {}: {e}", staging.display()))?;
+    } else {
+        std::fs::create_dir_all(&staging)
+            .map_err(|e| format!("staging 생성 실패 {}: {e}", staging.display()))?;
+    }
+    // ② 임베드 반영을 staging에(config 격리 셋업은 교체 후 실 dir에 — setup_config=false).
+    let items: Vec<(&str, &str)> = PACK_ALL.iter().map(|(r, c)| (*r, *c)).collect();
+    let (written, kept) = match install_into(
+        staging.clone(),
+        items.iter().copied(),
+        force,
+        env!("CARGO_PKG_VERSION"),
+        false,
+        false,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(e);
+        }
+    };
+    // ③ 검증(존재·수) — 실패 시 staging 폐기·교체 안 함(기존 팩 온전).
+    if let Err(e) = verify_staging(&staging, &items) {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(e);
+    }
+    // ④ 원자 교체(실패 시 pre-state 복구·staging 정리).
+    if let Err(e) = atomic_swap(&dir, &staging) {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(e);
+    }
+    // ⑤ 교체 후 실 pack_dir 기준 config 격리 셋업(pack_dir 형제 — staging 대상이 아니었다).
+    setup_isolated_config_dir();
     Ok((written, kept))
 }
 
@@ -1914,6 +2076,133 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(base.join(PACK_STATE_FILE).join("child")).unwrap();
         assert!(write_pack_state(&base, &test_free_state("1.0.0")).is_err());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ─── §3.1 팩 atomic swap ───
+
+    /// 성공 교체: staging→pack_dir, 기존 pack_dir→.prev(1세대 보존), staging 소진.
+    #[test]
+    fn atomic_swap_success_creates_prev() {
+        let base = std::env::temp_dir().join(format!("cys-swap-ok-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = base.join("pack");
+        let staging = base.join("staging");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "old").unwrap();
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("a.txt"), "new").unwrap();
+        std::fs::write(staging.join("b.txt"), "b").unwrap();
+
+        atomic_swap(&dir, &staging).unwrap();
+
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "new");
+        assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "b");
+        let prev = pack_prev_dir(&dir);
+        assert!(prev.exists(), ".prev 1세대 보존");
+        assert_eq!(std::fs::read_to_string(prev.join("a.txt")).unwrap(), "old");
+        assert!(!staging.exists(), "staging은 교체로 소진");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 교체 전 abort(2번째 rename 실패: staging 부재) → 역rename으로 기존 팩 온전 복구.
+    #[test]
+    fn atomic_swap_reverses_on_failure_keeps_old_pack() {
+        let base = std::env::temp_dir().join(format!("cys-swap-rev-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = base.join("pack");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "old").unwrap();
+        let staging = base.join("does-not-exist");
+
+        let r = atomic_swap(&dir, &staging);
+
+        assert!(r.is_err(), "staging 부재는 교체 실패");
+        assert!(dir.exists(), "역rename으로 pack_dir 복구");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+            "old",
+            "pre-state 온전(반쯤 쓰인 팩 없음)"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 검증 실패 = 임베드 파일 누락 시 Err(교체 전 차단 방어선).
+    #[test]
+    fn verify_staging_detects_missing_file() {
+        let base = std::env::temp_dir().join(format!("cys-verify-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("present.txt"), "x").unwrap();
+        let items = [("present.txt", "x"), ("missing.txt", "y")];
+
+        let r = verify_staging(&base, &items);
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("missing.txt"));
+
+        std::fs::write(base.join("missing.txt"), "y").unwrap();
+        assert!(verify_staging(&base, &items).is_ok(), "전부 존재 → Ok");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 신설 → written>0·임베드 반영·.prev 부재. 멱등 재설치 → written=0·pack 온전·.prev 1세대 생성.
+    #[test]
+    fn install_staged_fresh_then_idempotent_with_prev() {
+        let _g = PACK_ENV_LOCK.lock().unwrap();
+        let saved = std::env::var(ENV_PACK_DIR).ok();
+        let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
+        let base = std::env::temp_dir().join(format!("cys-staged-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let pd = base.join("pack");
+        std::env::set_var(ENV_PACK_DIR, &pd);
+        std::env::set_var(ENV_CONFIG_DIR, base.join("claude"));
+
+        let (rel0, _) = PACK_ALL[0];
+
+        let (w1, _k1) = install_staged(false).unwrap();
+        assert!(w1 > 0, "신설은 written>0");
+        assert!(pd.join(".pack-version").is_file(), ".pack-version 기록");
+        assert!(pd.join(rel0).is_file(), "임베드 파일 반영");
+        assert!(!pack_prev_dir(&pd).exists(), "첫 설치는 .prev 없음");
+
+        let (w2, _k2) = install_staged(false).unwrap();
+        assert_eq!(w2, 0, "멱등 재설치 written=0");
+        assert!(pack_prev_dir(&pd).exists(), "재설치는 .prev 1세대 보존");
+        assert!(pd.join(rel0).is_file(), "재설치 후 임베드 온전");
+
+        restore_env(saved, saved_cfg);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// user-edit 보존: force=false 재설치가 사용자 편집 파일을 덮지 않는다(init-pack '4 preserved' 정합).
+    #[test]
+    fn install_staged_preserves_user_edit() {
+        let _g = PACK_ENV_LOCK.lock().unwrap();
+        let saved = std::env::var(ENV_PACK_DIR).ok();
+        let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
+        let base = std::env::temp_dir().join(format!("cys-staged-pres-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let pd = base.join("pack");
+        std::env::set_var(ENV_PACK_DIR, &pd);
+        std::env::set_var(ENV_CONFIG_DIR, base.join("claude"));
+
+        install_staged(false).unwrap();
+        // 비-디렉티브·비-shebang 임베드 파일 하나를 사용자 편집으로 오염.
+        let target = PACK_ALL
+            .iter()
+            .find(|(rel, content)| !rel.ends_with("_DIRECTIVE.md") && !content.starts_with("#!"))
+            .map(|(rel, _)| *rel)
+            .expect("비-디렉티브 임베드 파일 존재");
+        std::fs::write(pd.join(target), "USER-EDIT-XYZ").unwrap();
+
+        install_staged(false).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(pd.join(target)).unwrap(),
+            "USER-EDIT-XYZ",
+            "user-edit 보존(force=false)"
+        );
+
+        restore_env(saved, saved_cfg);
         let _ = std::fs::remove_dir_all(&base);
     }
 }
