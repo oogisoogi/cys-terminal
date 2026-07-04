@@ -2253,6 +2253,7 @@ mod tests {
             created_at: now(),
             resolved_at: None,
             tier: Some("c".into()),
+            publisher_pid: None,
         });
     }
 

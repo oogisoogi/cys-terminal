@@ -4,6 +4,7 @@ use crate::events::EventBus;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use regex::Regex;
 use serde_json::json;
+use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::io::Write;
 use std::path::PathBuf;
@@ -198,6 +199,11 @@ pub struct FeedItem {
     /// tier≤C(a|b|c)만 허용된다. serde default로 구(舊) 영속 라인(tier 미포함)과 하위호환.
     #[serde(default)]
     pub tier: Option<String>,
+    /// 발행자 커널 peer pid(§3.2 표면정책). feed.reply의 caller_pid와 같으면 자기승인이라
+    /// 거부한다(요청한 자가 스스로 승인 불가). None=발행 pid 미상(예: 구 영속 라인)이면
+    /// 자기승인 판정을 적용하지 않는다(정보 없음 → 차단 근거 없음). serde default로 하위호환.
+    #[serde(default)]
+    pub publisher_pid: Option<u32>,
 }
 
 pub struct Config {
@@ -531,6 +537,24 @@ pub fn now_epoch() -> f64 {
         .unwrap_or(0.0)
 }
 
+/// §3.2 표면정책 — 자기승인 차단이 켜져 있는가.
+/// `~/.cys/policy.json`의 `deny_self_approve`(bool)를 읽는다. 파일이 없거나 파싱 실패하거나
+/// 키가 없으면 **기본값 true**(fail-safe — 정책 부재 시 더 안전한 쪽으로 차단). 명시적으로
+/// `{"deny_self_approve": false}`로만 끌 수 있다. (서명 검증은 이번 범위 밖 — 파일 존재·파싱까지.)
+pub fn deny_self_approve_policy() -> bool {
+    let path = cys::home_dir().join(".cys").join("policy.json");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return true; // 파일 없음 → 안전기본 차단 ON
+    };
+    match serde_json::from_str::<Value>(&text) {
+        Ok(v) => v
+            .get("deny_self_approve")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(true), // 키 없음 → 안전기본
+        Err(_) => true, // 파싱 실패 → 안전기본(정책 파일 손상이 차단을 끄면 안 됨)
+    }
+}
+
 /// Windows named pipe 경로(`\\.\pipe\<name>`)에서 `<name>` 슬러그를 추출한다(RC-13).
 /// 기본 데몬 `\\.\pipe\cys` → `"cys"`(호출자가 %LOCALAPPDATA%\cys 루트로 매핑·기존 호환 유지),
 /// 부서 데몬 `\\.\pipe\cys-dept-<n>` → `"cys-dept-<n>"`(루트 하위 부서 고유 디렉토리).
@@ -772,6 +796,7 @@ impl Daemon {
             created_at: now_epoch(),
             resolved_at: None,
             tier: None, // 데몬 자동 알림은 무태그(=D·미러 제외) — 채널 스팸 차단.
+            publisher_pid: None, // 데몬 발행 — 외부 caller 없음(자기승인 판정 비적용).
         };
         self.feed_items.lock().unwrap().push(item.clone());
         self.persist_feed_item(&item);
@@ -2591,6 +2616,7 @@ mod tests {
             created_at: now_epoch(),
             resolved_at: None,
             tier: None,
+            publisher_pid: None,
         }
     }
 

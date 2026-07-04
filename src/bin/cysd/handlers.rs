@@ -1666,6 +1666,8 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 created_at: crate::state::now_epoch(),
                 resolved_at: None,
                 tier: tier.clone(),
+                // §3.2 자기승인 차단: 발행자 pid를 각인해 feed.reply에서 대조한다.
+                publisher_pid: caller_pid,
             };
             // waiter 등록을 항목 공개와 같은 임계영역에서 수행 — 항목이 다른 커넥션에
             // 보이는 순간 waiter가 이미 존재해, 빠른 feed.reply의 결정이 유실되지 않는다.
@@ -1748,6 +1750,21 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                             &id,
                             "invalid_params",
                             "item already resolved",
+                        ));
+                    }
+                    // §3.2 표면정책 — 자기승인 차단: 요청을 발행한 프로세스가 자기 요청을 스스로
+                    // "allow"로 승인하는 것을 데몬이 거부한다(HITL 우회 방지). 자기-거부(deny)와
+                    // 발행 pid 미상(구 라인)은 허용 — 차단 근거가 없다. 정책 파일로 끌 수 있으나
+                    // 기본값은 차단 ON(fail-safe).
+                    if decision == "allow"
+                        && item.publisher_pid.is_some()
+                        && item.publisher_pid == caller_pid
+                        && crate::state::deny_self_approve_policy()
+                    {
+                        return Reply::Single(err_response(
+                            &id,
+                            "self_approval_denied",
+                            "요청 발행자는 자기 요청을 승인할 수 없다 — 다른 노드/오퍼레이터가 승인해야 한다(§3.2)",
                         ));
                     }
                     item.status = "resolved".into();
@@ -5641,6 +5658,80 @@ mod tests {
             }
         }
         assert_eq!(tier_none.as_deref(), Some("d"), "무태그는 이벤트에 d로 표기(fail-closed)");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // §3.2 표면정책 — feed 자기승인 차단: 발행 pid == reply pid + allow 는 거부,
+    // 다른 pid 승인·자기 거부(deny)는 허용.
+    #[test]
+    fn feed_reply_blocks_self_approval() {
+        let dir = std::env::temp_dir().join(format!(
+            "cys-selfapprove-{}-{}",
+            std::process::id(),
+            crate::state::now_epoch() as u64
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let daemon = Daemon::new(dir.join("cysd.sock"));
+        let publisher: u32 = 4242;
+        let approver: u32 = 9999;
+
+        // 헬퍼: 특정 pid로 permission feed를 발행하고 request_id 반환.
+        let push = |rid: &str, pid: u32| {
+            let req = Request {
+                id: json!(1),
+                method: "feed.push".into(),
+                params: json!({"kind":"permission","title":"t","body":"b","request_id":rid}),
+            };
+            let Reply::Single(resp) = dispatch(&daemon, req, Some(pid)) else {
+                panic!("push single expected");
+            };
+            assert_eq!(resp["ok"], json!(true), "push 실패: {resp}");
+        };
+        let reply = |rid: &str, decision: &str, pid: u32| -> Value {
+            let req = Request {
+                id: json!(2),
+                method: "feed.reply".into(),
+                params: json!({"request_id":rid,"decision":decision}),
+            };
+            let Reply::Single(resp) = dispatch(&daemon, req, Some(pid)) else {
+                panic!("reply single expected");
+            };
+            resp
+        };
+
+        // ① 자기승인(allow, 발행자 == 승인자) → 거부
+        push("f_self", publisher);
+        let r = reply("f_self", "allow", publisher);
+        assert_eq!(r["ok"], json!(false), "자기승인이 통과됨: {r}");
+        assert_eq!(r["error"]["code"], json!("self_approval_denied"), "코드 불일치: {r}");
+        // 여전히 pending — 미해소 확인
+        assert!(
+            daemon.feed_items.lock().unwrap().iter()
+                .any(|i| i.request_id == "f_self" && i.status == "pending"),
+            "자기승인 거부인데 상태가 바뀜"
+        );
+
+        // ② 다른 노드가 승인(allow, 발행자 != 승인자) → 허용
+        let r2 = reply("f_self", "allow", approver);
+        assert_eq!(r2["ok"], json!(true), "타 노드 승인이 거부됨: {r2}");
+
+        // ③ 자기-거부(deny, 발행자 == 승인자) → 허용(자기 요청 취소는 무해)
+        push("f_deny", publisher);
+        let r3 = reply("f_deny", "deny", publisher);
+        assert_eq!(r3["ok"], json!(true), "자기-거부가 차단됨(허용돼야): {r3}");
+
+        // ④ 발행 pid 미상(None) → 자기승인 판정 비적용(허용)
+        {
+            let req = Request {
+                id: json!(1),
+                method: "feed.push".into(),
+                params: json!({"kind":"permission","title":"t","body":"b","request_id":"f_anon"}),
+            };
+            let _ = dispatch(&daemon, req, None); // caller_pid None → publisher_pid None
+        }
+        let r4 = reply("f_anon", "allow", publisher);
+        assert_eq!(r4["ok"], json!(true), "발행 pid 미상인데 자기승인 판정이 걸림: {r4}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
