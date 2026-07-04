@@ -428,6 +428,9 @@ pub struct Daemon {
     pub consumption: Mutex<Consumption>,
     /// T7 E1-3 영속 분석 저장소(analytics.db) — open 실패 시 None(graceful degrade).
     pub analytics: Mutex<Option<rusqlite::Connection>>,
+    /// C0 채널 계층 저장소(channels.db) — desired-state·inbox·원장. 무결 필수라 open 실패 시
+    /// None(채널 모듈 비활성) — 데몬은 계속 동작한다(순수 추가 계층).
+    pub channels: Mutex<Option<rusqlite::Connection>>,
 }
 
 /// T6 Control Center 소비 트래커 — in-memory(재시작 리셋, 가동시간 의미론과 동일).
@@ -701,6 +704,8 @@ impl Daemon {
             });
         // T7 E1-3: 영속 분석 DB는 socket_path가 struct로 move되기 전에 연다.
         let analytics_conn = crate::analytics::open(&socket_path);
+        // C0: 채널 계층 DB(channels.db)도 move 전에 연다. 무결 필수 — open 실패 시 None(모듈 비활성).
+        let channels_conn = crate::channels::open(&socket_path);
         let daemon = Arc::new(Daemon {
             surfaces: Mutex::new(HashMap::new()),
             // 영속 트랜스크립트(transcripts.db)의 최대 id 이후부터 발급 — 재시작 시
@@ -731,6 +736,7 @@ impl Daemon {
             started_at: now_epoch(),
             consumption: Mutex::new(Consumption::default()),
             analytics: Mutex::new(analytics_conn),
+            channels: Mutex::new(channels_conn),
         });
         // 재시작에도 오늘 소비/비용/모델믹스/스파크라인 보존 — 최근 12h usage_records 리플레이.
         crate::analytics::seed_consumption(&daemon);

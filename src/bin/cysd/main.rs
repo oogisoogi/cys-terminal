@@ -10,6 +10,7 @@ mod alerts;
 mod analytics;
 mod approval;
 mod caps;
+mod channels;
 mod classifier;
 mod cost;
 mod events;
@@ -117,6 +118,10 @@ async fn main() {
     schedule::spawn_scheduler(Arc::clone(&daemon));
     usage::spawn_usage_collector(Arc::clone(&daemon));
     usage::spawn_agy_collector(Arc::clone(&daemon));
+    // C0: 채널 부팅 재조정(고아 선-kill→새 토큰 재스폰) — 이벤트버스·state 준비 후(§2.1-2).
+    // 불사조 복원 프로토콜의 "채널 재조정" 단계. 그 다음 주기 sweep(재배달·타임아웃·재스폰) 등록.
+    channels::reconcile(&daemon);
+    channels::spawn_channel_sweep(Arc::clone(&daemon));
     // 셧다운 경로: 원장은 메모리 전용이라 데몬이 죽으면 scoped 프로세스를 아무도 회수하지
     // 못한다 — SIGTERM/SIGINT 때 scoped 그룹을 전부 정리한 뒤 종료한다.
     #[cfg(unix)]

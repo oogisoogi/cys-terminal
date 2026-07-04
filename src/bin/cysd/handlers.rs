@@ -504,6 +504,10 @@ fn learn_state_dir() -> std::path::PathBuf {
 pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> Reply {
     let id = req.id.clone();
     let params = req.params;
+    // C0 채널 계층: channel.* RPC는 channels 모듈이 전담(단일 위임 — dispatch match 비대화 방지).
+    if let Some(sub) = req.method.strip_prefix("channel.") {
+        return crate::channels::handle(daemon, sub, &params, &id, caller_pid);
+    }
     match req.method.as_str() {
         "system.ping" => Reply::Single(ok_response(&id, json!("pong"))),
 
@@ -1957,7 +1961,9 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 }
             }
             let state = param_str(&params, "state").unwrap_or_else(|| "working".into());
-            const STATES: [&str; 4] = ["working", "waiting", "blocked", "done"];
+            // C0(§2.2): "quiescing" = master surface가 clear·복원·cycle-agent 진행 중이라
+            // 채널 inbox 주입을 보류해야 하는 상태(자기보고). 채널 배달기가 이 값을 게이트로 읽는다.
+            const STATES: [&str; 5] = ["working", "waiting", "blocked", "done", "quiescing"];
             if !STATES.contains(&state.as_str()) {
                 return Reply::Single(err_response(
                     &id,

@@ -1,0 +1,1779 @@
+//! C0 채널 계층 코어 — Slack·Discord 브리지를 cysd(신뢰 경계)가 스폰·재조정하고,
+//! 인바운드는 inbox-first 내구 퍼널로, 아웃바운드는 단조 상태기계(at-least-once)로 다룬다.
+//! 정본 설계: `_research/openclaw-absorption/DESIGN-ko.md` §2 (2.0~2.8).
+//!
+//! 원리: **프로세스가 아니라 상태가 영속한다**(불사조와 동일). 브리지는 cysd 스폰 자식이고,
+//! 채널 상태(desired-state·inbox·원장)는 channels.db가 소유한다. cysd/master가 정기 재시작되는
+//! 시스템 전제 위에서 "내구 상태 + 부팅 재조정(reconcile)"으로 설계한다(§1.1).
+//!
+//! analytics.rs(analytics.db)와 별개 DB. rusqlite(이미 의존)·sha2(이미 의존)·libc(이미 의존).
+//! open 실패는 graceful — Daemon.channels=None이면 채널 RPC는 channels_disabled를 돌려주고
+//! 데몬은 계속 동작한다(순수 추가 계층·제거 가능). 무결이 필요한 곳(dedupe·단조 전이)은 트랜잭션.
+
+use crate::handlers::Reply;
+use crate::state::{Daemon, LedgerEntry, ProcessHealth};
+use cys::{err_response, ok_response};
+use rusqlite::{params, Connection, OptionalExtension};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::path::Path;
+use std::sync::Arc;
+
+// ── 튜닝 상수 (테스트 주입 가능하게 분리 · §2.8) ──────────────────────────────
+/// 아웃바운드 receipt 부재 시 unknown 전이 창(초). 기본 30s(§2.3). 테스트는 env로 축소 가능.
+fn outbound_unknown_secs() -> f64 {
+    std::env::var("CYS_CHANNEL_OUTBOUND_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30.0)
+}
+/// 봇루프 슬라이딩 윈도우(초)와 상한 — 참여자쌍 20건/60초(+쿨다운 60초는 윈도우 유지로 발현).
+const LOOP_WINDOW_SECS: f64 = 60.0;
+const LOOP_LIMIT: u64 = 20;
+/// inbox un-acked 재배달 TTL(초) — injected 후 10분 미-ack면 재주입(§2.2).
+const INBOX_REDELIVER_TTL_SECS: f64 = 600.0;
+/// 브리지 사망 후 재스폰 백오프(초) — 크래시 루프 폭주 차단.
+const RESPAWN_BACKOFF_SECS: f64 = 5.0;
+/// 주기 sweep 간격(초) — 재배달·타임아웃·브리지 사망 재조정.
+const SWEEP_INTERVAL_SECS: u64 = 15;
+/// 봉투 sender 표기 최대 길이(초과 시 … 절단).
+const SENDER_MAXLEN: usize = 16;
+
+// ── DB open + 스키마 ─────────────────────────────────────────────────────────
+
+/// channels.db 열고 스키마 보장. 실패 시 None(graceful degrade — 채널 모듈 비활성).
+pub fn open(socket_path: &Path) -> Option<Connection> {
+    let path = crate::state::state_dir(socket_path).join("channels.db");
+    let conn = Connection::open(&path).ok()?;
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL;
+         CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
+         -- desired-state 채널: enabled·스폰 pgid·토큰 해시(영속 핀)·등록 여부.
+         CREATE TABLE IF NOT EXISTS channels(
+            channel      TEXT PRIMARY KEY,
+            enabled      INTEGER NOT NULL DEFAULT 0,
+            bridge_cmd   TEXT,
+            scoped_pid   INTEGER,
+            scoped_pgid  INTEGER,
+            token_hash   TEXT,
+            registered   INTEGER NOT NULL DEFAULT 0,
+            bridge_ver   TEXT,
+            caps         TEXT,
+            last_spawn_ts REAL,
+            last_in_ts   REAL,
+            last_out_ts  REAL,
+            updated_ts   REAL NOT NULL);
+         -- 아웃바운드 원장 + 단조 outcome(pending→terminal). approval 3필드·retry_of 체인.
+         CREATE TABLE IF NOT EXISTS outbound(
+            id            INTEGER PRIMARY KEY,
+            channel       TEXT NOT NULL,
+            target        TEXT NOT NULL,
+            kind          TEXT NOT NULL,
+            body          TEXT NOT NULL,
+            reply_to      TEXT,
+            idempotency_key TEXT NOT NULL,
+            retry_of      INTEGER,
+            outcome       TEXT NOT NULL,
+            platform_ref  TEXT,
+            detail        TEXT,
+            approval_feed_id TEXT,
+            approval_nonce   TEXT,
+            approval_owner   TEXT,
+            created_ts    REAL NOT NULL,
+            updated_ts    REAL NOT NULL,
+            UNIQUE(channel, idempotency_key));
+         CREATE INDEX IF NOT EXISTS ix_outbound_pending ON outbound(outcome, created_ts);
+         -- terminal 후 도착한 늦은 receipt(화해 레코드 — 상태 불변, 재전송 억제 근거).
+         CREATE TABLE IF NOT EXISTS late_receipt(
+            id           INTEGER PRIMARY KEY,
+            outbound_id  INTEGER NOT NULL,
+            outcome      TEXT NOT NULL,
+            platform_ref TEXT,
+            detail       TEXT,
+            ts           REAL NOT NULL);
+         -- 인바운드 원장 + dedupe(UNIQUE key·body_hash). 본문 비저장(프라이버시-바이-디자인·O7).
+         CREATE TABLE IF NOT EXISTS inbound(
+            id           INTEGER PRIMARY KEY,
+            channel      TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL,
+            body_hash    TEXT NOT NULL,
+            sender_id    TEXT,
+            sender_kind  TEXT,
+            peer         TEXT,
+            msg_ref      TEXT,
+            ts           REAL NOT NULL,
+            verdict      TEXT NOT NULL,
+            UNIQUE(channel, idempotency_key));
+         -- 내구 inbox: 단조 id·state(new|injected|acked). text는 배달까지만 보관(ack 시 소거).
+         CREATE TABLE IF NOT EXISTS inbox(
+            id           INTEGER PRIMARY KEY,
+            channel      TEXT NOT NULL,
+            sender_id    TEXT,
+            text         TEXT NOT NULL,
+            state        TEXT NOT NULL,
+            redelivered  INTEGER NOT NULL DEFAULT 0,
+            created_ts   REAL NOT NULL,
+            injected_ts  REAL,
+            acked_ts     REAL);
+         CREATE INDEX IF NOT EXISTS ix_inbox_state ON inbox(state, id);
+         -- owner-only allowlist(fail-closed — 비면 전량 deny).
+         CREATE TABLE IF NOT EXISTS allowlist(
+            channel   TEXT NOT NULL,
+            sender_id TEXT NOT NULL,
+            added_ts  REAL NOT NULL,
+            PRIMARY KEY(channel, sender_id));
+         -- 봇루프 슬라이딩 윈도우 원장(참여자쌍 타임스탬프).
+         CREATE TABLE IF NOT EXISTS loopwin(
+            id        INTEGER PRIMARY KEY,
+            channel   TEXT NOT NULL,
+            sender_id TEXT NOT NULL,
+            ts        REAL NOT NULL);
+         CREATE INDEX IF NOT EXISTS ix_loopwin ON loopwin(channel, sender_id, ts);",
+    )
+    .ok()?;
+    // schema_version 핀(D8 마이그레이션 토대).
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES('schema_version','1') ON CONFLICT(key) DO NOTHING",
+        [],
+    )
+    .ok()?;
+    Some(conn)
+}
+
+// ── 순수 헬퍼(테스트 핀 가능) ────────────────────────────────────────────────
+
+fn now() -> f64 {
+    crate::state::now_epoch()
+}
+
+/// sha256 hex(토큰 핀·body_hash 산식 — pack.rs content_hash와 동형).
+fn hex_sha256(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+/// 1회용 32바이트 토큰의 hex 문자열(env CYS_CHANNEL_TOKEN로 브리지에 주입).
+/// Unix=/dev/urandom, 실패 시 시간·pid 기반 폴백(approval.rs random_32와 동일 정신).
+fn random_token_hex() -> String {
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+            let mut buf = [0u8; 32];
+            if f.read_exact(&mut buf).is_ok() {
+                return buf.iter().map(|b| format!("{b:02x}")).collect();
+            }
+        }
+    }
+    let seed = format!(
+        "{}-{}-{:?}",
+        std::process::id(),
+        now(),
+        std::time::SystemTime::now()
+    );
+    hex_sha256(seed.as_bytes())
+}
+
+/// 봇루프 판정(순수) — 윈도우 내 카운트가 상한 초과면 억제.
+fn loop_suppressed(count_in_window: u64, limit: u64) -> bool {
+    count_in_window > limit
+}
+
+/// 아웃바운드 receipt가 '늦은' 것인가(순수) — pending이 아니면 이미 terminal이라 late.
+fn receipt_is_late(current_outcome: &str) -> bool {
+    current_outcome != "pending"
+}
+
+/// inbox 재배달 대상 판정(순수·테스트 핀) — new는 즉시, injected는 TTL 초과 un-acked면 재주입.
+/// 실경로(deliver_new_inbox·redeliver_unacked)는 동일 규칙을 SQL WHERE로 집행한다(등가 계약 박제).
+#[allow(dead_code)] // 계약 문서화 순수 술어 — SQL 집행과 동형(state.rs is_reusable 선례).
+fn redeliver_due(state: &str, injected_ts: Option<f64>, now: f64, ttl: f64) -> bool {
+    match state {
+        "new" => true,
+        "injected" => injected_ts.map(|t| now - t >= ttl).unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// 봉투 문자열: `[CH:<channel>|<sender>|<HH:MM>|#<inbox_id>] <text>` (+재배달 표기).
+fn envelope(channel: &str, sender: &str, ts: f64, inbox_id: i64, redelivered: bool, text: &str) -> String {
+    let short: String = if sender.chars().count() > SENDER_MAXLEN {
+        let head: String = sender.chars().take(SENDER_MAXLEN).collect();
+        format!("{head}…")
+    } else {
+        sender.to_string()
+    };
+    let hhmm = {
+        use chrono::TimeZone;
+        chrono::Local
+            .timestamp_opt(ts as i64, 0)
+            .single()
+            .map(|dt| dt.format("%H:%M").to_string())
+            .unwrap_or_else(|| "--:--".into())
+    };
+    let mark = if redelivered { " (재배달)" } else { "" };
+    format!("[CH:{channel}|{short}|{hhmm}|#{inbox_id}]{mark} {text}")
+}
+
+fn p_str(params: &Value, key: &str) -> Option<String> {
+    params.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
+}
+fn p_i64(params: &Value, key: &str) -> Option<i64> {
+    params
+        .get(key)
+        .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+}
+fn p_f64(params: &Value, key: &str) -> Option<f64> {
+    params
+        .get(key)
+        .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+}
+
+/// pid가 속한 프로세스 그룹(unix). 브리지 스폰 그룹 소속 검증(§2.1-3 pid 핀)에 쓴다.
+#[cfg(unix)]
+fn pgid_of(pid: u32) -> Option<i32> {
+    let r = unsafe { libc::getpgid(pid as libc::pid_t) };
+    if r < 0 {
+        None
+    } else {
+        Some(r as i32)
+    }
+}
+#[cfg(windows)]
+fn pgid_of(_pid: u32) -> Option<i32> {
+    None // Windows pid-핀은 C1 WINFIX에서 대칭화 — C0은 토큰 단독(문서화).
+}
+
+/// pid 생존 프로브(unix=kill(pid,0)). windows는 best-effort(C1 WINFIX 전까지).
+#[cfg(unix)]
+fn pid_alive(pid: u32) -> bool {
+    pid != 0 && unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+#[cfg(windows)]
+fn pid_alive(pid: u32) -> bool {
+    pid != 0 // best-effort — C1 WINFIX 전까지 재스폰 감지는 reaper 스레드 신호에 의존.
+}
+
+// ── 브리지 스폰(cysd 스폰 자식·scoped 원장 등록·reaper 스레드로 zombie 회수) ────
+
+/// bridge_cmd를 새 프로세스 그룹에서 스폰하고 (pid, pgid) 반환. env로 1회용 토큰·채널·소켓 주입.
+/// scoped=true로 daemon 원장에 등록(shutdown_cleanup·reap_orphan_ledger 계약 재사용).
+/// reaper 스레드가 wait()로 zombie를 회수하고 종료 시 registered=0 마킹+bridge.exited 발행한다.
+fn spawn_bridge(
+    daemon: &Arc<Daemon>,
+    channel: &str,
+    bridge_cmd: &str,
+    token: &str,
+) -> Result<(u32, i32), String> {
+    #[cfg(unix)]
+    let mut cmd = {
+        let mut c = std::process::Command::new("sh");
+        c.arg("-c").arg(bridge_cmd);
+        c
+    };
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut c = std::process::Command::new("cmd");
+        c.arg("/C").arg(bridge_cmd);
+        c
+    };
+    cmd.env("CYS_CHANNEL_TOKEN", token)
+        .env("CYS_CHANNEL", channel)
+        .env(cys::ENV_SOCKET, daemon.socket_path.to_string_lossy().as_ref());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid(); // 새 세션/그룹 → pgid == pid, 그룹 단위 회수 가능.
+                Ok(())
+            });
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
+    }
+    let child = cmd.spawn().map_err(|e| format!("bridge spawn failed: {e}"))?;
+    let pid = child.id();
+    let pgid = pid as i32; // setsid → pgid == pid(unix); windows는 pid 사용.
+
+    // scoped 원장 등록 — surface_id=None(소유 surface 없음). reap_orphan_ledger는 surface_id
+    // Some일 때만 '소유 surface 소멸' kill을 하므로 None은 pid 사망 시에만 원장에서 제거된다.
+    // shutdown_cleanup(collect_scoped_for_shutdown)은 scoped 전량을 pgid로 회수 → 데몬 종료 시
+    // 브리지 트리 동반 종료(§2.1-6).
+    daemon.ledger.lock().unwrap().insert(
+        pid,
+        LedgerEntry {
+            pid,
+            pgid,
+            cmd: format!("channel-bridge:{channel}"),
+            surface_id: None,
+            scoped: true,
+            registered_at: now(),
+            caps: None,
+            health: ProcessHealth::Reusable,
+        },
+    );
+
+    // reaper 스레드: 블로킹 wait()로 zombie 회수 + 종료 신호. std 스레드라 tokio 런타임 비의존
+    // (RPC 동기 경로·sweep 동기 경로 어디서 스폰해도 안전).
+    let d = Arc::clone(daemon);
+    let ch = channel.to_string();
+    let mut child = child;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+        on_bridge_exit(&d, &ch, pid);
+    });
+    Ok((pid, pgid))
+}
+
+/// 브리지 종료 콜백 — 현재 채널 scoped_pid가 이 pid일 때만(=새 스폰이 교체하지 않았을 때만)
+/// registered=0 마킹 + channel.bridge.exited 발행. 원장 항목도 제거. 재스폰은 sweep 정책 소관.
+fn on_bridge_exit(daemon: &Arc<Daemon>, channel: &str, pid: u32) {
+    {
+        let guard = daemon.channels.lock().unwrap();
+        if let Some(conn) = guard.as_ref() {
+            let cur: Option<i64> = conn
+                .query_row(
+                    "SELECT scoped_pid FROM channels WHERE channel=?1",
+                    [channel],
+                    |r| r.get(0),
+                )
+                .optional()
+                .ok()
+                .flatten();
+            if cur != Some(pid as i64) {
+                return; // 이미 재스폰이 교체함 — 이 종료는 구 프로세스라 무시.
+            }
+            let _ = conn.execute(
+                "UPDATE channels SET registered=0, updated_ts=?2 WHERE channel=?1",
+                params![channel, now()],
+            );
+        } else {
+            return;
+        }
+    }
+    daemon.ledger.lock().unwrap().remove(&pid);
+    daemon.bus.publish(
+        "channel.bridge.exited",
+        "channel",
+        None,
+        json!({"channel": channel, "pid": pid}),
+    );
+}
+
+// ── RPC 위임 ─────────────────────────────────────────────────────────────────
+
+/// dispatch에서 `channel.<sub>` 전량을 여기로 위임한다(match 비대화 방지·모듈 자기완결).
+pub fn handle(daemon: &Arc<Daemon>, sub: &str, params: &Value, id: &Value, caller_pid: Option<u32>) -> Reply {
+    let mut guard = daemon.channels.lock().unwrap();
+    let Some(conn) = guard.as_mut() else {
+        return Reply::Single(err_response(
+            id,
+            "channels_disabled",
+            "channels module unavailable (channels.db open failed)",
+        ));
+    };
+    let resp: Value = match sub {
+        "start" => start(daemon, conn, params, id),
+        "stop" => stop(daemon, conn, params, id),
+        "register" => register(daemon, conn, params, id, caller_pid),
+        "inbound" => inbound(daemon, conn, params, id, caller_pid),
+        "outbound" => outbound(daemon, conn, params, id),
+        "receipt" => receipt(daemon, conn, params, id),
+        "ack" => ack(conn, params, id),
+        "allow" => allow(conn, params, id),
+        "revoke" => revoke(conn, params, id),
+        "lockdown" => lockdown(daemon, conn, id),
+        "status" => status(conn, id),
+        other => err_response(id, "unknown_method", &format!("unknown channel method: channel.{other}")),
+    };
+    Reply::Single(resp)
+}
+
+fn meta_get(conn: &Connection, key: &str) -> Option<String> {
+    conn.query_row("SELECT value FROM meta WHERE key=?1", [key], |r| r.get(0))
+        .optional()
+        .ok()
+        .flatten()
+}
+fn meta_set(conn: &Connection, key: &str, val: &str) {
+    let _ = conn.execute(
+        "INSERT INTO meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=?2",
+        params![key, val],
+    );
+}
+fn lockdown_active(conn: &Connection) -> bool {
+    meta_get(conn, "lockdown").as_deref() == Some("1")
+}
+
+// ── channel.start / stop ─────────────────────────────────────────────────────
+
+fn start(daemon: &Arc<Daemon>, conn: &mut Connection, params: &Value, id: &Value) -> Value {
+    let Some(channel) = p_str(params, "channel") else {
+        return err_response(id, "invalid_params", "missing channel");
+    };
+    // 동일 채널 활성 레코드 존재 시 거부(§2.1-4 이중 연결 금지).
+    let existing: Option<(i64, Option<i64>)> = conn
+        .query_row(
+            "SELECT enabled, scoped_pid FROM channels WHERE channel=?1",
+            [&channel],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .ok()
+        .flatten();
+    if let Some((1, Some(pid))) = existing {
+        if pid_alive(pid as u32) {
+            return err_response(
+                id,
+                "channel_active",
+                &format!("channel '{channel}' already active (pid {pid}) — stop first"),
+            );
+        }
+    }
+    // bridge_cmd: --cmd로 신규 등록하거나 기록된 것 재사용. 둘 다 없으면 스폰 불가.
+    let bridge_cmd = p_str(params, "cmd").or_else(|| {
+        conn.query_row("SELECT bridge_cmd FROM channels WHERE channel=?1", [&channel], |r| r.get::<_, Option<String>>(0))
+            .optional()
+            .ok()
+            .flatten()
+            .flatten()
+    });
+    let Some(bridge_cmd) = bridge_cmd else {
+        return err_response(id, "invalid_params", "no bridge command (pass --cmd on first start)");
+    };
+    let token = random_token_hex();
+    let token_hash = hex_sha256(token.as_bytes());
+    let (pid, pgid) = match spawn_bridge(daemon, &channel, &bridge_cmd, &token) {
+        Ok(v) => v,
+        Err(e) => return err_response(id, "spawn_failed", &e),
+    };
+    let ts = now();
+    let r = conn.execute(
+        "INSERT INTO channels(channel, enabled, bridge_cmd, scoped_pid, scoped_pgid, token_hash, registered, last_spawn_ts, updated_ts)
+         VALUES(?1,1,?2,?3,?4,?5,0,?6,?6)
+         ON CONFLICT(channel) DO UPDATE SET
+            enabled=1, bridge_cmd=?2, scoped_pid=?3, scoped_pgid=?4, token_hash=?5, registered=0,
+            last_spawn_ts=?6, updated_ts=?6",
+        params![channel, bridge_cmd, pid as i64, pgid as i64, token_hash, ts],
+    );
+    if let Err(e) = r {
+        // DB 반영 실패 = 브리지 생명주기를 추적 불가 → 즉시 회수(고아 방지).
+        crate::governance::kill_group_or_pid(pid, pgid);
+        daemon.ledger.lock().unwrap().remove(&pid);
+        return err_response(id, "db_error", &format!("persist failed, bridge killed: {e}"));
+    }
+    // start가 명시 owner 동작이므로 이 채널의 lockdown 잔재는 없다고 보되, 전역 lockdown은
+    // 명시 재개 신호로 해제하지 않는다(안전측 — lockdown 해제는 별도 owner 결정).
+    ok_response(id, json!({"channel": channel, "pid": pid, "pgid": pgid, "started": true}))
+}
+
+fn stop(daemon: &Arc<Daemon>, conn: &mut Connection, params: &Value, id: &Value) -> Value {
+    let Some(channel) = p_str(params, "channel") else {
+        return err_response(id, "invalid_params", "missing channel");
+    };
+    let row: Option<(Option<i64>, Option<i64>)> = conn
+        .query_row(
+            "SELECT scoped_pid, scoped_pgid FROM channels WHERE channel=?1",
+            [&channel],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .ok()
+        .flatten();
+    if let Some((Some(pid), pgid)) = row {
+        crate::governance::kill_group_or_pid(pid as u32, pgid.unwrap_or(pid) as i32);
+        daemon.ledger.lock().unwrap().remove(&(pid as u32));
+    }
+    let _ = conn.execute(
+        "UPDATE channels SET enabled=0, registered=0, scoped_pid=NULL, scoped_pgid=NULL, updated_ts=?2 WHERE channel=?1",
+        params![channel, now()],
+    );
+    ok_response(id, json!({"channel": channel, "stopped": true}))
+}
+
+// ── channel.register ─────────────────────────────────────────────────────────
+
+fn register(daemon: &Arc<Daemon>, conn: &mut Connection, params: &Value, id: &Value, caller_pid: Option<u32>) -> Value {
+    let Some(channel) = p_str(params, "channel") else {
+        return err_response(id, "invalid_params", "missing channel");
+    };
+    let Some(token) = p_str(params, "token") else {
+        return err_response(id, "invalid_params", "missing token");
+    };
+    let row: Option<(String, Option<i64>)> = conn
+        .query_row(
+            "SELECT token_hash, scoped_pgid FROM channels WHERE channel=?1 AND enabled=1",
+            [&channel],
+            |r| Ok((r.get::<_, Option<String>>(0)?.unwrap_or_default(), r.get(1)?)),
+        )
+        .optional()
+        .ok()
+        .flatten();
+    let Some((token_hash, scoped_pgid)) = row else {
+        return err_response(id, "not_started", &format!("channel '{channel}' is not started"));
+    };
+    // ① 토큰 해시 일치(§2.1-3).
+    if hex_sha256(token.as_bytes()) != token_hash {
+        daemon.bus.publish(
+            "channel.auth.denied",
+            "channel",
+            None,
+            json!({"channel": channel, "reason": "token mismatch", "caller_pid": caller_pid}),
+        );
+        return err_response(id, "auth_denied", "token mismatch");
+    }
+    // ② caller_pid가 스폰 pgid 소속(pid 핀). unix 전용 — windows는 토큰 단독(C1 WINFIX).
+    #[cfg(unix)]
+    {
+        let ok = caller_pid
+            .and_then(pgid_of)
+            .zip(scoped_pgid)
+            .map(|(cg, sg)| cg as i64 == sg)
+            .unwrap_or(false);
+        if !ok {
+            daemon.bus.publish(
+                "channel.auth.denied",
+                "channel",
+                None,
+                json!({"channel": channel, "reason": "caller pid not in spawn process group",
+                       "caller_pid": caller_pid, "scoped_pgid": scoped_pgid}),
+            );
+            return err_response(id, "auth_denied", "caller pid not in bridge spawn process group");
+        }
+    }
+    #[cfg(windows)]
+    let _ = scoped_pgid;
+    let bridge_ver = p_str(params, "bridge_ver");
+    let caps = p_str(params, "caps");
+    let _ = conn.execute(
+        "UPDATE channels SET registered=1, bridge_ver=?2, caps=?3, updated_ts=?4 WHERE channel=?1",
+        params![channel, bridge_ver, caps, now()],
+    );
+    // §2.1-5 S1: 응답에 pending outbound 전량 동봉(재스폰 갭 중 발행분 재조정·outbound_id dedupe).
+    let pending = pending_outbound(conn, &channel);
+    daemon.bus.publish(
+        "channel.registered",
+        "channel",
+        None,
+        json!({"channel": channel, "bridge_ver": bridge_ver, "pending": pending.len()}),
+    );
+    ok_response(id, json!({"channel": channel, "registered": true, "pending": pending}))
+}
+
+fn pending_outbound(conn: &Connection, channel: &str) -> Vec<Value> {
+    let mut out = Vec::new();
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT id, target, kind, body, reply_to, idempotency_key, retry_of,
+                approval_feed_id, approval_nonce, approval_owner
+         FROM outbound WHERE channel=?1 AND outcome='pending' ORDER BY id",
+    ) {
+        if let Ok(rows) = stmt.query_map([channel], |r| {
+            Ok(json!({
+                "outbound_id": r.get::<_, i64>(0)?,
+                "target": r.get::<_, String>(1)?,
+                "kind": r.get::<_, String>(2)?,
+                "body": r.get::<_, String>(3)?,
+                "reply_to": r.get::<_, Option<String>>(4)?,
+                "idempotency_key": r.get::<_, String>(5)?,
+                "retry_of": r.get::<_, Option<i64>>(6)?,
+                "approval": approval_json(
+                    r.get::<_, Option<String>>(7)?,
+                    r.get::<_, Option<String>>(8)?,
+                    r.get::<_, Option<String>>(9)?,
+                ),
+            }))
+        }) {
+            for row in rows.flatten() {
+                out.push(row);
+            }
+        }
+    }
+    out
+}
+
+fn approval_json(feed_id: Option<String>, nonce: Option<String>, owner: Option<String>) -> Value {
+    if feed_id.is_none() && nonce.is_none() && owner.is_none() {
+        Value::Null
+    } else {
+        json!({"feed_id": feed_id, "nonce": nonce, "owner_sender_id": owner})
+    }
+}
+
+// ── channel.inbound — inbox-first 내구 퍼널(§2.2 ①~⑤) ─────────────────────────
+
+fn inbound(daemon: &Arc<Daemon>, conn: &mut Connection, params: &Value, id: &Value, caller_pid: Option<u32>) -> Value {
+    let Some(channel) = p_str(params, "channel") else {
+        return err_response(id, "invalid_params", "missing channel");
+    };
+    let Some(idempotency_key) = p_str(params, "idempotency_key") else {
+        return err_response(id, "invalid_params", "missing idempotency_key");
+    };
+    let text = p_str(params, "text").unwrap_or_default();
+    let sender_id = p_str(params, "sender_id").unwrap_or_default();
+    let sender_kind = p_str(params, "sender_kind").unwrap_or_else(|| "user".into());
+    let peer = p_str(params, "peer");
+    let msg_ref = p_str(params, "msg_ref");
+    let ts = p_f64(params, "ts").unwrap_or_else(now);
+    // body_hash: 브리지 제공값 우선, 없으면 text로 산출(계약 명세 — S3).
+    let body_hash = p_str(params, "body_hash").unwrap_or_else(|| hex_sha256(text.as_bytes()));
+
+    // lockdown 중이면 인바운드 전면 차단(§2.4-5).
+    if lockdown_active(conn) {
+        return err_response(id, "locked", "channel layer is in lockdown");
+    }
+
+    // ── ① 인가: 채널 enabled+registered + caller_pid가 스폰 pgid 소속(pid 핀) ──
+    let auth: Option<(i64, i64, Option<i64>)> = conn
+        .query_row(
+            "SELECT enabled, registered, scoped_pgid FROM channels WHERE channel=?1",
+            [&channel],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()
+        .ok()
+        .flatten();
+    let Some((enabled, registered, scoped_pgid)) = auth else {
+        return err_response(id, "not_registered", &format!("channel '{channel}' unknown"));
+    };
+    if enabled != 1 || registered != 1 {
+        return err_response(id, "not_registered", &format!("channel '{channel}' not registered/enabled"));
+    }
+    #[cfg(unix)]
+    {
+        let ok = caller_pid
+            .and_then(pgid_of)
+            .zip(scoped_pgid)
+            .map(|(cg, sg)| cg as i64 == sg)
+            .unwrap_or(false);
+        if !ok {
+            daemon.bus.publish(
+                "channel.auth.denied",
+                "channel",
+                None,
+                json!({"channel": channel, "reason": "inbound caller not in bridge group",
+                       "caller_pid": caller_pid}),
+            );
+            return err_response(id, "auth_denied", "inbound caller pid not in bridge spawn process group");
+        }
+    }
+    #[cfg(windows)]
+    let _ = (caller_pid, scoped_pgid);
+
+    // 이하 판정·적재는 단일 트랜잭션(dedupe check+insert 원자성).
+    let tx = match conn.transaction() {
+        Ok(t) => t,
+        Err(e) => return err_response(id, "db_error", &e.to_string()),
+    };
+
+    // ── ② dedupe: 같은 (channel, key) 존재 시 body_hash 비교 ──
+    let prior: Option<(String, String)> = tx
+        .query_row(
+            "SELECT body_hash, verdict FROM inbound WHERE channel=?1 AND idempotency_key=?2",
+            params![channel, idempotency_key],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .ok()
+        .flatten();
+    if let Some((prior_hash, prior_verdict)) = prior {
+        if prior_hash == body_hash {
+            let _ = tx.commit();
+            return ok_response(id, json!({"action": "dup", "verdict": prior_verdict}));
+        } else {
+            let _ = tx.commit();
+            // 같은 키·다른 해시 = 조용한 드롭 금지, 경보(S3·O11).
+            daemon.bus.publish(
+                "channel.dedup.conflict",
+                "channel",
+                None,
+                json!({"channel": channel, "idempotency_key": idempotency_key,
+                       "prior_hash": prior_hash, "new_hash": body_hash}),
+            );
+            return err_response(id, "dedup_conflict", "same idempotency_key with different body_hash");
+        }
+    }
+
+    // ── ③ 봇루프: sender_kind=bot이면 20건/60s 슬라이딩 윈도우 ──
+    if sender_kind == "bot" {
+        let _ = tx.execute(
+            "INSERT INTO loopwin(channel, sender_id, ts) VALUES(?1,?2,?3)",
+            params![channel, sender_id, ts],
+        );
+        let cnt: u64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM loopwin WHERE channel=?1 AND sender_id=?2 AND ts >= ?3",
+                params![channel, sender_id, ts - LOOP_WINDOW_SECS],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if loop_suppressed(cnt, LOOP_LIMIT) {
+            let _ = tx.execute(
+                "INSERT INTO inbound(channel, idempotency_key, body_hash, sender_id, sender_kind, peer, msg_ref, ts, verdict)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'loop_suppressed')",
+                params![channel, idempotency_key, body_hash, sender_id, sender_kind, peer, msg_ref, ts],
+            );
+            let _ = tx.commit();
+            daemon.bus.publish(
+                "channel.loop.suppressed",
+                "channel",
+                None,
+                json!({"channel": channel, "sender_id": sender_id, "count": cnt, "limit": LOOP_LIMIT}),
+            );
+            return ok_response(id, json!({"action": "suppressed", "count": cnt}));
+        }
+    }
+
+    // ── ④ owner-only fail-closed: allowlist(channel, sender_id) 존재해야 통과 ──
+    let allowed: bool = tx
+        .query_row(
+            "SELECT 1 FROM allowlist WHERE channel=?1 AND sender_id=?2",
+            params![channel, sender_id],
+            |_| Ok(()),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .is_some();
+    if !allowed {
+        let _ = tx.execute(
+            "INSERT INTO inbound(channel, idempotency_key, body_hash, sender_id, sender_kind, peer, msg_ref, ts, verdict)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'denied')",
+            params![channel, idempotency_key, body_hash, sender_id, sender_kind, peer, msg_ref, ts],
+        );
+        let _ = tx.execute(
+            "UPDATE channels SET last_in_ts=?2 WHERE channel=?1",
+            params![channel, ts],
+        );
+        let _ = tx.commit();
+        daemon.bus.publish(
+            "channel.auth.denied",
+            "channel",
+            None,
+            json!({"channel": channel, "sender_id": sender_id, "reason": "not in owner allowlist"}),
+        );
+        return ok_response(id, json!({"action": "deny", "reason": "sender not in owner allowlist"}));
+    }
+
+    // ── ⑤ inbox 적재(state=new, 단조 id) + 인바운드 원장(accepted) ──
+    if tx
+        .execute(
+            "INSERT INTO inbox(channel, sender_id, text, state, created_ts) VALUES(?1,?2,?3,'new',?4)",
+            params![channel, sender_id, text, ts],
+        )
+        .is_err()
+    {
+        return err_response(id, "db_error", "inbox insert failed");
+    }
+    let inbox_id = tx.last_insert_rowid();
+    let _ = tx.execute(
+        "INSERT INTO inbound(channel, idempotency_key, body_hash, sender_id, sender_kind, peer, msg_ref, ts, verdict)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'accepted')",
+        params![channel, idempotency_key, body_hash, sender_id, sender_kind, peer, msg_ref, ts],
+    );
+    let _ = tx.execute(
+        "UPDATE channels SET last_in_ts=?2 WHERE channel=?1",
+        params![channel, ts],
+    );
+    if let Err(e) = tx.commit() {
+        return err_response(id, "db_error", &e.to_string());
+    }
+
+    // 즉시 배달 시도(master 가용+비-quiescing이면 주입, 아니면 queued 유지).
+    let delivered = deliver_new_inbox(daemon, conn);
+    let action = if delivered.contains(&inbox_id) { "delivered" } else { "queued" };
+    let evt = if action == "delivered" { "channel.message" } else { "channel.message.queued" };
+    daemon.bus.publish(
+        evt,
+        "channel",
+        None,
+        json!({"channel": channel, "inbox_id": inbox_id, "sender_id": sender_id}),
+    );
+    ok_response(id, json!({"action": action, "inbox_id": inbox_id}))
+}
+
+// ── inbox 배달기(§2.2 배달 상태기계) ─────────────────────────────────────────
+
+/// master surface가 (a) resolve_role 성공 (b) quiescing 아님 이면 그 surface_id, 아니면 None.
+fn deliverable_master(daemon: &Arc<Daemon>) -> Option<u64> {
+    let sid = {
+        let roles = daemon.roles.lock().unwrap();
+        roles.get("master").copied()?
+    };
+    let surface = daemon.get_surface(sid)?;
+    if surface.exited.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    // quiescing 게이트(S5): 자기보고 상태가 quiescing이면 주입 보류.
+    let quiescing = surface
+        .agent_status
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|s| s.state == "quiescing")
+        .unwrap_or(false);
+    if quiescing {
+        return None;
+    }
+    Some(sid)
+}
+
+/// master stdin에 봉투를 주입(bracketed paste + Return). schedule.rs inject와 동형.
+fn inject_master(daemon: &Arc<Daemon>, sid: u64, envelope: &str) -> bool {
+    let Some(surface) = daemon.get_surface(sid) else {
+        return false;
+    };
+    surface
+        .write_tx
+        .try_send(crate::state::WriteReq::Inject {
+            text: envelope.to_string(),
+            cr_delay_ms: 500,
+            clear_first: false,
+        })
+        .is_ok()
+}
+
+/// state=new inbox 항목을 단조 id 순서로 배달(master 가용+비-quiescing일 때만). 배달된 inbox_id들 반환.
+fn deliver_new_inbox(daemon: &Arc<Daemon>, conn: &Connection) -> Vec<i64> {
+    let mut delivered = Vec::new();
+    let Some(sid) = deliverable_master(daemon) else {
+        return delivered; // master 부재/quiescing → 적재만(queued).
+    };
+    let rows: Vec<(i64, String, String, f64)> = {
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT id, channel, sender_id, created_ts FROM inbox WHERE state='new' ORDER BY id",
+        ) else {
+            return delivered;
+        };
+        let mapped = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                r.get::<_, f64>(3)?,
+            ))
+        });
+        match mapped {
+            Ok(m) => m.flatten().collect(),
+            Err(_) => return delivered,
+        }
+    };
+    for (inbox_id, channel, sender_id, created_ts) in rows {
+        let text: String = conn
+            .query_row("SELECT text FROM inbox WHERE id=?1", [inbox_id], |r| r.get(0))
+            .unwrap_or_default();
+        let env = envelope(&channel, &sender_id, created_ts, inbox_id, false, &text);
+        if inject_master(daemon, sid, &env) {
+            let _ = conn.execute(
+                "UPDATE inbox SET state='injected', injected_ts=?2 WHERE id=?1",
+                params![inbox_id, now()],
+            );
+            delivered.push(inbox_id);
+        } else {
+            break; // 주입 채널 정체 — 다음 sweep에서 재시도(순서 보존).
+        }
+    }
+    delivered
+}
+
+/// un-acked 재배달 sweep(§2.2): injected 후 TTL 초과 미-ack 항목을 재주입(`(재배달)` 표기).
+fn redeliver_unacked(daemon: &Arc<Daemon>, conn: &Connection) -> usize {
+    let Some(sid) = deliverable_master(daemon) else {
+        return 0;
+    };
+    let now = now();
+    let rows: Vec<(i64, String, String, f64)> = conn
+        .prepare(
+            "SELECT id, channel, sender_id, created_ts FROM inbox
+             WHERE state='injected' AND injected_ts IS NOT NULL AND (?1 - injected_ts) >= ?2 ORDER BY id",
+        )
+        .and_then(|mut stmt| {
+            stmt.query_map(params![now, INBOX_REDELIVER_TTL_SECS], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    r.get::<_, f64>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .unwrap_or_default();
+    let mut n = 0;
+    for (inbox_id, channel, sender_id, created_ts) in rows {
+        let text: String = conn
+            .query_row("SELECT text FROM inbox WHERE id=?1", [inbox_id], |r| r.get(0))
+            .unwrap_or_default();
+        let env = envelope(&channel, &sender_id, created_ts, inbox_id, true, &text);
+        if inject_master(daemon, sid, &env) {
+            let _ = conn.execute(
+                "UPDATE inbox SET injected_ts=?2, redelivered=1 WHERE id=?1",
+                params![inbox_id, now],
+            );
+            n += 1;
+        }
+    }
+    n
+}
+
+// ── channel.ack ──────────────────────────────────────────────────────────────
+
+fn ack(conn: &mut Connection, params: &Value, id: &Value) -> Value {
+    let Some(inbox_id) = p_i64(params, "inbox_id") else {
+        return err_response(id, "invalid_params", "missing inbox_id");
+    };
+    // ack 시 text 소거(프라이버시-바이-디자인·O7 — 배달 완료 후 본문 비보관).
+    let n = conn
+        .execute(
+            "UPDATE inbox SET state='acked', acked_ts=?2, text='' WHERE id=?1 AND state!='acked'",
+            params![inbox_id, now()],
+        )
+        .unwrap_or(0);
+    if n == 0 {
+        return err_response(id, "not_found", &format!("no un-acked inbox item {inbox_id}"));
+    }
+    ok_response(id, json!({"inbox_id": inbox_id, "acked": true}))
+}
+
+// ── channel.outbound — 단조 상태기계 + at-least-once(§2.3) ────────────────────
+
+fn outbound(daemon: &Arc<Daemon>, conn: &mut Connection, params: &Value, id: &Value) -> Value {
+    let Some(channel) = p_str(params, "channel") else {
+        return err_response(id, "invalid_params", "missing channel");
+    };
+    let Some(target) = p_str(params, "target") else {
+        return err_response(id, "invalid_params", "missing target");
+    };
+    let Some(idempotency_key) = p_str(params, "idempotency_key") else {
+        return err_response(id, "invalid_params", "missing idempotency_key");
+    };
+    let kind = p_str(params, "kind").unwrap_or_else(|| "message".into());
+    let body = p_str(params, "body").unwrap_or_default();
+    let reply_to = p_str(params, "reply_to");
+    let retry_of = p_i64(params, "retry_of");
+    let (ap_feed, ap_nonce, ap_owner) = match params.get("approval") {
+        Some(a) if a.is_object() => (
+            a.get("feed_id").and_then(|v| v.as_str()).map(String::from),
+            a.get("nonce").and_then(|v| v.as_str()).map(String::from),
+            a.get("owner_sender_id").and_then(|v| v.as_str()).map(String::from),
+        ),
+        _ => (None, None, None),
+    };
+
+    // owner allowlist 대상만(fail-closed) — target이 allowlist에 없으면 발신 거부.
+    let allowed: bool = conn
+        .query_row(
+            "SELECT 1 FROM allowlist WHERE channel=?1 AND sender_id=?2",
+            params![channel, target],
+            |_| Ok(()),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .is_some();
+    if !allowed {
+        return err_response(id, "target_not_allowed", "outbound target not in owner allowlist (fail-closed)");
+    }
+
+    // idempotency(§2.3): 같은 (channel, key) 재호출 = 기존 행 outcome 반환(신규 생성 안 함).
+    let existing: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT id, outcome FROM outbound WHERE channel=?1 AND idempotency_key=?2",
+            params![channel, idempotency_key],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .ok()
+        .flatten();
+    if let Some((oid, outcome)) = existing {
+        return ok_response(id, json!({"outbound_id": oid, "outcome": outcome, "idempotent": true}));
+    }
+
+    let ts = now();
+    if conn
+        .execute(
+            "INSERT INTO outbound(channel, target, kind, body, reply_to, idempotency_key, retry_of, outcome,
+                                  approval_feed_id, approval_nonce, approval_owner, created_ts, updated_ts)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,'pending',?8,?9,?10,?11,?11)",
+            params![channel, target, kind, body, reply_to, idempotency_key, retry_of,
+                    ap_feed, ap_nonce, ap_owner, ts],
+        )
+        .is_err()
+    {
+        return err_response(id, "db_error", "outbound insert failed");
+    }
+    let oid = conn.last_insert_rowid();
+    let _ = conn.execute(
+        "UPDATE channels SET last_out_ts=?2 WHERE channel=?1",
+        params![channel, ts],
+    );
+    // 브리지가 구독할 전문 이벤트(channel.outbound.<ch>) — payload에 outbound_id·전문.
+    daemon.bus.publish(
+        &format!("channel.outbound.{channel}"),
+        "channel",
+        None,
+        json!({"outbound_id": oid, "channel": channel, "target": target, "kind": kind,
+               "body": body, "reply_to": reply_to, "idempotency_key": idempotency_key,
+               "retry_of": retry_of, "approval": approval_json(ap_feed, ap_nonce, ap_owner)}),
+    );
+    ok_response(id, json!({"outbound_id": oid, "outcome": "pending"}))
+}
+
+// ── channel.receipt — 단조 전이 + late_receipt 화해(§2.3) ─────────────────────
+
+fn receipt(daemon: &Arc<Daemon>, conn: &mut Connection, params: &Value, id: &Value) -> Value {
+    let Some(oid) = p_i64(params, "outbound_id") else {
+        return err_response(id, "invalid_params", "missing outbound_id");
+    };
+    let Some(outcome) = p_str(params, "outcome") else {
+        return err_response(id, "invalid_params", "missing outcome");
+    };
+    const TERMINAL: [&str; 5] = ["sent", "suppressed", "partial_failed", "failed", "unknown"];
+    if !TERMINAL.contains(&outcome.as_str()) {
+        return err_response(id, "invalid_params", &format!("outcome must be one of {TERMINAL:?}"));
+    }
+    let platform_ref = p_str(params, "platform_ref");
+    let detail = p_str(params, "detail");
+    let current: Option<String> = conn
+        .query_row("SELECT outcome FROM outbound WHERE id=?1", [oid], |r| r.get(0))
+        .optional()
+        .ok()
+        .flatten();
+    let Some(current) = current else {
+        return err_response(id, "not_found", &format!("no outbound {oid}"));
+    };
+    if receipt_is_late(&current) {
+        // 이미 terminal — 상태 불변, late_receipt 화해 레코드 + 이벤트(§2.3).
+        let _ = conn.execute(
+            "INSERT INTO late_receipt(outbound_id, outcome, platform_ref, detail, ts) VALUES(?1,?2,?3,?4,?5)",
+            params![oid, outcome, platform_ref, detail, now()],
+        );
+        daemon.bus.publish(
+            "channel.receipt.late",
+            "channel",
+            None,
+            json!({"outbound_id": oid, "current": current, "late_outcome": outcome}),
+        );
+        return ok_response(id, json!({"outbound_id": oid, "outcome": current, "late": true}));
+    }
+    // pending → terminal(단조 1회).
+    let _ = conn.execute(
+        "UPDATE outbound SET outcome=?2, platform_ref=?3, detail=?4, updated_ts=?5 WHERE id=?1",
+        params![oid, outcome, platform_ref, detail, now()],
+    );
+    if outcome == "failed" {
+        daemon.bus.publish(
+            "channel.receipt.failed",
+            "channel",
+            None,
+            json!({"outbound_id": oid, "detail": detail}),
+        );
+    }
+    ok_response(id, json!({"outbound_id": oid, "outcome": outcome, "late": false}))
+}
+
+// ── channel.allow / revoke ───────────────────────────────────────────────────
+
+fn allow(conn: &mut Connection, params: &Value, id: &Value) -> Value {
+    let (Some(channel), Some(sender_id)) = (p_str(params, "channel"), p_str(params, "sender_id")) else {
+        return err_response(id, "invalid_params", "missing channel or sender_id");
+    };
+    let _ = conn.execute(
+        "INSERT INTO allowlist(channel, sender_id, added_ts) VALUES(?1,?2,?3)
+         ON CONFLICT(channel, sender_id) DO NOTHING",
+        params![channel, sender_id, now()],
+    );
+    ok_response(id, json!({"channel": channel, "sender_id": sender_id, "allowed": true}))
+}
+
+fn revoke(conn: &mut Connection, params: &Value, id: &Value) -> Value {
+    let (Some(channel), Some(sender_id)) = (p_str(params, "channel"), p_str(params, "sender_id")) else {
+        return err_response(id, "invalid_params", "missing channel or sender_id");
+    };
+    let n = conn
+        .execute(
+            "DELETE FROM allowlist WHERE channel=?1 AND sender_id=?2",
+            params![channel, sender_id],
+        )
+        .unwrap_or(0);
+    ok_response(id, json!({"channel": channel, "sender_id": sender_id, "revoked": n > 0}))
+}
+
+// ── channel.lockdown — 전 채널 즉시 정지·인바운드 전면 차단(§2.4-5) ───────────
+
+fn lockdown(daemon: &Arc<Daemon>, conn: &mut Connection, id: &Value) -> Value {
+    let rows: Vec<(Option<i64>, Option<i64>)> = conn
+        .prepare("SELECT scoped_pid, scoped_pgid FROM channels WHERE enabled=1")
+        .and_then(|mut stmt| {
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .unwrap_or_default();
+    let mut killed = 0;
+    for (pid, pgid) in &rows {
+        if let Some(pid) = pid {
+            crate::governance::kill_group_or_pid(*pid as u32, pgid.unwrap_or(*pid) as i32);
+            daemon.ledger.lock().unwrap().remove(&(*pid as u32));
+            killed += 1;
+        }
+    }
+    let _ = conn.execute(
+        "UPDATE channels SET enabled=0, registered=0, scoped_pid=NULL, scoped_pgid=NULL, updated_ts=?1",
+        params![now()],
+    );
+    meta_set(conn, "lockdown", "1");
+    daemon.bus.publish(
+        "channel.lockdown",
+        "channel",
+        None,
+        json!({"channels_stopped": rows.len(), "bridges_killed": killed}),
+    );
+    ok_response(id, json!({"lockdown": true, "channels_stopped": rows.len(), "bridges_killed": killed}))
+}
+
+// ── channel.status ───────────────────────────────────────────────────────────
+
+fn status(conn: &Connection, id: &Value) -> Value {
+    let mut channels = Vec::new();
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT channel, enabled, registered, scoped_pid, bridge_ver, last_in_ts, last_out_ts FROM channels ORDER BY channel",
+    ) {
+        if let Ok(rows) = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, Option<i64>>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, Option<f64>>(5)?,
+                r.get::<_, Option<f64>>(6)?,
+            ))
+        }) {
+            for (channel, enabled, registered, pid, bridge_ver, last_in, last_out) in rows.flatten() {
+                let alive = pid.map(|p| pid_alive(p as u32)).unwrap_or(false);
+                // outcome 분포
+                let mut outcomes = serde_json::Map::new();
+                if let Ok(mut s2) = conn.prepare(
+                    "SELECT outcome, COUNT(*) FROM outbound WHERE channel=?1 GROUP BY outcome",
+                ) {
+                    if let Ok(rr) = s2.query_map([&channel], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))) {
+                        for (oc, c) in rr.flatten() {
+                            outcomes.insert(oc, json!(c));
+                        }
+                    }
+                }
+                // inbox 상태 카운트
+                let mut inbox = serde_json::Map::new();
+                if let Ok(mut s3) = conn.prepare(
+                    "SELECT state, COUNT(*) FROM inbox WHERE channel=?1 GROUP BY state",
+                ) {
+                    if let Ok(rr) = s3.query_map([&channel], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))) {
+                        for (st, c) in rr.flatten() {
+                            inbox.insert(st, json!(c));
+                        }
+                    }
+                }
+                let allow_n: i64 = conn
+                    .query_row("SELECT COUNT(*) FROM allowlist WHERE channel=?1", [&channel], |r| r.get(0))
+                    .unwrap_or(0);
+                channels.push(json!({
+                    "channel": channel, "enabled": enabled == 1, "registered": registered == 1,
+                    "alive": alive, "pid": pid, "bridge_ver": bridge_ver,
+                    "last_in_ts": last_in, "last_out_ts": last_out,
+                    "outcomes": Value::Object(outcomes), "inbox": Value::Object(inbox),
+                    "allowlist": allow_n,
+                }));
+            }
+        }
+    }
+    ok_response(id, json!({"channels": channels, "lockdown": lockdown_active(conn)}))
+}
+
+// ── 부팅 재조정(reconcile) — §2.1-2 ─────────────────────────────────────────
+
+/// cysd 기동 시 enabled=1 채널마다: ①기록된 pgid 생존 시 고아 선-kill ②새 토큰으로 재스폰
+/// ③channel.reconciled 발행. lockdown 중이면 재스폰 보류(안전측 — lockdown은 재부팅에도 유지).
+pub fn reconcile(daemon: &Arc<Daemon>) {
+    let mut guard = daemon.channels.lock().unwrap();
+    let Some(conn) = guard.as_mut() else {
+        return;
+    };
+    if lockdown_active(conn) {
+        eprintln!("[cysd] channels: lockdown active — reconcile skips respawn");
+        return;
+    }
+    let rows: Vec<(String, Option<String>, Option<i64>, Option<i64>)> = conn
+        .prepare("SELECT channel, bridge_cmd, scoped_pid, scoped_pgid FROM channels WHERE enabled=1")
+        .and_then(|mut stmt| {
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .unwrap_or_default();
+    for (channel, bridge_cmd, old_pid, old_pgid) in rows {
+        // ① 고아 선-kill(구 토큰 브리지의 이중 연결·블랙홀 차단).
+        if let Some(pid) = old_pid {
+            if pid_alive(pid as u32) {
+                crate::governance::kill_group_or_pid(pid as u32, old_pgid.unwrap_or(pid) as i32);
+            }
+            daemon.ledger.lock().unwrap().remove(&(pid as u32));
+        }
+        // ② 새 토큰으로 재스폰(bridge_cmd 있을 때만).
+        let Some(cmd) = bridge_cmd else {
+            eprintln!("[cysd] channels: '{channel}' enabled but no bridge_cmd — cannot respawn");
+            continue;
+        };
+        let token = random_token_hex();
+        let token_hash = hex_sha256(token.as_bytes());
+        match spawn_bridge(daemon, &channel, &cmd, &token) {
+            Ok((pid, pgid)) => {
+                let _ = conn.execute(
+                    "UPDATE channels SET scoped_pid=?2, scoped_pgid=?3, token_hash=?4, registered=0, last_spawn_ts=?5, updated_ts=?5 WHERE channel=?1",
+                    params![channel, pid as i64, pgid as i64, token_hash, now()],
+                );
+                daemon.bus.publish(
+                    "channel.reconciled",
+                    "channel",
+                    None,
+                    json!({"channel": channel, "pid": pid, "reason": "boot reconcile"}),
+                );
+            }
+            Err(e) => eprintln!("[cysd] channels: reconcile respawn '{channel}' failed: {e}"),
+        }
+    }
+}
+
+// ── 주기 sweep — 재배달·타임아웃·브리지 사망 재스폰 ──────────────────────────
+
+/// outbound 타임아웃 전이(순수 SQL 캡슐) — pending이 timeout 창을 넘으면 unknown(단조).
+fn sweep_outbound_timeouts(conn: &Connection, now: f64, timeout: f64) -> usize {
+    conn.execute(
+        "UPDATE outbound SET outcome='unknown', updated_ts=?1 WHERE outcome='pending' AND (?1 - created_ts) >= ?2",
+        params![now, timeout],
+    )
+    .unwrap_or(0)
+}
+
+/// loopwin 오래된 행 프룬(윈도우 밖).
+fn prune_loopwin(conn: &Connection, now: f64) {
+    let _ = conn.execute(
+        "DELETE FROM loopwin WHERE ts < ?1",
+        params![now - LOOP_WINDOW_SECS * 2.0],
+    );
+}
+
+/// enabled=1이지만 브리지 pid가 죽은 채널을 백오프 후 재스폰(§2.1-5).
+fn respawn_dead_bridges(daemon: &Arc<Daemon>, conn: &mut Connection) {
+    if lockdown_active(conn) {
+        return;
+    }
+    let now = now();
+    let rows: Vec<(String, Option<String>, Option<i64>, Option<f64>)> = conn
+        .prepare("SELECT channel, bridge_cmd, scoped_pid, last_spawn_ts FROM channels WHERE enabled=1")
+        .and_then(|mut stmt| {
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .unwrap_or_default();
+    for (channel, bridge_cmd, pid, last_spawn) in rows {
+        let dead = pid.map(|p| !pid_alive(p as u32)).unwrap_or(true);
+        if !dead {
+            continue;
+        }
+        // 백오프: 직전 스폰 후 RESPAWN_BACKOFF_SECS 미만이면 대기(크래시 루프 폭주 차단).
+        if last_spawn.map(|t| now - t < RESPAWN_BACKOFF_SECS).unwrap_or(false) {
+            continue;
+        }
+        let Some(cmd) = bridge_cmd else {
+            continue;
+        };
+        let token = random_token_hex();
+        let token_hash = hex_sha256(token.as_bytes());
+        if let Ok((npid, npgid)) = spawn_bridge(daemon, &channel, &cmd, &token) {
+            let _ = conn.execute(
+                "UPDATE channels SET scoped_pid=?2, scoped_pgid=?3, token_hash=?4, registered=0, last_spawn_ts=?5, updated_ts=?5 WHERE channel=?1",
+                params![channel, npid as i64, npgid as i64, token_hash, now],
+            );
+            daemon.bus.publish(
+                "channel.reconciled",
+                "channel",
+                None,
+                json!({"channel": channel, "pid": npid, "reason": "respawn after bridge death"}),
+            );
+        }
+    }
+}
+
+/// sweep 1틱(동기) — 테스트가 직접 호출 가능. 재배달·타임아웃·프룬·재스폰.
+fn sweep_once(daemon: &Arc<Daemon>) {
+    let mut guard = daemon.channels.lock().unwrap();
+    let Some(conn) = guard.as_mut() else {
+        return;
+    };
+    let now = now();
+    sweep_outbound_timeouts(conn, now, outbound_unknown_secs());
+    prune_loopwin(conn, now);
+    // new 배달 → un-acked 재배달(순서: 신규 우선, 그 다음 재배달).
+    deliver_new_inbox(daemon, conn);
+    redeliver_unacked(daemon, conn);
+    respawn_dead_bridges(daemon, conn);
+}
+
+/// 주기 sweep 태스크 등록(governance watchdog 패턴). main.rs 초기화에서 spawn.
+pub fn spawn_channel_sweep(daemon: Arc<Daemon>) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(SWEEP_INTERVAL_SECS));
+        loop {
+            tick.tick().await;
+            sweep_once(&daemon);
+        }
+    });
+}
+
+// ── 테스트 ───────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::Daemon;
+
+    fn tmp_daemon(tag: &str) -> Arc<Daemon> {
+        let dir = std::env::temp_dir().join(format!("cys_chan_test_{}_{}", std::process::id(), tag));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Daemon::new(dir.join("cysd.sock"))
+    }
+
+    fn call(daemon: &Arc<Daemon>, sub: &str, params: Value, caller_pid: Option<u32>) -> Value {
+        match handle(daemon, sub, &params, &json!(1), caller_pid) {
+            Reply::Single(v) => v,
+            _ => panic!("expected Single reply"),
+        }
+    }
+
+    /// 채널을 registered 상태로 만드는 헬퍼(실스폰 없이 DB 직삽입). scoped_pgid=이 프로세스 그룹
+    /// → inbound/register의 pid 핀이 own pid로 통과. 토큰은 known.
+    fn seed_registered(daemon: &Arc<Daemon>, channel: &str, token: &str) {
+        let own_pgid = own_pgid();
+        let mut g = daemon.channels.lock().unwrap();
+        let conn = g.as_mut().unwrap();
+        let th = hex_sha256(token.as_bytes());
+        conn.execute(
+            "INSERT INTO channels(channel, enabled, bridge_cmd, scoped_pid, scoped_pgid, token_hash, registered, updated_ts)
+             VALUES(?1,1,'true',?2,?3,?4,1,?5)",
+            params![channel, std::process::id() as i64, own_pgid, th, now()],
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    fn own_pgid() -> i64 {
+        unsafe { libc::getpgid(0) as i64 }
+    }
+    #[cfg(windows)]
+    fn own_pgid() -> i64 {
+        0
+    }
+    fn own_pid() -> Option<u32> {
+        Some(std::process::id())
+    }
+
+    fn inbound_params(channel: &str, sender: &str, key: &str, text: &str, kind: &str) -> Value {
+        json!({"channel": channel, "sender_id": sender, "sender_kind": kind,
+               "idempotency_key": key, "text": text})
+    }
+
+    #[test]
+    fn open_creates_schema_and_version() {
+        let d = tmp_daemon("schema");
+        let g = d.channels.lock().unwrap();
+        let conn = g.as_ref().expect("channels db open");
+        let v: String = conn
+            .query_row("SELECT value FROM meta WHERE key='schema_version'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, "1");
+    }
+
+    #[test]
+    fn register_rejects_token_mismatch() {
+        let d = tmp_daemon("regtok");
+        // enabled 채널, token_hash=sha256("goodtoken"), scoped_pgid=own group.
+        {
+            let mut g = d.channels.lock().unwrap();
+            let conn = g.as_mut().unwrap();
+            conn.execute(
+                "INSERT INTO channels(channel, enabled, scoped_pid, scoped_pgid, token_hash, registered, updated_ts)
+                 VALUES('slack',1,?1,?2,?3,0,?4)",
+                params![std::process::id() as i64, own_pgid(), hex_sha256(b"goodtoken"), now()],
+            )
+            .unwrap();
+        }
+        let bad = call(&d, "register", json!({"channel": "slack", "token": "wrongtoken"}), own_pid());
+        assert_eq!(bad["ok"], json!(false), "위장 토큰 등록이 거부돼야 한다: {bad}");
+        assert_eq!(bad["error"]["code"], json!("auth_denied"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn register_rejects_non_spawn_pid() {
+        let d = tmp_daemon("regpid");
+        // scoped_pgid를 존재하지 않는 그룹(999999)로 → own pid의 pgid와 불일치 → 거부.
+        {
+            let mut g = d.channels.lock().unwrap();
+            let conn = g.as_mut().unwrap();
+            conn.execute(
+                "INSERT INTO channels(channel, enabled, scoped_pid, scoped_pgid, token_hash, registered, updated_ts)
+                 VALUES('slack',1,1234,999999,?1,0,?2)",
+                params![hex_sha256(b"tok"), now()],
+            )
+            .unwrap();
+        }
+        let r = call(&d, "register", json!({"channel": "slack", "token": "tok"}), own_pid());
+        assert_eq!(r["ok"], json!(false), "비스폰 pid 등록이 거부돼야 한다: {r}");
+        assert_eq!(r["error"]["code"], json!("auth_denied"));
+    }
+
+    #[test]
+    fn register_returns_pending_outbound() {
+        let d = tmp_daemon("regpend");
+        seed_registered(&d, "slack", "t");
+        // allowlist + pending outbound 하나 만들어둔다.
+        call(&d, "allow", json!({"channel": "slack", "sender_id": "U1"}), None);
+        let ob = call(&d, "outbound", json!({"channel": "slack", "target": "U1", "body": "hi", "idempotency_key": "o1"}), None);
+        assert_eq!(ob["result"]["outcome"], json!("pending"));
+        // 재등록(토큰 일치·own pid) → 응답에 pending 동봉.
+        let reg = call(&d, "register", json!({"channel": "slack", "token": "t", "bridge_ver": "v0"}), own_pid());
+        assert_eq!(reg["ok"], json!(true), "{reg}");
+        let pend = reg["result"]["pending"].as_array().unwrap();
+        assert_eq!(pend.len(), 1, "pending outbound 동봉돼야 한다: {reg}");
+        assert_eq!(pend[0]["idempotency_key"], json!("o1"));
+    }
+
+    #[test]
+    fn inbound_owner_only_fail_closed() {
+        let d = tmp_daemon("owner");
+        seed_registered(&d, "slack", "t");
+        // allowlist 비어있음 → deny.
+        let r = call(&d, "inbound", inbound_params("slack", "U_evil", "slack:1", "rm -rf", "user"), own_pid());
+        assert_eq!(r["result"]["action"], json!("deny"), "allowlist 밖 sender는 deny: {r}");
+        // 원장에 denied verdict 기록.
+        let g = d.channels.lock().unwrap();
+        let conn = g.as_ref().unwrap();
+        let verdict: String = conn
+            .query_row("SELECT verdict FROM inbound WHERE idempotency_key='slack:1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(verdict, "denied");
+        // inbox엔 적재되지 않음.
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM inbox", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 0, "deny된 메시지는 inbox에 적재되지 않는다");
+    }
+
+    #[test]
+    fn inbound_owner_allowed_lands_in_inbox() {
+        let d = tmp_daemon("inbox_land");
+        seed_registered(&d, "slack", "t");
+        call(&d, "allow", json!({"channel": "slack", "sender_id": "U1"}), None);
+        // master 없음 → queued.
+        let r = call(&d, "inbound", inbound_params("slack", "U1", "slack:1", "hello", "user"), own_pid());
+        assert_eq!(r["result"]["action"], json!("queued"), "master 부재 시 queued: {r}");
+        let g = d.channels.lock().unwrap();
+        let conn = g.as_ref().unwrap();
+        let (state, text): (String, String) = conn
+            .query_row("SELECT state, text FROM inbox WHERE id=?1", [r["result"]["inbox_id"].as_i64().unwrap()], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!(state, "new");
+        assert_eq!(text, "hello");
+    }
+
+    #[test]
+    fn inbound_idempotent_same_key_same_hash() {
+        let d = tmp_daemon("idem_in");
+        seed_registered(&d, "slack", "t");
+        call(&d, "allow", json!({"channel": "slack", "sender_id": "U1"}), None);
+        let a = call(&d, "inbound", inbound_params("slack", "U1", "slack:1", "hello", "user"), own_pid());
+        assert_eq!(a["result"]["action"], json!("queued"));
+        // 같은 key·같은 텍스트 재전송 → dup(신규 inbox 없음).
+        let b = call(&d, "inbound", inbound_params("slack", "U1", "slack:1", "hello", "user"), own_pid());
+        assert_eq!(b["result"]["action"], json!("dup"), "{b}");
+        let g = d.channels.lock().unwrap();
+        let conn = g.as_ref().unwrap();
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM inbox", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1, "dup은 새 inbox를 만들지 않는다");
+    }
+
+    #[test]
+    fn inbound_dedup_conflict_same_key_diff_hash() {
+        let d = tmp_daemon("idem_conf");
+        seed_registered(&d, "slack", "t");
+        call(&d, "allow", json!({"channel": "slack", "sender_id": "U1"}), None);
+        call(&d, "inbound", inbound_params("slack", "U1", "slack:1", "hello", "user"), own_pid());
+        // 같은 key·다른 텍스트 → dedup_conflict 에러.
+        let c = call(&d, "inbound", inbound_params("slack", "U1", "slack:1", "DIFFERENT", "user"), own_pid());
+        assert_eq!(c["ok"], json!(false), "{c}");
+        assert_eq!(c["error"]["code"], json!("dedup_conflict"));
+    }
+
+    #[test]
+    fn inbound_bot_loop_suppressed() {
+        let d = tmp_daemon("botloop");
+        seed_registered(&d, "slack", "t");
+        call(&d, "allow", json!({"channel": "slack", "sender_id": "bot1"}), None);
+        // 21건(LOOP_LIMIT=20 초과)째부터 suppressed.
+        let mut suppressed_seen = false;
+        for i in 0..25 {
+            let r = call(&d, "inbound", inbound_params("slack", "bot1", &format!("slack:{i}"), &format!("m{i}"), "bot"), own_pid());
+            if r["result"]["action"] == json!("suppressed") {
+                suppressed_seen = true;
+            }
+        }
+        assert!(suppressed_seen, "봇 20건/60s 초과분은 suppressed 돼야 한다");
+    }
+
+    #[test]
+    fn outbound_monotonic_and_idempotent() {
+        let d = tmp_daemon("ob_mono");
+        seed_registered(&d, "slack", "t");
+        call(&d, "allow", json!({"channel": "slack", "sender_id": "U1"}), None);
+        let a = call(&d, "outbound", json!({"channel": "slack", "target": "U1", "body": "x", "idempotency_key": "o1"}), None);
+        let oid = a["result"]["outbound_id"].as_i64().unwrap();
+        assert_eq!(a["result"]["outcome"], json!("pending"));
+        // 같은 key 재호출 → 기존 outcome·id(신규 없음).
+        let b = call(&d, "outbound", json!({"channel": "slack", "target": "U1", "body": "x", "idempotency_key": "o1"}), None);
+        assert_eq!(b["result"]["outbound_id"].as_i64().unwrap(), oid);
+        assert_eq!(b["result"]["idempotent"], json!(true));
+        // receipt: pending→sent.
+        let s = call(&d, "receipt", json!({"outbound_id": oid, "outcome": "sent", "platform_ref": "ts123"}), None);
+        assert_eq!(s["result"]["outcome"], json!("sent"));
+        // 늦은 receipt(다른 outcome) → 상태 불변 + late.
+        let late = call(&d, "receipt", json!({"outbound_id": oid, "outcome": "failed"}), None);
+        assert_eq!(late["result"]["late"], json!(true), "{late}");
+        assert_eq!(late["result"]["outcome"], json!("sent"), "terminal 후 상태 불변");
+        // late_receipt 레코드 존재.
+        let g = d.channels.lock().unwrap();
+        let conn = g.as_ref().unwrap();
+        let ln: i64 = conn.query_row("SELECT COUNT(*) FROM late_receipt WHERE outbound_id=?1", [oid], |r| r.get(0)).unwrap();
+        assert_eq!(ln, 1);
+    }
+
+    #[test]
+    fn outbound_target_fail_closed() {
+        let d = tmp_daemon("ob_fc");
+        seed_registered(&d, "slack", "t");
+        // allowlist 비어있음 → outbound 대상 거부.
+        let r = call(&d, "outbound", json!({"channel": "slack", "target": "U_x", "body": "x", "idempotency_key": "o1"}), None);
+        assert_eq!(r["ok"], json!(false), "{r}");
+        assert_eq!(r["error"]["code"], json!("target_not_allowed"));
+    }
+
+    #[test]
+    fn outbound_timeout_to_unknown() {
+        let d = tmp_daemon("ob_to");
+        seed_registered(&d, "slack", "t");
+        call(&d, "allow", json!({"channel": "slack", "sender_id": "U1"}), None);
+        let a = call(&d, "outbound", json!({"channel": "slack", "target": "U1", "body": "x", "idempotency_key": "o1"}), None);
+        let oid = a["result"]["outbound_id"].as_i64().unwrap();
+        // 타임아웃 상수 주입(0초) → 즉시 unknown 전이.
+        let mut g = d.channels.lock().unwrap();
+        let conn = g.as_mut().unwrap();
+        let n = sweep_outbound_timeouts(conn, now() + 1.0, 0.0);
+        assert_eq!(n, 1);
+        let oc: String = conn.query_row("SELECT outcome FROM outbound WHERE id=?1", [oid], |r| r.get(0)).unwrap();
+        assert_eq!(oc, "unknown", "receipt 부재 시 unknown(단조·미확인)");
+    }
+
+    #[test]
+    fn redeliver_due_pure() {
+        assert!(redeliver_due("new", None, 100.0, 600.0));
+        assert!(!redeliver_due("injected", Some(100.0), 200.0, 600.0));
+        assert!(redeliver_due("injected", Some(100.0), 800.0, 600.0));
+        assert!(!redeliver_due("acked", Some(100.0), 9999.0, 600.0));
+    }
+
+    #[test]
+    fn envelope_shape() {
+        let e = envelope("slack", "U0123", 0.0, 7, false, "hello");
+        assert!(e.starts_with("[CH:slack|U0123|"), "{e}");
+        assert!(e.ends_with("|#7] hello"), "{e}");
+        let r = envelope("slack", "U0123", 0.0, 7, true, "hi");
+        assert!(r.contains("(재배달)"), "{r}");
+    }
+
+    #[test]
+    fn ack_marks_acked_and_clears_text() {
+        let d = tmp_daemon("ack");
+        seed_registered(&d, "slack", "t");
+        call(&d, "allow", json!({"channel": "slack", "sender_id": "U1"}), None);
+        let r = call(&d, "inbound", inbound_params("slack", "U1", "slack:1", "secret", "user"), own_pid());
+        let inbox_id = r["result"]["inbox_id"].as_i64().unwrap();
+        let a = call(&d, "ack", json!({"inbox_id": inbox_id}), None);
+        assert_eq!(a["result"]["acked"], json!(true), "{a}");
+        // DB 검사 가드는 후속 call 전에 반드시 드롭한다(std Mutex 비재진입 — 자기 데드락 방지).
+        {
+            let g = d.channels.lock().unwrap();
+            let conn = g.as_ref().unwrap();
+            let (state, text): (String, String) = conn
+                .query_row("SELECT state, text FROM inbox WHERE id=?1", [inbox_id], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap();
+            assert_eq!(state, "acked");
+            assert_eq!(text, "", "ack 시 본문 소거(프라이버시)");
+        }
+        // 이미 acked → not_found.
+        let again = call(&d, "ack", json!({"inbox_id": inbox_id}), None);
+        assert_eq!(again["ok"], json!(false));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lockdown_stops_and_blocks_inbound() {
+        let d = tmp_daemon("lock");
+        // 실제 더미 브리지 스폰(setsid로 자체 그룹 — 테스트 프로세스 그룹과 분리돼 kill이 안전).
+        let st = call(&d, "start", json!({"channel": "slack", "cmd": "sleep 30"}), None);
+        assert_eq!(st["ok"], json!(true), "{st}");
+        let pid = st["result"]["pid"].as_u64().unwrap() as u32;
+        assert!(pid_alive(pid), "스폰된 브리지가 살아있어야 한다");
+        let l = call(&d, "lockdown", json!({}), None);
+        assert_eq!(l["result"]["lockdown"], json!(true), "{l}");
+        // 브리지 그룹 kill 확인(killpg 후 reaper 회수까지 짧은 유예 폴링).
+        let mut gone = false;
+        for _ in 0..100 {
+            if !pid_alive(pid) {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(gone, "lockdown이 브리지 그룹을 kill해야 한다");
+        // 인바운드 전면 차단.
+        let r = call(&d, "inbound", inbound_params("slack", "U1", "slack:9", "hi", "user"), own_pid());
+        assert_eq!(r["ok"], json!(false), "{r}");
+        assert_eq!(r["error"]["code"], json!("locked"));
+        // 채널 enabled=0 + lockdown 메타.
+        {
+            let g = d.channels.lock().unwrap();
+            let conn = g.as_ref().unwrap();
+            let en: i64 = conn.query_row("SELECT enabled FROM channels WHERE channel='slack'", [], |r| r.get(0)).unwrap();
+            assert_eq!(en, 0);
+            assert!(lockdown_active(conn));
+        }
+    }
+
+    #[test]
+    fn revoke_removes_from_allowlist() {
+        let d = tmp_daemon("revoke");
+        seed_registered(&d, "slack", "t");
+        call(&d, "allow", json!({"channel": "slack", "sender_id": "U1"}), None);
+        // 이제 revoke → 이후 인바운드 deny.
+        let rv = call(&d, "revoke", json!({"channel": "slack", "sender_id": "U1"}), None);
+        assert_eq!(rv["result"]["revoked"], json!(true));
+        let r = call(&d, "inbound", inbound_params("slack", "U1", "slack:1", "hi", "user"), own_pid());
+        assert_eq!(r["result"]["action"], json!("deny"), "revoke 후 deny: {r}");
+    }
+
+    #[test]
+    fn status_reports_channel_shape() {
+        let d = tmp_daemon("status");
+        seed_registered(&d, "slack", "t");
+        call(&d, "allow", json!({"channel": "slack", "sender_id": "U1"}), None);
+        let s = call(&d, "status", json!({}), None);
+        let chans = s["result"]["channels"].as_array().unwrap();
+        assert_eq!(chans.len(), 1);
+        assert_eq!(chans[0]["channel"], json!("slack"));
+        assert_eq!(chans[0]["registered"], json!(true));
+        assert_eq!(chans[0]["allowlist"], json!(1));
+        assert_eq!(s["result"]["lockdown"], json!(false));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconcile_cleans_dead_pgid_and_respawns() {
+        let d = tmp_daemon("reconcile");
+        // enabled=1, 죽은 pid(존재하지 않는 12345678), bridge_cmd=더미 sleep.
+        {
+            let mut g = d.channels.lock().unwrap();
+            let conn = g.as_mut().unwrap();
+            conn.execute(
+                "INSERT INTO channels(channel, enabled, bridge_cmd, scoped_pid, scoped_pgid, token_hash, registered, updated_ts)
+                 VALUES('slack',1,'sleep 30',12345678,12345678,?1,1,?2)",
+                params![hex_sha256(b"old"), now()],
+            )
+            .unwrap();
+        }
+        reconcile(&d);
+        // 재스폰 → scoped_pid가 새 살아있는 pid로 교체·registered=0.
+        let (pid, reg): (i64, i64) = {
+            let g = d.channels.lock().unwrap();
+            let conn = g.as_ref().unwrap();
+            conn.query_row("SELECT scoped_pid, registered FROM channels WHERE channel='slack'", [], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+        };
+        assert_ne!(pid, 12345678, "죽은 pid는 새 스폰으로 교체돼야 한다");
+        assert!(pid_alive(pid as u32), "재스폰된 브리지가 살아있어야 한다");
+        assert_eq!(reg, 0, "재스폰 후 registered=0(브리지 재등록 대기)");
+        // 정리: 스폰한 sleep 그룹 회수.
+        crate::governance::kill_group_or_pid(pid as u32, pid as i32);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inbox_delivered_then_redelivered_when_unacked() {
+        let d = tmp_daemon("redeliver");
+        seed_registered(&d, "slack", "t");
+        call(&d, "allow", json!({"channel": "slack", "sender_id": "U1"}), None);
+        // 비-quiescing master surface(agent_status None → quiescing 아님).
+        let surface = d
+            .create_surface(None, Some("sleep 30".into()), None, Some("master".into()), 24, 80)
+            .expect("surface");
+        d.roles.lock().unwrap().insert("master".into(), surface.id);
+        // 인바운드 → 즉시 배달(delivered·state=injected).
+        let r = call(&d, "inbound", inbound_params("slack", "U1", "slack:1", "hi", "user"), own_pid());
+        assert_eq!(r["result"]["action"], json!("delivered"), "master 가용 시 즉시 배달: {r}");
+        let inbox_id = r["result"]["inbox_id"].as_i64().unwrap();
+        {
+            let g = d.channels.lock().unwrap();
+            let conn = g.as_ref().unwrap();
+            let st: String = conn
+                .query_row("SELECT state FROM inbox WHERE id=?1", [inbox_id], |r| r.get(0))
+                .unwrap();
+            assert_eq!(st, "injected");
+            // injected_ts를 TTL 초과 과거로 → 재배달 sweep 대상.
+            conn.execute(
+                "UPDATE inbox SET injected_ts=?2 WHERE id=?1",
+                params![inbox_id, now() - INBOX_REDELIVER_TTL_SECS - 10.0],
+            )
+            .unwrap();
+            let n = redeliver_unacked(&d, conn);
+            assert_eq!(n, 1, "TTL 초과 un-acked 항목이 재배달돼야 한다");
+            let redel: i64 = conn
+                .query_row("SELECT redelivered FROM inbox WHERE id=?1", [inbox_id], |r| r.get(0))
+                .unwrap();
+            assert_eq!(redel, 1, "재배달 표기(redelivered=1)");
+        }
+        // 정리: master surface의 sleep 30 회수.
+        crate::governance::close_surface(&d, surface.id);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quiescing_master_holds_injection() {
+        let d = tmp_daemon("quiesce");
+        seed_registered(&d, "slack", "t");
+        call(&d, "allow", json!({"channel": "slack", "sender_id": "U1"}), None);
+        // master surface 생성 + quiescing 자기보고.
+        let surface = d
+            .create_surface(None, Some("sleep 30".into()), None, Some("master".into()), 24, 80)
+            .expect("surface");
+        let sid = surface.id;
+        d.roles.lock().unwrap().insert("master".into(), sid);
+        *surface.agent_status.lock().unwrap() = Some(crate::state::AgentStatus {
+            state: "quiescing".into(),
+            context_pct: None,
+            task: None,
+            updated_at: now(),
+        });
+        assert!(deliverable_master(&d).is_none(), "quiescing master는 배달 불가");
+        // inbound → queued(주입 보류).
+        let r = call(&d, "inbound", inbound_params("slack", "U1", "slack:1", "hi", "user"), own_pid());
+        assert_eq!(r["result"]["action"], json!("queued"), "quiescing 중 주입 보류: {r}");
+    }
+}
