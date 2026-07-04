@@ -565,10 +565,12 @@ enum ChannelAction {
     /// 채널 상태 스냅샷(alive·enabled·registered·outcome 분포·inbox 카운트·allowlist 수).
     Status,
     /// 브리지 자기등록(토큰+pid 이중검증). 응답에 pending outbound 전량 동봉.
+    /// 토큰은 --token 대신 **env `CYS_CHANNEL_TOKEN`**(스폰 시 이미 주입됨)에서 읽는 것을 권장한다
+    /// (M10: argv 노출=ps 유출 위험). --token 없으면 env로 폴백(argv는 하위호환).
     Register {
         channel: String,
         #[arg(long)]
-        token: String,
+        token: Option<String>,
         #[arg(long)]
         caps: Option<String>,
         #[arg(long = "bridge-ver")]
@@ -2048,6 +2050,31 @@ fn run_channel(action: ChannelAction) -> i32 {
             }
         };
     }
+    // M10: register 토큰은 argv 대신 env `CYS_CHANNEL_TOKEN`(스폰 시 주입) 우선 — ps 노출 회피.
+    // --token 있으면 그것을, 없으면 env로 폴백. 둘 다 없으면 명확히 보고.
+    if let ChannelAction::Register { channel, token, caps, bridge_ver } = &action {
+        let token = token
+            .clone()
+            .or_else(|| std::env::var("CYS_CHANNEL_TOKEN").ok().filter(|s| !s.is_empty()));
+        let Some(token) = token else {
+            println!("{}", json!({"ok": false,
+                "error": "no token — pass --token or set CYS_CHANNEL_TOKEN env"}));
+            return 1;
+        };
+        return match request(
+            "channel.register",
+            json!({"channel": channel, "token": token, "caps": caps, "bridge_ver": bridge_ver}),
+        ) {
+            Ok(r) => {
+                println!("{}", serde_json::to_string(&r).unwrap_or_default());
+                0
+            }
+            Err(e) => {
+                println!("{}", json!({"ok": false, "error": e}));
+                1
+            }
+        };
+    }
     let (method, params): (&str, Value) = match action {
         ChannelAction::Start { channel, cmd } => (
             "channel.start",
@@ -2055,10 +2082,8 @@ fn run_channel(action: ChannelAction) -> i32 {
         ),
         ChannelAction::Stop { channel } => ("channel.stop", json!({"channel": channel})),
         ChannelAction::Status => ("channel.status", json!({})),
-        ChannelAction::Register { channel, token, caps, bridge_ver } => (
-            "channel.register",
-            json!({"channel": channel, "token": token, "caps": caps, "bridge_ver": bridge_ver}),
-        ),
+        // 위에서 조기 return으로 처리됨(env 토큰 폴백 경로).
+        ChannelAction::Register { .. } => unreachable!(),
         ChannelAction::Inbound {
             channel, sender_id, sender_kind, peer, text, ts, msg_ref, idempotency_key, body_hash,
             kind, feed_id, nonce, decision,
