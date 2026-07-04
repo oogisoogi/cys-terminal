@@ -110,9 +110,51 @@ jobs:
         shell: bash
         run: bash scripts/prep-mac-runtime.sh "${{ matrix.target }}"
 
+      # ★RC-23 git-core dedup (macOS 전용) — Tauri 번들러가 bundle.resources 심볼릭링크를 역참조(upstream
+      #   #13219, 미해결)해 runtime/git 을 141MB→608MB(중복 464MB)·DMG 434MB로 부풀린다. tauri-action에 그대로
+      #   맡기면 fat DMG가 나오므로, 여기서 '앱만 빌드 → dedup → hdiutil UDZO DMG → 업데이터 재생성'까지 하고,
+      #   아래 tauri-action은 mac 레그에서 tauriScript=true(빌드 no-op)로 이 slim 산출물을 그대로 수집·업로드·
+      #   latest.json 병합만 하게 한다. tauri-action은 표준 번들 경로(bundle/dmg/<name>_<ver>_<arch>.dmg,
+      #   bundle/macos/<name>.app.tar.gz[.sig])를 existsSync로 수집하므로 아래 파일명이 정확히 일치해야 한다.
+      #   CI는 인증서 미보유 → 미서명(현행과 동일 · Gatekeeper 경고 감수). 서명·공증은 로컬 build-macos-signed.sh 경로.
+      - name: git-core dedup + UDZO DMG + 업데이터 재생성 (macOS 전용)
+        if: matrix.platform == 'macos-latest'
+        shell: bash
+        env:
+          CYS_TARGET: ${{ matrix.target }}                         # bundle-prep.sh 크로스빌드 타깃
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
+        run: |
+          set -euo pipefail
+          TRIPLE="${{ matrix.target }}"
+          BUNDLE="target/$TRIPLE/release/bundle"
+          APP="$BUNDLE/macos/cys.app"
+          VERSION="$(grep -m1 '"version"' src-tauri/tauri.conf.json | sed -E 's/.*"([0-9][0-9.]*)".*/\1/')"
+          case "$TRIPLE" in
+            aarch64-apple-darwin) ARCH=aarch64 ;;
+            x86_64-apple-darwin)  ARCH=x64 ;;
+            *) echo "unexpected target: $TRIPLE"; exit 1 ;;
+          esac
+          # ① 앱 번들만 빌드(--bundles app) — beforeBuildCommand(bundle-prep)가 UI·cys/cysd·pack 빌드. fat DMG는 생략.
+          bun x @tauri-apps/cli@2 build --bundles app --target "$TRIPLE"
+          # ② git-core dedup (역참조 되돌리기 · build-macos-signed.sh와 동일 공유 스크립트) → runtime/git 608→~144MB
+          bash scripts/dedup-git-core.sh "$APP"
+          # ③ 업데이터 tar.gz 재생성(dedup 반영·심볼릭링크 보존) + 재서명 → tauri-action이 이 .sig로 latest.json 작성
+          ( cd "$BUNDLE/macos" && tar czf cys.app.tar.gz cys.app )
+          bun x @tauri-apps/cli@2 signer sign --private-key "$TAURI_SIGNING_PRIVATE_KEY" --password "" "$BUNDLE/macos/cys.app.tar.gz"
+          # ④ dedup된 .app으로 UDZO DMG(hdiutil · Tauri 기본 포맷 동일). 파일명 cys_<ver>_<arch>.dmg = tauri-action 표준 수집명.
+          STAGE="$(mktemp -d)"; ditto "$APP" "$STAGE/cys.app"; ln -s /Applications "$STAGE/Applications"
+          mkdir -p "$BUNDLE/dmg"
+          hdiutil create -volname "cys" -srcfolder "$STAGE" -ov -format UDZO "$BUNDLE/dmg/cys_${VERSION}_${ARCH}.dmg"
+          rm -rf "$STAGE"
+          echo "✓ macOS slim 산출물 준비: $BUNDLE/dmg/cys_${VERSION}_${ARCH}.dmg + $BUNDLE/macos/cys.app.tar.gz(.sig)"
+
       # tauri build → beforeBuildCommand(bundle-prep.sh)가 UI 번들 + cys/cysd 릴리스 빌드 + externalBin
       # 배치 → 번들(dmg/app) → createUpdaterArtifacts(.app.tar.gz + .sig + latest.json) → 비공개 repo 릴리스 업로드.
       # Windows: NSIS setup.exe + .sig — tauri-action이 같은 릴리스의 latest.json에 platforms.windows-x86_64를 병합.
+      # ★macOS는 위 스텝이 slim 산출물을 이미 만들었으므로 tauriScript=true 로 빌드를 no-op 시킨다(재빌드=fat 재역참조
+      #   방지). tauri-action은 표준 경로의 그 산출물을 수집·업로드·latest.json 병합만 수행한다. Windows는 tauriScript=''
+      #   → getRunner가 falsy로 무시하고 기본 러너로 정상 빌드(동작 불변 — tauri-action src/runner.ts 실측 확인).
       - name: Build, sign, and release (private)
         uses: tauri-apps/tauri-action@v0
         env:
@@ -126,6 +168,8 @@ jobs:
           # ★빈 APPLE_* env 를 넘기면 tauri 번들러가 빈 인증서를 security import 하려다 실패하므로,
           #   인증서가 없는 동안에는 APPLE_* 를 아예 전달하지 않는다(=미서명 빌드 → Gatekeeper 경고 감수).
         with:
+          # macOS='true'(빌드 no-op → 위 스텝의 slim 산출물 수집) · Windows=''(falsy → 기본 러너 정상 빌드, 불변).
+          tauriScript: ${{ matrix.platform == 'macos-latest' && 'true' || '' }}
           tagName: ${{ github.ref_name }}
           # Phase 2(릴리스 통합·2026-07-03): 소스 repo가 public이 되면서 이 릴리스가 곧 공개 배포다.
           releaseName: 'cys ${{ github.ref_name }}'
