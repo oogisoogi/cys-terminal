@@ -3168,6 +3168,30 @@ fn diag_stale_lock(_ctx: &DoctorCtx, _fix: bool) -> DiagItem {
     }
 }
 
+/// L5 진행중 staging 보호 임계(초) — 이 시간 내 수정된 staging은 doctor --fix가 삭제하지 않는다.
+/// 기본 60초·env override(테스트는 0으로 보호 해제). 0이면 항상 삭제(보호 off).
+fn staging_protect_secs() -> u64 {
+    std::env::var("CYS_DOCTOR_STAGING_MIN_IDLE_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(60)
+}
+
+/// staging 디렉토리(자신+직속 엔트리)의 최신 수정 후 경과 초(L5 진행중 보호용). 실패 시 None.
+fn staging_idle_secs(path: &std::path::Path) -> Option<u64> {
+    let mut newest = std::fs::metadata(path).ok()?.modified().ok()?;
+    if let Ok(rd) = std::fs::read_dir(path) {
+        for e in rd.flatten() {
+            if let Ok(mt) = e.metadata().and_then(|m| m.modified()) {
+                if mt > newest {
+                    newest = mt;
+                }
+            }
+        }
+    }
+    newest.elapsed().ok().map(|d| d.as_secs())
+}
+
 fn diag_staging_residue(ctx: &DoctorCtx, fix: bool) -> DiagItem {
     let mut residue: Vec<std::path::PathBuf> = Vec::new();
     if let Ok(rd) = std::fs::read_dir(&ctx.state_base) {
@@ -3192,7 +3216,15 @@ fn diag_staging_residue(ctx: &DoctorCtx, fix: bool) -> DiagItem {
     if fix {
         let mut removed = 0usize;
         let mut fail = 0usize;
+        let mut skipped = 0usize;
         for p in &residue {
+            // L5: 진행중(최근 N초 내 수정) staging은 삭제하지 않는다 — 무중단 배포/init 도중
+            // 스테이징을 파괴해 배포를 깨는 것을 방지(mtime 미상=보수적으로 삭제 진행).
+            let protect = staging_protect_secs();
+            if protect > 0 && staging_idle_secs(p).map(|s| s < protect).unwrap_or(false) {
+                skipped += 1;
+                continue;
+            }
             if std::fs::remove_dir_all(p).is_ok() {
                 removed += 1;
             } else {
@@ -3201,14 +3233,19 @@ fn diag_staging_residue(ctx: &DoctorCtx, fix: bool) -> DiagItem {
         }
         DiagItem {
             name: "staging-residue",
-            status: if fail == 0 {
+            status: if fail == 0 && skipped == 0 {
                 DiagStatus::Ok
             } else {
                 DiagStatus::Warn
             },
             detail: format!("staging 잔재 {}건", residue.len()),
             action: format!(
-                "{removed}건 정리{}",
+                "{removed}건 정리{}{}",
+                if skipped > 0 {
+                    format!(", {skipped}건 진행중 보호")
+                } else {
+                    String::new()
+                },
                 if fail > 0 {
                     format!(", {fail}건 실패")
                 } else {
@@ -3256,6 +3293,16 @@ fn diag_channels_db(ctx: &DoctorCtx) -> DiagItem {
                 |r| r.get(0),
             );
             match sv {
+                // L3: windows는 브리지 pid 생존 프로브가 없어 status alive 항상 true·자가치유 미발현
+                // (재스폰은 reaper 신호 의존) — doctor가 이 한계를 경고한다(WINFIX 트랙). unix는 정상.
+                #[cfg(windows)]
+                Ok(v) => DiagItem {
+                    name: "channels-db",
+                    status: DiagStatus::Warn,
+                    detail: format!("채널 DB 정상·schema_version={v} · [WINFIX] windows는 pid 생존 프로브 부재로 status alive 항상 true·자가치유(죽은 브리지 재스폰) 미발현"),
+                    action: "windows 채널 자가치유는 WINFIX 트랙 — 브리지 이상 시 수동 재기동".into(),
+                },
+                #[cfg(not(windows))]
                 Ok(v) => DiagItem {
                     name: "channels-db",
                     status: DiagStatus::Ok,
@@ -7898,6 +7945,8 @@ mod tests {
 
     #[test]
     fn doctor_staging_residue_fix_keeps_prev() {
+        // L5 보호 해제(방금 만든 staging이 <60s라 보호에 걸리지 않게) — 이 테스트는 삭제 동작 검증.
+        std::env::set_var("CYS_DOCTOR_STAGING_MIN_IDLE_SECS", "0");
         let base = std::env::temp_dir().join(format!("cys-doc-stg-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
@@ -7914,6 +7963,26 @@ mod tests {
         assert!(!base.join(".pack-staging").exists());
         assert!(base.join("pack.prev").exists(), ".prev 롤백 세대 보존(삭제 금지)");
         let _ = std::fs::remove_dir_all(&base);
+        std::env::remove_var("CYS_DOCTOR_STAGING_MIN_IDLE_SECS");
+    }
+
+    // L5: 진행중(최근 수정) staging은 doctor --fix가 삭제하지 않고 보호한다.
+    #[test]
+    fn doctor_staging_residue_protects_in_progress() {
+        std::env::set_var("CYS_DOCTOR_STAGING_MIN_IDLE_SECS", "3600"); // 1시간 보호창
+        let base = std::env::temp_dir().join(format!("cys-doc-stg-prot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let ctx = doctor_ctx_at(&base);
+        std::fs::create_dir_all(base.join(".pack-staging")).unwrap();
+        std::fs::write(base.join(".pack-staging/f"), "in-progress").unwrap();
+        // 방금 수정 → 보호창 내라 --fix가 skip → 잔재 유지(WARN·삭제 안 됨).
+        let d = diag_staging_residue(&ctx, true);
+        assert_eq!(d.status, DiagStatus::Warn, "진행중 staging은 보호되어 WARN: {}", d.action);
+        assert!(base.join(".pack-staging").exists(), "진행중 staging은 삭제되지 않는다");
+        assert!(d.action.contains("진행중 보호"), "보호 사유 보고: {}", d.action);
+        let _ = std::fs::remove_dir_all(&base);
+        std::env::remove_var("CYS_DOCTOR_STAGING_MIN_IDLE_SECS");
     }
 
     #[test]
