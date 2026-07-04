@@ -27,6 +27,16 @@ fn outbound_unknown_secs() -> f64 {
         .and_then(|s| s.parse().ok())
         .unwrap_or(30.0)
 }
+/// 종결 원장 행 보존기간(일·M5) — 이 기간 지난 terminal outbound·acked inbox·denied/suppressed
+/// inbound·late_receipt를 주기 sweep이 프룬한다(무한성장·disk DoS 차단). 기본 7일·env override.
+fn channel_retain_secs() -> f64 {
+    std::env::var("CYS_CHANNEL_RETAIN_DAYS")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|d| *d > 0.0)
+        .unwrap_or(7.0)
+        * 86400.0
+}
 /// 봇루프 슬라이딩 윈도우(초)와 상한 — 참여자쌍 20건/60초(+쿨다운 60초는 윈도우 유지로 발현).
 const LOOP_WINDOW_SECS: f64 = 60.0;
 const LOOP_LIMIT: u64 = 20;
@@ -1659,6 +1669,40 @@ fn prune_loopwin(conn: &Connection, now: f64) {
     );
 }
 
+/// M5: 종결 원장 행 보존기간 프룬(무한성장·disk DoS 차단). pending·최근 행·**미소각 approval_prompt
+/// (M6 재조정 대상 = 살아있는 버튼)**는 보존한다. 삭제한 총 행수 반환(관측용).
+fn prune_retention(conn: &Connection, now: f64, retain_secs: f64) -> usize {
+    let cutoff = now - retain_secs;
+    let mut n = 0;
+    // terminal outbound(비-pending·updated_ts 기준) — 단, 미소각 approval_prompt는 살아있는 버튼이라 보존.
+    n += conn
+        .execute(
+            "DELETE FROM outbound WHERE outcome!='pending' AND updated_ts < ?1
+             AND NOT (kind='approval_prompt' AND approval_nonce_used=0)",
+            params![cutoff],
+        )
+        .unwrap_or(0);
+    // acked inbox(본문은 ack 때 이미 소거) — new/injected는 배달 대기라 보존.
+    n += conn
+        .execute(
+            "DELETE FROM inbox WHERE state='acked' AND acked_ts IS NOT NULL AND acked_ts < ?1",
+            params![cutoff],
+        )
+        .unwrap_or(0);
+    // denied·loop_suppressed inbound(거부·억제 판정) — accepted는 감사 추적으로 보존.
+    n += conn
+        .execute(
+            "DELETE FROM inbound WHERE verdict IN ('denied','loop_suppressed') AND ts < ?1",
+            params![cutoff],
+        )
+        .unwrap_or(0);
+    // late_receipt 화해 레코드.
+    n += conn
+        .execute("DELETE FROM late_receipt WHERE ts < ?1", params![cutoff])
+        .unwrap_or(0);
+    n
+}
+
 /// enabled=1이지만 브리지 pid가 죽은 채널을 백오프 후 재스폰(§2.1-5).
 fn respawn_dead_bridges(daemon: &Arc<Daemon>, conn: &mut Connection) {
     if lockdown_active(conn) {
@@ -1716,6 +1760,7 @@ fn sweep_once(daemon: &Arc<Daemon>) {
         sweep_outbound_timeouts(conn, now, outbound_unknown_secs());
     }
     prune_loopwin(conn, now);
+    prune_retention(conn, now, channel_retain_secs()); // M5: 종결 원장 보존기간 프룬.
     // new 배달 → un-acked 재배달(순서: 신규 우선, 그 다음 재배달).
     deliver_new_inbox(daemon, conn);
     redeliver_unacked(daemon, conn);
@@ -1967,6 +2012,53 @@ mod tests {
         let pend = reg["result"]["pending"].as_array().unwrap();
         assert_eq!(pend.len(), 1, "pending outbound 동봉돼야 한다: {reg}");
         assert_eq!(pend[0]["idempotency_key"], json!("o1"));
+    }
+
+    // M5: 종결 원장 보존기간 프룬 — 오래된 종결행 삭제·pending/최근/미소각 approval/accepted 보존.
+    #[test]
+    fn prune_retention_removes_old_terminal_keeps_live() {
+        let d = tmp_daemon("m5prune");
+        seed_registered(&d, "slack", "t");
+        let old = now() - 100.0 * 86400.0; // 100일 전(보존기간 7일 초과)
+        let fresh = now();
+        {
+            let mut g = d.channels.lock().unwrap();
+            let conn = g.as_mut().unwrap();
+            // outbound: old sent(프룬)·old pending(보존)·fresh sent(보존)·old 미소각 approval(보존).
+            conn.execute("INSERT INTO outbound(channel,target,kind,body,idempotency_key,outcome,created_ts,updated_ts) VALUES('slack','U1','message','x','o_old','sent',?1,?1)", params![old]).unwrap();
+            conn.execute("INSERT INTO outbound(channel,target,kind,body,idempotency_key,outcome,created_ts,updated_ts) VALUES('slack','U1','message','x','o_pending','pending',?1,?1)", params![old]).unwrap();
+            conn.execute("INSERT INTO outbound(channel,target,kind,body,idempotency_key,outcome,created_ts,updated_ts) VALUES('slack','U1','message','x','o_fresh','sent',?1,?1)", params![fresh]).unwrap();
+            conn.execute("INSERT INTO outbound(channel,target,kind,body,idempotency_key,outcome,approval_nonce_used,created_ts,updated_ts) VALUES('slack','U1','approval_prompt','x','a_live','sent',0,?1,?1)", params![old]).unwrap();
+            // inbox: old acked(프룬)·old new(보존).
+            conn.execute("INSERT INTO inbox(channel,sender_id,text,state,created_ts,acked_ts) VALUES('slack','U1','','acked',?1,?1)", params![old]).unwrap();
+            conn.execute("INSERT INTO inbox(channel,sender_id,text,state,created_ts) VALUES('slack','U1','hi','new',?1)", params![old]).unwrap();
+            // inbound: old denied(프룬)·old accepted(보존).
+            conn.execute("INSERT INTO inbound(channel,idempotency_key,body_hash,ts,verdict) VALUES('slack','k_old','h',?1,'denied')", params![old]).unwrap();
+            conn.execute("INSERT INTO inbound(channel,idempotency_key,body_hash,ts,verdict) VALUES('slack','k_acc','h',?1,'accepted')", params![old]).unwrap();
+            // late_receipt: old(프룬).
+            conn.execute("INSERT INTO late_receipt(outbound_id,outcome,ts) VALUES(1,'sent',?1)", params![old]).unwrap();
+
+            let removed = prune_retention(conn, now(), channel_retain_secs());
+            assert!(removed >= 4, "오래된 종결행 최소 4건 프룬: {removed}");
+
+            let has_ob = |k: &str| -> bool {
+                conn.query_row("SELECT 1 FROM outbound WHERE idempotency_key=?1", [k], |_| Ok(())).optional().unwrap().is_some()
+            };
+            assert!(!has_ob("o_old"), "오래된 sent 프룬");
+            assert!(has_ob("o_pending"), "pending 보존");
+            assert!(has_ob("o_fresh"), "최근 sent 보존");
+            assert!(has_ob("a_live"), "미소각 approval(살아있는 버튼) 보존");
+            let inbox_new: i64 = conn.query_row("SELECT COUNT(*) FROM inbox WHERE state='new'", [], |r| r.get(0)).unwrap();
+            let inbox_acked: i64 = conn.query_row("SELECT COUNT(*) FROM inbox WHERE state='acked'", [], |r| r.get(0)).unwrap();
+            assert_eq!(inbox_new, 1, "new inbox 보존");
+            assert_eq!(inbox_acked, 0, "오래된 acked inbox 프룬");
+            let denied: i64 = conn.query_row("SELECT COUNT(*) FROM inbound WHERE verdict='denied'", [], |r| r.get(0)).unwrap();
+            let accepted: i64 = conn.query_row("SELECT COUNT(*) FROM inbound WHERE verdict='accepted'", [], |r| r.get(0)).unwrap();
+            assert_eq!(denied, 0, "오래된 denied 프룬");
+            assert_eq!(accepted, 1, "accepted 보존(감사 추적)");
+            let lr: i64 = conn.query_row("SELECT COUNT(*) FROM late_receipt", [], |r| r.get(0)).unwrap();
+            assert_eq!(lr, 0, "오래된 late_receipt 프룬");
+        }
     }
 
     // M6: 재스폰 후 register가 sent-but-feed-pending approval_prompt를 재조정 목록에 포함(버튼 복원).
