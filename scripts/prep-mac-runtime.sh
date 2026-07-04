@@ -39,6 +39,10 @@ TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 curl -fL -o "$TMP/py.tgz" "https://github.com/astral-sh/python-build-standalone/releases/download/${PBS_TAG}/cpython-3.12.13+${PBS_TAG}-${PY_ARCH}-apple-darwin-install_only.tar.gz"
 tar xzf "$TMP/py.tgz" -C "$RT"           # 최상위 python/ → runtime/python (bin/python3·pip)
 # ── git (desktop/dugite-native 포터블 · CLT 불요) ──
+# 이 tar.gz는 libexec/git-core 빌트인 143개를 이미 `git` 심볼릭링크로 dedup(추출 트리 ≈141MB)한다.
+# ★여기서 추가 dedup을 하지 마라 — Tauri 번들러가 bundle.resources 복사 시 심볼릭링크를 역참조해
+#   각 링크를 3.4MB 실복사본으로 부풀린다(upstream #13219). 이 단계 dedup은 복사 때 무효화된다.
+#   실효 dedup은 '.app 생성 후·서명 전'에만 가능 → scripts/build-macos-signed.sh(RC-23 dedup 단계) 참조.
 curl -fL -o "$TMP/git.tgz" "https://github.com/desktop/dugite-native/releases/download/${DUGITE_TAG}/dugite-native-v2.53.0-f49d009-macOS-${DUGITE_ARCH}.tar.gz"
 tar xzf "$TMP/git.tgz" -C "$RT/git"      # bin/git·libexec/git-core
 # ── uv/uvx (astral 단일 바이너리) ──

@@ -70,26 +70,94 @@ while IFS= read -r -d '' exe; do
 done < <(find src-tauri/runtime -type f -perm +111 ! -name '*.dylib' ! -name '*.so' ! -name '*.node' -print0)
 echo "  ✓ runtime Mach-O ${SIGN_N}개 재서명 (python/node=entitlements·git/uv=무 entitlements)"
 
-echo "== Apple 공증 빌드 v$VERSION (Tauri 자동 codesign[hardened]+notarize+staple) =="
-bun x @tauri-apps/cli build
+# ── 앱 번들 빌드 (서명만 · 공증은 dedup 뒤로 1회 미룸) — RC-23 git-core dedup ──
+# ★Tauri 번들러는 bundle.resources 디렉토리의 심볼릭링크를 역참조(dereference)한다(upstream #13219, 미해결).
+#   dugite tar.gz는 libexec/git-core 빌트인 143개를 이미 `git` 심볼릭링크로 dedup(트리 141MB)하나, Tauri가
+#   .app으로 복사하며 각 링크를 3.4MB 실복사본으로 부풀려 runtime/git 608MB(중복 464MB)·DMG 434MB가 된다.
+#   → prep-mac-runtime.sh 단계 dedup은 무효(복사 시 재역참조). '.app 생성 후·서명 전' dedup만 유효하다(실측).
+#   Tauri에 서명 신원만 주고 공증 자격은 감춰 '서명만' 시킨다(dedup이 서명 봉인을 깨므로 공증은 1회로 미룸).
+#   fat DMG도 건너뛴다(--bundles app) — DMG는 dedup된 .app에서 hdiutil로 만든다
+#   (`tauri build --bundles dmg`는 .app을 재빌드해 역참조를 되돌리므로 사용 불가 — 실측 확인).
+echo "== 앱 번들 빌드(서명만·공증 보류) v$VERSION =="
+env -u APPLE_ID -u APPLE_PASSWORD -u APPLE_TEAM_ID -u APPLE_API_KEY -u APPLE_API_ISSUER \
+  bun x @tauri-apps/cli build --bundles app
 
 APP="target/release/bundle/macos/cys.app"
 DMG="target/release/bundle/dmg/cys_${VERSION}_aarch64.dmg"
+RTGIT="$APP/Contents/Resources/runtime/git"
 
-# ★동봉 Mach-O 포함 앱 전체 서명 무결성 검증 (codex T6b.1) — 공증 제출 전 중첩 바이너리 서명 결손 조기 검출.
-# --deep는 *검증 전용*으로만 사용(D-4 규칙 유지 — 서명은 위 inside-out 개별, 검증은 --deep 허용).
+# ── git-core 빌트인 dedup (Tauri 역참조 되돌리기) ──
+# libexec/git-core 안에서 bin/git 과 '바이트 동일'한 파일만 상대 심볼릭링크(../../bin/git)로 치환.
+# 결정론: 크기 일치 → cmp 바이트 대조 통과분만(git-lfs·GCM .dll/.dylib·remote 헬퍼 등 비동일 파일 불가침).
+# bin/git 만 실본으로 남고 143개 빌트인은 argv[0] 디스패치로 정상(실측: init/add/commit/stash/log/직접호출 OK).
+echo "== runtime/git dedup (git-core 빌트인 → ../../bin/git 심볼릭링크) =="
+REF="$RTGIT/bin/git"; REF_SIZE="$(stat -f '%z' "$REF")"
+DEDUP_BEFORE_KB="$(du -sk "$RTGIT" | awk '{print $1}')"; DEDUP_N=0
+while IFS= read -r -d '' f; do
+  if [ "$(stat -f '%z' "$f")" = "$REF_SIZE" ] && cmp -s "$f" "$REF"; then
+    ln -sf "../../bin/git" "$f"; DEDUP_N=$((DEDUP_N+1))
+  fi
+done < <(find "$RTGIT/libexec/git-core" -type f -print0)
+DEDUP_AFTER_KB="$(du -sk "$RTGIT" | awk '{print $1}')"
+echo "  ✓ 빌트인 ${DEDUP_N}개 링크화 · runtime/git $((DEDUP_BEFORE_KB/1024))MB → $((DEDUP_AFTER_KB/1024))MB"
+[ "$DEDUP_N" -ge 100 ] || { echo "  ✗ dedup 대상($DEDUP_N)이 비정상적으로 적음 — 트리 구조 확인 후 중단"; exit 1; }
+
+# dedup은 Resources를 바꿔 Tauri가 봉인한 외부 앱 서명을 깬다 → 외부 앱 서명만 재봉인(--force · ★--deep 금지).
+# 중첩 Mach-O(pre-sign된 runtime bin/git·Tauri가 서명한 sidecar/framework/메인바이너리)는 그대로 유효하다.
+echo "== dedup 후 외부 앱 서명 재봉인 (inside-out 유지·--deep 금지) =="
+codesign --force --options runtime --timestamp --entitlements "$ENT" --sign "$APPLE_SIGNING_IDENTITY" "$APP"
+
+# ★동봉 Mach-O 포함 앱 전체 서명 무결성 검증 (공증 제출 전) — dedup 심볼릭링크 포함 sealed resource 검증.
+# --deep는 *검증 전용*으로만 사용(D-4 규칙 유지 — 서명은 inside-out 개별, 검증은 --deep 허용). 실측: 링크 트리 통과.
 echo "== 동봉 서명 검증: codesign --verify --deep --strict (제출 전) =="
 if codesign --verify --deep --strict --verbose=4 "$APP" 2>&1; then
-  echo "  ✓ codesign --verify --deep --strict 통과 (중첩 runtime Mach-O 서명 무결)"
+  echo "  ✓ codesign --verify --deep --strict 통과 (dedup 링크 포함 중첩 서명 무결)"
 else
   echo "  ✗ 서명 검증 실패 — 중첩 바이너리 서명 결손. 위 로그의 offender 재서명 필요"; exit 1
 fi
+
+# ── 공증(1회) + staple + DMG/업데이터 재생성 ──
+# ⚠ 아래 notarytool/stapler/signer 경로는 Apple Developer 자격·업데이터 키가 필요해 워커 환경에선 실행 검증
+#   불가 — dedup/재서명/hdiutil UDZO/codesign --verify 는 실측 통과. 오너 자격으로 최종 실행 검증을 요한다.
+# notarytool 자격: APPLE_API_KEY(우선) 또는 APPLE_ID+APPLE_PASSWORD+APPLE_TEAM_ID (스크립트 상단서 fail-closed 검증됨).
+if [ -n "${APPLE_API_KEY:-}" ]; then
+  NOTARY_ARGS=(--key "${APPLE_API_KEY_PATH:?APPLE_API_KEY 사용 시 APPLE_API_KEY_PATH(.p8) 필요}" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER")
+else
+  NOTARY_ARGS=(--apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID")
+fi
+
+echo "== 공증: 앱(zip 제출) → staple (dmg 안에 staple된 앱을 담아 offline 검증까지 견고) =="
+APPZIP="$APP.notarize.zip"
+ditto -c -k --keepParent "$APP" "$APPZIP"
+xcrun notarytool submit "$APPZIP" "${NOTARY_ARGS[@]}" --wait
+xcrun stapler staple "$APP"
+rm -f "$APPZIP"
+
+# 업데이터 아티팩트 재생성(dedup 반영): Tauri가 만든 fat cys.app.tar.gz(447MB)를 dedup·staple된 앱으로
+# 다시 tar(심볼릭링크 보존 → 다운로드 축소)하고 업데이터 키로 재서명. make-update-manifest.sh가 이 .sig를 읽는다.
+# (주의: Tauri 업데이터 *클라이언트*의 심볼릭링크 보존은 버전의존 #7480 — 다운로드는 축소되나 설치 후 on-disk
+#  크기는 클라이언트 tauri 동작에 좌우될 수 있음. 신규 설치 경로인 DMG는 확실히 축소된다.)
+if [ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
+  echo "== 업데이터 tar.gz 재생성(dedup 반영) + 재서명 =="
+  ( cd "$(dirname "$APP")" && tar czf cys.app.tar.gz cys.app )
+  bun x @tauri-apps/cli signer sign --private-key "$TAURI_SIGNING_PRIVATE_KEY" --password "" "$APP.tar.gz"
+fi
+
+echo "== dedup·staple된 앱으로 UDZO DMG 생성(hdiutil — Tauri 기본 포맷과 동일) =="
+DMGSTAGE="$(mktemp -d)"; ditto "$APP" "$DMGSTAGE/cys.app"; ln -s /Applications "$DMGSTAGE/Applications"
+mkdir -p "$(dirname "$DMG")"
+hdiutil create -volname "cys" -srcfolder "$DMGSTAGE" -ov -format UDZO "$DMG"
+rm -rf "$DMGSTAGE"
+
+echo "== 공증: DMG 제출 → staple =="
+xcrun notarytool submit "$DMG" "${NOTARY_ARGS[@]}" --wait
+xcrun stapler staple "$DMG"
 
 echo "== 검증: Gatekeeper(spctl) + 공증 티켓(stapler) =="
 if spctl -a -vv "$APP" 2>&1 | grep -qi "accepted"; then
   echo "  ✓ spctl: accepted (다른 맥에서도 경고 없이 열림 — '손상됨' 해소)"
 else
-  echo "  ✗ spctl 거부 — 공증 실패. 위 빌드 로그의 notarization 결과를 확인하라"; exit 1
+  echo "  ✗ spctl 거부 — 공증 실패. 위 notarytool 결과를 확인하라"; exit 1
 fi
 xcrun stapler validate "$APP" >/dev/null 2>&1 && echo "  ✓ app 공증 티켓 stapled" || echo "  ⚠ app staple 미확인"
 xcrun stapler validate "$DMG" >/dev/null 2>&1 && echo "  ✓ DMG 공증 티켓 stapled" || echo "  ⚠ DMG staple 미확인(앱 공증되면 설치는 정상)"
