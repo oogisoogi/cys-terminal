@@ -171,6 +171,18 @@ pub fn dept_socket_path(name: &str) -> PathBuf {
     }
 }
 
+/// 이 소켓/파이프 경로가 부서(dept) 데몬의 것인가 — 부서 규약 `cys-dept-<name>`(dept_socket_path와 정합).
+/// 채널은 메인 cysd 단독 소유(DESIGN §2.5)이므로 부서 데몬의 브리지 스폰을 구조적으로 거부하는 데 쓴다.
+/// 판별: 경로 컴포넌트(unix 부모 디렉토리 `cys-dept-<name>` / windows 파이프명 `cys-dept-<name>`) 중
+/// `cys-dept-` 접두 이름이 있으면 부서. 메인 데몬(슬러그 `cys`·`cys.sock`)은 오판하지 않는다
+/// (`cys`는 `cys-dept-` 접두가 아님 — 오탐 시 채널 전면 불능이라 접두를 정확히 요구).
+pub fn is_dept_socket(socket_path: &std::path::Path) -> bool {
+    socket_path
+        .to_string_lossy()
+        .split(|c| c == '/' || c == '\\')
+        .any(|comp| comp.starts_with("cys-dept-"))
+}
+
 /// Parse a surface reference: "surface:31", "31", or 31 → 31.
 pub fn parse_surface_ref(s: &str) -> Option<u64> {
     let t = s.trim();
@@ -268,6 +280,18 @@ mod tests {
             assert!(s.ends_with(".local/state/cys-dept-dept-3/cys.sock"), "unix .sock: {s}");
             assert!(!s.starts_with('/') || s.contains("/.local/state/"), "home 기반: {s}");
         }
+    }
+
+    #[test]
+    fn is_dept_socket_detects_dept_not_main() {
+        // H3: dept_socket_path와 정합 — 부서만 true, 메인은 false(오판=채널 전면 불능이라 접두 정확).
+        assert!(is_dept_socket(&dept_socket_path("dept-3")), "부서 소켓은 true");
+        assert!(is_dept_socket(Path::new("/x/.local/state/cys-dept-future/cys.sock")));
+        assert!(is_dept_socket(Path::new(r"\\.\pipe\cys-dept-3")), "windows 파이프");
+        // 메인 데몬 — 오판 금지.
+        assert!(!is_dept_socket(Path::new("/x/.local/state/cys/cys.sock")), "메인 unix");
+        assert!(!is_dept_socket(Path::new(r"\\.\pipe\cys")), "메인 windows");
+        assert!(!is_dept_socket(Path::new("/tmp/cys_chan_test_1_tag/cysd.sock")), "테스트 임시");
     }
 
     #[test]

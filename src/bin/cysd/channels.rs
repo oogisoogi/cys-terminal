@@ -457,6 +457,16 @@ fn remote_approve_active(conn: &Connection, now: f64) -> bool {
 // ── channel.start / stop ─────────────────────────────────────────────────────
 
 fn start(daemon: &Arc<Daemon>, conn: &mut Connection, params: &Value, id: &Value) -> Value {
+    // H3: 채널은 메인 cysd 단독 소유(§2.5) — 부서 데몬은 브리지 스폰 금지(동일 봇토큰 이중
+    // 게이트웨이 연결 차단). 부서 데몬은 자기 channels.db만 검사해 교차 스폰을 못 막으므로,
+    // 스폰 진입점(start·register)에서 구조적으로 거부한다.
+    if cys::is_dept_socket(&daemon.socket_path) {
+        return err_response(
+            id,
+            "dept_channel_forbidden",
+            "채널은 메인 cysd 단독 소유 — 부서 데몬은 브리지 스폰 불가",
+        );
+    }
     let Some(channel) = p_str(params, "channel") else {
         return err_response(id, "invalid_params", "missing channel");
     };
@@ -543,6 +553,14 @@ fn stop(daemon: &Arc<Daemon>, conn: &mut Connection, params: &Value, id: &Value)
 // ── channel.register ─────────────────────────────────────────────────────────
 
 fn register(daemon: &Arc<Daemon>, conn: &mut Connection, params: &Value, id: &Value, caller_pid: Option<u32>) -> Value {
+    // H3: 부서 데몬은 브리지를 스폰하지 않으므로 등록도 받지 않는다(메인 단독 소유·§2.5).
+    if cys::is_dept_socket(&daemon.socket_path) {
+        return err_response(
+            id,
+            "dept_channel_forbidden",
+            "채널은 메인 cysd 단독 소유 — 부서 데몬은 브리지 등록 불가",
+        );
+    }
     let Some(channel) = p_str(params, "channel") else {
         return err_response(id, "invalid_params", "missing channel");
     };
@@ -1811,6 +1829,29 @@ mod tests {
         // inbound가 다시 inbox에 적재됨(정상 복원 — 원격 잠금이 영구 불능이 아님).
         let r = call(&d, "inbound", inbound_params("slack", "U1", "slack:after", "hello", "user"), own_pid());
         assert_eq!(r["result"]["action"], json!("queued"), "unlock 후 inbound 복원: {r}");
+    }
+
+    // H3: 부서 데몬은 channel.start·register를 구조적으로 거부(메인 단독 소유). 메인은 오판 없음.
+    fn tmp_daemon_dept(tag: &str) -> Arc<Daemon> {
+        let dir = std::env::temp_dir().join(format!("cys-dept-chtest-{}-{}", std::process::id(), tag));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Daemon::new(dir.join("cys.sock"))
+    }
+
+    #[test]
+    fn dept_daemon_forbids_channel_spawn_main_allows() {
+        let d = tmp_daemon_dept("deptreject");
+        let s = call(&d, "start", json!({"channel": "slack", "cmd": "true"}), None);
+        assert_eq!(s["ok"], json!(false), "{s}");
+        assert_eq!(s["error"]["code"], json!("dept_channel_forbidden"), "부서 start 거부: {s}");
+        let r = call(&d, "register", json!({"channel": "slack", "token": "t"}), own_pid());
+        assert_eq!(r["error"]["code"], json!("dept_channel_forbidden"), "부서 register 거부: {r}");
+        // 메인 데몬(비-부서)은 dept 거부가 아니라 정상 경로 진입 — register는 미기동이라 not_started
+        // (dept_channel_forbidden이 아님을 확인 = 메인 오판 금지). start 스폰은 회피(register로 증명).
+        let m = tmp_daemon("main_notdept");
+        let mr = call(&m, "register", json!({"channel": "slack", "token": "t"}), own_pid());
+        assert_eq!(mr["error"]["code"], json!("not_started"), "메인은 dept 거부 아닌 정상 경로: {mr}");
     }
 
     #[test]
