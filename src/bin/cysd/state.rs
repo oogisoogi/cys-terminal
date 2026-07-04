@@ -194,6 +194,10 @@ pub struct FeedItem {
     pub decision: Option<String>,
     pub created_at: f64,
     pub resolved_at: Option<f64>,
+    /// 승인 tier(§2.4-3 S8): "a"|"b"|"c"|"d". None=무태그=D 취급(fail-closed) — 채널 미러는
+    /// tier≤C(a|b|c)만 허용된다. serde default로 구(舊) 영속 라인(tier 미포함)과 하위호환.
+    #[serde(default)]
+    pub tier: Option<String>,
 }
 
 pub struct Config {
@@ -767,6 +771,7 @@ impl Daemon {
             decision: None,
             created_at: now_epoch(),
             resolved_at: None,
+            tier: None, // 데몬 자동 알림은 무태그(=D·미러 제외) — 채널 스팸 차단.
         };
         self.feed_items.lock().unwrap().push(item.clone());
         self.persist_feed_item(&item);
@@ -777,6 +782,36 @@ impl Daemon {
             json!({"request_id": request_id, "kind": kind, "title": title,
                    "body": body, "wait": false}),
         );
+    }
+
+    /// feed 항목을 결정으로 해소한다(pending→resolved) — feed.reply와 채널 승인 미러 interaction이
+    /// 공유하는 단일 경로. 성공 시 스냅샷을 영속·대기 pusher wake·feed.item.resolved 발행하고 스냅샷
+    /// 반환, pending이 아니거나 없으면 None(멱등 — 중복 해소는 None). ★락 순서: feed_items →
+    /// feed_waiters(feed.push와 동일). channels 락을 잡은 채 호출돼도 안전하다(feed_items→channels
+    /// 역순 경로 없음 — mirror는 feed_items 해제 후 호출).
+    pub fn resolve_feed_item(&self, request_id: &str, decision: &str) -> Option<FeedItem> {
+        let snapshot = {
+            let mut items = self.feed_items.lock().unwrap();
+            let item = items.iter_mut().find(|i| i.request_id == request_id)?;
+            if item.status != "pending" {
+                return None;
+            }
+            item.status = "resolved".into();
+            item.decision = Some(decision.to_string());
+            item.resolved_at = Some(now_epoch());
+            item.clone()
+        };
+        self.persist_feed_item(&snapshot);
+        if let Some(tx) = self.feed_waiters.lock().unwrap().remove(request_id) {
+            let _ = tx.send(decision.to_string());
+        }
+        self.bus.publish(
+            "feed.item.resolved",
+            "feed",
+            None,
+            json!({"request_id": request_id, "decision": decision}),
+        );
+        Some(snapshot)
     }
 
     /// Feed 항목 스냅샷 한 줄을 JSONL에 append (영속화 — 데몬 재시작 복원용).
@@ -2552,6 +2587,7 @@ mod tests {
             decision: None,
             created_at: now_epoch(),
             resolved_at: None,
+            tier: None,
         }
     }
 

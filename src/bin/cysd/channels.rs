@@ -79,6 +79,7 @@ pub fn open(socket_path: &Path) -> Option<Connection> {
             approval_feed_id TEXT,
             approval_nonce   TEXT,
             approval_owner   TEXT,
+            approval_nonce_used INTEGER NOT NULL DEFAULT 0,
             created_ts    REAL NOT NULL,
             updated_ts    REAL NOT NULL,
             UNIQUE(channel, idempotency_key));
@@ -131,12 +132,21 @@ pub fn open(socket_path: &Path) -> Option<Connection> {
          CREATE INDEX IF NOT EXISTS ix_loopwin ON loopwin(channel, sender_id, ts);",
     )
     .ok()?;
-    // schema_version 핀(D8 마이그레이션 토대).
+    // schema_version 핀(D8 마이그레이션 토대). 신규 DB는 2로 출발.
     conn.execute(
-        "INSERT INTO meta(key, value) VALUES('schema_version','1') ON CONFLICT(key) DO NOTHING",
+        "INSERT INTO meta(key, value) VALUES('schema_version','2') ON CONFLICT(key) DO NOTHING",
         [],
     )
     .ok()?;
+    // C2 마이그레이션: C0/C1이 만든 기존 channels.db(v1)에는 approval_nonce_used 컬럼이 없다.
+    // ALTER는 컬럼이 이미 있으면 에러(신규 DB) → `let _`로 흡수해 멱등(신규·기존 모두 안전).
+    // 승인 미러 nonce 단회 소각의 영속 플래그로, 재생(replay) 공격을 재시작 후에도 차단한다.
+    let _ = conn.execute(
+        "ALTER TABLE outbound ADD COLUMN approval_nonce_used INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    // v1 DB를 v2로 올린다(신규 DB는 이미 2 → no-op). 실패해도 graceful.
+    let _ = conn.execute("UPDATE meta SET value='2' WHERE key='schema_version' AND value='1'", []);
     Some(conn)
 }
 
@@ -181,6 +191,12 @@ fn loop_suppressed(count_in_window: u64, limit: u64) -> bool {
 /// 아웃바운드 receipt가 '늦은' 것인가(순수) — pending이 아니면 이미 terminal이라 late.
 fn receipt_is_late(current_outcome: &str) -> bool {
     current_outcome != "pending"
+}
+
+/// tier가 채널 미러 가능한가(순수·fail-closed·§2.4-3 S8). None(무태그)·"d"·미지값은 **절대 미러 금지**
+/// — Tier D(비가역·외부발행·헌법변경)는 구조적으로 채널에 도달 불가. "a"|"b"|"c"만 true.
+fn tier_mirrorable(tier: Option<&str>) -> bool {
+    matches!(tier, Some("a") | Some("b") | Some("c"))
 }
 
 /// inbox 재배달 대상 판정(순수·테스트 핀) — new는 즉시, injected는 TTL 초과 un-acked면 재주입.
@@ -385,6 +401,7 @@ pub fn handle(daemon: &Arc<Daemon>, sub: &str, params: &Value, id: &Value, calle
         "receipt" => receipt(daemon, conn, params, id),
         "ack" => ack(conn, params, id),
         "allow" => allow(conn, params, id),
+        "allow-remote-approve" => allow_remote_approve(conn, params, id),
         "revoke" => revoke(conn, params, id),
         "lockdown" => lockdown(daemon, conn, id),
         "status" => status(conn, id),
@@ -407,6 +424,18 @@ fn meta_set(conn: &Connection, key: &str, val: &str) {
 }
 fn lockdown_active(conn: &Connection) -> bool {
     meta_get(conn, "lockdown").as_deref() == Some("1")
+}
+
+/// Tier C 원격 승인 opt-in 만료 절대 ts(초). 미설정/파싱실패=0(=상시 만료·기본 OFF·§2.4-5).
+fn remote_approve_until(conn: &Connection) -> f64 {
+    meta_get(conn, "allow_remote_approve_until")
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.0)
+}
+/// 원격 승인 게이트가 지금 열려있는가 — 만료 ts가 now보다 미래일 때만. 기본 OFF(폰 분실 시 안전측).
+/// 이 게이트가 닫혀있으면 **미러 발행도, interaction 승인 처리도** 하지 않는다(꺼짐=버튼 없음).
+fn remote_approve_active(conn: &Connection, now: f64) -> bool {
+    remote_approve_until(conn) > now
 }
 
 // ── channel.start / stop ─────────────────────────────────────────────────────
@@ -603,6 +632,107 @@ fn approval_json(feed_id: Option<String>, nonce: Option<String>, owner: Option<S
     }
 }
 
+// ── 승인 미러(§2.4·§2.6 O9) — feed.push/aging 시 tier≤C·게이트 ON이면 채널 버튼 발행 ──────
+
+/// 미러 버튼 본문: 제목·요지(절단)·feed_id·유효기간. nonce는 표시 텍스트가 아니라 outbound
+/// approval_* 원장·이벤트 payload(버튼 custom_id)로만 흐른다(§2.3 각인).
+fn mirror_body(title: &str, summary: &str, feed_id: &str, until: f64) -> String {
+    let s: String = summary.chars().take(200).collect();
+    let ell = if summary.chars().count() > 200 { "…" } else { "" };
+    let hhmm = {
+        use chrono::TimeZone;
+        chrono::Local
+            .timestamp_opt(until as i64, 0)
+            .single()
+            .map(|dt| dt.format("%H:%M").to_string())
+            .unwrap_or_else(|| "--:--".into())
+    };
+    format!("[승인 요청] {title}\n{s}{ell}\nfeed:{feed_id}\n(원격 승인 버튼 · 유효 ~{hhmm})")
+}
+
+/// 한 (채널,owner)에 approval_prompt 미러 1건을 멱등 발행한다(§2.6 O9: feed당 1버튼).
+/// idempotency_key=`approval:<feed_id>:<owner>` — 재호출(aging)은 기존 행 존재로 skip(중복 버튼 0).
+/// 신규 발행 시 32B hex nonce 단회를 outbound 원장에 각인하고 channel.outbound.<ch> 이벤트를 낸다
+/// (pause 중이면 행만 남기고 이벤트 동결 — resume_flush가 재발행·outbound() 정책과 동형).
+fn mirror_one(daemon: &Arc<Daemon>, conn: &Connection, channel: &str, owner: &str, feed_id: &str, body: &str) {
+    let key = format!("approval:{feed_id}:{owner}");
+    let exists = conn
+        .query_row(
+            "SELECT 1 FROM outbound WHERE channel=?1 AND idempotency_key=?2",
+            params![channel, key],
+            |_| Ok(()),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .is_some();
+    if exists {
+        return; // 이미 미러됨 — 중복 버튼 금지(aging은 갱신이지 신규 발행 아님).
+    }
+    let nonce = random_token_hex();
+    let ts = now();
+    if conn
+        .execute(
+            "INSERT INTO outbound(channel, target, kind, body, reply_to, idempotency_key, retry_of, outcome,
+                                  approval_feed_id, approval_nonce, approval_owner, approval_nonce_used, created_ts, updated_ts)
+             VALUES(?1,?2,'approval_prompt',?3,NULL,?4,NULL,'pending',?5,?6,?2,0,?7,?7)",
+            params![channel, owner, body, key, feed_id, nonce, ts],
+        )
+        .is_err()
+    {
+        return;
+    }
+    let oid = conn.last_insert_rowid();
+    let _ = conn.execute("UPDATE channels SET last_out_ts=?2 WHERE channel=?1", params![channel, ts]);
+    if !daemon.paused.load(std::sync::atomic::Ordering::Relaxed) {
+        daemon.bus.publish(
+            &format!("channel.outbound.{channel}"),
+            "channel",
+            None,
+            json!({"outbound_id": oid, "channel": channel, "target": owner, "kind": "approval_prompt",
+                   "body": body, "reply_to": Value::Null, "idempotency_key": key, "retry_of": Value::Null,
+                   "approval": {"feed_id": feed_id, "nonce": nonce, "owner_sender_id": owner}}),
+        );
+    }
+}
+
+/// 승인 미러 진입점 — feed.push·aging에서 호출. **fail-closed 2중 게이트**:
+/// ① tier≤C(a|b|c)만(무태그/D 차단) ② 원격승인 게이트 ON(OFF면 버튼 없음이 안전측). 둘 다 통과 시
+/// enabled+registered 채널의 owner allowlist마다 멱등 미러(§2.4·§2.6 O9). 데몬 lock: channels만
+/// 잡는다(호출자는 feed_items 락을 이미 해제 — lock-order 안전).
+pub fn mirror_approval(daemon: &Arc<Daemon>, feed_id: &str, title: &str, summary: &str, tier: Option<&str>) {
+    if !tier_mirrorable(tier) {
+        return; // ① tier fail-closed — 무태그/D는 절대 미러 금지.
+    }
+    let mut guard = daemon.channels.lock().unwrap();
+    let Some(conn) = guard.as_mut() else {
+        return;
+    };
+    if !remote_approve_active(conn, now()) {
+        return; // ② 원격승인 게이트 OFF — 미러 발행 자체 금지.
+    }
+    let until = remote_approve_until(conn);
+    // (채널, owner) 쌍을 먼저 수집(prepared stmt 대여 종료) 후 삽입 — borrow 충돌 회피.
+    let channels: Vec<String> = conn
+        .prepare("SELECT channel FROM channels WHERE enabled=1 AND registered=1")
+        .and_then(|mut s| s.query_map([], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>())
+        .unwrap_or_default();
+    let mut targets: Vec<(String, String)> = Vec::new();
+    for ch in &channels {
+        let owners: Vec<String> = conn
+            .prepare("SELECT sender_id FROM allowlist WHERE channel=?1")
+            .and_then(|mut s| s.query_map([ch], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>())
+            .unwrap_or_default();
+        for o in owners {
+            targets.push((ch.clone(), o));
+        }
+    }
+    let body = mirror_body(title, summary, feed_id, until);
+    for (ch, owner) in targets {
+        mirror_one(daemon, conn, &ch, &owner, feed_id, &body);
+    }
+}
+
 // ── channel.inbound — inbox-first 내구 퍼널(§2.2 ①~⑤) ─────────────────────────
 
 fn inbound(daemon: &Arc<Daemon>, conn: &mut Connection, params: &Value, id: &Value, caller_pid: Option<u32>) -> Value {
@@ -662,6 +792,12 @@ fn inbound(daemon: &Arc<Daemon>, conn: &mut Connection, params: &Value, id: &Val
     }
     #[cfg(windows)]
     let _ = (caller_pid, scoped_pgid);
+
+    // ── 승인 버튼 클릭(interaction) 분기(§2.4-4·§2.7) — 브리지 인가를 통과한 뒤에만.
+    // kind=interaction이면 inbox 퍼널이 아니라 nonce 3중 검증 경로로 간다(원격 승인 해소).
+    if p_str(params, "kind").as_deref() == Some("interaction") {
+        return verify_interaction(daemon, conn, &channel, params, id);
+    }
 
     // 이하 판정·적재는 단일 트랜잭션(dedupe check+insert 원자성).
     let tx = match conn.transaction() {
@@ -793,6 +929,121 @@ fn inbound(daemon: &Arc<Daemon>, conn: &mut Connection, params: &Value, id: &Val
         json!({"channel": channel, "inbox_id": inbox_id, "sender_id": sender_id}),
     );
     ok_response(id, json!({"action": action, "inbox_id": inbox_id}))
+}
+
+// ── 승인 버튼 interaction 검증(§2.4-4) — nonce 3중 + 게이트 + allow-once ─────────
+
+/// 브리지가 보고한 버튼 클릭을 검증해 원격 승인을 해소한다. 순서(각 실패는 구분된 사유+이벤트):
+/// ⓪ 게이트 ON(allow-remote-approve 유효) ① sender=owner allowlist ② decision∈{allow,deny}
+/// ③ nonce 실재+feed 일치+미사용+owner 바인딩 ④ feed_id 실재·pending ⑤ nonce 원자 소각(재생 차단)
+/// ⑥ feed reply 경로로 해소 → channel.approval.resolved. allow는 allow-once만(단회 nonce가 강제).
+fn verify_interaction(daemon: &Arc<Daemon>, conn: &Connection, channel: &str, params: &Value, id: &Value) -> Value {
+    let sender_id = p_str(params, "sender_id").unwrap_or_default();
+    let Some(feed_id) = p_str(params, "feed_id") else {
+        return err_response(id, "invalid_params", "missing feed_id");
+    };
+    let Some(nonce) = p_str(params, "nonce") else {
+        return err_response(id, "invalid_params", "missing nonce");
+    };
+    let decision = p_str(params, "decision").unwrap_or_default();
+
+    // 거부 헬퍼: 구분된 사유로 이벤트 발행 + interaction_denied 결과(브리지가 ephemeral 회신).
+    let deny = |reason: &str| -> Value {
+        daemon.bus.publish(
+            "channel.approval.denied",
+            "channel",
+            None,
+            json!({"channel": channel, "feed_id": feed_id, "sender_id": sender_id, "reason": reason}),
+        );
+        ok_response(id, json!({"action": "interaction_denied", "reason": reason}))
+    };
+
+    // ⓪ 원격 승인 게이트(OFF면 버튼 무효 — 폰 분실 안전측).
+    if !remote_approve_active(conn, now()) {
+        return deny("remote_approve_off");
+    }
+    // ① sender=owner allowlist(fail-closed).
+    let is_owner = conn
+        .query_row(
+            "SELECT 1 FROM allowlist WHERE channel=?1 AND sender_id=?2",
+            params![channel, sender_id],
+            |_| Ok(()),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .is_some();
+    if !is_owner {
+        return deny("not_owner");
+    }
+    // ② decision 화이트리스트(allow|deny만 — allow-always 등 불가).
+    if decision != "allow" && decision != "deny" {
+        return deny("bad_decision");
+    }
+    // ③ nonce 실재 + feed 일치 + 미사용 + owner 바인딩(다른 owner의 nonce 도용 차단).
+    let row: Option<(i64, String, i64, Option<String>)> = conn
+        .query_row(
+            "SELECT id, approval_feed_id, approval_nonce_used, approval_owner
+             FROM outbound WHERE channel=?1 AND approval_nonce=?2 AND kind='approval_prompt'",
+            params![channel, nonce],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .ok()
+        .flatten();
+    let Some((oid, row_feed, used, owner)) = row else {
+        return deny("nonce_invalid");
+    };
+    if row_feed != feed_id {
+        return deny("nonce_feed_mismatch");
+    }
+    if used != 0 {
+        return deny("nonce_used");
+    }
+    if owner.as_deref() != Some(sender_id.as_str()) {
+        return deny("owner_mismatch");
+    }
+    // ④ feed_id 실재·pending(해소 대상이 살아있어야 함).
+    let pending = daemon
+        .feed_items
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|i| i.request_id == feed_id && i.status == "pending");
+    if !pending {
+        return deny("feed_not_pending");
+    }
+    // ⑤ nonce 원자 소각(WHERE used=0 → 0행이면 동시 재생이 이미 태움 = 재생 차단).
+    let burned = conn
+        .execute(
+            "UPDATE outbound SET approval_nonce_used=1, updated_ts=?2 WHERE id=?1 AND approval_nonce_used=0",
+            params![oid, now()],
+        )
+        .unwrap_or(0);
+    if burned == 0 {
+        return deny("nonce_race");
+    }
+    // ⑥ 기존 feed reply 경로로 해소(pending→resolved·대기 pusher wake·feed.item.resolved).
+    match daemon.resolve_feed_item(&feed_id, &decision) {
+        Some(_) => {
+            daemon.bus.publish(
+                "channel.approval.resolved",
+                "channel",
+                None,
+                json!({"channel": channel, "feed_id": feed_id, "sender_id": sender_id, "decision": decision}),
+            );
+            ok_response(id, json!({"action": "approval_resolved", "feed_id": feed_id, "decision": decision}))
+        }
+        // 소각~해소 사이 레이스로 feed가 사라짐(다른 경로가 해소) — nonce는 이미 태워 안전.
+        None => deny("feed_gone"),
+    }
 }
 
 // ── inbox 배달기(§2.2 배달 상태기계) ─────────────────────────────────────────
@@ -1099,6 +1350,21 @@ fn allow(conn: &mut Connection, params: &Value, id: &Value) -> Value {
     ok_response(id, json!({"channel": channel, "sender_id": sender_id, "allowed": true}))
 }
 
+// ── channel.allow-remote-approve — Tier C 원격 승인 기간 한정 opt-in(§2.4-5) ────
+
+/// `cys channel allow-remote-approve --for <기간>` → meta에 만료 ts 기록(기본 OFF에서 기간 열기).
+/// duration_secs=0(또는 --off)이면 즉시 닫는다(만료 ts=0=상시 만료). 폰 분실 시 기본이 안전측.
+fn allow_remote_approve(conn: &mut Connection, params: &Value, id: &Value) -> Value {
+    let secs = p_f64(params, "duration_secs").unwrap_or(0.0);
+    if secs <= 0.0 {
+        meta_set(conn, "allow_remote_approve_until", "0");
+        return ok_response(id, json!({"allow_remote_approve": false, "until": 0.0}));
+    }
+    let until = now() + secs;
+    meta_set(conn, "allow_remote_approve_until", &until.to_string());
+    ok_response(id, json!({"allow_remote_approve": true, "until": until, "for_secs": secs}))
+}
+
 fn revoke(conn: &mut Connection, params: &Value, id: &Value) -> Value {
     let (Some(channel), Some(sender_id)) = (p_str(params, "channel"), p_str(params, "sender_id")) else {
         return err_response(id, "invalid_params", "missing channel or sender_id");
@@ -1199,7 +1465,12 @@ fn status(conn: &Connection, id: &Value) -> Value {
             }
         }
     }
-    ok_response(id, json!({"channels": channels, "lockdown": lockdown_active(conn)}))
+    let ra_until = remote_approve_until(conn);
+    ok_response(
+        id,
+        json!({"channels": channels, "lockdown": lockdown_active(conn),
+               "remote_approve": {"active": ra_until > now(), "until": ra_until}}),
+    )
 }
 
 // ── 부팅 재조정(reconcile) — §2.1-2 ─────────────────────────────────────────
@@ -1440,7 +1711,7 @@ mod tests {
         let v: String = conn
             .query_row("SELECT value FROM meta WHERE key='schema_version'", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, "1");
+        assert_eq!(v, "2");
     }
 
     #[test]
@@ -1966,5 +2237,239 @@ mod tests {
             let oc: String = conn.query_row("SELECT outcome FROM outbound WHERE id=?1", [oid], |r| r.get(0)).unwrap();
             assert_eq!(oc, "unknown", "resume 후엔 타임아웃 시계가 재개되어 unknown");
         }
+    }
+
+    // ── C2: feed tier 태깅·승인 미러·interaction 검증 ─────────────────────────────
+
+    fn push_pending_feed(d: &Arc<Daemon>, request_id: &str) {
+        d.feed_items.lock().unwrap().push(crate::state::FeedItem {
+            request_id: request_id.into(),
+            kind: "permission".into(),
+            title: "approval".into(),
+            body: "body".into(),
+            surface_id: None,
+            status: "pending".into(),
+            decision: None,
+            created_at: now(),
+            resolved_at: None,
+            tier: Some("c".into()),
+        });
+    }
+
+    fn mirror_nonce(d: &Arc<Daemon>, channel: &str, feed_id: &str, target: &str) -> Option<String> {
+        let g = d.channels.lock().unwrap();
+        let conn = g.as_ref().unwrap();
+        conn.query_row(
+            "SELECT approval_nonce FROM outbound WHERE channel=?1 AND approval_feed_id=?2 AND target=?3 AND kind='approval_prompt'",
+            params![channel, feed_id, target],
+            |r| r.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    fn count_approval_prompts(d: &Arc<Daemon>, channel: &str, feed_id: &str) -> i64 {
+        let g = d.channels.lock().unwrap();
+        let conn = g.as_ref().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM outbound WHERE channel=?1 AND approval_feed_id=?2 AND kind='approval_prompt'",
+            params![channel, feed_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(-1)
+    }
+
+    fn interaction_params(channel: &str, sender: &str, feed_id: &str, nonce: &str, decision: &str) -> Value {
+        json!({"channel": channel, "sender_id": sender,
+               "idempotency_key": format!("{channel}:interaction:{feed_id}:{nonce}"),
+               "kind": "interaction", "feed_id": feed_id, "nonce": nonce, "decision": decision})
+    }
+
+    #[test]
+    fn tier_mirrorable_pure() {
+        assert!(tier_mirrorable(Some("a")));
+        assert!(tier_mirrorable(Some("b")));
+        assert!(tier_mirrorable(Some("c")));
+        assert!(!tier_mirrorable(Some("d")), "Tier D는 절대 미러 금지");
+        assert!(!tier_mirrorable(None), "무태그=D 취급(fail-closed)");
+        assert!(!tier_mirrorable(Some("x")), "미지 tier도 fail-closed");
+    }
+
+    #[test]
+    fn schema_version_is_2() {
+        let d = tmp_daemon("schema2");
+        let g = d.channels.lock().unwrap();
+        let conn = g.as_ref().unwrap();
+        let v: String = conn
+            .query_row("SELECT value FROM meta WHERE key='schema_version'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, "2");
+        // approval_nonce_used 컬럼 존재(마이그레이션 확인).
+        let has: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('outbound') WHERE name='approval_nonce_used'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has, 1, "approval_nonce_used 컬럼이 있어야 한다");
+    }
+
+    #[test]
+    fn mirror_blocked_when_tier_d_or_untagged() {
+        let d = tmp_daemon("mirror_faild");
+        seed_registered(&d, "slack", "t");
+        call(&d, "allow", json!({"channel": "slack", "sender_id": "U1"}), None);
+        call(&d, "allow-remote-approve", json!({"duration_secs": 3600}), None); // 게이트 ON
+        // tier=d → 미러 금지.
+        mirror_approval(&d, "feedD", "t", "b", Some("d"));
+        assert_eq!(count_approval_prompts(&d, "slack", "feedD"), 0, "Tier D는 미러되면 안 된다");
+        // 무태그(None) → 미러 금지(fail-closed).
+        mirror_approval(&d, "feedNone", "t", "b", None);
+        assert_eq!(count_approval_prompts(&d, "slack", "feedNone"), 0, "무태그는 미러되면 안 된다");
+    }
+
+    #[test]
+    fn mirror_blocked_when_gate_off() {
+        let d = tmp_daemon("mirror_gateoff");
+        seed_registered(&d, "slack", "t");
+        call(&d, "allow", json!({"channel": "slack", "sender_id": "U1"}), None);
+        // 게이트 OFF(기본) — tier=c여도 미러 금지.
+        mirror_approval(&d, "feedC", "t", "b", Some("c"));
+        assert_eq!(count_approval_prompts(&d, "slack", "feedC"), 0, "게이트 OFF면 미러 금지");
+        // 게이트 ON 후엔 미러됨.
+        call(&d, "allow-remote-approve", json!({"duration_secs": 3600}), None);
+        mirror_approval(&d, "feedC", "t", "b", Some("c"));
+        assert_eq!(count_approval_prompts(&d, "slack", "feedC"), 1, "게이트 ON·tier≤C면 미러 1건");
+    }
+
+    #[test]
+    fn mirror_idempotent_no_duplicate_button() {
+        let d = tmp_daemon("mirror_idem");
+        seed_registered(&d, "slack", "t");
+        call(&d, "allow", json!({"channel": "slack", "sender_id": "U1"}), None);
+        call(&d, "allow-remote-approve", json!({"duration_secs": 3600}), None);
+        mirror_approval(&d, "feedX", "t", "b", Some("c"));
+        // 재호출(aging 모사) → 신규 outbound 발행 없음(중복 버튼 금지·O9).
+        mirror_approval(&d, "feedX", "t", "b", Some("c"));
+        assert_eq!(count_approval_prompts(&d, "slack", "feedX"), 1, "aging 재미러는 버튼 1건 유지");
+    }
+
+    #[test]
+    fn status_reports_remote_approve() {
+        let d = tmp_daemon("status_ra");
+        seed_registered(&d, "slack", "t");
+        let s0 = call(&d, "status", json!({}), None);
+        assert_eq!(s0["result"]["remote_approve"]["active"], json!(false), "기본 OFF");
+        call(&d, "allow-remote-approve", json!({"duration_secs": 3600}), None);
+        let s1 = call(&d, "status", json!({}), None);
+        assert_eq!(s1["result"]["remote_approve"]["active"], json!(true), "opt-in 후 ON");
+        // --off(duration_secs=0) → 다시 OFF.
+        call(&d, "allow-remote-approve", json!({"duration_secs": 0}), None);
+        let s2 = call(&d, "status", json!({}), None);
+        assert_eq!(s2["result"]["remote_approve"]["active"], json!(false), "--off 후 OFF");
+    }
+
+    #[test]
+    fn interaction_valid_button_resolves_feed() {
+        let d = tmp_daemon("intr_ok");
+        seed_registered(&d, "slack", "t");
+        call(&d, "allow", json!({"channel": "slack", "sender_id": "U1"}), None);
+        call(&d, "allow-remote-approve", json!({"duration_secs": 3600}), None);
+        push_pending_feed(&d, "feed1");
+        mirror_approval(&d, "feed1", "t", "b", Some("c"));
+        let nonce = mirror_nonce(&d, "slack", "feed1", "U1").expect("nonce minted");
+        let r = call(&d, "inbound", interaction_params("slack", "U1", "feed1", &nonce, "allow"), own_pid());
+        assert_eq!(r["result"]["action"], json!("approval_resolved"), "{r}");
+        assert_eq!(r["result"]["decision"], json!("allow"));
+        // feed가 resolved.
+        let resolved = d
+            .feed_items
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|i| i.request_id == "feed1" && i.status == "resolved" && i.decision.as_deref() == Some("allow"));
+        assert!(resolved, "interaction이 feed를 resolved로 해소해야 한다");
+    }
+
+    #[test]
+    fn interaction_replay_rejected_nonce_burned() {
+        let d = tmp_daemon("intr_replay");
+        seed_registered(&d, "slack", "t");
+        call(&d, "allow", json!({"channel": "slack", "sender_id": "U1"}), None);
+        call(&d, "allow-remote-approve", json!({"duration_secs": 3600}), None);
+        push_pending_feed(&d, "feed1");
+        mirror_approval(&d, "feed1", "t", "b", Some("c"));
+        let nonce = mirror_nonce(&d, "slack", "feed1", "U1").unwrap();
+        let ok = call(&d, "inbound", interaction_params("slack", "U1", "feed1", &nonce, "allow"), own_pid());
+        assert_eq!(ok["result"]["action"], json!("approval_resolved"));
+        // 재생(같은 nonce 재사용) → 소각됨 → denied(nonce_used).
+        push_pending_feed(&d, "feed1b"); // (feed는 이미 resolved라 상관없이) nonce가 먼저 막는다
+        let replay = call(&d, "inbound", interaction_params("slack", "U1", "feed1", &nonce, "allow"), own_pid());
+        assert_eq!(replay["result"]["action"], json!("interaction_denied"), "{replay}");
+        assert_eq!(replay["result"]["reason"], json!("nonce_used"), "재생은 nonce_used로 거부");
+    }
+
+    #[test]
+    fn interaction_forged_nonce_rejected() {
+        let d = tmp_daemon("intr_forge");
+        seed_registered(&d, "slack", "t");
+        call(&d, "allow", json!({"channel": "slack", "sender_id": "U1"}), None);
+        call(&d, "allow-remote-approve", json!({"duration_secs": 3600}), None);
+        push_pending_feed(&d, "feed1");
+        mirror_approval(&d, "feed1", "t", "b", Some("c"));
+        let r = call(&d, "inbound", interaction_params("slack", "U1", "feed1", "deadbeefforged", "allow"), own_pid());
+        assert_eq!(r["result"]["action"], json!("interaction_denied"), "{r}");
+        assert_eq!(r["result"]["reason"], json!("nonce_invalid"), "위조 nonce는 nonce_invalid");
+    }
+
+    #[test]
+    fn interaction_non_owner_rejected() {
+        let d = tmp_daemon("intr_nonowner");
+        seed_registered(&d, "slack", "t");
+        call(&d, "allow", json!({"channel": "slack", "sender_id": "U1"}), None);
+        call(&d, "allow-remote-approve", json!({"duration_secs": 3600}), None);
+        push_pending_feed(&d, "feed1");
+        mirror_approval(&d, "feed1", "t", "b", Some("c"));
+        let nonce = mirror_nonce(&d, "slack", "feed1", "U1").unwrap();
+        // 비-allowlist sender가 유효 nonce로 시도 → not_owner.
+        let r = call(&d, "inbound", interaction_params("slack", "U_evil", "feed1", &nonce, "allow"), own_pid());
+        assert_eq!(r["result"]["action"], json!("interaction_denied"), "{r}");
+        assert_eq!(r["result"]["reason"], json!("not_owner"), "비owner는 not_owner");
+    }
+
+    #[test]
+    fn interaction_gate_off_rejected() {
+        let d = tmp_daemon("intr_gateoff");
+        seed_registered(&d, "slack", "t");
+        call(&d, "allow", json!({"channel": "slack", "sender_id": "U1"}), None);
+        // 게이트 ON 상태로 미러 발행해 nonce 확보.
+        call(&d, "allow-remote-approve", json!({"duration_secs": 3600}), None);
+        push_pending_feed(&d, "feed1");
+        mirror_approval(&d, "feed1", "t", "b", Some("c"));
+        let nonce = mirror_nonce(&d, "slack", "feed1", "U1").unwrap();
+        // 게이트 닫기(--off) → 유효 nonce·owner여도 승인 처리 금지.
+        call(&d, "allow-remote-approve", json!({"duration_secs": 0}), None);
+        let r = call(&d, "inbound", interaction_params("slack", "U1", "feed1", &nonce, "allow"), own_pid());
+        assert_eq!(r["result"]["action"], json!("interaction_denied"), "{r}");
+        assert_eq!(r["result"]["reason"], json!("remote_approve_off"), "게이트 OFF면 승인 처리 금지");
+    }
+
+    #[test]
+    fn interaction_owner_mismatch_rejected() {
+        // 다른 owner용으로 발행된 nonce를 또 다른 allowlist owner가 도용 → owner_mismatch.
+        let d = tmp_daemon("intr_ownermis");
+        seed_registered(&d, "slack", "t");
+        call(&d, "allow", json!({"channel": "slack", "sender_id": "U1"}), None);
+        call(&d, "allow", json!({"channel": "slack", "sender_id": "U2"}), None);
+        call(&d, "allow-remote-approve", json!({"duration_secs": 3600}), None);
+        push_pending_feed(&d, "feed1");
+        mirror_approval(&d, "feed1", "t", "b", Some("c"));
+        // U1용 nonce를 U2가 사용 시도.
+        let nonce_u1 = mirror_nonce(&d, "slack", "feed1", "U1").unwrap();
+        let r = call(&d, "inbound", interaction_params("slack", "U2", "feed1", &nonce_u1, "allow"), own_pid());
+        assert_eq!(r["result"]["action"], json!("interaction_denied"), "{r}");
+        assert_eq!(r["result"]["reason"], json!("owner_mismatch"), "타 owner nonce 도용은 owner_mismatch");
     }
 }

@@ -1648,6 +1648,12 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 .unwrap_or(false);
             // 클라이언트 임의값으로 waiter·태스크가 장기 상주하지 않게 1시간 상한
             let timeout_secs = param_u64(&params, "timeout_secs").unwrap_or(120).min(3600);
+            // 승인 tier(§2.4-3 S8): a|b|c|d. 미지정=None(=D 취급·fail-closed). 알 수 없는 값도
+            // None으로 강등해 미러 게이트에서 안전측(비-미러)으로 떨어지게 한다.
+            let tier = param_str(&params, "tier").and_then(|t| {
+                let t = t.to_lowercase();
+                matches!(t.as_str(), "a" | "b" | "c" | "d").then_some(t)
+            });
 
             let item = FeedItem {
                 request_id: request_id.clone(),
@@ -1659,6 +1665,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 decision: None,
                 created_at: crate::state::now_epoch(),
                 resolved_at: None,
+                tier: tier.clone(),
             };
             // waiter 등록을 항목 공개와 같은 임계영역에서 수행 — 항목이 다른 커넥션에
             // 보이는 순간 waiter가 이미 존재해, 빠른 feed.reply의 결정이 유실되지 않는다.
@@ -1698,6 +1705,16 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 surface_id,
                 json!({"request_id": request_id, "kind": kind, "title": title,
                        "body": body, "wait": wait}),
+            );
+            // 승인 미러(§2.4·§2.6 O9): tier≤C(a|b|c) + 원격승인 게이트 ON이면 등록 채널로 버튼 미러.
+            // 무태그/D·게이트 OFF는 mirror_approval 내부에서 fail-closed로 무발행(버튼 없음=안전측).
+            // feed_items 락은 위 임계영역에서 이미 해제됨 — channels 락만 잡으므로 lock-order 안전.
+            crate::channels::mirror_approval(
+                daemon,
+                &request_id,
+                &title,
+                &body,
+                tier.as_deref(),
             );
             match rx {
                 None => Reply::Single(ok_response(
@@ -1777,7 +1794,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         "request_id": i.request_id, "kind": i.kind, "title": i.title,
                         "body": i.body, "surface_id": i.surface_id, "status": i.status,
                         "decision": i.decision, "created_at": i.created_at,
-                        "resolved_at": i.resolved_at,
+                        "resolved_at": i.resolved_at, "tier": i.tier,
                     })
                 })
                 .collect();

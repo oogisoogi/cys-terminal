@@ -564,7 +564,7 @@ enum ChannelAction {
         #[arg(long = "bridge-ver")]
         bridge_ver: Option<String>,
     },
-    /// 인바운드 메시지 제출(브리지→cysd). inbox-first 퍼널 판정.
+    /// 인바운드 메시지 제출(브리지→cysd). inbox-first 퍼널 판정. kind=interaction이면 승인 버튼 검증.
     Inbound {
         channel: String,
         #[arg(long = "sender-id")]
@@ -573,7 +573,8 @@ enum ChannelAction {
         sender_kind: String,
         #[arg(long)]
         peer: Option<String>,
-        #[arg(long)]
+        /// 메시지 본문(kind=message일 때). interaction은 생략 가능.
+        #[arg(long, default_value = "")]
         text: String,
         #[arg(long)]
         ts: Option<f64>,
@@ -584,6 +585,18 @@ enum ChannelAction {
         idempotency_key: String,
         #[arg(long = "body-hash")]
         body_hash: Option<String>,
+        /// 메시지 종류: message(기본) | interaction(승인 버튼 클릭).
+        #[arg(long, default_value = "message")]
+        kind: String,
+        /// interaction 전용 — 대상 feed 항목 id.
+        #[arg(long = "feed-id")]
+        feed_id: Option<String>,
+        /// interaction 전용 — 버튼 nonce(단회 hex).
+        #[arg(long)]
+        nonce: Option<String>,
+        /// interaction 전용 — allow | deny.
+        #[arg(long)]
+        decision: Option<String>,
     },
     /// 아웃바운드 발신 요청(단조 상태기계·at-least-once). owner allowlist 대상만.
     Outbound {
@@ -617,6 +630,16 @@ enum ChannelAction {
     Ack { inbox_id: i64 },
     /// owner allowlist에 sender 추가(fail-closed 게이트 통과 대상).
     Allow { channel: String, sender_id: String },
+    /// Tier C 원격 승인 기간 한정 opt-in(기본 OFF). --for 8h|30m|45s|1d, --off로 즉시 닫기.
+    #[command(name = "allow-remote-approve")]
+    AllowRemoteApprove {
+        /// 여는 기간(예: 8h, 30m, 45s, 1d). --off와 상호배타.
+        #[arg(long = "for")]
+        duration: Option<String>,
+        /// 즉시 닫기(기간 무시).
+        #[arg(long)]
+        off: bool,
+    },
     /// owner allowlist에서 sender 제거(탈취 개별 철회).
     Revoke { channel: String, sender_id: String },
     /// 긴급 잠금 — 전 채널 브리지 즉시 정지·인바운드 전면 차단(터미널 1명령).
@@ -753,6 +776,9 @@ enum FeedAction {
         wait: bool,
         #[arg(long, default_value_t = 120)]
         timeout_secs: u64,
+        /// 승인 tier(a|b|c|d). 채널 미러는 tier≤C만·무태그=D(미러 금지·fail-closed·§2.4-3).
+        #[arg(long)]
+        tier: Option<String>,
     },
     /// List feed items
     List {
@@ -1737,7 +1763,7 @@ fn run(command: Command) -> i32 {
 
 fn run_feed(action: FeedAction) -> i32 {
     let result: Result<i32, String> = match action {
-        FeedAction::Push { kind, title, body, surface, request_id, wait, timeout_secs } => {
+        FeedAction::Push { kind, title, body, surface, request_id, wait, timeout_secs, tier } => {
             parse_explicit_surface(&surface)
                 .and_then(|explicit| {
                     let sid = explicit
@@ -1745,7 +1771,8 @@ fn run_feed(action: FeedAction) -> i32 {
                     request(
                         "feed.push",
                         json!({"kind": kind, "title": title, "body": body, "surface_id": sid,
-                               "request_id": request_id, "wait": wait, "timeout_secs": timeout_secs}),
+                               "request_id": request_id, "wait": wait, "timeout_secs": timeout_secs,
+                               "tier": tier}),
                     )
                 })
             .map(|r| {
@@ -1982,6 +2009,31 @@ fn chrono_fmt(epoch: i64) -> String {
 /// C0 채널 서브명령 디스패처 — 전부 channel.* RPC의 thin wrapper. 결과 JSON을 한 줄로 출력
 /// (브리지가 파싱해 소비). 에러도 JSON({"ok":false,...})으로 stdout에 내보내되 exit는 비0.
 fn run_channel(action: ChannelAction) -> i32 {
+    // Tier C opt-in은 duration 파싱 실패를 깔끔히 보고해야 하므로 조기 처리.
+    if let ChannelAction::AllowRemoteApprove { duration, off } = &action {
+        let secs = if *off {
+            0
+        } else {
+            match duration.as_deref().map(parse_duration_secs) {
+                Some(Ok(n)) => n,
+                _ => {
+                    println!("{}", json!({"ok": false,
+                        "error": "invalid --for duration (use 8h|30m|45s|1d) or --off"}));
+                    return 1;
+                }
+            }
+        };
+        return match request("channel.allow-remote-approve", json!({"duration_secs": secs})) {
+            Ok(r) => {
+                println!("{}", serde_json::to_string(&r).unwrap_or_default());
+                0
+            }
+            Err(e) => {
+                println!("{}", json!({"ok": false, "error": e}));
+                1
+            }
+        };
+    }
     let (method, params): (&str, Value) = match action {
         ChannelAction::Start { channel, cmd } => (
             "channel.start",
@@ -1995,11 +2047,13 @@ fn run_channel(action: ChannelAction) -> i32 {
         ),
         ChannelAction::Inbound {
             channel, sender_id, sender_kind, peer, text, ts, msg_ref, idempotency_key, body_hash,
+            kind, feed_id, nonce, decision,
         } => (
             "channel.inbound",
             json!({"channel": channel, "sender_id": sender_id, "sender_kind": sender_kind,
                    "peer": peer, "text": text, "ts": ts, "msg_ref": msg_ref,
-                   "idempotency_key": idempotency_key, "body_hash": body_hash}),
+                   "idempotency_key": idempotency_key, "body_hash": body_hash,
+                   "kind": kind, "feed_id": feed_id, "nonce": nonce, "decision": decision}),
         ),
         ChannelAction::Outbound {
             channel, target, kind, body, reply_to, idempotency_key, retry_of,
@@ -2023,6 +2077,8 @@ fn run_channel(action: ChannelAction) -> i32 {
             json!({"channel": channel, "sender_id": sender_id}),
         ),
         ChannelAction::Lockdown => ("channel.lockdown", json!({})),
+        // 위에서 조기 return으로 처리됨(duration 파싱 보고 경로).
+        ChannelAction::AllowRemoteApprove { .. } => unreachable!(),
     };
     match request(method, params) {
         Ok(r) => {
