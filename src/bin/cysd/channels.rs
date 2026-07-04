@@ -867,37 +867,9 @@ fn inbound(daemon: &Arc<Daemon>, conn: &mut Connection, params: &Value, id: &Val
         }
     }
 
-    // ── ③ 봇루프: sender_kind=bot이면 20건/60s 슬라이딩 윈도우 ──
-    if sender_kind == "bot" {
-        let _ = tx.execute(
-            "INSERT INTO loopwin(channel, sender_id, ts) VALUES(?1,?2,?3)",
-            params![channel, sender_id, ts],
-        );
-        let cnt: u64 = tx
-            .query_row(
-                "SELECT COUNT(*) FROM loopwin WHERE channel=?1 AND sender_id=?2 AND ts >= ?3",
-                params![channel, sender_id, ts - LOOP_WINDOW_SECS],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
-        if loop_suppressed(cnt, LOOP_LIMIT) {
-            let _ = tx.execute(
-                "INSERT INTO inbound(channel, idempotency_key, body_hash, sender_id, sender_kind, peer, msg_ref, ts, verdict)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'loop_suppressed')",
-                params![channel, idempotency_key, body_hash, sender_id, sender_kind, peer, msg_ref, ts],
-            );
-            let _ = tx.commit();
-            daemon.bus.publish(
-                "channel.loop.suppressed",
-                "channel",
-                None,
-                json!({"channel": channel, "sender_id": sender_id, "count": cnt, "limit": LOOP_LIMIT}),
-            );
-            return ok_response(id, json!({"action": "suppressed", "count": cnt}));
-        }
-    }
-
-    // ── ④ owner-only fail-closed: allowlist(channel, sender_id) 존재해야 통과 ──
+    // ── ③ owner-only fail-closed: allowlist(channel, sender_id) 존재해야 통과 ──
+    // M9: owner-only를 봇루프보다 **앞**에 둔다 — 비owner sender는 loopwin 행조차 만들지 못하게
+    // 즉시 deny(자원 절약·원장 무한성장 완화). 봇루프는 인가된 sender에만 적용된다.
     let allowed: bool = tx
         .query_row(
             "SELECT 1 FROM allowlist WHERE channel=?1 AND sender_id=?2",
@@ -926,6 +898,36 @@ fn inbound(daemon: &Arc<Daemon>, conn: &mut Connection, params: &Value, id: &Val
             json!({"channel": channel, "sender_id": sender_id, "reason": "not in owner allowlist"}),
         );
         return ok_response(id, json!({"action": "deny", "reason": "sender not in owner allowlist"}));
+    }
+
+    // ── ④ 봇루프: (인가된) sender_kind=bot이면 20건/60s 슬라이딩 윈도우 ──
+    if sender_kind == "bot" {
+        let _ = tx.execute(
+            "INSERT INTO loopwin(channel, sender_id, ts) VALUES(?1,?2,?3)",
+            params![channel, sender_id, ts],
+        );
+        let cnt: u64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM loopwin WHERE channel=?1 AND sender_id=?2 AND ts >= ?3",
+                params![channel, sender_id, ts - LOOP_WINDOW_SECS],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if loop_suppressed(cnt, LOOP_LIMIT) {
+            let _ = tx.execute(
+                "INSERT INTO inbound(channel, idempotency_key, body_hash, sender_id, sender_kind, peer, msg_ref, ts, verdict)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'loop_suppressed')",
+                params![channel, idempotency_key, body_hash, sender_id, sender_kind, peer, msg_ref, ts],
+            );
+            let _ = tx.commit();
+            daemon.bus.publish(
+                "channel.loop.suppressed",
+                "channel",
+                None,
+                json!({"channel": channel, "sender_id": sender_id, "count": cnt, "limit": LOOP_LIMIT}),
+            );
+            return ok_response(id, json!({"action": "suppressed", "count": cnt}));
+        }
     }
 
     // ── ⑤ inbox 적재(state=new, 단조 id) + 인바운드 원장(accepted) ──
@@ -1981,6 +1983,24 @@ mod tests {
             }
         }
         assert!(suppressed_seen, "봇 20건/60s 초과분은 suppressed 돼야 한다");
+    }
+
+    // M9: 비owner sender는 봇루프보다 앞선 owner-only에서 즉시 deny — loopwin 행 미생성.
+    #[test]
+    fn non_owner_denied_before_botloop_no_loopwin() {
+        let d = tmp_daemon("m9order");
+        seed_registered(&d, "slack", "t");
+        // U_bot는 allowlist 밖(비owner) + sender_kind=bot.
+        let r = call(&d, "inbound", inbound_params("slack", "U_bot", "slack:1", "spam", "bot"), own_pid());
+        assert_eq!(r["result"]["action"], json!("deny"), "비owner bot는 봇루프 앞에서 즉시 deny: {r}");
+        let g = d.channels.lock().unwrap();
+        let conn = g.as_ref().unwrap();
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM loopwin", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 0, "비owner deny 시 loopwin 미생성(자원 절약)");
+        let v: String = conn
+            .query_row("SELECT verdict FROM inbound WHERE idempotency_key='slack:1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, "denied");
     }
 
     #[test]
