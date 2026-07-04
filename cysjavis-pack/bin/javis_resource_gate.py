@@ -242,6 +242,9 @@ def cmd_enforce(a):
     victims = sorted(set(root_pids) | _descendants(root_pids))  # 죽이기 전에 트리 수집
     killed = 0
     if a.kill:
+        # Windows 패리티: SIGKILL 부재(getattr 폴백) · os.kill(pid,0) 프로브는 Windows에서
+        # TerminateProcess라 금지 — 생존 확인은 ps로만(부재 시 kill 시도 완료를 종료로 간주).
+        sigkill = getattr(_signal, "SIGKILL", _signal.SIGTERM)
         for v in victims:
             try:
                 os.kill(v, _signal.SIGTERM)
@@ -250,14 +253,22 @@ def cmd_enforce(a):
         time.sleep(1)
         for v in victims:
             try:
-                os.kill(v, 0)
-                os.kill(v, _signal.SIGKILL)
-            except OSError:
-                pass
+                st = subprocess.run(["ps", "-o", "pid=", "-p", str(v)],
+                                    capture_output=True, text=True, timeout=10).stdout.strip()
+            except (subprocess.SubprocessError, OSError):
+                st = ""
+            if st:
+                try:
+                    os.kill(v, sigkill)
+                except OSError:
+                    pass
         time.sleep(0.3)
-        for v in victims:  # 좀비 인지 집계 — kill(v,0)는 좀비에 성공해 잔존으로 오판(G5 동형)
-            st = subprocess.run(["ps", "-o", "state=", "-p", str(v)],
-                                capture_output=True, text=True).stdout.strip()
+        for v in victims:  # 좀비 인지 집계 — kill(v,0) 프로브는 좀비에 성공해 잔존으로 오판(G5 동형)
+            try:
+                st = subprocess.run(["ps", "-o", "state=", "-p", str(v)],
+                                    capture_output=True, text=True, timeout=10).stdout.strip()
+            except (subprocess.SubprocessError, OSError):
+                st = ""
             if not st or st.startswith("Z"):
                 killed += 1
     ledger = os.path.join(os.environ.get("JAVIS_ROOT") or os.getcwd(),
