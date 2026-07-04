@@ -20,7 +20,9 @@ import argparse
 import json
 import os
 import re
+import shutil
 import sys
+import time
 
 RESERVED_SENTINEL = "__CYS__RESERVED__"
 FIELDS = ("restore_pointer", "open_gates")
@@ -114,16 +116,64 @@ def ensure_text(text):
     return text
 
 
+def _write_atomic(path, text):
+    """★G1(a): wakeup._write_json_atomic 동형 텍스트판 — tmp→flush→fsync→os.replace.
+    SESSION_STATE는 재부팅 복원의 단일 진실이라 크래시 시점의 반쪽 파일이 곧 복원 실패다."""
+    tmp = "%s.tmp.%d.%d" % (path, os.getpid(), time.time_ns())
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+class _FileLock:
+    """★G1(b): wakeup._FileLock 이식 — mkdir 원자성 락. stale(30초+)은 rename으로 원자 회수."""
+
+    def __init__(self, path, timeout=5.0, stale_sec=30.0):
+        self.path, self.timeout, self.stale_sec = path, timeout, stale_sec
+
+    def __enter__(self):
+        deadline = time.time() + self.timeout
+        parent = os.path.dirname(os.path.abspath(self.path))
+        os.makedirs(parent, exist_ok=True)
+        while True:
+            try:
+                os.mkdir(self.path)
+                return self
+            except FileExistsError:
+                try:
+                    if time.time() - os.stat(self.path).st_mtime > self.stale_sec:
+                        os.rename(self.path, "%s.stale.%d" % (self.path, time.time_ns()))
+                        continue
+                except OSError:
+                    pass
+                if time.time() > deadline:
+                    raise TimeoutError("lock timeout: %s" % self.path)
+                time.sleep(0.02)
+
+    def __exit__(self, *exc):
+        try:
+            os.rmdir(self.path)
+        except OSError:
+            pass
+
+
 def cmd_ensure(path):
     try:
-        text = open(path, encoding="utf-8").read() if os.path.isfile(path) else ""
-        out = ensure_text(text)
-        if out != text:  # diff0: 변화 없으면 쓰지 않음(idempotent·mtime 보존)
-            open(path, "w", encoding="utf-8").write(out)
-        # ensure-then-verify(R5 hide≠lose 가드): 재읽기 후 verify 통과해야 성공.
-        re_read = open(path, encoding="utf-8").read()
-        return 0 if verify_text(re_read)["ok"] else 2
-    except OSError:
+        # ★G1(b): read-modify-write 전체를 배타락으로 직렬화(동시 ensure 경쟁 차단).
+        with _FileLock(path + ".lock"):
+            text = open(path, encoding="utf-8").read() if os.path.isfile(path) else ""
+            out = ensure_text(text)
+            if out != text:  # diff0: 변화 없으면 쓰지 않음(idempotent·mtime 보존)
+                # ★G1(c): corrupt 복구는 원문 스팬을 지우므로 교체 전 백업(증거 보존).
+                if os.path.isfile(path) and any(_scan(text, f)[0] == "corrupt" for f in FIELDS):
+                    shutil.copy2(path, "%s.bak-corrupt-%s" % (path, time.strftime("%Y%m%dT%H%M%S")))
+                _write_atomic(path, out)  # ★G1(a): 크래시에도 반쪽 파일 0
+            # ensure-then-verify(R5 hide≠lose 가드): 재읽기 후 verify 통과해야 성공.
+            re_read = open(path, encoding="utf-8").read()
+            return 0 if verify_text(re_read)["ok"] else 2
+    except (OSError, TimeoutError):
         return 2
 
 

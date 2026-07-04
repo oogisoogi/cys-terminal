@@ -20,6 +20,7 @@ import argparse
 import getpass
 import json
 import os
+import re
 import socket
 import sys
 import time
@@ -37,6 +38,12 @@ EXIT_OK, EXIT_USAGE, EXIT_NOTFOUND, EXIT_BLOCKED, EXIT_DUP, EXIT_CONFLICT = 0, 2
 
 def _now():
     return time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+# ★G10(cokacdir 성찰 2026-07-04): task id allowlist — 경로 조합 전 traversal 차단.
+#   wakeup._safe(:45)와 동일 문자집합이나 조용한 치환 대신 '거부'(fail-loud) —
+#   기존 유효 id의 경로 매핑을 바꾸지 않고, `--id ../../tmp/x` 류 임의 쓰기를 닫는다.
+_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,80}$")
 
 
 def _task_path(task_id):
@@ -277,6 +284,16 @@ def cmd_release(a):
     if not task:
         print(f"not found: {a.id}", file=sys.stderr)
         return EXIT_NOTFOUND
+    # ★G11(cokacdir 성찰 2026-07-04): --force 무검증 폐기 — 사유 필수 + 태스크 JSON에
+    #   force_history 감사 기록. (암호학 verifier는 다중노드/원격 확장 시 — per-node secret
+    #   없는 로컬 단일 시스템에서 해시는 검증이 아니라 장식이다. 성찰 G11 'P2 조건부' 준수.)
+    if a.force:
+        if not getattr(a, "force_reason", None):
+            print("error: --force는 --force-reason '<사유>' 필수 — 무검증 탈취 금지(G11)",
+                  file=sys.stderr)
+            return EXIT_USAGE
+        task.setdefault("force_history", []).append(
+            {"at": _now(), "by": a.owner, "reason": a.force_reason})
     if not _release_lock(a.id, a.owner, force=a.force):
         holder = _read_owner(a.id)
         print(f"conflict(409): 락 소유자 불일치 (holder={(holder or {}).get('owner_id')})", file=sys.stderr)
@@ -291,11 +308,80 @@ def cmd_release(a):
     return EXIT_OK
 
 
+_PROBE_IDX = 0
+
+
+def _settle_probe(owner):
+    """1회 관측 → (idle_secs|None, todo_mtime|None). JAVIS_SETTLE_PROBE로 결정론 주입 가능
+    (형식 "idle:mtime;idle:mtime" — 호출마다 하나 소비 · wakeup JAVIS_WAKEUP_LIVENESS 관례)."""
+    global _PROBE_IDX
+    seq = os.environ.get("JAVIS_SETTLE_PROBE")
+    if seq is not None:
+        parts = seq.split(";")
+        p = parts[min(_PROBE_IDX, len(parts) - 1)]
+        _PROBE_IDX += 1
+        try:
+            i, m = p.split(":", 1)
+            return (float(i) if i else None), (float(m) if m else None)
+        except ValueError:
+            return None, None
+    try:
+        import javis_boot_node as _bn  # 형제 모듈(orchestra:194 관례) — 부재 시 관측불가=fail-closed
+        st = _bn.cys_status()
+        row = _bn.status_surface(st, owner) if st else None
+    except Exception:
+        row = None
+    idle = row.get("idle_secs") if row else None
+    todo = os.path.join(ROOT, "_round", "%s_TODO.md" % owner.upper())
+    try:
+        mt = os.stat(todo).st_mtime
+    except OSError:
+        mt = None
+    return idle, mt
+
+
+def _completion_settled(owner):
+    """★G6(cokacdir 성찰 2026-07-04): 완료 하한선 — 단일 스냅샷 완료 판정 금지.
+    owner 노드가 2회 연속(settle 간격) idle 안착 + 그 사이 TODO 갱신(mtime) 정지일 때만
+    True(boot_node POLL-IDLE·channel_watch 2-strike 프리미티브 이식). sub-agent 활동은
+    같은 surface의 idle_secs에 반영된다는 전제(부정확하면 idle 미안착으로 안전측 거부).
+    반환 (ok, 사유)."""
+    settle = float(os.environ.get("JAVIS_SETTLE_SEC", "5"))
+    idle_min = float(os.environ.get("JAVIS_SETTLE_IDLE_MIN", "4"))
+    last_mt = None
+    for strike in range(2):
+        if strike:
+            time.sleep(settle)
+        idle, mt = _settle_probe(owner)
+        if idle is None:
+            return False, "owner '%s' 상태 관측 불가 — 완료 거부(fail-closed)" % owner
+        if idle < idle_min:
+            return False, ("owner '%s' idle 미안착(idle=%s<%s) — sub-agent/작업 진행 중 추정"
+                           % (owner, idle, idle_min))
+        if strike and mt != last_mt:
+            return False, "owner '%s' TODO 갱신 진행 중(mtime 변동) — 완료 아님" % owner
+        last_mt = mt
+    return True, "settled(2-strike idle)"
+
+
 def cmd_set_status(a):
     task = _read_task(a.id)
     if not task:
         print(f"not found: {a.id}", file=sys.stderr)
         return EXIT_NOTFOUND
+    # ★G6: done은 완료 하한선 통과 후에만 — 오종결이 의존자 unblock(:308)을 조기 발화하는
+    #   경로를 닫는다. owner 없는(체크아웃 이력 없는) 태스크는 안착 대상이 없어 게이트 생략.
+    if a.status == "done" and task.get("owner"):
+        if getattr(a, "settled_override", None):
+            task.setdefault("settle_overrides", []).append(
+                {"at": _now(), "reason": a.settled_override})
+        else:
+            ok, why = _completion_settled(task["owner"])
+            if not ok:
+                print(json.dumps({"id": a.id, "status_denied": "done", "reason": why,
+                                  "hint": "안착 후 재시도 또는 --settled-override '<사유>'"},
+                                 ensure_ascii=False), file=sys.stderr)
+                return EXIT_BLOCKED
     task["status"] = a.status
     task["updated_at"] = _now()
     _write_json_atomic(_task_path(a.id), task)
@@ -364,11 +450,16 @@ def main(argv=None):
     c.add_argument("id")
     c.add_argument("--owner", required=True)
     c.add_argument("--force", action="store_true")
+    c.add_argument("--force-reason", dest="force_reason", default=None,
+                   help="★G11: --force 필수 동반 — 강제 해제 사유(task JSON force_history 감사)")
     c.set_defaults(fn=cmd_release)
 
     c = sub.add_parser("set-status")
     c.add_argument("id")
     c.add_argument("status", choices=STATUSES)
+    c.add_argument("--settled-override", dest="settled_override", default=None,
+                   help="★G6: 완료 하한선 우회(사유 필수 기록) — owner 자신이 done을 선언하는 "
+                        "등 안착 관측이 불가한 경우만")
     c.set_defaults(fn=cmd_set_status)
 
     c = sub.add_parser("ready")
@@ -384,6 +475,12 @@ def main(argv=None):
     c.set_defaults(fn=cmd_list)
 
     a = p.parse_args(argv)
+    # ★G10: 모든 진입 id(본 id + create --blocked-by)를 경로 조합 전에 검증 — 단일 집행 지점.
+    for tid in [getattr(a, "id", None)] + list(getattr(a, "blocked_by", None) or []):
+        if tid is not None and not _ID_RE.match(tid):
+            print("error: invalid task id %r — 허용 [A-Za-z0-9._-]{1,80} (G10 traversal 차단)"
+                  % tid, file=sys.stderr)
+            return EXIT_USAGE
     return a.fn(a)
 
 

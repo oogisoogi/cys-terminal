@@ -3267,6 +3267,162 @@ class Preflight:
             self.add(cid, PASS,
                      "cysjavis 워크스페이스 트러스트 OK(갭 없음 · %d config 점검)" % len(targets))
 
+    # ── C60 결정론 게이트 '배선' 검증 (G4 · cokacdir 성찰 2026-07-04) ──
+    # C41/C42는 게이트 도구의 존재·self-test만 본다 — "게이트를 짓고 문에 안 달았다"(G4)를
+    # 여기서 닫는다: ①재주입 포이즌 게이트(G3) 배선 ②memory 스캐너 로드 가능(fail-closed는
+    # 부트 게이트인 여기 — 런타임 memory 쓰기는 생명선 WARN 유지, G14 층 분리) ③skillscan
+    # 집행 스캔 실행 ④mcpgate 스냅샷 diff(rug-pull).
+    def c60_gate_wiring(self):
+        cid = "C60.gate-wiring"
+        if self.skipped(cid):
+            return
+        probs, warns = [], []
+        # (a) G3 재주입 게이트 배선 — hook이 게이트를 실제로 경유하는가
+        hook = os.path.join(pack_dir(), "hooks", "inject-context.sh")
+        gate = os.path.join(pack_dir(), "hooks", "inject_gate.py")
+        try:
+            hook_txt = open(hook, encoding="utf-8").read()
+        except OSError:
+            hook_txt = ""
+        if not (os.path.isfile(gate) and "inject_gate.py" in hook_txt):
+            probs.append("재주입 포이즌 게이트 미배선(hooks/inject_gate.py + inject-context.sh _gate)")
+        # (b) memory 포이즌 스캐너 로드 가능 — 다운이면 부트 FAIL(fail-closed 층)
+        r = subprocess.run(
+            [sys.executable, "-c",
+             "import sys; sys.path.insert(0, %r); import javis_memory as m; "
+             "sys.exit(0 if m._skillscan is not None else 3)" % os.path.join(pack_dir(), "bin")],
+            capture_output=True, timeout=60)
+        if r.returncode != 0:
+            probs.append("memory 포이즌 스캐너 다운(_skillscan=None · fail-open 상태)")
+        # (c) skillscan 집행 스캔(전 스킬 정적·~6s 실측) — BLOCK verdict는 정지경계 정책
+        #     (feedback_skillscan-gate-policy)에 따라 WARN+명시 목록(처분은 master/CSO).
+        #     ★승인 저장소(2026-07-04 master 승인): _round/skillscan_acknowledged.json —
+        #     fingerprint 핀 일치 시만 면제. 스킬 내용 변경=핀 불일치=자동 재차단.
+        acked_note = ""
+        try:
+            scan_tool = os.path.join(pack_dir(), "bin", "javis_skillscan.py")
+            r = subprocess.run([sys.executable, scan_tool, "all", "--json"],
+                               capture_output=True, text=True, timeout=120)
+            data = json.loads(r.stdout or "{}")
+            blocked = data.get("blocked") or []
+            if blocked:
+                ack_p = os.path.join(os.environ.get("JAVIS_ROOT") or os.getcwd(),
+                                     "_round", "skillscan_acknowledged.json")
+                try:
+                    acks = json.load(open(ack_p, encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    acks = {}
+                residual, acked = [], []
+                for s in blocked:
+                    fp = None
+                    if s in acks:
+                        rc = subprocess.run(
+                            [sys.executable, scan_tool, "card",
+                             os.path.join(pack_dir(), "skills", s), "--json"],
+                            capture_output=True, text=True, timeout=60)
+                        try:
+                            fp = json.loads(rc.stdout).get("fingerprint")
+                        except (json.JSONDecodeError, ValueError):
+                            fp = None
+                    if fp and fp == acks[s].get("fingerprint"):
+                        acked.append(s)
+                    else:
+                        residual.append(s)
+                if residual:
+                    warns.append("skillscan BLOCK %d건(미승인/핀 불일치): %s — 정지경계 정책 "
+                                 "검토(master/CSO)" % (len(residual), ", ".join(sorted(residual)[:8])))
+                if acked:
+                    acked_note = " · BLOCK 승인 %d건(핀 일치)" % len(acked)
+        except Exception as e:
+            probs.append("skillscan 집행 스캔 실행 불가(%s)" % e)
+        # (d) mcpgate rug-pull diff — 승인 스냅샷 저장소 기반(스냅샷 없으면 미가동 경고)
+        store = os.path.join(os.environ.get("JAVIS_ROOT") or os.getcwd(), "_round", "mcp_approved")
+        snaps = sorted(f for f in (os.listdir(store) if os.path.isdir(store) else [])
+                       if f.endswith(".json"))
+        if not snaps:
+            warns.append("mcpgate 승인 스냅샷 0 — MCP 등록 시 snapshot 의무화 미가동")
+        else:
+            changed = []
+            for f in snaps[:10]:
+                skill = os.path.join(pack_dir(), "skills", f[:-5])
+                r = subprocess.run(
+                    [sys.executable, os.path.join(pack_dir(), "bin", "javis_mcpgate.py"),
+                     "diff", skill, "--store", store, "--json"],
+                    capture_output=True, text=True, timeout=60)
+                if r.returncode != 0:
+                    changed.append(f[:-5])
+            if changed:
+                probs.append("mcpgate diff 변경 감지(rug-pull 의심): %s" % ", ".join(changed))
+        if probs:
+            self.add(cid, FAIL, " | ".join(probs + warns))
+        elif warns:
+            self.add(cid, WARN, " | ".join(warns) + acked_note)
+        else:
+            self.add(cid, PASS, "게이트 배선 OK(재주입·memory·skillscan 집행·mcpgate diff)" + acked_note)
+
+    # ── C61 doc-code SOT 대조 확장 (G15) — 스킬 한정(:2286)을 넘어 SESSION_STATE·directive가
+    #     명명한 파일 실재를 대조(드리프트=WARN — 산문은 계획·과거를 적을 수 있어 FAIL 아님) ──
+    def c61_doc_code_sot(self):
+        cid = "C61.doc-code-sot"
+        if self.skipped(cid):
+            return
+        root = os.environ.get("JAVIS_ROOT") or os.getcwd()
+        docs = [os.path.join(root, "_round", "SESSION_STATE.md")]
+        ddir = os.path.join(pack_dir(), "directives")
+        if os.path.isdir(ddir):
+            docs += [os.path.join(ddir, f) for f in sorted(os.listdir(ddir))
+                     if f.endswith(".md")]
+        tok_re = re.compile(r"`([^`\n]{3,120})`")
+        missing, seen, checked = [], set(), 0
+        for doc in docs:
+            try:
+                # SESSION_STATE는 고정 헤더부만(날짜 진행로그 제외 — inject-context 발췌와 동일 규칙)
+                lines = open(doc, encoding="utf-8").read().split("\n")
+                if doc.endswith("SESSION_STATE.md"):
+                    kept, keep = [], True
+                    for ln in lines:
+                        if ln.startswith("## "):
+                            keep = not re.search(r"\[20[0-9][0-9]", ln)
+                        if keep:
+                            kept.append(ln)
+                    lines = kept
+                text = "\n".join(lines)
+            except OSError:
+                continue
+            for tok in tok_re.findall(text):
+                if tok in seen:
+                    continue
+                seen.add(tok)
+                # 경로형 토큰만: 구분자 포함 + 파일 확장자, 글롭/플레이스홀더/URL 제외.
+                # ★말줄임(...)·중간 ~(범위 표기 3.1~3.9)은 산문 표기지 경로가 아님(실측 오탐 2건).
+                if ("/" not in tok or any(c in tok for c in "*<>{}$|;\" ")
+                        or tok.startswith("http") or not re.search(r"\.(py|sh|md|json|jsonl)$", tok)
+                        or "..." in tok or "~" in tok[1:]):
+                    continue
+                p = os.path.expanduser(tok)
+                if not os.path.isabs(p):
+                    # 해석 루트 = 프로젝트 + 팩 + ★doc_sot_roots.txt(교차 repo 참조 — 개인경로는
+                    #   팩 코드가 아니라 프로젝트 소유 설정 파일에 둔다: pack scan gate 관례)
+                    roots_f = os.path.join(root, "_round", "doc_sot_roots.txt")
+                    extra = []
+                    try:
+                        extra = [ln.strip() for ln in open(roots_f, encoding="utf-8")
+                                 if ln.strip() and not ln.startswith("#")]
+                    except OSError:
+                        pass
+                    cands = [os.path.join(root, p), os.path.join(pack_dir(), p)] \
+                        + [os.path.join(os.path.expanduser(r), p) for r in extra]
+                else:
+                    cands = [p]
+                checked += 1
+                if not any(os.path.exists(c) for c in cands):
+                    missing.append(tok)
+        if missing:
+            self.add(cid, WARN, "doc-code 드리프트 %d/%d건 — 문서가 명명한 파일 부재: %s"
+                     % (len(missing), checked, ", ".join(missing[:10])))
+        else:
+            self.add(cid, PASS, "doc-code SOT 대조 OK(경로형 토큰 %d건 실재)" % checked)
+
     def run(self):
         self.c01_pack_dir()
         self.c02_directives()
@@ -3329,6 +3485,8 @@ class Preflight:
         self.c56_dept_hook_leak()
         self.c57_temp_hook_leak()
         self.c58_trust_harden()
+        self.c60_gate_wiring()
+        self.c61_doc_code_sot()
         return self.results
 
 

@@ -34,7 +34,7 @@ master가 (a) "4개 노드 다 떴나"를 눈대중 판단, (b) 리뷰 프롬프
                                 pipeline·cys 워커 순차 위임으로 실행(스킬 안내).
                                 exit: 0=출력 / 2=phases 비었거나 역할명 위반.
   round-init   --task T                       라운드 장부 생성
-  round-log    --task T --round N --evaluator E [--score X --verdict V | --from-cmd CMD]
+  round-log    --task T --round N --evaluator E [--score X --verdict V | --from-cmd CMD | --verdict-json J]
                                 라운드 기록 append. --from-cmd는 기계검증 명령을 직접 실행해
                                 exit code로 verdict 자동 기록(machine 평가자 규약 — 전사 금지).
                                 exit: 0=기록(검증 통과 포함) / 1=기록됨·기계검증 실패
@@ -714,19 +714,56 @@ def cmd_round_log(args):
             # OS중립 기계검증 명령(빌드·테스트) 전제다. bash 전용 문법을 넣으면 Windows cmd.exe에서
             # 실패하므로 RSI machine-eval 티켓은 OS중립 명령을 쓴다(저 consumer 영향·T3 실측 후 재판단).
             r = subprocess.run(args.from_cmd, shell=True, capture_output=True, timeout=1800)
-            verdict = ("PASS(exit 0)" if r.returncode == 0
-                       else "FAIL(exit %d)" % r.returncode)
-            machine_fail = r.returncode != 0
             tail = (r.stdout or r.stderr or b"").decode("utf-8", "replace").strip()
+            # ★G8(cokacdir 성찰 2026-07-04 · _round/NODE_MEASURED_CONTRACT.md §2):
+            #   exit 0은 PASS의 필요조건일 뿐이다 — ①stdout 에러형상(agy는 에러문을 stdout에
+            #   싣는다, 계약 실측 #4·#6) ②LLM 노드 호출(agy/codex/claude)인데 빈 stdout
+            #   (계약 §2·§4·§5)은 exit 0이어도 FAIL. 결정론 유닉스 명령의 무언 성공은 PASS 유지.
+            first = next((l for l in tail.splitlines() if l.strip()), "")
+            error_shaped = bool(re.match(r"\s*error\b", first, re.I))
+            llm_cmd = bool(re.search(r"\b(agy|codex|claude)\b", args.from_cmd))
+            if r.returncode != 0:
+                verdict, machine_fail = "FAIL(exit %d)" % r.returncode, True
+            elif error_shaped:
+                verdict, machine_fail = "FAIL(exit 0·stdout 에러형상 — MEASURED_CONTRACT §2)", True
+            elif llm_cmd and not tail:
+                verdict, machine_fail = "FAIL(exit 0·LLM 빈 stdout — MEASURED_CONTRACT §2)", True
+            else:
+                verdict = "PASS(exit 0)"
             score = (tail.splitlines()[-1][:60] if tail else "-")
         except subprocess.TimeoutExpired:
             verdict, score, machine_fail = "FAIL(timeout 1800s)", "-", True
     elif evaluator_std(args.evaluator) == "machine":
-        # 전사 금지(앵커6 축1·MASTER §14): machine 행은 --from-cmd 자동 기록이 규약 —
-        # 수기 verdict는 기록하되 경고를 남긴다(기존 호환 유지·게이트 신뢰는 운영 규약).
-        print("[round-log] 경고: machine 평가자를 --from-cmd 없이 수기 기록 중 — "
-              "전사 금지 규약(MASTER §14) 위반 소지. --from-cmd \"<명령>\"을 써라.",
-              file=sys.stderr)
+        # ★G8: 경고→거부 격상 — machine 행은 --from-cmd 결정론 기록만(전사 금지 hard,
+        #   MASTER §14). 스키마 미통과 기록이 게이트 신뢰를 갉는 경로를 닫는다.
+        print("[round-log] 거부: machine 평가자는 --from-cmd 없이 기록 불가 — "
+              "전사 금지(MASTER §14·G8). --from-cmd \"<명령>\"을 써라.", file=sys.stderr)
+        return 2
+    elif evaluator_std(args.evaluator) in ("gemini", "codex") and skip_reason(verdict) is None:
+        # ★G8: 리뷰어 행은 타입 계약(_round/REVIEWER_VERDICT_CONTRACT.md) 강제 —
+        #   verdict JSON이 javis_verdict 스키마(enum·evidence·score 금지)를 통과할 때만 기록.
+        #   산문 전사·스키마 미통과는 거부. SKIP 행("SKIPPED: 사유")은 3-state 게이트 경로라 예외.
+        vj = getattr(args, "verdict_json", None)
+        if not vj:
+            print("[round-log] 거부: 리뷰어(%s) 행은 --verdict-json <파일> 필수 — "
+                  "산문 전사 금지(G8·REVIEWER_VERDICT_CONTRACT §2)." % args.evaluator,
+                  file=sys.stderr)
+            return 2
+        try:
+            import javis_verdict
+            obj = json.load(open(vj, encoding="utf-8"))
+            schema_errors, _lint, verdict_out = javis_verdict.validate_verdict(obj)
+        except Exception as e:  # 모듈 부재·파일 없음·JSON 깨짐 전부 거부(fail-closed)
+            print("[round-log] 거부: verdict JSON 검증 불가(%s) — fail-closed(G8)." % e,
+                  file=sys.stderr)
+            return 2
+        if schema_errors:
+            print("[round-log] 거부: verdict 스키마 미통과 — %s" % "; ".join(schema_errors),
+                  file=sys.stderr)
+            return 2
+        # 기록 verdict = 검증기 출력 enum 그대로(R2 강등 반영). justification 산문은 셀에
+        # 넣지 않는다(부정 어휘가 REJECT_MARKERS 게이트를 오작동). score 금지 계약 → "-".
+        verdict, score = verdict_out, "-"
     with open(p, "a", encoding="utf-8") as f:
         f.write("| %d | %s | %s | %s |\n"
                 % (args.round, _cell(args.evaluator), _cell(score), _cell(verdict)))
@@ -778,7 +815,7 @@ GATE_EVALUATORS = ("gemini", "codex", "master", "machine")
 # 표기해도 표준 평가자 'gemini'로 매핑한다(역할명 reviewer-gemini·어댑터 키 'gemini'와의
 # 계약은 무변 — 식별자 층은 유지, 표기 층만 agy).
 EVALUATOR_ALIASES = {"agy": "gemini"}
-APPROVE_PREFIXES = ("pass", "수렴", "approve", "ok", "green", "승인")
+APPROVE_PREFIXES = ("pass", "수렴", "approve", "accept", "ok", "green", "승인")  # ★G8: enum ACCEPT 수용
 # 부정 토큰이 하나라도 있으면 무조건 미승인 — 한국어 부정은 접미에 붙으므로("승인 불가"·
 # "수렴 실패") 접두 매칭만으로는 게이트가 열린다(적대 검증 6차 R1 HIGH-1). 부정이 승인을
 # 이긴다(안전 우선: 모호하면 닫힘).
@@ -1611,6 +1648,9 @@ def main():
     rl.add_argument("--from-cmd", dest="from_cmd", default=None,
                     help="기계검증 명령을 직접 실행해 exit code로 verdict 자동 기록"
                          "(machine 평가자 권장 — 전사 없는 producer≠evaluator 경로)")
+    rl.add_argument("--verdict-json", dest="verdict_json", default=None,
+                    help="★G8 리뷰어(gemini/agy/codex) 행 필수 — javis_verdict 스키마 통과 "
+                         "verdict JSON 경로(미통과·부재 시 기록 거부, SKIP 행만 예외)")
     rs = sub.add_parser("round-status"); rs.add_argument("--task", required=True)
 
     gs = sub.add_parser("gate-status", help="자율주행 축1 — 4자 수렴 결정론 판정")

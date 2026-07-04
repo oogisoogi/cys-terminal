@@ -13,6 +13,8 @@ import json
 import re
 import sys
 
+import javis_scrub  # ★G2: 기록·전파 직전 비밀 마스킹(같은 폴더 형제 모듈 — 부재 시 즉시 실패=fail-closed)
+
 EXIT_OK, EXIT_USAGE, EXIT_INVALID = 0, 2, 6
 
 WIRE_PREFIX = "[EVT v1]"
@@ -71,6 +73,9 @@ def validate(evt_type, payload):
 
 
 def to_wire(evt_type, payload):
+    # ★G2(cokacdir 성찰 2026-07-04): 와이어 기록 직전 비밀 마스킹 — 값 단위 재귀
+    #   (직렬화 '후' 마스킹은 JSON 구조 훼손 위험이라 scrub_obj로 str 값만 교체).
+    payload = javis_scrub.scrub_obj(payload)
     return f"{WIRE_PREFIX} {evt_type} {json.dumps(payload, ensure_ascii=False)}"
 
 
