@@ -1576,9 +1576,24 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
   if (isWKWebView) {
     const ta = term.textarea;
     if (ta) {
+      // ★한글 IME 누출 수정 (upstream issue #2 · "이"→"ㅇ이" 선행 자모 유출)
+      //   이 xterm.js 네이티브 composition이 완성 음절을 onData로 1회 발화하는 WebKit에서는,
+      //   아래 insertText 상태머신이 선행 자모를 pendingHangul에 버퍼했다가 onData의
+      //   flushPending이 그 자모를 완성 음절 앞에 뱉어 "ㅇ이" 이중 경로 누출을 만든다.
+      //   → compositionstart가 한 번이라도 관측되면(=네이티브 composition 존재) 이 머신을
+      //   비활성화해 네이티브 경로에 위임한다. composition 이벤트가 없는 WebKit(이 머신의
+      //   본래 대상)에선 flag가 false로 남아 종전대로 동작 — 회귀 0. 이 수정은 sendRaw를
+      //   새로 추가하지 않으므로(누출 제거 방향으로만 작용) 이중 전송을 만들 수 없다.
+      let sawNativeComposition = false;
+      ta.addEventListener("compositionstart", () => { sawNativeComposition = true; });
+      ta.addEventListener("compositionend", () => {
+        // 네이티브 경로(onData)가 확정 음절을 보낸다 — 버퍼된 조합중 자모는 버려 누출 차단.
+        if (pendingHangul) { dbg(`DROP(compositionend) "${pendingHangul}"`); pendingHangul = ""; }
+      });
       ta.addEventListener("input", (e) => {
         const ie = e as InputEvent;
         dbg(`input ${ie.inputType} data="${ie.data ?? "∅"}" pending="${pendingHangul}"`);
+        if (sawNativeComposition) return; // 네이티브 composition 처리 위임 — insertText 머신 비활성
         if (ie.inputType === "insertText" && ie.data && isHangulText(ie.data)) {
           // 직전 조합 확정 후 새 커밋을 '수정 가능 창'(pending)에 둔다. 병합 커밋
           // (2음절+)은 마지막 음절만 수정 창에 — 앞 음절들은 확정분이므로 즉시 전송
