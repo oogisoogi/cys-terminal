@@ -50,6 +50,8 @@ const RESPAWN_FAIL_ALERT_THRESHOLD: u64 = 5;
 const SWEEP_INTERVAL_SECS: u64 = 15;
 /// 봉투 sender 표기 최대 길이(초과 시 … 절단).
 const SENDER_MAXLEN: usize = 16;
+/// 승인 미러 본문 요지 최대 길이(초과 시 … 절단·L4 매직넘버 상수화).
+const SUMMARY_MAXLEN: usize = 200;
 
 // ── DB open + 스키마 ─────────────────────────────────────────────────────────
 
@@ -174,25 +176,27 @@ fn hex_sha256(bytes: &[u8]) -> String {
 }
 
 /// 1회용 32바이트 토큰의 hex 문자열(env CYS_CHANNEL_TOKEN로 브리지에 주입).
-/// Unix=/dev/urandom, 실패 시 시간·pid 기반 폴백(approval.rs random_32와 동일 정신).
-fn random_token_hex() -> String {
+/// L2: unix=/dev/urandom. **urandom 실패 시 예측가능 폴백(sha256(pid,now)) 금지 — hard-fail(Err)**
+/// 로 예측가능 토큰/nonce를 원천 차단한다(브리지 인가·승인 nonce의 무결성 근거). windows는 std에
+/// CSPRNG가 없어 시간·pid 시드 폴백을 유지하되(WINFIX 전까지), 이는 예측가능성 잔여 위험으로 L3와
+/// 함께 WINFIX 트랙에 명시된 한계다.
+fn random_token_hex() -> Result<String, String> {
     #[cfg(unix)]
     {
         use std::io::Read;
-        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-            let mut buf = [0u8; 32];
-            if f.read_exact(&mut buf).is_ok() {
-                return buf.iter().map(|b| format!("{b:02x}")).collect();
-            }
-        }
+        let mut f = std::fs::File::open("/dev/urandom")
+            .map_err(|e| format!("open /dev/urandom failed: {e}"))?;
+        let mut buf = [0u8; 32];
+        f.read_exact(&mut buf)
+            .map_err(|e| format!("read /dev/urandom failed: {e}"))?;
+        Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
     }
-    let seed = format!(
-        "{}-{}-{:?}",
-        std::process::id(),
-        now(),
-        std::time::SystemTime::now()
-    );
-    hex_sha256(seed.as_bytes())
+    #[cfg(windows)]
+    {
+        // WINFIX: std CSPRNG 부재 — 시드 폴백(예측가능 잔여 위험·L3와 동일 트랙에 고지).
+        let seed = format!("{}-{}-{:?}", std::process::id(), now(), std::time::SystemTime::now());
+        Ok(hex_sha256(seed.as_bytes()))
+    }
 }
 
 /// 봇루프 판정(순수) — 윈도우 내 카운트가 상한 초과면 억제.
@@ -293,7 +297,12 @@ fn pid_alive(pid: u32) -> bool {
 }
 #[cfg(windows)]
 fn pid_alive(pid: u32) -> bool {
-    pid != 0 // best-effort — C1 WINFIX 전까지 재스폰 감지는 reaper 스레드 신호에 의존.
+    // L3 한계 명문화: windows는 pid 생존 프로브가 없어 **항상 alive로 보고**한다 — 그 결과
+    // ①respawn_dead_bridges의 자가치유(죽은 브리지 재스폰)가 발현 안 하고(dead 판정 불가)
+    // ②channel.status의 alive가 항상 true다. 재스폰 감지는 reaper 스레드 신호(on_bridge_exit)에만
+    // 의존한다. 실제 프로브(OpenProcess/GetExitCodeProcess) 편입은 WINFIX 트랙. doctor도 이 한계를
+    // 경고한다(diag_channels_db).
+    pid != 0
 }
 
 // ── 브리지 스폰(cysd 스폰 자식·scoped 원장 등록·reaper 스레드로 zombie 회수) ────
@@ -512,7 +521,10 @@ fn start(daemon: &Arc<Daemon>, conn: &mut Connection, params: &Value, id: &Value
     let Some(bridge_cmd) = bridge_cmd else {
         return err_response(id, "invalid_params", "no bridge command (pass --cmd on first start)");
     };
-    let token = random_token_hex();
+    let token = match random_token_hex() {
+        Ok(t) => t,
+        Err(e) => return err_response(id, "token_gen_failed", &e), // L2: 예측가능 폴백 금지.
+    };
     let token_hash = hex_sha256(token.as_bytes());
     let (pid, pgid) = match spawn_bridge(daemon, &channel, &bridge_cmd, &token) {
         Ok(v) => v,
@@ -747,8 +759,8 @@ fn sent_pending_approvals(
 /// 미러 버튼 본문: 제목·요지(절단)·feed_id·유효기간. nonce는 표시 텍스트가 아니라 outbound
 /// approval_* 원장·이벤트 payload(버튼 custom_id)로만 흐른다(§2.3 각인).
 fn mirror_body(title: &str, summary: &str, feed_id: &str, until: f64) -> String {
-    let s: String = summary.chars().take(200).collect();
-    let ell = if summary.chars().count() > 200 { "…" } else { "" };
+    let s: String = summary.chars().take(SUMMARY_MAXLEN).collect();
+    let ell = if summary.chars().count() > SUMMARY_MAXLEN { "…" } else { "" };
     let hhmm = {
         use chrono::TimeZone;
         chrono::Local
@@ -779,7 +791,10 @@ fn mirror_one(daemon: &Arc<Daemon>, conn: &Connection, channel: &str, owner: &st
     if exists {
         return; // 이미 미러됨 — 중복 버튼 금지(aging은 갱신이지 신규 발행 아님).
     }
-    let nonce = random_token_hex();
+    // L2: nonce 생성 실패 시 예측가능 폴백 금지 — 미러를 건너뛴다(약한 nonce 버튼 발행 방지).
+    let Ok(nonce) = random_token_hex() else {
+        return;
+    };
     let ts = now();
     if conn
         .execute(
@@ -1304,6 +1319,11 @@ fn ack(conn: &mut Connection, params: &Value, id: &Value) -> Value {
 // ── channel.outbound — 단조 상태기계 + at-least-once(§2.3) ────────────────────
 
 fn outbound(daemon: &Arc<Daemon>, conn: &mut Connection, params: &Value, id: &Value) -> Value {
+    // L1: lockdown 중엔 outbound도 게이트한다(행 생성·이벤트 발행 차단·완결성). inbound·reconcile와
+    // 대칭 — 긴급 잠금은 발신도 멈춘다. 해제는 channel.unlock(H2).
+    if lockdown_active(conn) {
+        return err_response(id, "lockdown_active", "channel lockdown active — outbound blocked");
+    }
     let Some(channel) = p_str(params, "channel") else {
         return err_response(id, "invalid_params", "missing channel");
     };
@@ -1637,7 +1657,13 @@ pub fn reconcile(daemon: &Arc<Daemon>) {
             eprintln!("[cysd] channels: '{channel}' enabled but no bridge_cmd — cannot respawn");
             continue;
         };
-        let token = random_token_hex();
+        let token = match random_token_hex() {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("[cysd] channels: '{channel}' token gen failed, skip reconcile: {e}");
+                continue; // L2: 예측가능 폴백 금지 — 다음 sweep/재시도에서 다시 시도.
+            }
+        };
         let token_hash = hex_sha256(token.as_bytes());
         match spawn_bridge(daemon, &channel, &cmd, &token) {
             Ok((pid, pgid)) => {
@@ -1757,7 +1783,13 @@ fn respawn_dead_bridges(daemon: &Arc<Daemon>, conn: &mut Connection) {
         let Some(cmd) = bridge_cmd else {
             continue;
         };
-        let token = random_token_hex();
+        let token = match random_token_hex() {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("[cysd] channels: '{channel}' token gen failed, skip respawn: {e}");
+                continue; // L2: 예측가능 폴백 금지.
+            }
+        };
         let token_hash = hex_sha256(token.as_bytes());
         match spawn_bridge(daemon, &channel, &cmd, &token) {
             Ok((npid, npgid)) => {
@@ -2280,6 +2312,24 @@ mod tests {
             .query_row("SELECT verdict FROM inbound WHERE idempotency_key='slack:1'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, "denied");
+    }
+
+    // L1: lockdown 중 outbound 게이트 — 행 생성·이벤트 차단.
+    #[test]
+    fn outbound_blocked_during_lockdown() {
+        let d = tmp_daemon("l1lockout");
+        seed_registered(&d, "slack", "t");
+        call(&d, "allow", json!({"channel": "slack", "sender_id": "U1"}), None);
+        {
+            let mut g = d.channels.lock().unwrap();
+            meta_set(g.as_mut().unwrap(), "lockdown", "1"); // 직접 set(브리지 kill 회피).
+        }
+        let r = call(&d, "outbound", json!({"channel": "slack", "target": "U1", "body": "x", "idempotency_key": "o1"}), None);
+        assert_eq!(r["ok"], json!(false), "{r}");
+        assert_eq!(r["error"]["code"], json!("lockdown_active"), "{r}");
+        let g = d.channels.lock().unwrap();
+        let n: i64 = g.as_ref().unwrap().query_row("SELECT COUNT(*) FROM outbound", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 0, "lockdown 중 outbound 행 미생성");
     }
 
     #[test]
