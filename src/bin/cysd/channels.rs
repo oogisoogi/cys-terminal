@@ -419,6 +419,7 @@ pub fn handle(daemon: &Arc<Daemon>, sub: &str, params: &Value, id: &Value, calle
         "allow-remote-approve" => allow_remote_approve(conn, params, id),
         "revoke" => revoke(conn, params, id),
         "lockdown" => lockdown(daemon, conn, id),
+        "unlock" => unlock(daemon, conn, id),
         "status" => status(conn, id),
         other => err_response(id, "unknown_method", &format!("unknown channel method: channel.{other}")),
     };
@@ -1425,6 +1426,26 @@ fn lockdown(daemon: &Arc<Daemon>, conn: &mut Connection, id: &Value) -> Value {
     ok_response(id, json!({"lockdown": true, "channels_stopped": rows.len(), "bridges_killed": killed}))
 }
 
+// ── channel.unlock — lockdown 해제(one-way door 제거·H2) ──────────────────────
+
+/// `cys channel unlock` → lockdown 플래그 해제(meta lockdown="0") + channel.unlocked 이벤트.
+/// lockdown은 전 채널을 enabled=0으로 내리고 인바운드를 전면 차단하는데, 지금까지 "1" 쓰기만 있고
+/// "0" 복원 경로가 없어 1회 잠금이 영구 불능(DB 수동편집 외 복구 불가)이었다. 이 RPC가 그 유일한
+/// 해제 경로다. 터미널 전용 — lockdown 중에는 인바운드가 이미 차단이라 원격으로는 도달 불가하므로
+/// 자연히 로컬 cys CLI에서만 호출된다(pause resume와 동형·별도 인가 불요). 해제는 desired-state를
+/// 되돌리지 않는다(enabled는 그대로 0) — 채널 재개는 `cys channel start`로 명시한다(안전측).
+fn unlock(daemon: &Arc<Daemon>, conn: &mut Connection, id: &Value) -> Value {
+    let was = lockdown_active(conn);
+    meta_set(conn, "lockdown", "0");
+    daemon.bus.publish(
+        "channel.unlocked",
+        "channel",
+        None,
+        json!({"was_locked": was}),
+    );
+    ok_response(id, json!({"unlocked": true, "was_locked": was}))
+}
+
 // ── channel.status ───────────────────────────────────────────────────────────
 
 fn status(conn: &Connection, id: &Value) -> Value {
@@ -1744,6 +1765,52 @@ mod tests {
         assert!(!env.contains('\x1b'), "봉투에 ESC 유입: {env:?}");
         assert!(!env.contains('\r'), "봉투에 CR 유입: {env:?}");
         assert!(env.contains("#7"), "봉투 구조 보존: {env:?}");
+    }
+
+    // H2: lockdown → unlock → inbound 복원 + reconcile 재개(플래그 OFF).
+    #[test]
+    fn lockdown_then_unlock_restores_inbound() {
+        let d = tmp_daemon("unlock");
+        // scoped_pid=NULL로 seed — lockdown의 브리지 kill이 실프로세스(테스트 자신)를 죽이지 않게.
+        {
+            let mut g = d.channels.lock().unwrap();
+            let conn = g.as_mut().unwrap();
+            conn.execute(
+                "INSERT INTO channels(channel, enabled, bridge_cmd, scoped_pid, scoped_pgid, token_hash, registered, updated_ts)
+                 VALUES('slack',1,'true',NULL,NULL,?1,1,?2)",
+                params![hex_sha256(b"t"), now()],
+            )
+            .unwrap();
+        }
+        call(&d, "allow", json!({"channel": "slack", "sender_id": "U1"}), None);
+        // lockdown: 전역 플래그 ON + 채널 enabled=0(scoped_pid NULL이라 kill 없음).
+        let lk = call(&d, "lockdown", json!({}), None);
+        assert_eq!(lk["result"]["lockdown"], json!(true), "{lk}");
+        {
+            let g = d.channels.lock().unwrap();
+            assert!(lockdown_active(g.as_ref().unwrap()), "lockdown 후 플래그 ON — reconcile 보류");
+        }
+        // unlock: 플래그 OFF(reconcile 재개 조건) + was_locked 보고.
+        let un = call(&d, "unlock", json!({}), None);
+        assert_eq!(un["result"]["unlocked"], json!(true), "{un}");
+        assert_eq!(un["result"]["was_locked"], json!(true), "{un}");
+        {
+            let g = d.channels.lock().unwrap();
+            assert!(!lockdown_active(g.as_ref().unwrap()), "unlock 후 플래그 OFF — reconcile 재개");
+        }
+        // 채널 재개(start가 desired-state 복원) 시뮬레이션 — lockdown이 내린 enabled/registered 복원.
+        {
+            let mut g = d.channels.lock().unwrap();
+            let conn = g.as_mut().unwrap();
+            conn.execute(
+                "UPDATE channels SET enabled=1, registered=1, scoped_pid=?1, scoped_pgid=?2 WHERE channel='slack'",
+                params![std::process::id() as i64, own_pgid()],
+            )
+            .unwrap();
+        }
+        // inbound가 다시 inbox에 적재됨(정상 복원 — 원격 잠금이 영구 불능이 아님).
+        let r = call(&d, "inbound", inbound_params("slack", "U1", "slack:after", "hello", "user"), own_pid());
+        assert_eq!(r["result"]["action"], json!("queued"), "unlock 후 inbound 복원: {r}");
     }
 
     #[test]

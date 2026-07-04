@@ -654,6 +654,8 @@ enum ChannelAction {
     Revoke { channel: String, sender_id: String },
     /// 긴급 잠금 — 전 채널 브리지 즉시 정지·인바운드 전면 차단(터미널 1명령).
     Lockdown,
+    /// lockdown 해제 — 인바운드 차단·reconcile 보류를 푼다(터미널 전용·H2). 채널 재개는 start로.
+    Unlock,
 }
 
 #[derive(Subcommand)]
@@ -2089,6 +2091,7 @@ fn run_channel(action: ChannelAction) -> i32 {
             json!({"channel": channel, "sender_id": sender_id}),
         ),
         ChannelAction::Lockdown => ("channel.lockdown", json!({})),
+        ChannelAction::Unlock => ("channel.unlock", json!({})),
         // 위에서 조기 return으로 처리됨(duration 파싱 보고 경로).
         ChannelAction::AllowRemoteApprove { .. } => unreachable!(),
     };
