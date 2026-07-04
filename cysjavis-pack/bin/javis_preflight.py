@@ -3121,7 +3121,7 @@ class Preflight:
                      "PreToolUse 등록·SKILL 핀 pack+메인)")
 
     # ── C58 트러스트 하드닝 (개인 alias 프로필 config가 cysjavis 워크스페이스를 자동 신뢰) ──
-    # 배경(실측): 개인 alias(claude-ysfuture 등·config=~/.claude-ysfuture)로 Claude 기동 시
+    # 배경(실측): 개인 alias(claude-<profile> 등·config=~/.claude-<profile>)로 Claude 기동 시
     #   그 config의 .claude.json에서 cysjavis 워크스페이스 hasTrustDialogAccepted=False/부재면
     #   시작 시 "Ignoring N permissions.allow entries … workspace has not been trusted" 경고가
     #   flash하고 permissions.allow가 무시된다. 패키지 표준 경로(launch-agent→~/.cys/claude)는

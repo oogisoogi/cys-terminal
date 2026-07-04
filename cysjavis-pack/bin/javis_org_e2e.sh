@@ -16,7 +16,7 @@ cat > "$DOC" <<'MD'
 MD
 SHA=$(python3 -c "import hashlib;print(hashlib.sha256(open('$DOC',encoding='utf-8').read().encode()).hexdigest())")
 # catalog에 future-research 등록(good=기존key) — exploit의 shadow-ops는 미등록(fabricated)
-echo '{"version":1,"accounts":{"cysinsight":"x","ysfuture":"y"},"departments":{"future-research":{"display":"미래연구부","account":"cysinsight"}}}' > "$CYS_DEPT_CATALOG"
+echo '{"version":1,"accounts":{"cysinsight":"x","owner":"y"},"departments":{"future-research":{"display":"미래연구부","account":"cysinsight"}}}' > "$CYS_DEPT_CATALOG"
 cat > "$T/m.json" <<JSON
 {"manifest_version":1,"kind":"org-manifest","reconcile_mode":"additive",
  "source":{"design_doc":"$DOC","design_doc_sha256":"$SHA"},

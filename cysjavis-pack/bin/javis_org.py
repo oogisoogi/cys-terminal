@@ -414,10 +414,10 @@ def self_test():
     doc = ("미래연구부는 모든 통찰의 원천 엔진이다. "
            "저술콘텐츠부는 통찰을 칼럼과 책으로 대중에 전파한다. "
            "이 문장은 부서 정체 토큰을 포함하지 않는 충분히 긴 고유 문장이다.")
-    cat = {"accounts":{"cysinsight":"x","ysfuture":"y"},
+    cat = {"accounts":{"cysinsight":"x","owner":"y"},
            "departments":{
              "future-research":{"display":"미래연구부","account":"cysinsight"},
-             "authoring":{"display":"저술콘텐츠부","account":"ysfuture"}}}
+             "authoring":{"display":"저술콘텐츠부","account":"owner"}}}
     d_ok = {"key":"future-research","display":"미래연구부","account":"cysinsight",
             "cwd":"$HOME/Desktop/CYSjavis/미래연구부",
             "source_quote":"미래연구부는 모든 통찰의 원천 엔진이다."}
@@ -425,7 +425,7 @@ def self_test():
     # 오귀속: 실재(미래연구부) 문장을 엉뚱한 key/account(authoring/cysinsight)에 붙임 → FAIL
     d_mis = {**d_ok, "key":"authoring", "display":"미래연구부", "account":"cysinsight"}
     chk("f1-misattr", v_quote_binding([d_mis], doc, cat) != [], "오귀속 미검출")
-    # key↔account 불일치 (authoring은 ysfuture여야)
+    # key↔account 불일치 (authoring은 owner여야)
     d_acct = {"key":"authoring","display":"저술콘텐츠부","account":"cysinsight",
               "cwd":"$HOME/Desktop/CYSjavis/저술콘텐츠부",
               "source_quote":"저술콘텐츠부는 통찰을 칼럼과 책으로 대중에 전파한다."}
@@ -444,7 +444,7 @@ def self_test():
     d_short = {**d_ok, "source_quote":"미래연구부"}
     chk("f1-short", any("길이" in e or "고유" in e for e in v_quote_binding([d_short], doc, cat)), "짧은 quote 미검출")
     # --- R1 BLOCK-2: 오귀속이 account 대조가 아니라 '결속/승인플래그'로 잡히는가 ---
-    empty_cat = {"accounts":{"cysinsight":"x","ysfuture":"y"},"departments":{}}
+    empty_cat = {"accounts":{"cysinsight":"x","owner":"y"},"departments":{}}
     # greenfield(empty catalog) fabricated 신규key + 실재 quote + display 위장 → 승인플래그 없으면 FAIL
     d_mis_empty = {**d_ok, "key":"shadow-ops", "display":"미래연구부", "account":"cysinsight",
                    "source_quote":"미래연구부는 모든 통찰의 원천 엔진이다."}
@@ -465,10 +465,10 @@ def self_test():
     import tempfile as _tf
     td = _tf.mkdtemp()
     cpath = os.path.join(td, "catalog.json")
-    json.dump({"version":1,"accounts":{"cysinsight":"x","ysfuture":"y"},"departments":{}}, open(cpath,"w"))
-    catalog_upsert(cpath, {"key":"authoring","display":"저술콘텐츠부","account":"ysfuture",
+    json.dump({"version":1,"accounts":{"cysinsight":"x","owner":"y"},"departments":{}}, open(cpath,"w"))
+    catalog_upsert(cpath, {"key":"authoring","display":"저술콘텐츠부","account":"owner",
                            "cwd":"$HOME/Desktop/CYSjavis/저술콘텐츠부"})
-    catalog_upsert(cpath, {"key":"authoring","display":"저술콘텐츠부","account":"ysfuture",
+    catalog_upsert(cpath, {"key":"authoring","display":"저술콘텐츠부","account":"owner",
                            "cwd":"$HOME/Desktop/CYSjavis/저술콘텐츠부"})  # 멱등
     c2 = json.load(open(cpath))
     chk("cat-upsert", "authoring" in c2["departments"], "upsert 미반영")

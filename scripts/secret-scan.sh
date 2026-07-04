@@ -26,13 +26,18 @@ esac
 [ "${#files[@]}" -gt 0 ] || { echo "✓ secret-scan: 스캔 대상 없음"; exit 0; }
 
 # 스캔 제외(노이즈·바이너리·잠금파일): 시크릿이 살지 않고 오탐만 만드는 파일들
-# 스캐너 자신은 제외(자기 패턴 정의에 /Users/cys·토큰 형식이 리터럴로 들어 자기-오탐 방지 — 린터 관례)
-skip_re='\.(lock|png|jpe?g|gif|ico|svg|woff2?|ttf|wasm|pdf|zip|dmg|msi|exe)$|(^|/)Cargo\.lock$|(^|/)LICENSE$|(^|/)secret-scan\.sh$'
+# 스캐너 자신과 형제 스캐너(scan-pack-secrets.sh)는 제외 — 둘 다 자기 패턴/정책 정의에 /Users/cys·
+# 토큰 형식·개인 핸들(ysfuture)이 리터럴로 들어 자기-오탐을 만든다(린터 관례)
+skip_re='\.(lock|png|jpe?g|gif|ico|svg|woff2?|ttf|wasm|pdf|zip|dmg|msi|exe)$|(^|/)Cargo\.lock$|(^|/)LICENSE$|(^|/)secret-scan\.sh$|(^|/)scan-pack-secrets\.sh$'
 # 더미 username(제네릭화된 테스트 픽스처) — 그 외 /Users/<name>은 개인경로로 차단
 dummy_user_re='/Users/(user|x|youruser|USERNAME|runner|home)(/|"|$)'
 # 이메일 허용(공개 연락처가 의도적으로 박힌 배포 문서만 — SECURITY.md 취약점 신고 연락처 포함)
 email_allow_re='^(README\.md|README\.en\.md|SECURITY\.md)$'
 email_fp_re='example\.(com|org|net)|noreply|@types/|@google/|@tauri|@scope|user@host|you@'
+# 개인 계정 핸들 denylist(맨몸) — /Users·.claude- 접두 없이 계정키·설정값으로 박힌 개인 핸들도 차단한다.
+# 넓은 패턴 대신 '알려진 개인 핸들'만 명시 등재해 제네릭 영어단어 오탐을 배제한다(deny-by-default 유지).
+# ysfuture = 오너 개인 alias·이메일 prefix. 부분일치라 'claude-ysfuture'·'ysfuture@…'도 함께 걸린다.
+handle_deny_re='ysfuture'
 
 findings="$(mktemp)"; trap 'rm -f "$findings"' EXIT
 
@@ -55,6 +60,9 @@ for f in "${files[@]}"; do
   #    'api_key = resolve_api_key()' 같은 함수호출·변수참조(따옴표 없음) 오탐을 배제한다.
   grep -nE 'sk-ant-[A-Za-z0-9]|sk-[A-Za-z0-9]{20}|ghp_[A-Za-z0-9]{10}|github_pat_[A-Za-z0-9]|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9]|-----BEGIN [A-Z ]*PRIVATE KEY-----|(password|passwd|secret|api[_-]?key|access[_-]?token)["'"'"' ]*[:=][ ]*["'"'"'][A-Za-z0-9/+=_-]{12,}' "$f" 2>/dev/null \
     | sed "s|^|SECRET\t$f:|" >> "$findings" || true
+  # 5) 개인 계정 핸들(맨몸 denylist) — 접두(/Users·.claude-) 없이 계정키로 박혀도 차단(규칙2 보강)
+  grep -nE "$handle_deny_re" "$f" 2>/dev/null \
+    | sed "s|^|HANDLE\t$f:|" >> "$findings" || true
 done
 
 n=$(wc -l < "$findings" | tr -d ' ')
