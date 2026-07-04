@@ -22,11 +22,13 @@ VERSION=$(grep -m1 '"version"' src-tauri/tauri.conf.json | sed -E 's/.*"([0-9][0
 
 # ── 자격증명 fail-closed 검증 ──
 : "${APPLE_SIGNING_IDENTITY:?필요: export APPLE_SIGNING_IDENTITY='Developer ID Application: NAME (TEAMID)'}"
-if [ -n "${APPLE_API_KEY:-}" ]; then
+if [ -n "${APPLE_NOTARY_PROFILE:-}" ]; then
+  echo "공증 자격: notarytool keychain 프로파일($APPLE_NOTARY_PROFILE)"
+elif [ -n "${APPLE_API_KEY:-}" ]; then
   : "${APPLE_API_ISSUER:?APPLE_API_KEY 사용 시 APPLE_API_ISSUER 필요}"
   echo "공증 자격: App Store Connect API key"
 else
-  : "${APPLE_ID:?공증용 Apple ID 필요 (또는 APPLE_API_KEY 경로)}"
+  : "${APPLE_ID:?공증용 Apple ID 필요 (또는 APPLE_NOTARY_PROFILE / APPLE_API_KEY)}"
   : "${APPLE_PASSWORD:?app-specific password 필요 (APPLE_PASSWORD)}"
   : "${APPLE_TEAM_ID:?APPLE_TEAM_ID 필요}"
   echo "공증 자격: Apple ID($APPLE_ID) + app-specific password"
@@ -87,15 +89,19 @@ DMG="target/release/bundle/dmg/cys_${VERSION}_aarch64.dmg"
 RTGIT="$APP/Contents/Resources/runtime/git"
 
 # ── git-core 빌트인 dedup (Tauri 역참조 되돌리기) ──
-# libexec/git-core 안에서 bin/git 과 '바이트 동일'한 파일만 상대 심볼릭링크(../../bin/git)로 치환.
+# libexec/git-core 안에서 git-core/git 과 '바이트 동일'한 파일만 동일 디렉토리 심볼릭링크(git)로 치환.
 # 결정론: 크기 일치 → cmp 바이트 대조 통과분만(git-lfs·GCM .dll/.dylib·remote 헬퍼 등 비동일 파일 불가침).
 # bin/git 만 실본으로 남고 143개 빌트인은 argv[0] 디스패치로 정상(실측: init/add/commit/stash/log/직접호출 OK).
-echo "== runtime/git dedup (git-core 빌트인 → ../../bin/git 심볼릭링크) =="
-REF="$RTGIT/bin/git"; REF_SIZE="$(stat -f '%z' "$REF")"
+echo "== runtime/git dedup (git-core 빌트인 → 동일 디렉토리 git 심볼릭링크) =="
+# ★기준점은 bin/git 이 아니라 libexec/git-core/git — Tauri가 역참조하는 원본이 git-core/git 이고,
+#   위 inside-out 재서명이 bin/git·git-core/git 을 각각 서명해 CMS 블롭(타임스탬프)이 달라지므로
+#   bin/git 대조는 서명 빌드에서 0건이 된다(2026-07-04 풀런 실측). 링크도 동일 디렉토리 `git`으로
+#   (dugite 원본 타르볼 레이아웃과 동일). 기준 파일 자신은 스캔에서 제외(자기링크 방지).
+REF="$RTGIT/libexec/git-core/git"; REF_SIZE="$(stat -f '%z' "$REF")"
 DEDUP_BEFORE_KB="$(du -sk "$RTGIT" | awk '{print $1}')"; DEDUP_N=0
 while IFS= read -r -d '' f; do
-  if [ "$(stat -f '%z' "$f")" = "$REF_SIZE" ] && cmp -s "$f" "$REF"; then
-    ln -sf "../../bin/git" "$f"; DEDUP_N=$((DEDUP_N+1))
+  if [ "$f" != "$REF" ] && [ "$(stat -f '%z' "$f")" = "$REF_SIZE" ] && cmp -s "$f" "$REF"; then
+    ln -sf "git" "$f"; DEDUP_N=$((DEDUP_N+1))
   fi
 done < <(find "$RTGIT/libexec/git-core" -type f -print0)
 DEDUP_AFTER_KB="$(du -sk "$RTGIT" | awk '{print $1}')"
@@ -119,8 +125,10 @@ fi
 # ── 공증(1회) + staple + DMG/업데이터 재생성 ──
 # ⚠ 아래 notarytool/stapler/signer 경로는 Apple Developer 자격·업데이터 키가 필요해 워커 환경에선 실행 검증
 #   불가 — dedup/재서명/hdiutil UDZO/codesign --verify 는 실측 통과. 오너 자격으로 최종 실행 검증을 요한다.
-# notarytool 자격: APPLE_API_KEY(우선) 또는 APPLE_ID+APPLE_PASSWORD+APPLE_TEAM_ID (스크립트 상단서 fail-closed 검증됨).
-if [ -n "${APPLE_API_KEY:-}" ]; then
+# notarytool 자격: APPLE_NOTARY_PROFILE(keychain 프로파일·오너 로컬 기본) > APPLE_API_KEY > APPLE_ID 3원 (상단서 fail-closed 검증됨).
+if [ -n "${APPLE_NOTARY_PROFILE:-}" ]; then
+  NOTARY_ARGS=(--keychain-profile "$APPLE_NOTARY_PROFILE")
+elif [ -n "${APPLE_API_KEY:-}" ]; then
   NOTARY_ARGS=(--key "${APPLE_API_KEY_PATH:?APPLE_API_KEY 사용 시 APPLE_API_KEY_PATH(.p8) 필요}" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER")
 else
   NOTARY_ARGS=(--apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID")
@@ -148,6 +156,9 @@ DMGSTAGE="$(mktemp -d)"; ditto "$APP" "$DMGSTAGE/cys.app"; ln -s /Applications "
 mkdir -p "$(dirname "$DMG")"
 hdiutil create -volname "cys" -srcfolder "$DMGSTAGE" -ov -format UDZO "$DMG"
 rm -rf "$DMGSTAGE"
+# DMG 자체도 Developer ID 서명 — 구 Tauri 흐름과 패리티. 서명 없으면 spctl -t open(primary-signature)
+# 이 'no usable signature'로 거부한다(2026-07-04 실측). 서명은 반드시 notarytool 제출 전(CDHash 결속).
+codesign --force --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$DMG"
 
 echo "== 공증: DMG 제출 → staple =="
 xcrun notarytool submit "$DMG" "${NOTARY_ARGS[@]}" --wait
@@ -161,6 +172,12 @@ else
 fi
 xcrun stapler validate "$APP" >/dev/null 2>&1 && echo "  ✓ app 공증 티켓 stapled" || echo "  ⚠ app staple 미확인"
 xcrun stapler validate "$DMG" >/dev/null 2>&1 && echo "  ✓ DMG 공증 티켓 stapled" || echo "  ⚠ DMG staple 미확인(앱 공증되면 설치는 정상)"
+# DMG 자체 Gatekeeper 게이트 — .app spctl만으론 DMG 서명 누락을 못 잡는다(2026-07-04 실측 갭).
+if spctl -a -t open --context context:primary-signature -vv "$DMG" 2>&1 | grep -qi "accepted"; then
+  echo "  ✓ DMG spctl: accepted (primary-signature)"
+else
+  echo "  ✗ DMG spctl 거부 — DMG codesign/공증 확인 필요"; exit 1
+fi
 
 echo "== 배포본 정리 + 자동업데이트 매니페스트 =="
 cp "$DMG" "dist-mac/cys-${VERSION}-macos-arm64.dmg"
