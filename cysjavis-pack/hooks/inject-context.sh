@@ -25,6 +25,19 @@ SOUL="${CYS_SOUL:-$HOME/.claude/soul.md}"
 ROOT="${CYS_ROOT:-$HOME}"
 OUT=""
 
+# ---------- ★G3(cokacdir 성찰 2026-07-04): 재주입 포이즌 게이트 ----------
+# SESSION_STATE·RSI_LEDGER는 FS 쓰기 권한 노드가 지시를 심을 수 있는 재주입 면 — verbatim
+# 주입 전 skillscan 규칙(add 시점과 동일)으로 의심 라인만 격리(deny-by-default·라인 단위).
+# 게이트 부재·실패 시 원문 통과(복원 생명선 — 전면 차단 금지), 게이트 안에서 다운 배너 표기.
+GATE="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/inject_gate.py"
+_gate() {
+  if [ -f "$GATE" ]; then
+    python3 "$GATE" || cat
+  else
+    cat
+  fi
+}
+
 # ---------- L0: soul ANCHOR 전문 (startup/resume에서 풍요 주입) ----------
 if { [ "$SOURCE" = "startup" ] || [ "$SOURCE" = "resume" ]; } && [ -f "$SOUL" ]; then
   OUT="${OUT}■ 불변 정체·절대규칙 (L0 · soul.md ANCHOR — 매 부팅 재확립)\n"
@@ -61,9 +74,9 @@ if [ -n "$STATE" ]; then
   SS_BRIEF_MAX=6144
   if [ -n "$SS_SZ" ] && [ "$SS_SZ" -gt "$SS_BRIEF_MAX" ]; then
     OUT="${OUT}⚠ 작업기억 ${SS_SZ}B>${SS_BRIEF_MAX} — 고정 헤더부만 발췌 주입('## [YYYY' 날짜 진행로그 제외; 그 형식이 없으면 전체 유지). 전체 필요시: cat $STATE\n"
-    OUT="${OUT}$(awk 'BEGIN{keep=1} /^## /{keep=($0 ~ /\[20[0-9][0-9]/)?0:1} keep' "$STATE")\n\n"
+    OUT="${OUT}$(awk 'BEGIN{keep=1} /^## /{keep=($0 ~ /\[20[0-9][0-9]/)?0:1} keep' "$STATE" | _gate)\n\n"
   else
-    OUT="${OUT}$(cat "$STATE")\n\n"
+    OUT="${OUT}$(cat "$STATE" | _gate)\n\n"
   fi
 else
   OUT="${OUT}■ 작업기억 미발견 — 임의 추정 금지. 활성 프로젝트를 지정하라.\n\n"
@@ -90,7 +103,7 @@ if { [ "$SOURCE" = "startup" ] || [ "$SOURCE" = "resume" ]; } && [ -n "$STATE" ]
   RSI_DIR="$(dirname "$STATE")"   # ledger 는 SESSION_STATE 와 동일 _round (STATE_DIR 은 master 에서 프로젝트루트라 부적합)
   RSI_LEDGER="$RSI_DIR/RSI_LEDGER.md"
   if [ -f "$RSI_LEDGER" ]; then
-    RSI_HEADS="$(grep '^- \[' "$RSI_LEDGER" | tail -4 | sed -E 's/(\*\*[^*]*\*\*).*/\1/')"
+    RSI_HEADS="$(grep '^- \[' "$RSI_LEDGER" | tail -4 | sed -E 's/(\*\*[^*]*\*\*).*/\1/' | _gate)"
     if [ -n "$RSI_HEADS" ]; then
       OUT="${OUT}■ RSI 자산 — 최근 lesson 헤드 (작동 시작 자동 상기 · 전문은 _round/RSI_LEDGER.md)\n"
       OUT="${OUT}${RSI_HEADS}\n"

@@ -28,12 +28,17 @@ import os
 import re
 import subprocess
 import sys
+import time
 
 EXIT_ALLOW, EXIT_SOFT, EXIT_HARD = 0, 1, 2
 
 SERVER_PATTERNS = [
     r"bun .*server", r"node .*server", r"vite(\s|$)", r"next dev", r"uvicorn",
-    r"python3? -m http\.server", r"python3? .*server\.py", r"webpack.*serve",
+    # ★G12 실측 교정(2026-07-04): macOS 프레임워크 파이썬은 ps에
+    #   ".../Python.app/Contents/MacOS/Python -m http.server"로 표시 — 'python3? ' 접두는
+    #   실서버를 영영 못 잡는다(분류 갭 실측). 경로·대소문자 내성으로 확장.
+    r"(?i)python[^ ]* -m http\.server", r"(?i)python[^ ]* .*server\.py",
+    r"webpack.*serve",
 ]
 # 서버가 아닌 상주 인프라(오탐 제외): 언어 서버(LSP)·MCP 서버 등은 자원 거버넌스의
 # 'dev 서버 누적' 대상이 아니다 (실측: pyright langserver.index.js가 node .*server에 걸림).
@@ -149,6 +154,149 @@ def cmd_classify(a):
     return EXIT_ALLOW
 
 
+# ── ★G12(cokacdir 성찰 2026-07-04): hard_block '판정'과 분리돼 있던 '집행' ──
+def _server_procs(lines=None):
+    """SERVER_PATTERNS 매칭 (pid, cmd) 목록 — _count_matching과 동일 분류(제외 패턴 포함)."""
+    lines = lines if lines is not None else _ps_lines()
+    regs = [re.compile(p) for p in SERVER_PATTERNS]
+    excl = [re.compile(p, re.IGNORECASE) for p in SERVER_EXCLUDE_PATTERNS]
+    out = []
+    for line in lines:
+        parts = line.strip().split(None, 1)
+        if len(parts) != 2 or not parts[0].isdigit():
+            continue
+        pid, cmd = int(parts[0]), parts[1]
+        if "javis_resource_gate" in cmd:
+            continue
+        if any(r.search(cmd) for r in regs) and not any(r.search(cmd) for r in excl):
+            out.append((pid, cmd))
+    return out
+
+
+def _descendants(roots):
+    """pid/ppid 체인 전(全) 자손 — phoenix_harness._descendants 동형(문자열 매칭 아님·collateral 0)."""
+    try:
+        out = subprocess.run(["ps", "-Ao", "pid=,ppid="], capture_output=True,
+                             text=True, timeout=10).stdout
+    except (subprocess.SubprocessError, OSError):
+        return set()
+    kids = {}
+    for line in out.splitlines():
+        p = line.split()
+        if len(p) == 2 and p[0].isdigit() and p[1].isdigit():
+            kids.setdefault(int(p[1]), []).append(int(p[0]))
+    seen, stack = set(), list(roots)
+    while stack:
+        for c in kids.get(stack.pop(), []):
+            if c not in seen:
+                seen.add(c)
+                stack.append(c)
+    return seen
+
+
+def _proc_age_sec(pid):
+    """ps etime([[dd-]hh:]mm:ss) → 초. 조회 불가 시 None."""
+    try:
+        et = subprocess.run(["ps", "-o", "etime=", "-p", str(pid)],
+                            capture_output=True, text=True, timeout=10).stdout.strip()
+        if not et:
+            return None
+        days, rest = (et.split("-", 1) + [""])[:2] if "-" in et else ("0", et)
+        parts = [int(x) for x in rest.split(":")]
+        while len(parts) < 3:
+            parts.insert(0, 0)
+        h, m, s = parts
+        return int(days) * 86400 + h * 3600 + m * 60 + s
+    except (subprocess.SubprocessError, OSError, ValueError):
+        return None
+
+
+def cmd_enforce(a):
+    """dev 서버 초과분 정리 집행 — hard 임계 도달 시 매칭 서버 pid-tree kill.
+    기본 dry-run(파괴 행위 deny-by-default) · --kill 명시 시만 실행 · 원장 기록.
+    --min-age N: 기동 N초 미만 서버는 보호(watchdog '45초+' 규칙 — 방금 띄운 의도 서버 오살 방지).
+    --notify R: 실제 kill 발생 시에만 역할 R에 1줄 push(무사건 무push — 스케줄 스팸 0).
+    (사후 watchdog·사전 check와 별개의 '집행' 경로 — 판정과 집행의 분리 해소.)"""
+    import signal as _signal
+    if a.pids:  # 테스트 결정론 주입(servers-override 관례) — 임계 게이트 우회
+        roots = [(p, "(injected)") for p in a.pids]
+    else:
+        roots = _server_procs()
+        if len(roots) < a.servers_hard:
+            print(json.dumps({"verdict": "no_enforce", "servers": len(roots),
+                              "hard": a.servers_hard}, ensure_ascii=False))
+            return EXIT_ALLOW
+        if a.min_age:
+            aged = []
+            for p, c in roots:
+                age = _proc_age_sec(p)
+                if age is None or age >= a.min_age:  # 나이 미상=보호 아님(watchdog 의도 우선)
+                    aged.append((p, c))
+            if not aged:
+                print(json.dumps({"verdict": "no_enforce", "servers": len(roots),
+                                  "why": "전건 min-age(%ss) 미만 — 신생 보호" % a.min_age},
+                                 ensure_ascii=False))
+                return EXIT_ALLOW
+            roots = aged
+    root_pids = [p for p, _ in roots]
+    victims = sorted(set(root_pids) | _descendants(root_pids))  # 죽이기 전에 트리 수집
+    killed = 0
+    if a.kill:
+        # Windows 패리티: SIGKILL 부재(getattr 폴백) · os.kill(pid,0) 프로브는 Windows에서
+        # TerminateProcess라 금지 — 생존 확인은 ps로만(부재 시 kill 시도 완료를 종료로 간주).
+        sigkill = getattr(_signal, "SIGKILL", _signal.SIGTERM)
+        for v in victims:
+            try:
+                os.kill(v, _signal.SIGTERM)
+            except OSError:
+                pass
+        time.sleep(1)
+        for v in victims:
+            try:
+                st = subprocess.run(["ps", "-o", "pid=", "-p", str(v)],
+                                    capture_output=True, text=True, timeout=10).stdout.strip()
+            except (subprocess.SubprocessError, OSError):
+                st = ""
+            if st:
+                try:
+                    os.kill(v, sigkill)
+                except OSError:
+                    pass
+        time.sleep(0.3)
+        for v in victims:  # 좀비 인지 집계 — kill(v,0) 프로브는 좀비에 성공해 잔존으로 오판(G5 동형)
+            try:
+                st = subprocess.run(["ps", "-o", "state=", "-p", str(v)],
+                                    capture_output=True, text=True, timeout=10).stdout.strip()
+            except (subprocess.SubprocessError, OSError):
+                st = ""
+            if not st or st.startswith("Z"):
+                killed += 1
+    ledger = os.path.join(os.environ.get("JAVIS_ROOT") or os.getcwd(),
+                          "_round", "resource_enforce.jsonl")
+    try:
+        os.makedirs(os.path.dirname(ledger), exist_ok=True)
+        with open(ledger, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                                "mode": "kill" if a.kill else "dry_run",
+                                "roots": [{"pid": p, "cmd": c[:120]} for p, c in roots],
+                                "victims": victims, "killed": killed},
+                               ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+    if a.kill and killed and getattr(a, "notify", None):
+        try:  # 실사건에만 push — 무사건 스케줄 주기는 침묵(스팸 0)
+            subprocess.run(["cys", "send", "--queued", "--to", a.notify,
+                            "[watchdog] 자원 집행 — dev 서버 pid-tree %d개 kill (roots %s). "
+                            "원장: _round/resource_enforce.jsonl" % (killed, root_pids)],
+                           timeout=15)
+        except (subprocess.SubprocessError, OSError, FileNotFoundError):
+            pass
+    print(json.dumps({"verdict": "enforced" if a.kill else "dry_run",
+                      "roots": root_pids, "victims": victims, "killed": killed},
+                     ensure_ascii=False))
+    return EXIT_ALLOW
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description="자원 사전 게이트 — 착수 전 차단 (P0-3)")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -171,6 +319,17 @@ def main(argv=None):
 
     c = sub.add_parser("classify")
     c.set_defaults(fn=cmd_classify)
+
+    c = sub.add_parser("enforce")
+    c.add_argument("--servers-hard", type=int, default=3)
+    c.add_argument("--kill", action="store_true",
+                   help="실제 kill 집행 — 미지정 시 dry-run(대상 목록만)")
+    c.add_argument("--min-age", dest="min_age", type=int, default=0,
+                   help="기동 N초 미만 서버 보호(watchdog 45초 규칙)")
+    c.add_argument("--notify", default=None,
+                   help="실제 kill 발생 시에만 이 역할로 1줄 push(무사건 무push)")
+    c.add_argument("--pids", type=int, nargs="*", default=None, help="테스트 주입(임계 우회)")
+    c.set_defaults(fn=cmd_enforce)
 
     a = p.parse_args(argv)
     return a.fn(a)

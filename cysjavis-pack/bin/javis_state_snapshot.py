@@ -27,6 +27,7 @@
 #   javis_state_snapshot.py self-test              # 원자성/중단내성 실증(격리 임시폴더)
 
 import argparse
+import glob as _glob
 import hashlib
 import json
 import os
@@ -87,6 +88,15 @@ def default_sources(home=HOME, state_root=None, depts_json=None):
     srcs.append(os.path.join(home, ".cys", "depts.json"))
     for dd in _dept_state_dirs(state_root, depts_json=depts_json):
         srcs.extend(os.path.join(dd, b) for b in DECLARATIVE_BASENAMES)
+    # ★G1(d)(cokacdir 성찰 2026-07-04): 복원 SOT·노드 TODO·장기기억도 세대 보관에 포함 —
+    #   SESSION_STATE.md 는 재부팅 복원의 단일 진실인데 세대 보관 대상에서 빠져 있었다.
+    #   개인경로 하드코딩 금지(pack scan gate): 프로젝트는 $JAVIS_ROOT(env 또는 CWD),
+    #   장기기억은 HOME glob 파생만(javis_wakeup.py 등과 동일 관례).
+    proj_round = os.path.join(os.environ.get("JAVIS_ROOT") or os.getcwd(), "_round")
+    srcs.append(os.path.join(proj_round, "SESSION_STATE.md"))
+    srcs.extend(sorted(_glob.glob(os.path.join(proj_round, "*_TODO.md"))))
+    srcs.extend(sorted(_glob.glob(os.path.join(
+        home, ".claude*", "projects", "*", "memory", "*.md"))))
     return srcs
 
 # GC 파라미터

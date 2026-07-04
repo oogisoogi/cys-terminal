@@ -24,7 +24,9 @@ import re
 import sys
 import unicodedata
 
-DEFAULT_STORE = os.path.join(os.path.expanduser("~"), "Desktop", "CYSjavis", "_round", "mcp_approved")
+# ★G4 교정(2026-07-04): 개인 프로젝트 경로 하드코딩 제거(pack scan gate 교훈 — v0.12.4 실사고
+#   재발 방지). 관례 = $JAVIS_ROOT(env) 또는 CWD (javis_wakeup.py:33 등과 동일).
+DEFAULT_STORE = os.path.join(os.environ.get("JAVIS_ROOT") or os.getcwd(), "_round", "mcp_approved")
 
 # ── 유니코드 기만 (TP2) ──
 _CONFUSABLES = {  # 키릴/그리스 → 라틴 대표 (SkillSpector _CONFUSABLES 발췌)

@@ -30,6 +30,8 @@ import sys
 import time
 import uuid
 
+import javis_scrub  # ★G2: 원장 기록 직전 비밀 마스킹(같은 폴더 형제 모듈 — 부재 시 즉시 실패=fail-closed)
+
 ROOT = os.environ.get("JAVIS_ROOT") or os.getcwd()  # 개인경로 하드코딩 금지(pack scan gate) — env 또는 CWD(워크스페이스 루트에서 호출)
 WK_DIR = os.path.join(ROOT, "_round", "wakeups")
 PENDING_DIR = os.path.join(WK_DIR, "pending")
@@ -53,6 +55,8 @@ def _pending_path(target, task_key):
 def _ledger_append(event):
     os.makedirs(WK_DIR, exist_ok=True)
     event["ts"] = _now()
+    # ★G2(cokacdir 성찰 2026-07-04): 원장(queue.jsonl) 기록 직전 비밀 마스킹 — 값 단위 재귀.
+    event = javis_scrub.scrub_obj(event)
     with open(LEDGER, "a", encoding="utf-8") as f:
         f.write(json.dumps(event, ensure_ascii=False) + "\n")
 
@@ -190,7 +194,30 @@ def _build_send_message(rec):
             f"payload={json.dumps(rec.get('payload', {}), ensure_ascii=False)}")
 
 
+# ★G13(cokacdir 성찰 2026-07-04): 연속 배달실패 카운터 + fast-fail — hang/유령 대상 무한
+#   재시도('idle 5분' 산문 규칙뿐이던 갭)를 결정론으로 차단. 임계 도달 시 pending 종결 +
+#   카운터 리셋(이후 재큐잉은 깨끗한 재시도 — 자가 회복·수동 리셋 불요).
+FAILCOUNT = os.path.join(WK_DIR, "failcount.json")
+
+
+def _load_failcount():
+    try:
+        with open(FAILCOUNT, encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _bump_failcount(target, reset=False):
+    with _FileLock(FAILCOUNT + ".lock"):
+        fc = _load_failcount()
+        fc[target] = 0 if reset else fc.get(target, 0) + 1
+        _write_json_atomic(FAILCOUNT, fc)
+        return fc[target]
+
+
 def cmd_drain(a):
+    fastfail_max = int(os.environ.get("JAVIS_FASTFAIL_MAX", "3"))
     pending = _iter_pending()
     if a.target:
         pending = [(p, r) for p, r in pending if r["target"] == a.target]
@@ -215,10 +242,25 @@ def cmd_drain(a):
                 print(f"warn: {rec['target']} 생존 미확인 상태로 배달 시도", file=sys.stderr)
             try:
                 subprocess.run(cmd, check=True, timeout=15)
+                if _load_failcount().get(rec["target"]):
+                    _bump_failcount(rec["target"], reset=True)  # 성공 = 연속실패 해소
             except (subprocess.SubprocessError, OSError, FileNotFoundError) as e:
+                streak = _bump_failcount(rec["target"])
+                if streak >= fastfail_max:
+                    # ★G13 fast-fail: 임계 도달 — pending 종결(무한 재시도 차단)·카운터 리셋
+                    os.remove(path)
+                    _ledger_append({"event": "skipped", "target": rec["target"],
+                                    "wakeup_id": rec["id"],
+                                    "why": f"fast-fail(연속 {streak}회 배달실패)"})
+                    _bump_failcount(rec["target"], reset=True)
+                    print(f"skipped (fast-fail {streak}회): {rec['id']} → {rec['target']}",
+                          file=sys.stderr)
+                    skipped += 1
+                    continue
                 _ledger_append({"event": "deliver_failed", "target": rec["target"],
-                                "wakeup_id": rec["id"], "why": str(e)})
-                print(f"deliver failed (pending 유지): {rec['id']} — {e}", file=sys.stderr)
+                                "wakeup_id": rec["id"], "why": str(e), "fail_streak": streak})
+                print(f"deliver failed (pending 유지·연속 {streak}회): {rec['id']} — {e}",
+                      file=sys.stderr)
                 continue
         else:
             print("DRYRUN:", " ".join(cmd))
