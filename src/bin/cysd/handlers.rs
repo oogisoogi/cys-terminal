@@ -1666,8 +1666,9 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 created_at: crate::state::now_epoch(),
                 resolved_at: None,
                 tier: tier.clone(),
-                // §3.2 자기승인 차단: 발행자 pid를 각인해 feed.reply에서 대조한다.
+                // §3.2 자기승인 차단: 발행자 pid·pgid를 각인해 feed.reply에서 대조한다(M4 pgid 격상).
                 publisher_pid: caller_pid,
+                publisher_pgid: caller_pid.and_then(crate::state::pgid_of),
             };
             // waiter 등록을 항목 공개와 같은 임계영역에서 수행 — 항목이 다른 커넥션에
             // 보이는 순간 waiter가 이미 존재해, 빠른 feed.reply의 결정이 유실되지 않는다.
@@ -1741,62 +1742,51 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             let Some(decision) = param_str(&params, "decision") else {
                 return Reply::Single(err_response(&id, "invalid_params", "missing decision"));
             };
-            let mut resolved_snapshot = None;
-            {
-                let mut items = daemon.feed_items.lock().unwrap();
-                if let Some(item) = items.iter_mut().find(|i| i.request_id == request_id) {
-                    if item.status != "pending" {
+            // M7: 해소는 단일 경로(resolve_feed_item)에 위임한다. 위임 전 precheck로 ①존재 여부
+            // ②already-resolved를 구분(resolve_feed_item은 둘 다 None)하고, 자기승인 판정용 발행자
+            // pid/pgid를 캡처한다.
+            let (pub_pid, pub_pgid) = {
+                let items = daemon.feed_items.lock().unwrap();
+                match items.iter().find(|i| i.request_id == request_id) {
+                    None => {
+                        return Reply::Single(err_response(
+                            &id,
+                            "not_found",
+                            &format!("no feed item {request_id}"),
+                        ))
+                    }
+                    Some(item) if item.status != "pending" => {
                         return Reply::Single(err_response(
                             &id,
                             "invalid_params",
                             "item already resolved",
-                        ));
+                        ))
                     }
-                    // §3.2 표면정책 — 자기승인 차단: 요청을 발행한 프로세스가 자기 요청을 스스로
-                    // "allow"로 승인하는 것을 데몬이 거부한다(HITL 우회 방지). 자기-거부(deny)와
-                    // 발행 pid 미상(구 라인)은 허용 — 차단 근거가 없다. 정책 파일로 끌 수 있으나
-                    // 기본값은 차단 ON(fail-safe).
-                    if decision == "allow"
-                        && item.publisher_pid.is_some()
-                        && item.publisher_pid == caller_pid
-                        && crate::state::deny_self_approve_policy()
-                    {
-                        return Reply::Single(err_response(
-                            &id,
-                            "self_approval_denied",
-                            "요청 발행자는 자기 요청을 승인할 수 없다 — 다른 노드/오퍼레이터가 승인해야 한다(§3.2)",
-                        ));
-                    }
-                    item.status = "resolved".into();
-                    item.decision = Some(decision.clone());
-                    item.resolved_at = Some(crate::state::now_epoch());
-                    resolved_snapshot = Some(item.clone());
+                    Some(item) => (item.publisher_pid, item.publisher_pgid),
                 }
-            }
-            let Some(snapshot) = resolved_snapshot else {
+            };
+            // §3.2 표면정책 — 자기승인 차단(M4 pgid 격상): 발행자와 승인자가 pid 또는 pgid가 같고
+            // allow면 거부한다(HITL 우회 방지). 자기-거부(deny)·발행자 미상·타 노드(다른 pgid) 승인은
+            // 통과. 정책 파일로 끌 수 있으나 기본 ON(fail-safe).
+            let caller_pgid = caller_pid.and_then(crate::state::pgid_of);
+            if crate::state::is_self_approval(pub_pid, pub_pgid, caller_pid, caller_pgid, &decision)
+                && crate::state::deny_self_approve_policy()
+            {
                 return Reply::Single(err_response(
                     &id,
-                    "not_found",
-                    &format!("no feed item {request_id}"),
+                    "self_approval_denied",
+                    "요청 발행자는 자기 요청을 승인할 수 없다 — 다른 노드/오퍼레이터가 승인해야 한다(§3.2)",
                 ));
-            };
-            daemon.persist_feed_item(&snapshot);
-            // Unblock the waiting pusher, if any.
-            if let Some(tx) = daemon.feed_waiters.lock().unwrap().remove(&request_id) {
-                let _ = tx.send(decision.clone());
             }
-            daemon.bus.publish(
-                "feed.item.resolved",
-                "feed",
-                None,
-                json!({"request_id": request_id, "decision": decision,
-                       // 미러/브리지 tier 필터용(§2.4-3). None(무태그)=D 표기(fail-closed).
-                       "tier": snapshot.tier.as_deref().unwrap_or("d")}),
-            );
-            Reply::Single(ok_response(
-                &id,
-                json!({"request_id": request_id, "decision": decision}),
-            ))
+            // 위임: persist·waiter wake·feed.item.resolved 발행을 resolve_feed_item이 단일 수행.
+            match daemon.resolve_feed_item(&request_id, &decision) {
+                Some(_) => Reply::Single(ok_response(
+                    &id,
+                    json!({"request_id": request_id, "decision": decision}),
+                )),
+                // precheck 후 동시 해소(레이스)로 pending이 사라짐 — 이미 해소로 보고.
+                None => Reply::Single(err_response(&id, "invalid_params", "item already resolved")),
+            }
         }
 
         "feed.list" => {

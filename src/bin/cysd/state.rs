@@ -204,6 +204,11 @@ pub struct FeedItem {
     /// 자기승인 판정을 적용하지 않는다(정보 없음 → 차단 근거 없음). serde default로 하위호환.
     #[serde(default)]
     pub publisher_pid: Option<u32>,
+    /// 발행자 프로세스 그룹 id(M4 pgid 격상). feed.reply의 caller pgid와 같으면 자기승인으로 본다
+    /// — push/reply가 별개 CLI 프로세스라도 같은 노드면 그룹이 같아 pid 단독보다 실효적이다.
+    /// None=미상(구 영속 라인·windows·해소 실패)이면 이 경로로는 차단하지 않는다. serde default 하위호환.
+    #[serde(default)]
+    pub publisher_pgid: Option<u32>,
 }
 
 pub struct Config {
@@ -555,6 +560,42 @@ pub fn deny_self_approve_policy() -> bool {
     }
 }
 
+/// pid가 속한 프로세스 그룹 id(unix). 자기승인 판정의 pgid 격상(M4)에 쓴다 — `cys feed push`와
+/// `reply`가 별개 CLI 프로세스라 pid가 달라도, 같은 노드(워커)에서 나오면 프로세스 그룹이 같다.
+/// 존재하지 않는 pid/실패는 None. windows는 프로세스 그룹 개념이 달라 None(pid 단독 폴백).
+#[cfg(unix)]
+pub fn pgid_of(pid: u32) -> Option<u32> {
+    let r = unsafe { libc::getpgid(pid as libc::pid_t) };
+    if r < 0 {
+        None
+    } else {
+        Some(r as u32)
+    }
+}
+#[cfg(windows)]
+pub fn pgid_of(_pid: u32) -> Option<u32> {
+    None
+}
+
+/// 자기승인 판정(순수·M4) — decision="allow"이고 발행자와 승인자가 **(pid 동일 OR pgid 동일)**이면
+/// 자기승인이다. pgid 격상으로 push/reply가 별개 CLI 프로세스라도 같은 프로세스 그룹(=같은 노드)이면
+/// 잡는다. master가 워커 feed를 승인하는 정상 흐름은 pgid가 달라 통과한다(같을 때만 차단). 정책
+/// 게이트(deny_self_approve_policy)는 호출자가 AND로 결합한다(순수 테스트 가능하게 분리).
+pub fn is_self_approval(
+    pub_pid: Option<u32>,
+    pub_pgid: Option<u32>,
+    caller_pid: Option<u32>,
+    caller_pgid: Option<u32>,
+    decision: &str,
+) -> bool {
+    if decision != "allow" {
+        return false;
+    }
+    let pid_match = pub_pid.is_some() && pub_pid == caller_pid;
+    let pgid_match = pub_pgid.is_some() && pub_pgid == caller_pgid;
+    pid_match || pgid_match
+}
+
 /// Windows named pipe 경로(`\\.\pipe\<name>`)에서 `<name>` 슬러그를 추출한다(RC-13).
 /// 기본 데몬 `\\.\pipe\cys` → `"cys"`(호출자가 %LOCALAPPDATA%\cys 루트로 매핑·기존 호환 유지),
 /// 부서 데몬 `\\.\pipe\cys-dept-<n>` → `"cys-dept-<n>"`(루트 하위 부서 고유 디렉토리).
@@ -797,6 +838,7 @@ impl Daemon {
             resolved_at: None,
             tier: None, // 데몬 자동 알림은 무태그(=D·미러 제외) — 채널 스팸 차단.
             publisher_pid: None, // 데몬 발행 — 외부 caller 없음(자기승인 판정 비적용).
+            publisher_pgid: None,
         };
         self.feed_items.lock().unwrap().push(item.clone());
         self.persist_feed_item(&item);
@@ -808,6 +850,16 @@ impl Daemon {
                    // 데몬 자동 알림은 항상 무태그(=D·미러 제외) — tier 필드 계약 균일성(§2.4-3).
                    "body": body, "wait": false, "tier": "d"}),
         );
+    }
+
+    /// 특정 feed 항목이 아직 pending인가(M8) — channels 모듈이 feed_items 내부를 직접 순회하지 않게
+    /// 캡슐화한 헬퍼. verify_interaction(승인 nonce 검증)·register 재조정(승인버튼 복원)이 공유한다.
+    pub fn feed_item_pending(&self, request_id: &str) -> bool {
+        self.feed_items
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|i| i.request_id == request_id && i.status == "pending")
     }
 
     /// feed 항목을 결정으로 해소한다(pending→resolved) — feed.reply와 채널 승인 미러 interaction이
@@ -1805,6 +1857,23 @@ fn default_health_rules() -> Vec<HealthRule> {
 mod tests {
     use super::*;
 
+    // ── M4: 자기승인 pgid 격상 순수 판정 — 같은 pgid(별개 CLI 프로세스)면 차단, 다른 pgid는 허용 ──
+    #[test]
+    fn is_self_approval_pgid_promotion() {
+        // 같은 pid → 차단(allow).
+        assert!(is_self_approval(Some(100), None, Some(100), None, "allow"));
+        // 다른 pid이지만 같은 pgid(push/reply가 별개 프로세스·같은 노드) → 차단.
+        assert!(is_self_approval(Some(100), Some(50), Some(200), Some(50), "allow"));
+        // 다른 pid·다른 pgid(master가 워커 feed 승인) → 통과.
+        assert!(!is_self_approval(Some(100), Some(50), Some(200), Some(60), "allow"));
+        // deny는 항상 통과(자기 요청 취소는 무해).
+        assert!(!is_self_approval(Some(100), Some(50), Some(100), Some(50), "deny"));
+        // 발행자 pid·pgid 미상(구 라인) → 차단 근거 없음 → 통과.
+        assert!(!is_self_approval(None, None, Some(100), Some(50), "allow"));
+        // pgid만 미상이고 pid 불일치 → 통과(pgid None은 매칭 안 함).
+        assert!(!is_self_approval(Some(100), None, Some(200), Some(50), "allow"));
+    }
+
     // ── T6b.1 회귀 핀(codex): mac -lc PATH 프리픽스는 POSIX single-quote로 특수문자 리터럴화 ──
     // 버그: 큰따옴표 quoting은 경로의 $·백틱·$()가 셸 확장돼 명령 주입/오해석 취약.
     #[cfg(target_os = "macos")]
@@ -2617,6 +2686,7 @@ mod tests {
             resolved_at: None,
             tier: None,
             publisher_pid: None,
+            publisher_pgid: None,
         }
     }
 

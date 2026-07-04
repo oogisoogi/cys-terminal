@@ -1044,14 +1044,8 @@ fn verify_interaction(daemon: &Arc<Daemon>, conn: &Connection, channel: &str, pa
     if owner.as_deref() != Some(sender_id.as_str()) {
         return deny("owner_mismatch");
     }
-    // ④ feed_id 실재·pending(해소 대상이 살아있어야 함).
-    let pending = daemon
-        .feed_items
-        .lock()
-        .unwrap()
-        .iter()
-        .any(|i| i.request_id == feed_id && i.status == "pending");
-    if !pending {
+    // ④ feed_id 실재·pending(해소 대상이 살아있어야 함). M8: feed_items 직접 순회 대신 캡슐 헬퍼.
+    if !daemon.feed_item_pending(&feed_id) {
         return deny("feed_not_pending");
     }
     // ⑤ nonce 원자 소각(WHERE used=0 → 0행이면 동시 재생이 이미 태움 = 재생 차단).
@@ -2394,6 +2388,7 @@ mod tests {
             resolved_at: None,
             tier: Some("c".into()),
             publisher_pid: None,
+            publisher_pgid: None,
         });
     }
 
