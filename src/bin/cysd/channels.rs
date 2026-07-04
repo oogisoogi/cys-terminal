@@ -44,6 +44,8 @@ const LOOP_LIMIT: u64 = 20;
 const INBOX_REDELIVER_TTL_SECS: f64 = 600.0;
 /// 브리지 사망 후 재스폰 백오프(초) — 크래시 루프 폭주 차단.
 const RESPAWN_BACKOFF_SECS: f64 = 5.0;
+/// 연속 재스폰 실패 임계(M12) — 초과 시 health.alert 1회 발행·status에 down 표시(무한 재시도는 유지).
+const RESPAWN_FAIL_ALERT_THRESHOLD: u64 = 5;
 /// 주기 sweep 간격(초) — 재배달·타임아웃·브리지 사망 재조정.
 const SWEEP_INTERVAL_SECS: u64 = 15;
 /// 봉투 sender 표기 최대 길이(초과 시 … 절단).
@@ -1579,12 +1581,17 @@ fn status(conn: &Connection, id: &Value) -> Value {
                 let allow_n: i64 = conn
                     .query_row("SELECT COUNT(*) FROM allowlist WHERE channel=?1", [&channel], |r| r.get(0))
                     .unwrap_or(0);
+                // M12: 연속 재스폰 실패 카운터 + down 관측(임계 이상이면 채널 수준 down).
+                let respawn_fails: i64 = meta_get(conn, &format!("respawn_fails:{channel}"))
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+                let down = respawn_fails >= RESPAWN_FAIL_ALERT_THRESHOLD as i64;
                 channels.push(json!({
                     "channel": channel, "enabled": enabled == 1, "registered": registered == 1,
                     "alive": alive, "pid": pid, "bridge_ver": bridge_ver,
                     "last_in_ts": last_in, "last_out_ts": last_out,
                     "outcomes": Value::Object(outcomes), "inbox": Value::Object(inbox),
-                    "allowlist": allow_n,
+                    "allowlist": allow_n, "respawn_fails": respawn_fails, "down": down,
                 }));
             }
         }
@@ -1703,6 +1710,28 @@ fn prune_retention(conn: &Connection, now: f64, retain_secs: f64) -> usize {
     n
 }
 
+/// M12: 재스폰 실패 카운터 증가 — 임계 도달·미경보면 Some(fails)(=health.alert 발행 신호), 아니면
+/// None. 경보는 임계 도달 시 **1회만**(respawn_alerted 플래그) — 무한 재시도 중 경보 폭주 차단.
+fn bump_respawn_failure(conn: &Connection, channel: &str, threshold: u64) -> Option<u64> {
+    let fk = format!("respawn_fails:{channel}");
+    let fails = meta_get(conn, &fk).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0) + 1;
+    meta_set(conn, &fk, &fails.to_string());
+    let ak = format!("respawn_alerted:{channel}");
+    let already = meta_get(conn, &ak).as_deref() == Some("1");
+    if fails >= threshold && !already {
+        meta_set(conn, &ak, "1");
+        Some(fails)
+    } else {
+        None
+    }
+}
+
+/// M12: 재스폰 성공 시 실패 카운터·경보 플래그 리셋(다음 사망 시 다시 임계까지 카운트).
+fn reset_respawn_failure(conn: &Connection, channel: &str) {
+    meta_set(conn, &format!("respawn_fails:{channel}"), "0");
+    meta_set(conn, &format!("respawn_alerted:{channel}"), "0");
+}
+
 /// enabled=1이지만 브리지 pid가 죽은 채널을 백오프 후 재스폰(§2.1-5).
 fn respawn_dead_bridges(daemon: &Arc<Daemon>, conn: &mut Connection) {
     if lockdown_active(conn) {
@@ -1730,17 +1759,37 @@ fn respawn_dead_bridges(daemon: &Arc<Daemon>, conn: &mut Connection) {
         };
         let token = random_token_hex();
         let token_hash = hex_sha256(token.as_bytes());
-        if let Ok((npid, npgid)) = spawn_bridge(daemon, &channel, &cmd, &token) {
-            let _ = conn.execute(
-                "UPDATE channels SET scoped_pid=?2, scoped_pgid=?3, token_hash=?4, registered=0, last_spawn_ts=?5, updated_ts=?5 WHERE channel=?1",
-                params![channel, npid as i64, npgid as i64, token_hash, now],
-            );
-            daemon.bus.publish(
-                "channel.reconciled",
-                "channel",
-                None,
-                json!({"channel": channel, "pid": npid, "reason": "respawn after bridge death"}),
-            );
+        match spawn_bridge(daemon, &channel, &cmd, &token) {
+            Ok((npid, npgid)) => {
+                reset_respawn_failure(conn, &channel); // M12: 성공 → 실패 카운터·경보 리셋.
+                let _ = conn.execute(
+                    "UPDATE channels SET scoped_pid=?2, scoped_pgid=?3, token_hash=?4, registered=0, last_spawn_ts=?5, updated_ts=?5 WHERE channel=?1",
+                    params![channel, npid as i64, npgid as i64, token_hash, now],
+                );
+                daemon.bus.publish(
+                    "channel.reconciled",
+                    "channel",
+                    None,
+                    json!({"channel": channel, "pid": npid, "reason": "respawn after bridge death"}),
+                );
+            }
+            Err(e) => {
+                // M12: 연속 실패 카운터 → 임계 초과 시 health.alert 1회(무한 재시도는 유지·관측 가능).
+                // last_spawn_ts를 갱신해 백오프 창을 유지(폭주 차단) — 실패해도 즉시 재시도 안 함.
+                let _ = conn.execute(
+                    "UPDATE channels SET last_spawn_ts=?2, updated_ts=?2 WHERE channel=?1",
+                    params![channel, now],
+                );
+                if let Some(fails) = bump_respawn_failure(conn, &channel, RESPAWN_FAIL_ALERT_THRESHOLD) {
+                    daemon.bus.publish(
+                        "health.alert",
+                        "health",
+                        None,
+                        json!({"rule": "channel_bridge_down", "channel": channel,
+                               "fails": fails, "detail": e}),
+                    );
+                }
+            }
         }
     }
 }
@@ -2012,6 +2061,29 @@ mod tests {
         let pend = reg["result"]["pending"].as_array().unwrap();
         assert_eq!(pend.len(), 1, "pending outbound 동봉돼야 한다: {reg}");
         assert_eq!(pend[0]["idempotency_key"], json!("o1"));
+    }
+
+    // M12: 재스폰 실패 카운터 → 임계서 health.alert 신호 1회, 성공 리셋 후 다시 임계서 재신호.
+    #[test]
+    fn respawn_failure_counter_alerts_once_then_resets() {
+        let d = tmp_daemon("m12fail");
+        let mut g = d.channels.lock().unwrap();
+        let conn = g.as_mut().unwrap();
+        // 임계=3: 1·2회 None, 3회 Some(3)=경보 발행 신호, 이후 None(1회만).
+        assert_eq!(bump_respawn_failure(conn, "slack", 3), None);
+        assert_eq!(bump_respawn_failure(conn, "slack", 3), None);
+        assert_eq!(bump_respawn_failure(conn, "slack", 3), Some(3), "임계 도달 시 경보 신호");
+        assert_eq!(bump_respawn_failure(conn, "slack", 3), None, "임계 후 재경보 억제(폭주 차단)");
+        // 성공 리셋 → 카운터·경보 플래그 해제.
+        reset_respawn_failure(conn, "slack");
+        assert_eq!(
+            meta_get(conn, "respawn_fails:slack").as_deref(),
+            Some("0"),
+            "리셋 후 카운터 0"
+        );
+        assert_eq!(bump_respawn_failure(conn, "slack", 3), None);
+        assert_eq!(bump_respawn_failure(conn, "slack", 3), None);
+        assert_eq!(bump_respawn_failure(conn, "slack", 3), Some(3), "리셋 후 다시 임계서 경보");
     }
 
     // M5: 종결 원장 보존기간 프룬 — 오래된 종결행 삭제·pending/최근/미소각 approval/accepted 보존.
