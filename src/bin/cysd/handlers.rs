@@ -2825,6 +2825,9 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             }
             daemon.bus.publish(
                 "surface.quiescing",
+                // L7: category="channel"는 의도적 — quiescing 게이트는 채널 inbox 주입 보류를 위한
+                // 신호라(deliverable_master가 이 상태를 읽는다) 채널 구독자가 함께 받도록 채널 계열로
+                // 분류했다. 표면 상태 변화이기도 하나 소비 주체가 채널이라 무해·인지 목적 주석.
                 "channel",
                 Some(sid),
                 json!({"surface_id": sid, "quiescing": on}),

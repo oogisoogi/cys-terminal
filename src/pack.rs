@@ -658,6 +658,12 @@ fn rename_dir_or_move(src: &Path, dst: &Path) -> std::io::Result<()> {
 
 /// 원자 교체(§3.1-3): pack_dir→pack_dir.prev, staging→pack_dir. 2번째 rename 실패 시 역rename으로
 /// pre-state 복구. pack_dir.prev는 1세대만 보존. 반환 Err = 교체 안 됨(기존 팩 온전).
+///
+/// L6 전제 명문화: 두 rename 사이엔 pack_dir가 잠깐 **부재하는 창**이 있다(원자 교체지만 순간 공백).
+/// 이는 **데몬 미가동/init 시점**(팩을 읽는 상주 소비자가 없는 때)을 전제로 안전하다 — 무중단
+/// 업데이트 경로(deploy_gate --execute)는 이 함수를 데몬이 팩을 읽지 않는 시점에만 호출한다.
+/// 상주 데몬이 그 창에 팩을 읽으면 일시적 not-found가 날 수 있으므로, 라이브 교체는 이 전제를
+/// 지키는 호출자 책임이다(코드 변경 불요·전제 고지).
 pub fn atomic_swap(dir: &Path, staging: &Path) -> Result<(), String> {
     let prev = pack_prev_dir(dir);
     // 직전 세대 정리(1세대 보존).
