@@ -210,8 +210,23 @@ fn redeliver_due(state: &str, injected_ts: Option<f64>, now: f64, ttl: f64) -> b
     }
 }
 
+/// 채널 인바운드 미신뢰 텍스트 살균(C1·순수) — 봉투 조립 전 ESC·C0 제어·CR·DEL을 제거한다.
+/// bracketed-paste 종료 시퀀스(`\x1b[201~`)나 CR(`\r`)이 채널 text에 섞이면, master(무승인) PTY에
+/// 붙여넣기가 조기 종료되어 이후 바이트가 실제 키입력·조기 제출되는 경계 붕괴가 난다(state.rs 주입은
+/// `\x1b[200~{text}\x1b[201~`+`\r`). 여기서 미신뢰 text의 위험 바이트를 봉투 진입 전에 없앤다.
+/// 보존: HT(`\t`)·LF(`\n`)·인쇄 가능 문자(한글·이모지 등 U+0020 이상, DEL 제외). 제거: 그 외 C0(0x00-0x1F
+/// 중 \t·\n 제외 — CR·ESC 포함)·DEL(0x7F). 채널 전용 살균 — 공유 WriteReq::Inject·cys send 신뢰 경로는
+/// 절대 건드리지 않는다(회귀 방지·§C1).
+fn sanitize_inbound_text(s: &str) -> String {
+    s.chars()
+        .filter(|&c| c == '\n' || c == '\t' || (c >= ' ' && c != '\u{7f}'))
+        .collect()
+}
+
 /// 봉투 문자열: `[CH:<channel>|<sender>|<HH:MM>|#<inbox_id>] <text>` (+재배달 표기).
 fn envelope(channel: &str, sender: &str, ts: f64, inbox_id: i64, redelivered: bool, text: &str) -> String {
+    // C1: 채널에서 온 미신뢰 text를 봉투에 넣기 직전 살균(ESC/제어바이트 유입 0).
+    let text = sanitize_inbound_text(text);
     let short: String = if sender.chars().count() > SENDER_MAXLEN {
         let head: String = sender.chars().take(SENDER_MAXLEN).collect();
         format!("{head}…")
@@ -1712,6 +1727,23 @@ mod tests {
             .query_row("SELECT value FROM meta WHERE key='schema_version'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, "2");
+    }
+
+    // C1: 채널 인바운드 살균 — paste-escape·CR·ESC·C0/DEL 제거, 한글·이모지·개행·탭 보존.
+    #[test]
+    fn sanitize_strips_paste_escape_preserves_text() {
+        // bracketed-paste 종료 시퀀스 strip(경계 붕괴 차단).
+        assert_eq!(sanitize_inbound_text("\x1b[201~rm -rf"), "[201~rm -rf");
+        // ESC·CR·기타 C0·DEL 제거.
+        assert_eq!(sanitize_inbound_text("a\rb\x00c\x1bd\x7fe"), "abcde");
+        assert_eq!(sanitize_inbound_text("x\x1b[200~y"), "x[200~y");
+        // 정상 한글/이모지/개행/탭 무손상.
+        assert_eq!(sanitize_inbound_text("안녕하세요 🚀\n다음\t줄"), "안녕하세요 🚀\n다음\t줄");
+        // 봉투에 ESC/CR 유입 0(수용기준).
+        let env = envelope("slack", "U1", 0.0, 7, false, "hi\x1b[201~\r\nX");
+        assert!(!env.contains('\x1b'), "봉투에 ESC 유입: {env:?}");
+        assert!(!env.contains('\r'), "봉투에 CR 유입: {env:?}");
+        assert!(env.contains("#7"), "봉투 구조 보존: {env:?}");
     }
 
     #[test]
