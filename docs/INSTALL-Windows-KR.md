@@ -13,7 +13,7 @@
 
 ## 설치 (사람)
 1. 릴리스에서 **`cys_0.6.0_x64-setup.exe`** (NSIS 설치파일)를 내려받아 실행합니다.
-   - 내려받는 곳: GitHub 릴리스 `idoforgod/cys-terminal-releases` (오너이 발행한 정식본).
+   - 내려받는 곳: GitHub 릴리스 `idoforgod/cys-terminal` (오너이 발행한 정식본).
    - 설치파일 안에 실행환경이 동봉돼 있어(설치 폴더 `\runtime\` 아래 Git Bash·Python) 인터넷이나
      추가 설치 없이 첫 기동에 바로 작동합니다.
 2. 설치가 끝나면 **cys 앱을 한 번 실행**합니다.

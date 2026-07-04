@@ -41,11 +41,13 @@
 # - reviewer의 tmp/로그 write는 과도차단 방지를 위해 허용(검증 대상 경로 한정 — propmap T6-P3 §5).
 # - 검증: 내장 배터리 --self-test.
 
-if ! command -v python3 >/dev/null 2>&1; then
-  # python3 없음 — role을 알 수 없으니 안전측: reviewer 환경이면 막아야 하나 role 판별 불가.
+# 인터프리터 해소 — Windows는 python3 명령이 없고 python/py만 있는 경우가 흔하다(부트 실패 방지).
+CYS_PY="$(command -v python3 || command -v python || command -v py)"
+if [ -z "$CYS_PY" ]; then
+  # python(3) 전무 — role을 알 수 없으니 안전측: reviewer 환경이면 막아야 하나 role 판별 불가.
   # 환경변수로 role 힌트가 있으면 그것으로 fail-closed, 없으면 통과(무역할 가정).
   case "${CYS_SURFACE_ROLE:-}" in
-    reviewer*|planner|planner-*) echo "role-capability-gate: python3 missing — failing closed for reviewer/planner" >&2; exit 2 ;;
+    reviewer*|planner|planner-*) echo "role-capability-gate: python missing — failing closed for reviewer/planner" >&2; exit 2 ;;
     *) exit 0 ;;
   esac
 fi
@@ -62,7 +64,7 @@ else
   export CYS_SURFACE_ROLE
 fi
 
-exec python3 - <<'PYEOF'
+exec "$CYS_PY" - <<'PYEOF'
 import json, os, shlex, sys, tempfile
 
 # 변형(mutation) 도구 — reviewer/planner에게 deny.

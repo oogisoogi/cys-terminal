@@ -13,8 +13,10 @@
 # 입력: gate-input JSON (인자 $1=파일 경로, 없으면 stdin). 스키마는 아래 python 헤더 참조.
 # 종료코드: 0=allow · 1=deny(사유 stderr). --self-test=결정론 자기검증(0 통과/1 실패).
 
-if ! command -v python3 >/dev/null 2>&1; then
-  echo "deny: python3 부재 — fail-closed(봉쇄는 판단 불가 시 차단)" >&2
+# 인터프리터 해소 — Windows는 python3 명령이 없고 python/py만 있는 경우가 흔하다(부트 실패 방지).
+CYS_PY="$(command -v python3 || command -v python || command -v py)"
+if [ -z "$CYS_PY" ]; then
+  echo "deny: python(3) 부재 — fail-closed(봉쇄는 판단 불가 시 차단)" >&2
   exit 1
 fi
 
@@ -23,7 +25,7 @@ if [ "${1:-}" = "--self-test" ]; then export RSI_GATE_SELF_TEST=1; INPUT="{}"; e
 fi
 export RSI_GATE_INPUT="$INPUT"
 
-exec python3 - <<'PYEOF'
+exec "$CYS_PY" - <<'PYEOF'
 import hashlib
 import json
 import os

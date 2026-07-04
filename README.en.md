@@ -51,7 +51,7 @@ those three problems first-class features.
 
 ## Install
 
-Grab the latest from [Releases](https://github.com/idoforgod/cys-terminal-releases/releases/latest).
+Grab the latest from [Releases](https://github.com/idoforgod/cys-terminal/releases/latest).
 No separate daemon setup — the app boots it and installs the pack automatically.
 
 - **macOS**: `cys_<version>_aarch64.dmg` (Apple Silicon) — drag to install, launch, done.

@@ -13,7 +13,7 @@
 [개발]   오너이 cysjavis-pack/(팩) 또는 src/(앱)에 새 기능 → git commit
 [빌드]   pack.rs include_str! + build.rs(skills walk)가 팩을 cys 바이너리에 컴파일타임 embed
          bundle-prep.sh가 cys/cysd를 src-tauri/binaries로 → tauri externalBin 동봉(.app)
-[릴리스]  git tag vX.Y.Z → release.yml CI → 빌드·minisign 서명 → 공개 repo(cys-terminal-releases) draft → 오너 Publish
+[릴리스]  git tag vX.Y.Z → release.yml CI → 빌드·minisign 서명 → 공개 repo(cys-terminal) draft → 오너 Publish
 [배포]   사용자 앱이 시작+6h마다 latest.json 체크 → 업데이트 버튼 → Tauri updater download_and_install → .app 통째 교체
 [설치]   install_update가 pending-restore 마커 기록 → app.restart
 [반영]   새 cys-app setup → daemon-ready → spawn_event_forwarder(먼저) → maybe_apply_pending_update:

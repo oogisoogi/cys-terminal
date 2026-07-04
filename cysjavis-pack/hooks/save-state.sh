@@ -8,11 +8,13 @@
 set +e
 
 INPUT=$(cat 2>/dev/null)
-CWD=$(printf '%s' "$INPUT" | python3 -c "import json,sys
+# 인터프리터 해소 — Windows는 python3 명령이 없고 python/py만 있는 경우가 흔하다(미해소 시 graceful degrade).
+CYS_PY="$(command -v python3 || command -v python || command -v py || echo python3)"
+CWD=$(printf '%s' "$INPUT" | "$CYS_PY" -c "import json,sys
 try: print(json.load(sys.stdin).get('cwd',''))
 except Exception: print('')" 2>/dev/null)
 case "$CWD" in /*) ;; *) CWD="" ;; esac  # 절대경로만 상향탐색 (무한루프 방지)
-EVENT=$(printf '%s' "$INPUT" | python3 -c "import json,sys
+EVENT=$(printf '%s' "$INPUT" | "$CYS_PY" -c "import json,sys
 try:
  d=json.load(sys.stdin); print(d.get('hook_event_name', d.get('trigger','event')))
 except Exception: print('event')" 2>/dev/null)
