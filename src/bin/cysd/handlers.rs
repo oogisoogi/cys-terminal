@@ -1704,7 +1704,9 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 "feed",
                 surface_id,
                 json!({"request_id": request_id, "kind": kind, "title": title,
-                       "body": body, "wait": wait}),
+                       "body": body, "wait": wait,
+                       // 채널 브리지·미러가 tier로 필터 가능하게(§2.4-3). None(무태그)=D 표기(fail-closed).
+                       "tier": tier.as_deref().unwrap_or("d")}),
             );
             // 승인 미러(§2.4·§2.6 O9): tier≤C(a|b|c) + 원격승인 게이트 ON이면 등록 채널로 버튼 미러.
             // 무태그/D·게이트 OFF는 mirror_approval 내부에서 fail-closed로 무발행(버튼 없음=안전측).
@@ -1770,7 +1772,9 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 "feed.item.resolved",
                 "feed",
                 None,
-                json!({"request_id": request_id, "decision": decision}),
+                json!({"request_id": request_id, "decision": decision,
+                       // 미러/브리지 tier 필터용(§2.4-3). None(무태그)=D 표기(fail-closed).
+                       "tier": snapshot.tier.as_deref().unwrap_or("d")}),
             );
             Reply::Single(ok_response(
                 &id,
@@ -5546,6 +5550,98 @@ mod tests {
         );
 
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── C2 (가)-2: feed.item.created·resolved 이벤트 tier 필드 ────────────────────
+
+    /// feed.push(tier=c) → feed.item.created 페이로드에 tier=c. reply → resolved에도 tier 전파.
+    /// 미지 tier(x)·무태그는 D 강등돼 이벤트에도 "d"로 표기(채널 브리지 필터 계약).
+    #[test]
+    fn feed_events_carry_tier() {
+        let dir = std::env::temp_dir().join(format!(
+            "cys_feed_tier_{}_{}",
+            std::process::id(),
+            crate::state::now_epoch() as u64
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let daemon = Daemon::new(dir.join("cysd.sock"));
+        let mut rx = daemon.bus.subscribe();
+
+        // tier=c → created 이벤트에 tier=c.
+        let req = Request {
+            id: json!(1),
+            method: "feed.push".into(),
+            params: json!({"kind": "permission", "title": "t", "body": "b",
+                           "request_id": "f_c", "wait": false, "tier": "c"}),
+        };
+        let Reply::Single(resp) = dispatch(&daemon, req, None) else {
+            panic!("expected single reply");
+        };
+        assert_eq!(resp["ok"], json!(true), "{resp}");
+        let mut created_tier = None;
+        while let Ok(ev) = rx.try_recv() {
+            if ev["name"].as_str() == Some("feed.item.created")
+                && ev["payload"]["request_id"].as_str() == Some("f_c")
+            {
+                created_tier = ev["payload"]["tier"].as_str().map(String::from);
+            }
+        }
+        assert_eq!(created_tier.as_deref(), Some("c"), "created 이벤트에 tier=c 포함돼야");
+
+        // reply → resolved 이벤트에도 tier=c 전파.
+        let rr = Request {
+            id: json!(2),
+            method: "feed.reply".into(),
+            params: json!({"request_id": "f_c", "decision": "allow"}),
+        };
+        let _ = dispatch(&daemon, rr, None);
+        let mut resolved_tier = None;
+        while let Ok(ev) = rx.try_recv() {
+            if ev["name"].as_str() == Some("feed.item.resolved")
+                && ev["payload"]["request_id"].as_str() == Some("f_c")
+            {
+                resolved_tier = ev["payload"]["tier"].as_str().map(String::from);
+            }
+        }
+        assert_eq!(resolved_tier.as_deref(), Some("c"), "resolved 이벤트에 tier=c 전파돼야");
+
+        // 미지 tier(x) → 파싱에서 None 강등 → 이벤트에 "d"(fail-closed 표기).
+        let req_x = Request {
+            id: json!(3),
+            method: "feed.push".into(),
+            params: json!({"kind": "permission", "title": "t", "body": "b",
+                           "request_id": "f_x", "wait": false, "tier": "x"}),
+        };
+        let _ = dispatch(&daemon, req_x, None);
+        let mut tier_x = None;
+        while let Ok(ev) = rx.try_recv() {
+            if ev["name"].as_str() == Some("feed.item.created")
+                && ev["payload"]["request_id"].as_str() == Some("f_x")
+            {
+                tier_x = ev["payload"]["tier"].as_str().map(String::from);
+            }
+        }
+        assert_eq!(tier_x.as_deref(), Some("d"), "미지 tier는 이벤트에 d로 강등 표기");
+
+        // 무태그 → 이벤트에 "d".
+        let req_none = Request {
+            id: json!(4),
+            method: "feed.push".into(),
+            params: json!({"kind": "permission", "title": "t", "body": "b",
+                           "request_id": "f_none", "wait": false}),
+        };
+        let _ = dispatch(&daemon, req_none, None);
+        let mut tier_none = None;
+        while let Ok(ev) = rx.try_recv() {
+            if ev["name"].as_str() == Some("feed.item.created")
+                && ev["payload"]["request_id"].as_str() == Some("f_none")
+            {
+                tier_none = ev["payload"]["tier"].as_str().map(String::from);
+            }
+        }
+        assert_eq!(tier_none.as_deref(), Some("d"), "무태그는 이벤트에 d로 표기(fail-closed)");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

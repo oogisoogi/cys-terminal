@@ -780,7 +780,8 @@ impl Daemon {
             "feed",
             surface_id,
             json!({"request_id": request_id, "kind": kind, "title": title,
-                   "body": body, "wait": false}),
+                   // 데몬 자동 알림은 항상 무태그(=D·미러 제외) — tier 필드 계약 균일성(§2.4-3).
+                   "body": body, "wait": false, "tier": "d"}),
         );
     }
 
@@ -809,7 +810,9 @@ impl Daemon {
             "feed.item.resolved",
             "feed",
             None,
-            json!({"request_id": request_id, "decision": decision}),
+            json!({"request_id": request_id, "decision": decision,
+                   // 미러/브리지 tier 필터용(§2.4-3). None(무태그)=D 표기(fail-closed).
+                   "tier": snapshot.tier.as_deref().unwrap_or("d")}),
         );
         Some(snapshot)
     }

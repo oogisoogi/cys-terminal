@@ -444,19 +444,20 @@ fn check_feed_aging(daemon: &Arc<Daemon>, reminded: &mut HashMap<String, f64>) {
         return;
     }
     let now = now_epoch();
-    let pending: Vec<(String, String, f64)> = {
+    // (request_id, title, created_at, tier, body) — tier·body는 승인 미러 재조정에 필요(§2.4·O9).
+    let pending: Vec<(String, String, f64, Option<String>, String)> = {
         let items = daemon.feed_items.lock().unwrap();
         items
             .iter()
             .filter(|i| i.status == "pending")
-            .map(|i| (i.request_id.clone(), i.title.clone(), i.created_at))
+            .map(|i| (i.request_id.clone(), i.title.clone(), i.created_at, i.tier.clone(), i.body.clone()))
             .collect()
-    };
+    }; // ★feed_items 락은 여기서 해제 — 아래 mirror_approval(channels 락)이 lock-order 안전.
     let pending_ids: std::collections::HashSet<&String> =
-        pending.iter().map(|(id, _, _)| id).collect();
+        pending.iter().map(|(id, _, _, _, _)| id).collect();
     reminded.retain(|id, _| pending_ids.contains(id));
     let total = pending.len();
-    for (request_id, title, created_at) in &pending {
+    for (request_id, title, created_at, tier, body) in &pending {
         let age = now - created_at;
         if age < remind_secs as f64 {
             continue;
@@ -473,6 +474,10 @@ fn check_feed_aging(daemon: &Arc<Daemon>, reminded: &mut HashMap<String, f64>) {
             json!({"request_id": request_id, "title": title,
                    "age_secs": age as u64, "pending_total": total}),
         );
+        // §2.4·§2.6 O9: aging 재알림은 채널측 자체 재발행이 아니라 feed aging에 일원화한다. mirror_approval은
+        // 멱등(기존 버튼 있으면 skip)이라 중복 버튼 0을 유지하되, 채널이 push 이후 등록된 경우 늦은 미러를
+        // 발행한다. tier≤C·게이트 ON이 아니면 내부에서 fail-closed로 무발행.
+        crate::channels::mirror_approval(daemon, request_id, title, body, tier.as_deref());
     }
 }
 

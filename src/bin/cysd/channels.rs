@@ -2472,4 +2472,56 @@ mod tests {
         assert_eq!(r["result"]["action"], json!("interaction_denied"), "{r}");
         assert_eq!(r["result"]["reason"], json!("owner_mismatch"), "타 owner nonce 도용은 owner_mismatch");
     }
+
+    #[test]
+    fn interaction_unknown_feed_rejected() {
+        // 유효 nonce·owner·게이트 ON이지만 feed_id가 pending 목록에 없음(미존재/미지) → feed_not_pending.
+        let d = tmp_daemon("intr_unknownfeed");
+        seed_registered(&d, "slack", "t");
+        call(&d, "allow", json!({"channel": "slack", "sender_id": "U1"}), None);
+        call(&d, "allow-remote-approve", json!({"duration_secs": 3600}), None);
+        // feed를 pending으로 push하지 않은 채 미러만 발행(nonce 확보) → feed는 미존재.
+        mirror_approval(&d, "ghostfeed", "t", "b", Some("c"));
+        let nonce = mirror_nonce(&d, "slack", "ghostfeed", "U1").unwrap();
+        let r = call(&d, "inbound", interaction_params("slack", "U1", "ghostfeed", &nonce, "allow"), own_pid());
+        assert_eq!(r["result"]["action"], json!("interaction_denied"), "{r}");
+        assert_eq!(r["result"]["reason"], json!("feed_not_pending"), "미지 feed_id는 feed_not_pending");
+    }
+
+    #[test]
+    fn interaction_expired_rejected() {
+        // opt-in 기간 만료 후엔 유효 nonce·owner여도 승인 처리 금지(remote_approve_off).
+        let d = tmp_daemon("intr_expired");
+        seed_registered(&d, "slack", "t");
+        call(&d, "allow", json!({"channel": "slack", "sender_id": "U1"}), None);
+        call(&d, "allow-remote-approve", json!({"duration_secs": 3600}), None);
+        push_pending_feed(&d, "feed1");
+        mirror_approval(&d, "feed1", "t", "b", Some("c"));
+        let nonce = mirror_nonce(&d, "slack", "feed1", "U1").unwrap();
+        // 자연 만료 모사: 만료 ts를 과거로 민다(remote_approve_active = until > now → false).
+        {
+            let mut g = d.channels.lock().unwrap();
+            let conn = g.as_mut().unwrap();
+            meta_set(conn, "allow_remote_approve_until", &(now() - 10.0).to_string());
+        }
+        let r = call(&d, "inbound", interaction_params("slack", "U1", "feed1", &nonce, "allow"), own_pid());
+        assert_eq!(r["result"]["action"], json!("interaction_denied"), "{r}");
+        assert_eq!(r["result"]["reason"], json!("remote_approve_off"), "만료 후는 remote_approve_off");
+    }
+
+    #[test]
+    fn mirror_blocked_after_expiry() {
+        // opt-in 만료 후 발행되는 feed는 미러되지 않는다(미러 게이트가 만료를 재확인).
+        let d = tmp_daemon("mirror_expired");
+        seed_registered(&d, "slack", "t");
+        call(&d, "allow", json!({"channel": "slack", "sender_id": "U1"}), None);
+        call(&d, "allow-remote-approve", json!({"duration_secs": 3600}), None);
+        {
+            let mut g = d.channels.lock().unwrap();
+            let conn = g.as_mut().unwrap();
+            meta_set(conn, "allow_remote_approve_until", &(now() - 10.0).to_string());
+        }
+        mirror_approval(&d, "feedLate", "t", "b", Some("c"));
+        assert_eq!(count_approval_prompts(&d, "slack", "feedLate"), 0, "만료 후엔 미러 금지");
+    }
 }
