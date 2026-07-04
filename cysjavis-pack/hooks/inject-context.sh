@@ -30,6 +30,8 @@ OUT=""
 # 주입 전 skillscan 규칙(add 시점과 동일)으로 의심 라인만 격리(deny-by-default·라인 단위).
 # 게이트 부재·실패 시 원문 통과(복원 생명선 — 전면 차단 금지), 게이트 안에서 다운 배너 표기.
 GATE="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/inject_gate.py"
+# Windows(PortableGit sh) 패리티: 네이티브 python3는 POSIX 경로(/c/...)를 못 연다 — cygpath 변환.
+command -v cygpath >/dev/null 2>&1 && GATE="$(cygpath -w "$GATE" 2>/dev/null || printf '%s' "$GATE")"
 _gate() {
   if [ -f "$GATE" ]; then
     python3 "$GATE" || cat
