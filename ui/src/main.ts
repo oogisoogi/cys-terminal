@@ -1527,7 +1527,16 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
       const text = e.clipboardData?.getData("text") ?? "";
       e.preventDefault();
       e.stopPropagation();
-      if (text) term.paste(text);
+      if (text) {
+        // pasting 플래그: term.paste→onData는 동기 발화 — onData의 자모 필터를
+        // 붙여넣기에는 적용하지 않기 위한 결정론 마커("ㅋㅋㅋ" 붙여넣기 보존).
+        pasting = true;
+        try {
+          term.paste(text);
+        } finally {
+          pasting = false;
+        }
+      }
     },
     true,
   );
@@ -1537,6 +1546,20 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
   // 전송해버림 = 자모 유출) ②조합 진행을 insertReplacementText로 value 치환(xterm 미인지 =
   // 완성 글자 유실)한다. 여기서 자모 유출을 차단하고 음절 확정 시 완성 글자만 보낸다.
   let pendingHangul = "";
+  // ★한글 IME 이중 경로 누출의 실측 확정(2026-07-05 · cys-ime.log + pty 바이트 프로브 1ms 대조):
+  //   이 wry WKWebView에서는 composition 이벤트가 textarea에 전혀 발화하지 않고
+  //   (sawNativeComposition 영구 false), 조합 첫 자모가 inputType=insertText로 온다.
+  //   그때 xterm.js 코어의 textarea input 처리도 같은 이벤트를 일반 텍스트로 받아
+  //   onData(자모)를 emit한다 — 완성 음절은 아래 상태머신 flush가 보내므로, 코어가
+  //   emit한 "순수 자모" onData가 그대로 pty에 얹혀 "이"→"ㅇ이" 선행 자모 유출이 된다.
+  //   (xterm 내부 composition 래치 타이밍에 따라 간헐 억제 — 유출이 속도 의존이던 이유.)
+  //   ∴ onData에서 순수 자모 문자열만 차단한다. 3중 가드로 회귀 0:
+  //   ①isWKWebView 한정(WebView2 무영향) ②네이티브 composition 관측 시 해제(그 경로가
+  //   완성분을 emit하는 WebKit 보호) ③붙여넣기(pasting) 통과("ㅋㅋㅋ" 페이스트 보존).
+  //   직접 타이핑한 낱자모(ㅋㅋㅋ)는 insertText→pendingHangul 머신 경로로 정상 전송된다.
+  let sawNativeComposition = false;
+  let pasting = false;
+  const isJamoOnly = (t: string) => /^[\u3131-\u318E\u1100-\u11FF]+$/.test(t);
   // 자모(31xx·11xx) + 완성형 음절(AC00-D7A3) — ★멀티문자 허용(2026-06-13): 고속 입력에서
   // IME가 여러 음절을 한 insertText로 병합 커밋하는데, 단일 문자만 인정하면 그 묶음이
   // input 핸들러에서 무시되고 onData(고속에서 발화 비결정)도 못 받쳐 통째로 유실된다
@@ -1557,11 +1580,16 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
   };
 
   term.onData((data) => {
-    // 한글 음절: 이 WebKit은 조합을 표준 composition inputType(insertFromComposition)으로
-    // 확정하고, 그때 xterm이 완성 음절을 onData로 정확히 1회 발화한다 — 차단 없이 그대로
-    // PTY로 보낸다. (구 isHangulText 차단은 insertText 기반 상태머신을 전제했으나, 실기기
-    // WebKit은 insertCompositionText/insertFromComposition을 보내 그 머신이 작동한 적이
-    // 없었고, 차단만 살아 순수 한글 음절을 통째로 유실시켰다 — "너는 마스터다"→"는 다".)
+    // ★자모 유출 차단(파일 상단 실측 주석 참조): 이 wry WKWebView에서 xterm 코어는
+    //   조합 첫 자모(insertText)를 일반 텍스트로 오인해 onData(자모)를 emit한다.
+    //   완성 음절은 insertText/keydown/blur의 flushPending이 순서 보존으로 책임지므로
+    //   "순수 자모" onData는 여기서 버린다. flushPending을 이 분기에서 부르지 않는 것이
+    //   핵심 — 부르면 pending 음절이 자모 시점에 조기 전송되어 이중 경로가 재현된다.
+    //   가드: WKWebView 한정 · 네이티브 composition 관측 시 해제 · 붙여넣기 통과.
+    if (isWKWebView && !sawNativeComposition && !pasting && isJamoOnly(data)) {
+      dbg(`DROP(onData-jamo) "${data}"`);
+      return;
+    }
     flushPending("onData"); // (no-op 안전장치: 잔여 pending 있으면 순서 보존 후 전송)
     sendRaw(data);
   });
@@ -1584,7 +1612,10 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
       //   비활성화해 네이티브 경로에 위임한다. composition 이벤트가 없는 WebKit(이 머신의
       //   본래 대상)에선 flag가 false로 남아 종전대로 동작 — 회귀 0. 이 수정은 sendRaw를
       //   새로 추가하지 않으므로(누출 제거 방향으로만 작용) 이중 전송을 만들 수 없다.
-      let sawNativeComposition = false;
+      //   (2026-07-05 실측: 이 wry WKWebView에서는 composition 이벤트가 textarea에 전혀
+      //   발화하지 않아 이 flag는 영구 false — 실제 누출은 xterm 코어의 onData 자모 emit이며
+      //   위 term.onData의 isJamoOnly 필터가 차단한다. flag 선언은 onData와 공유하도록
+      //   pendingHangul 옆으로 호이스팅.)
       ta.addEventListener("compositionstart", () => { sawNativeComposition = true; });
       ta.addEventListener("compositionend", () => {
         // 네이티브 경로(onData)가 확정 음절을 보낸다 — 버퍼된 조합중 자모는 버려 누출 차단.
