@@ -617,7 +617,13 @@ fn register(daemon: &Arc<Daemon>, conn: &mut Connection, params: &Value, id: &Va
         params![channel, bridge_ver, caps, now()],
     );
     // §2.1-5 S1: 응답에 pending outbound 전량 동봉(재스폰 갭 중 발행분 재조정·outbound_id dedupe).
-    let pending = pending_outbound(conn, &channel);
+    let mut pending = pending_outbound(conn, &channel);
+    // M6: sent 됐지만 feed가 아직 pending인 approval_prompt도 재조정(승인버튼 복원). outbound_id dedupe.
+    let seen: std::collections::HashSet<i64> = pending
+        .iter()
+        .filter_map(|v| v.get("outbound_id").and_then(|x| x.as_i64()))
+        .collect();
+    pending.extend(sent_pending_approvals(daemon, conn, &channel, &seen));
     daemon.bus.publish(
         "channel.registered",
         "channel",
@@ -664,6 +670,64 @@ fn approval_json(feed_id: Option<String>, nonce: Option<String>, owner: Option<S
     } else {
         json!({"feed_id": feed_id, "nonce": nonce, "owner_sender_id": owner})
     }
+}
+
+/// M6: 이미 sent(비-pending)됐지만 대상 feed가 아직 pending인 approval_prompt를 register 재조정에
+/// 포함시킨다(브리지 재스폰 후 승인버튼 복원). pending_outbound는 outcome='pending'만 잡아 sent 버튼을
+/// 놓치는데, 그 사이 feed가 미해소면 새 브리지엔 버튼이 안 뜨고 승인이 영영 원격으로 안 온다.
+/// nonce 미소각(재사용 가능) + feed pending인 행만 재-emit. outbound_id는 seen으로 dedupe.
+fn sent_pending_approvals(
+    daemon: &Arc<Daemon>,
+    conn: &Connection,
+    channel: &str,
+    seen: &std::collections::HashSet<i64>,
+) -> Vec<Value> {
+    let mut out = Vec::new();
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT id, target, kind, body, reply_to, idempotency_key, retry_of,
+                approval_feed_id, approval_nonce, approval_owner
+         FROM outbound
+         WHERE channel=?1 AND kind='approval_prompt' AND outcome!='pending' AND approval_nonce_used=0
+         ORDER BY id",
+    ) else {
+        return out;
+    };
+    let rows = stmt.query_map([channel], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, Option<String>>(4)?,
+            r.get::<_, String>(5)?,
+            r.get::<_, Option<i64>>(6)?,
+            r.get::<_, Option<String>>(7)?,
+            r.get::<_, Option<String>>(8)?,
+            r.get::<_, Option<String>>(9)?,
+        ))
+    });
+    let Ok(rows) = rows else {
+        return out;
+    };
+    for (oid, target, kind, body, reply_to, key, retry_of, feed, nonce, owner) in rows.flatten() {
+        if seen.contains(&oid) {
+            continue; // pending_outbound에 이미 포함(중복 방지).
+        }
+        // feed가 여전히 pending일 때만 버튼 복원(해소된 것은 재렌더 불필요).
+        let feed_pending = feed
+            .as_deref()
+            .map(|f| daemon.feed_item_pending(f))
+            .unwrap_or(false);
+        if !feed_pending {
+            continue;
+        }
+        out.push(json!({
+            "outbound_id": oid, "target": target, "kind": kind, "body": body,
+            "reply_to": reply_to, "idempotency_key": key, "retry_of": retry_of,
+            "approval": approval_json(feed, nonce, owner),
+        }));
+    }
+    out
 }
 
 // ── 승인 미러(§2.4·§2.6 O9) — feed.push/aging 시 tier≤C·게이트 ON이면 채널 버튼 발행 ──────
@@ -1903,6 +1967,57 @@ mod tests {
         let pend = reg["result"]["pending"].as_array().unwrap();
         assert_eq!(pend.len(), 1, "pending outbound 동봉돼야 한다: {reg}");
         assert_eq!(pend[0]["idempotency_key"], json!("o1"));
+    }
+
+    // M6: 재스폰 후 register가 sent-but-feed-pending approval_prompt를 재조정 목록에 포함(버튼 복원).
+    #[test]
+    fn register_reprompts_sent_approval_with_pending_feed() {
+        let d = tmp_daemon("m6reprompt");
+        seed_registered(&d, "slack", "t");
+        call(&d, "allow", json!({"channel": "slack", "sender_id": "U1"}), None);
+        // pending feed 하나.
+        d.feed_items.lock().unwrap().push(crate::state::FeedItem {
+            request_id: "F1".into(),
+            kind: "permission".into(),
+            title: "t".into(),
+            body: "b".into(),
+            surface_id: None,
+            status: "pending".into(),
+            decision: None,
+            created_at: now(),
+            resolved_at: None,
+            tier: Some("c".into()),
+            publisher_pid: None,
+            publisher_pgid: None,
+        });
+        // 이미 sent된 approval_prompt(feed F1·nonce 미소각).
+        {
+            let mut g = d.channels.lock().unwrap();
+            let conn = g.as_mut().unwrap();
+            conn.execute(
+                "INSERT INTO outbound(channel,target,kind,body,reply_to,idempotency_key,retry_of,outcome,
+                                      approval_feed_id,approval_nonce,approval_owner,approval_nonce_used,created_ts,updated_ts)
+                 VALUES('slack','U1','approval_prompt','[승인]',NULL,'approval:F1:U1',NULL,'sent','F1','nonceA','U1',0,?1,?1)",
+                params![now()],
+            )
+            .unwrap();
+        }
+        // register → sent-but-pending approval 재조정 포함.
+        let reg = call(&d, "register", json!({"channel": "slack", "token": "t", "bridge_ver": "v0"}), own_pid());
+        assert_eq!(reg["ok"], json!(true), "{reg}");
+        let pend = reg["result"]["pending"].as_array().unwrap();
+        assert!(
+            pend.iter().any(|p| p["idempotency_key"] == json!("approval:F1:U1")),
+            "sent approval(feed pending) 재조정 포함: {reg}"
+        );
+        // feed 해소 → 재조정 제외.
+        d.resolve_feed_item("F1", "allow");
+        let reg2 = call(&d, "register", json!({"channel": "slack", "token": "t"}), own_pid());
+        let pend2 = reg2["result"]["pending"].as_array().unwrap();
+        assert!(
+            !pend2.iter().any(|p| p["idempotency_key"] == json!("approval:F1:U1")),
+            "해소된 feed의 approval은 재조정 제외: {reg2}"
+        );
     }
 
     #[test]
