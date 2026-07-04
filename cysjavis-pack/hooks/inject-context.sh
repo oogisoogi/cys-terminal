@@ -43,7 +43,7 @@ _gate() {
 # ---------- L0: soul ANCHOR 전문 (startup/resume에서 풍요 주입) ----------
 if { [ "$SOURCE" = "startup" ] || [ "$SOURCE" = "resume" ]; } && [ -f "$SOUL" ]; then
   OUT="${OUT}■ 불변 정체·절대규칙 (L0 · soul.md ANCHOR — 매 부팅 재확립)\n"
-  OUT="${OUT}$(awk '/^## \[/{p=1} p' "$SOUL")\n\n"
+  OUT="${OUT}$(awk '/^## \[/{p=1} p' "$SOUL" | sed 's/\\/\\\\/g')\n\n"
 fi
 
 # ---------- L2: cwd 상향탐색 → SESSION_STATE 최신본 ----------
@@ -75,10 +75,10 @@ if [ -n "$STATE" ]; then
   SS_SZ=$(wc -c < "$STATE" 2>/dev/null | tr -d ' ')
   SS_BRIEF_MAX=6144
   if [ -n "$SS_SZ" ] && [ "$SS_SZ" -gt "$SS_BRIEF_MAX" ]; then
-    OUT="${OUT}⚠ 작업기억 ${SS_SZ}B>${SS_BRIEF_MAX} — 고정 헤더부만 발췌 주입('## [YYYY' 날짜 진행로그 제외; 그 형식이 없으면 전체 유지). 전체 필요시: cat $STATE\n"
-    OUT="${OUT}$(awk 'BEGIN{keep=1} /^## /{keep=($0 ~ /\[20[0-9][0-9]/)?0:1} keep' "$STATE" | _gate)\n\n"
+    OUT="${OUT}⚠ 작업기억 ${SS_SZ}B>${SS_BRIEF_MAX} — 고정 헤더부만 발췌 주입('## [YYYY' 날짜 진행로그 제외; 그 형식이 없으면 전체 유지)·발췌도 16KB 캡(컨텍스트 예산 보호). 전체 필요시: cat $STATE\n"
+    OUT="${OUT}$(awk 'BEGIN{keep=1} /^## /{keep=($0 ~ /\[20[0-9][0-9]/)?0:1} keep' "$STATE" | _gate | head -c 16384 | sed 's/\\/\\\\/g')\n\n"
   else
-    OUT="${OUT}$(cat "$STATE" | _gate)\n\n"
+    OUT="${OUT}$(cat "$STATE" | _gate | sed 's/\\/\\\\/g')\n\n"
   fi
 else
   OUT="${OUT}■ 작업기억 미발견 — 임의 추정 금지. 활성 프로젝트를 지정하라.\n\n"
@@ -90,6 +90,22 @@ if command -v lsof >/dev/null 2>&1 && [ -n "$CWD" ]; then
   SHARE=$(lsof -c node -d cwd -Fn 2>/dev/null | grep -cxF "n$CWD")
   if [ "${SHARE:-0}" -ge 2 ]; then
     OUT="${OUT}⚠ 같은 작업폴더($CWD)에서 동시에 도는 claude 세션이 ${SHARE}개 감지됨 — SESSION_STATE 편집 충돌(race) 위험. 작업기억은 한 세션에서만 편집하고, 나머지는 읽기 전용으로 쓸 것.\n"
+  fi
+fi
+
+# ---------- ★실측 체크리스트 (vimax-w0 A3 · SESSION_STATE '주장' 옆에 디스크 '실측' — G2 보조) ----------
+# 안전: 파일 부재 시 조용히 스킵(stale-hook 사고 방지) · 실패·공백 출력 시 미주입 · compact 제외.
+# 출력은 javis_checklist가 6줄·1KB 이내로 자체 절단, 머리에 P0.2 방어 문구 내장.
+if [ "$SOURCE" != "compact" ] && [ -n "$STATE" ]; then
+  CHK="${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_checklist.py"
+  command -v cygpath >/dev/null 2>&1 && CHK="$(cygpath -w "$CHK" 2>/dev/null || printf '%s' "$CHK")"
+  if [ -f "$CHK" ]; then
+    if command -v timeout >/dev/null 2>&1; then
+      CHK_OUT=$(timeout 25 "$CYS_PY" "$CHK" --state "$STATE" --round-dir "$(dirname "$STATE")" 2>/dev/null)
+    else
+      CHK_OUT=$("$CYS_PY" "$CHK" --state "$STATE" --round-dir "$(dirname "$STATE")" 2>/dev/null)
+    fi
+    [ -n "$CHK_OUT" ] && OUT="${OUT}$(printf '%s' "$CHK_OUT" | sed 's/\\/\\\\/g')\n\n"
   fi
 fi
 
@@ -105,7 +121,7 @@ if { [ "$SOURCE" = "startup" ] || [ "$SOURCE" = "resume" ]; } && [ -n "$STATE" ]
   RSI_DIR="$(dirname "$STATE")"   # ledger 는 SESSION_STATE 와 동일 _round (STATE_DIR 은 master 에서 프로젝트루트라 부적합)
   RSI_LEDGER="$RSI_DIR/RSI_LEDGER.md"
   if [ -f "$RSI_LEDGER" ]; then
-    RSI_HEADS="$(grep '^- \[' "$RSI_LEDGER" | tail -4 | sed -E 's/(\*\*[^*]*\*\*).*/\1/' | _gate)"
+    RSI_HEADS="$(grep '^- \[' "$RSI_LEDGER" | tail -4 | sed -E 's/(\*\*[^*]*\*\*).*/\1/' | _gate | sed 's/\\/\\\\/g')"
     if [ -n "$RSI_HEADS" ]; then
       OUT="${OUT}■ RSI 자산 — 최근 lesson 헤드 (작동 시작 자동 상기 · 전문은 _round/RSI_LEDGER.md)\n"
       OUT="${OUT}${RSI_HEADS}\n"

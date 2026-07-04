@@ -63,7 +63,17 @@ description: 주제 한 문장 → 완성된 유튜브 영상(아바타 + 모션
 - **사실성 최우선**: `[[script-writer-factcheck]]`(대본)와 `[[video-verify-final-gate]]`(화면
   텍스트)가 이중으로 사실성을 막는다 — 둘 다 통과 못 하면 출고 금지.
 - **비용 거버넌스**: 유료 단계(음성·아바타·생성형·업스케일)는 `[[cost-preview-confirm]]`로
-  사전 확인·세션 누적 추적. 종료 보고에 총비용 포함.
+  사전 확인·세션 누적 추적. 종료 보고에 총비용 포함. 실지출은 `media/manifest.jsonl` 원장
+  합산(`python3 ${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/check_manifest.py total-cost`)으로 결정론
+  산출해 단계 전환·종료 보고에 병기한다. 중단 후 재실행 시 체크포인트 규약 덕에 기생성
+  산출물은 자동 생략(RESULT=skipped)됨을 시작 보고에 명시한다.
+- **task_progress 방출**: 기둥 1~6 전환 시 `[EVT v2] task_progress`(task·stage·pct·cost_usd_cum)
+  를 `javis_event.py emit`으로 방출한다(EVENT_CONTRACT v2). 단계 전환 시에만 — 폴링·주기
+  방출 금지. HUD·음성 자비스의 구독 소스.
+- **서사 모드 인지**: 시작 시 `entity_registry.json` 유무를 보고한다. 존재하면 1단계
+  `[[script-writer]]` 진입 전에 registry 검증(`check_entity_registry.py validate` exit 0)을
+  수행하고, 4단계 media-gen 계열이 [서사 모드] 단계를 수행함을 게이트에 포함한다. 부재
+  시(기본) 전 단계는 기존 그대로다.
 - **/goal 연동**: `/goal`이 이 스킬을 호출하면 위 단계가 곧 goal의 하위 목표가 된다.
 
 ## 출력 계약
