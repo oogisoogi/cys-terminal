@@ -380,6 +380,16 @@ enum Command {
         #[arg(long, default_value = "")]
         min_binary_version: String,
     },
+    /// 시스템 자기진단·수리(§3.4) — pack 스큐·stale lock·고아 소켓·hook·채널 DB 무결 진단.
+    /// --fix: stale lock·고아 소켓·staging 잔재 제거 + hook 재등록(사용자 데이터·pack 본체·DB 미삭제).
+    Doctor {
+        /// 감지된 문제를 자동 수리(안전 항목만). 생략 시 진단(읽기전용)만 수행한다.
+        #[arg(long)]
+        fix: bool,
+        /// 진단 결과를 JSON으로 출력.
+        #[arg(long)]
+        json: bool,
+    },
     /// Search the persistent transcript memory of ALL agents' terminal activity (FTS)
     Recall {
         /// Search text (substring matching via trigram FTS)
@@ -1581,6 +1591,8 @@ fn run(command: Command) -> i32 {
             return run_pack_manifest(key_id, signed_at, expires_at, &min_binary_version);
         }
 
+        Command::Doctor { fix, json } => return run_doctor(fix, json),
+
         Command::License { action } => {
             let now = chrono::Utc::now().timestamp();
             match action {
@@ -2764,6 +2776,601 @@ fn install_claude_hook(settings_path: &str, pack_dir: &std::path::Path) -> Resul
     Ok(format!(
         "SessionStart hook registered in {settings_path} (backup: .bak-cys)"
     ))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// cys doctor (§3.4) — 시스템 자기진단·수리. 진단은 읽기전용, --fix는 안전 항목만
+// (stale lock·고아 소켓·staging 잔재 제거 + hook 재등록). ★사용자 데이터·pack 본체·
+// channels.db는 절대 삭제하지 않는다(비가역 삭제 경계).
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+enum DiagStatus {
+    Ok,
+    Warn,
+    Fail,
+}
+
+impl DiagStatus {
+    fn as_str(&self) -> &'static str {
+        match self {
+            DiagStatus::Ok => "OK",
+            DiagStatus::Warn => "WARN",
+            DiagStatus::Fail => "FAIL",
+        }
+    }
+}
+
+struct DiagItem {
+    name: &'static str,
+    status: DiagStatus,
+    detail: String,
+    /// 권고(진단 전용) 또는 --fix 시 실제 수행한 조치.
+    action: String,
+}
+
+/// 진단 컨텍스트 — 실 경로(run_doctor) 또는 임시 경로(테스트)를 주입한다.
+struct DoctorCtx {
+    pack_dir: std::path::PathBuf,
+    /// pack_dir 부모(~/.cys) — apply lock·.pack-staging 잔재 루트.
+    state_base: std::path::PathBuf,
+    socket_path: std::path::PathBuf,
+    /// channels.db 위치(= state_dir(socket)). unix는 소켓 부모 디렉토리.
+    daemon_state_dir: std::path::PathBuf,
+    settings_paths: Vec<String>,
+    binary_version: String,
+}
+
+/// settings.json 루트에 우리 SessionStart hook 명령이 등록돼 있는가.
+fn doctor_hook_present(root: &Value, hook_cmd: &str) -> bool {
+    root.get("hooks")
+        .and_then(|h| h.get("SessionStart"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter().any(|m| {
+                m.get("hooks")
+                    .and_then(|v| v.as_array())
+                    .map(|hs| {
+                        hs.iter()
+                            .any(|h| h.get("command").and_then(|c| c.as_str()) == Some(hook_cmd))
+                    })
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn diag_pack_version(ctx: &DoctorCtx) -> DiagItem {
+    let vf = ctx.pack_dir.join(".pack-version");
+    match std::fs::read_to_string(&vf) {
+        Err(_) => DiagItem {
+            name: "pack-version",
+            status: DiagStatus::Warn,
+            detail: "팩 미설치(.pack-version 없음)".into(),
+            action: "cys init-pack 실행".into(),
+        },
+        Ok(s) => {
+            let disk = s.trim().to_string();
+            if disk == ctx.binary_version {
+                return DiagItem {
+                    name: "pack-version",
+                    status: DiagStatus::Ok,
+                    detail: format!("팩 {disk} = 바이너리 {}", ctx.binary_version),
+                    action: String::new(),
+                };
+            }
+            let note = match (
+                cys::pack::parse_semver(&disk),
+                cys::pack::parse_semver(&ctx.binary_version),
+            ) {
+                (Some(d), Some(b)) if d < b => "팩이 바이너리보다 구버전 — cys init-pack 권장",
+                (Some(d), Some(b)) if d > b => "팩이 바이너리보다 신버전(바이너리 구버전) — 업데이트 권장",
+                _ => "버전 파싱 불가 — 수동 확인",
+            };
+            DiagItem {
+                name: "pack-version",
+                status: DiagStatus::Warn,
+                detail: format!("팩 {disk} ≠ 바이너리 {}", ctx.binary_version),
+                action: note.into(),
+            }
+        }
+    }
+}
+
+fn diag_pack_state(ctx: &DoctorCtx) -> DiagItem {
+    match cys::pack::read_pack_state(&ctx.pack_dir) {
+        cys::pack::PackStateRead::Absent => DiagItem {
+            name: "pack-state",
+            status: DiagStatus::Ok,
+            detail: "채널 상태 미기록(free 기본)".into(),
+            action: String::new(),
+        },
+        cys::pack::PackStateRead::Valid(st) => DiagItem {
+            name: "pack-state",
+            status: DiagStatus::Ok,
+            detail: format!(
+                "channel={} base={} pro_rev={}",
+                st.channel, st.base_version, st.pro_revision
+            ),
+            action: String::new(),
+        },
+        cys::pack::PackStateRead::Corrupt(e) => DiagItem {
+            name: "pack-state",
+            status: DiagStatus::Fail,
+            detail: format!(".pack-state.json 손상: {e}"),
+            action: "cys pack-repair-channel (doctor는 상태파일을 자동 수정하지 않음)".into(),
+        },
+    }
+}
+
+fn diag_install_manifest(ctx: &DoctorCtx) -> DiagItem {
+    let mf = ctx.pack_dir.join(".install-manifest.json");
+    if !mf.exists() {
+        let installed = ctx.pack_dir.join(".pack-version").exists();
+        return if installed {
+            DiagItem {
+                name: "install-manifest",
+                status: DiagStatus::Warn,
+                detail: "설치 매니페스트 없음(구설치본) — 자동갱신·prune이 보존측으로만 동작".into(),
+                action: "cys init-pack --force 로 매니페스트 재생성 권장".into(),
+            }
+        } else {
+            DiagItem {
+                name: "install-manifest",
+                status: DiagStatus::Ok,
+                detail: "팩 미설치(매니페스트 해당 없음)".into(),
+                action: String::new(),
+            }
+        };
+    }
+    match std::fs::read_to_string(&mf)
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+    {
+        Some(v) => {
+            let n = v.as_object().map(|o| o.len()).unwrap_or(0);
+            DiagItem {
+                name: "install-manifest",
+                status: DiagStatus::Ok,
+                detail: format!("설치 매니페스트 {n}개 항목·정상 파싱"),
+                action: String::new(),
+            }
+        }
+        None => DiagItem {
+            name: "install-manifest",
+            status: DiagStatus::Fail,
+            detail: "설치 매니페스트 파싱 실패(손상)".into(),
+            action: "cys init-pack --force 로 재생성".into(),
+        },
+    }
+}
+
+fn diag_hook(ctx: &DoctorCtx, fix: bool) -> DiagItem {
+    let hook_cmd = cys::pack::session_start_hook_command(&ctx.pack_dir);
+    let is_registered = |path: &str| -> bool {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+            .map(|root| doctor_hook_present(&root, &hook_cmd))
+            .unwrap_or(false)
+    };
+    if ctx.settings_paths.iter().any(|p| is_registered(p)) {
+        return DiagItem {
+            name: "hook",
+            status: DiagStatus::Ok,
+            detail: "SessionStart hook 등록됨".into(),
+            action: String::new(),
+        };
+    }
+    if fix {
+        let mut done = 0usize;
+        let mut errs: Vec<String> = Vec::new();
+        for p in &ctx.settings_paths {
+            if let Some(parent) = std::path::Path::new(p).parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            match install_claude_hook(p, &ctx.pack_dir) {
+                Ok(_) => done += 1,
+                Err(e) => errs.push(format!("{p}: {e}")),
+            }
+        }
+        let status = if errs.is_empty() && done > 0 {
+            DiagStatus::Ok
+        } else if done > 0 {
+            DiagStatus::Warn
+        } else {
+            DiagStatus::Fail
+        };
+        return DiagItem {
+            name: "hook",
+            status,
+            detail: "SessionStart hook 미등록 — 재등록 시도".into(),
+            action: format!(
+                "등록 {done}건{}",
+                if errs.is_empty() {
+                    String::new()
+                } else {
+                    format!(", 실패: {}", errs.join("; "))
+                }
+            ),
+        };
+    }
+    DiagItem {
+        name: "hook",
+        status: DiagStatus::Warn,
+        detail: format!(
+            "SessionStart hook 미등록({}개 settings 확인)",
+            ctx.settings_paths.len()
+        ),
+        action: "cys doctor --fix 또는 cys init-pack 로 등록".into(),
+    }
+}
+
+#[cfg(unix)]
+fn doctor_socket_connectable(p: &std::path::Path) -> bool {
+    std::os::unix::net::UnixStream::connect(p).is_ok()
+}
+
+#[cfg(unix)]
+fn diag_orphan_socket(ctx: &DoctorCtx, fix: bool) -> DiagItem {
+    let sp = &ctx.socket_path;
+    if !sp.exists() {
+        return DiagItem {
+            name: "socket",
+            status: DiagStatus::Ok,
+            detail: "소켓 파일 없음(데몬 미가동)".into(),
+            action: String::new(),
+        };
+    }
+    if doctor_socket_connectable(sp) {
+        return DiagItem {
+            name: "socket",
+            status: DiagStatus::Ok,
+            detail: "데몬 소켓 연결 가능(가동 중)".into(),
+            action: String::new(),
+        };
+    }
+    // 존재하나 연결 불가 = 고아 소켓.
+    if fix {
+        match std::fs::remove_file(sp) {
+            Ok(()) => DiagItem {
+                name: "socket",
+                status: DiagStatus::Ok,
+                detail: "고아 소켓 제거".into(),
+                action: "삭제함".into(),
+            },
+            Err(e) => DiagItem {
+                name: "socket",
+                status: DiagStatus::Warn,
+                detail: format!("고아 소켓 제거 실패: {e}"),
+                action: "수동 삭제 필요".into(),
+            },
+        }
+    } else {
+        DiagItem {
+            name: "socket",
+            status: DiagStatus::Warn,
+            detail: "고아 소켓(리스너 없음)".into(),
+            action: "cys doctor --fix 로 제거".into(),
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn diag_orphan_socket(_ctx: &DoctorCtx, _fix: bool) -> DiagItem {
+    DiagItem {
+        name: "socket",
+        status: DiagStatus::Ok,
+        detail: "소켓 진단은 unix 전용(skip)".into(),
+        action: String::new(),
+    }
+}
+
+#[cfg(unix)]
+fn diag_stale_lock(ctx: &DoctorCtx, fix: bool) -> DiagItem {
+    use std::os::unix::io::AsRawFd;
+    // 데몬 시작 락 = socket_path.with_extension("lock") (main.rs 부트락과 동일 규약·읽기 전용 참조).
+    let lock = ctx.socket_path.with_extension("lock");
+    if !lock.exists() {
+        return DiagItem {
+            name: "startup-lock",
+            status: DiagStatus::Ok,
+            detail: "시작 락 없음".into(),
+            action: String::new(),
+        };
+    }
+    let f = match std::fs::OpenOptions::new().read(true).write(true).open(&lock) {
+        Ok(f) => f,
+        Err(e) => {
+            return DiagItem {
+                name: "startup-lock",
+                status: DiagStatus::Warn,
+                detail: format!("시작 락 열기 실패(보수적 유지): {e}"),
+                action: "수동 확인".into(),
+            }
+        }
+    };
+    // 비차단 획득 시도: 획득되면 아무도 안 쥔 잔여(stale), 실패면 데몬 보유(정상). fd를 쥔 채
+    // 제거해 진단↔제거 사이 데몬 재기동 레이스를 차단한다.
+    let got = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+    if !got {
+        return DiagItem {
+            name: "startup-lock",
+            status: DiagStatus::Ok,
+            detail: "시작 락 활성(데몬 보유)".into(),
+            action: String::new(),
+        };
+    }
+    let item = if fix {
+        match std::fs::remove_file(&lock) {
+            Ok(()) => DiagItem {
+                name: "startup-lock",
+                status: DiagStatus::Ok,
+                detail: "잔여 시작 락 제거".into(),
+                action: "삭제함".into(),
+            },
+            Err(e) => DiagItem {
+                name: "startup-lock",
+                status: DiagStatus::Warn,
+                detail: format!("잔여 락 제거 실패: {e}"),
+                action: "수동 삭제".into(),
+            },
+        }
+    } else {
+        DiagItem {
+            name: "startup-lock",
+            status: DiagStatus::Warn,
+            detail: "잔여 시작 락(아무도 미보유)".into(),
+            action: "cys doctor --fix 로 제거".into(),
+        }
+    };
+    unsafe {
+        libc::flock(f.as_raw_fd(), libc::LOCK_UN);
+    }
+    item
+}
+
+#[cfg(not(unix))]
+fn diag_stale_lock(_ctx: &DoctorCtx, _fix: bool) -> DiagItem {
+    DiagItem {
+        name: "startup-lock",
+        status: DiagStatus::Ok,
+        detail: "락 진단은 unix 전용(skip)".into(),
+        action: String::new(),
+    }
+}
+
+fn diag_staging_residue(ctx: &DoctorCtx, fix: bool) -> DiagItem {
+    let mut residue: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&ctx.state_base) {
+        for e in rd.flatten() {
+            if let Some(name) = e.file_name().to_str() {
+                // .pack-staging(pack-update)·.pack-staging-init-<pid>(init-pack) 잔재만.
+                // pack.prev(1세대 롤백)는 이름이 다르므로 건드리지 않는다.
+                if name.starts_with(".pack-staging") {
+                    residue.push(e.path());
+                }
+            }
+        }
+    }
+    if residue.is_empty() {
+        return DiagItem {
+            name: "staging-residue",
+            status: DiagStatus::Ok,
+            detail: "staging 잔재 없음".into(),
+            action: String::new(),
+        };
+    }
+    if fix {
+        let mut removed = 0usize;
+        let mut fail = 0usize;
+        for p in &residue {
+            if std::fs::remove_dir_all(p).is_ok() {
+                removed += 1;
+            } else {
+                fail += 1;
+            }
+        }
+        DiagItem {
+            name: "staging-residue",
+            status: if fail == 0 {
+                DiagStatus::Ok
+            } else {
+                DiagStatus::Warn
+            },
+            detail: format!("staging 잔재 {}건", residue.len()),
+            action: format!(
+                "{removed}건 정리{}",
+                if fail > 0 {
+                    format!(", {fail}건 실패")
+                } else {
+                    String::new()
+                }
+            ),
+        }
+    } else {
+        DiagItem {
+            name: "staging-residue",
+            status: DiagStatus::Warn,
+            detail: format!("staging 잔재 {}건", residue.len()),
+            action: "cys doctor --fix 로 정리".into(),
+        }
+    }
+}
+
+fn diag_channels_db(ctx: &DoctorCtx) -> DiagItem {
+    let db = ctx.daemon_state_dir.join("channels.db");
+    if !db.exists() {
+        return DiagItem {
+            name: "channels-db",
+            status: DiagStatus::Ok,
+            detail: "채널 DB 없음(온디맨드 생성)".into(),
+            action: String::new(),
+        };
+    }
+    match rusqlite::Connection::open(&db) {
+        Ok(conn) => {
+            // 유효 SQLite 파일인지 먼저 확인 — garbage 파일은 sqlite_master 접근에서 NotADatabase.
+            if conn
+                .query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))
+                .is_err()
+            {
+                return DiagItem {
+                    name: "channels-db",
+                    status: DiagStatus::Fail,
+                    detail: "채널 DB가 유효한 SQLite가 아님(손상 가능)".into(),
+                    action: "수동 점검(doctor는 DB를 삭제하지 않음)".into(),
+                };
+            }
+            let sv: rusqlite::Result<String> = conn.query_row(
+                "SELECT value FROM meta WHERE key='schema_version'",
+                [],
+                |r| r.get(0),
+            );
+            match sv {
+                Ok(v) => DiagItem {
+                    name: "channels-db",
+                    status: DiagStatus::Ok,
+                    detail: format!("채널 DB 정상·schema_version={v}"),
+                    action: String::new(),
+                },
+                Err(_) => DiagItem {
+                    name: "channels-db",
+                    status: DiagStatus::Warn,
+                    detail: "채널 DB 열림·schema_version 없음(구 스키마?)".into(),
+                    action: "데몬 기동 시 마이그레이션 확인".into(),
+                },
+            }
+        }
+        Err(e) => DiagItem {
+            name: "channels-db",
+            status: DiagStatus::Fail,
+            detail: format!("채널 DB 열기 실패(손상 가능): {e}"),
+            action: "수동 점검(doctor는 DB를 삭제하지 않음)".into(),
+        },
+    }
+}
+
+fn diag_legacy_config(_ctx: &DoctorCtx) -> DiagItem {
+    // 이 시스템의 config는 env 기반(온디스크 canonical config 파일 없음). 레거시 env 키 사용을
+    // 진단한다(런타임은 canonical CYS_* 우선). 백업·재작성은 대상 파일이 없어 해당 없음(진단만).
+    let legacy_keys = [
+        "JAVIS_PACK_DIR",
+        "AITERM_JARVIS_DIR",
+        "AITERM_PACK_DIR",
+        "JAVIS_SOCKET",
+        "AITERM_SOCKET",
+    ];
+    let set: Vec<&str> = legacy_keys
+        .iter()
+        .copied()
+        .filter(|k| std::env::var(k).map(|v| !v.is_empty()).unwrap_or(false))
+        .collect();
+    if set.is_empty() {
+        DiagItem {
+            name: "legacy-config",
+            status: DiagStatus::Ok,
+            detail: "레거시 env 미사용(canonical CYS_*)".into(),
+            action: String::new(),
+        }
+    } else {
+        DiagItem {
+            name: "legacy-config",
+            status: DiagStatus::Warn,
+            detail: format!("레거시 env 사용: {}", set.join(", ")),
+            action: "CYS_* 키로 이관 권장(런타임은 canonical 우선)".into(),
+        }
+    }
+}
+
+fn run_doctor_diagnostics(ctx: &DoctorCtx, fix: bool) -> Vec<DiagItem> {
+    vec![
+        diag_pack_version(ctx),
+        diag_pack_state(ctx),
+        diag_install_manifest(ctx),
+        diag_hook(ctx, fix),
+        diag_orphan_socket(ctx, fix),
+        diag_stale_lock(ctx, fix),
+        diag_staging_residue(ctx, fix),
+        diag_channels_db(ctx),
+        diag_legacy_config(ctx),
+    ]
+}
+
+fn run_doctor(fix: bool, json_out: bool) -> i32 {
+    let pack_dir = cys::pack::pack_dir();
+    let state_base = pack_dir
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let socket_path = cys::socket_path();
+    let daemon_state_dir = socket_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let mut settings_paths = discover_claude_settings();
+    if settings_paths.is_empty() {
+        settings_paths = vec![dirs::home_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join(".claude/settings.json")
+            .to_string_lossy()
+            .into_owned()];
+    }
+    let ctx = DoctorCtx {
+        pack_dir,
+        state_base,
+        socket_path,
+        daemon_state_dir,
+        settings_paths,
+        binary_version: env!("CARGO_PKG_VERSION").to_string(),
+    };
+    let items = run_doctor_diagnostics(&ctx, fix);
+    let fails = items.iter().filter(|i| i.status == DiagStatus::Fail).count();
+    let warns = items.iter().filter(|i| i.status == DiagStatus::Warn).count();
+    if json_out {
+        let arr: Vec<Value> = items
+            .iter()
+            .map(|i| {
+                json!({
+                    "name": i.name,
+                    "status": i.status.as_str(),
+                    "detail": i.detail,
+                    "action": i.action,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "fix": fix,
+                "summary": {"ok": items.len() - fails - warns, "warn": warns, "fail": fails},
+                "items": arr
+            }))
+            .unwrap_or_default()
+        );
+    } else {
+        println!(
+            "cys doctor — 시스템 자기진단{}",
+            if fix { " (--fix)" } else { "" }
+        );
+        for i in &items {
+            println!("  [{:<4}] {:<16} {}", i.status.as_str(), i.name, i.detail);
+            if !i.action.is_empty() {
+                println!("           └ {}", i.action);
+            }
+        }
+        println!(
+            "요약: {} OK · {} WARN · {} FAIL",
+            items.len() - fails - warns,
+            warns,
+            fails
+        );
+    }
+    if fails > 0 {
+        1
+    } else {
+        0
+    }
 }
 
 /// 표준 노드 일괄 부트: 설치된 CLI만 자동 감지해 워커+리뷰어를 기동·지침 주입한다.
@@ -7195,6 +7802,155 @@ mod tests {
         assert!(missing_cys.exists(), "lock이 부모 디렉토리를 생성했어야 함");
         assert!(lock_path.exists(), "lock 파일이 생성됐어야 함");
 
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ─── §3.4 cys doctor ───
+
+    fn doctor_ctx_at(base: &std::path::Path) -> DoctorCtx {
+        DoctorCtx {
+            pack_dir: base.join("pack"),
+            state_base: base.to_path_buf(),
+            socket_path: base.join("cys.sock"),
+            daemon_state_dir: base.to_path_buf(),
+            settings_paths: vec![base.join("settings.json").to_string_lossy().into_owned()],
+            binary_version: env!("CARGO_PKG_VERSION").to_string(),
+        }
+    }
+
+    #[test]
+    fn doctor_pack_version_ok_and_skew() {
+        let base = std::env::temp_dir().join(format!("cys-doc-ver-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let ctx = doctor_ctx_at(&base);
+        std::fs::create_dir_all(&ctx.pack_dir).unwrap();
+        std::fs::write(ctx.pack_dir.join(".pack-version"), env!("CARGO_PKG_VERSION")).unwrap();
+        assert_eq!(diag_pack_version(&ctx).status, DiagStatus::Ok);
+        std::fs::write(ctx.pack_dir.join(".pack-version"), "0.0.1").unwrap();
+        assert_eq!(diag_pack_version(&ctx).status, DiagStatus::Warn);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_orphan_socket_detect_and_fix() {
+        let base = std::env::temp_dir().join(format!("cys-doc-sock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let ctx = doctor_ctx_at(&base);
+        // 소켓 없음 → OK
+        assert_eq!(diag_orphan_socket(&ctx, false).status, DiagStatus::Ok);
+        // 존재하나 연결 불가(일반 파일) → 고아 → WARN
+        std::fs::write(&ctx.socket_path, b"not-a-socket").unwrap();
+        assert_eq!(diag_orphan_socket(&ctx, false).status, DiagStatus::Warn);
+        // --fix → 제거 → OK
+        assert_eq!(diag_orphan_socket(&ctx, true).status, DiagStatus::Ok);
+        assert!(!ctx.socket_path.exists(), "고아 소켓 제거됨");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_stale_lock_detect_and_fix() {
+        let base = std::env::temp_dir().join(format!("cys-doc-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let ctx = doctor_ctx_at(&base);
+        let lock = ctx.socket_path.with_extension("lock");
+        // 없음 → OK
+        assert_eq!(diag_stale_lock(&ctx, false).status, DiagStatus::Ok);
+        // 잔여 락(아무도 미보유) → WARN
+        std::fs::write(&lock, b"").unwrap();
+        assert_eq!(diag_stale_lock(&ctx, false).status, DiagStatus::Warn);
+        // --fix → 제거
+        assert_eq!(diag_stale_lock(&ctx, true).status, DiagStatus::Ok);
+        assert!(!lock.exists(), "잔여 락 제거됨");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn doctor_staging_residue_fix_keeps_prev() {
+        let base = std::env::temp_dir().join(format!("cys-doc-stg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let ctx = doctor_ctx_at(&base);
+        std::fs::create_dir_all(base.join(".pack-staging-init-999")).unwrap();
+        std::fs::create_dir_all(base.join(".pack-staging")).unwrap();
+        std::fs::create_dir_all(base.join("pack.prev")).unwrap();
+        std::fs::write(base.join("pack.prev/x"), "keep").unwrap();
+        // 잔재 감지 → WARN
+        assert_eq!(diag_staging_residue(&ctx, false).status, DiagStatus::Warn);
+        // --fix → 정리, .prev 보존
+        assert_eq!(diag_staging_residue(&ctx, true).status, DiagStatus::Ok);
+        assert!(!base.join(".pack-staging-init-999").exists());
+        assert!(!base.join(".pack-staging").exists());
+        assert!(base.join("pack.prev").exists(), ".prev 롤백 세대 보존(삭제 금지)");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn doctor_channels_db_ok_and_corrupt() {
+        let base = std::env::temp_dir().join(format!("cys-doc-db-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let ctx = doctor_ctx_at(&base);
+        // 없음 → OK
+        assert_eq!(diag_channels_db(&ctx).status, DiagStatus::Ok);
+        // 정상 DB(schema_version) → OK
+        let db = base.join("channels.db");
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute("CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT)", [])
+                .unwrap();
+            conn.execute("INSERT INTO meta(key,value) VALUES('schema_version','2')", [])
+                .unwrap();
+        }
+        assert_eq!(diag_channels_db(&ctx).status, DiagStatus::Ok);
+        // 손상(비-SQLite) → FAIL, 그리고 삭제하지 않음
+        std::fs::write(&db, b"this is definitely not sqlite").unwrap();
+        assert_eq!(diag_channels_db(&ctx).status, DiagStatus::Fail);
+        assert!(db.exists(), "doctor는 DB를 삭제하지 않는다");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn doctor_hook_missing_then_fix() {
+        let base = std::env::temp_dir().join(format!("cys-doc-hook-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let ctx = doctor_ctx_at(&base);
+        std::fs::create_dir_all(&ctx.pack_dir).unwrap();
+        std::fs::write(&ctx.settings_paths[0], "{}").unwrap();
+        // 미등록 → WARN
+        assert_eq!(diag_hook(&ctx, false).status, DiagStatus::Warn);
+        // --fix → 등록 → OK, 재진단 OK
+        assert_eq!(diag_hook(&ctx, true).status, DiagStatus::Ok);
+        assert_eq!(diag_hook(&ctx, false).status, DiagStatus::Ok);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_fix_then_rediag_ok() {
+        let base = std::env::temp_dir().join(format!("cys-doc-fix-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let ctx = doctor_ctx_at(&base);
+        std::fs::create_dir_all(&ctx.pack_dir).unwrap();
+        std::fs::write(ctx.pack_dir.join(".pack-version"), env!("CARGO_PKG_VERSION")).unwrap();
+        std::fs::write(&ctx.socket_path, b"x").unwrap(); // 고아 소켓
+        std::fs::write(ctx.socket_path.with_extension("lock"), b"").unwrap(); // 잔여 락
+        std::fs::create_dir_all(base.join(".pack-staging-init-1")).unwrap(); // 잔재
+        std::fs::write(&ctx.settings_paths[0], "{}").unwrap();
+
+        let _ = run_doctor_diagnostics(&ctx, true);
+
+        let items = run_doctor_diagnostics(&ctx, false);
+        let by = |n: &str| items.iter().find(|i| i.name == n).unwrap().status;
+        assert_eq!(by("socket"), DiagStatus::Ok, "고아 소켓 수리됨");
+        assert_eq!(by("startup-lock"), DiagStatus::Ok, "잔여 락 수리됨");
+        assert_eq!(by("staging-residue"), DiagStatus::Ok, "잔재 정리됨");
+        assert_eq!(by("hook"), DiagStatus::Ok, "hook 재등록됨");
         let _ = std::fs::remove_dir_all(&base);
     }
 }
