@@ -797,8 +797,14 @@ fn inbound(daemon: &Arc<Daemon>, conn: &mut Connection, params: &Value, id: &Val
 
 // ── inbox 배달기(§2.2 배달 상태기계) ─────────────────────────────────────────
 
-/// master surface가 (a) resolve_role 성공 (b) quiescing 아님 이면 그 surface_id, 아니면 None.
+/// master surface가 (a) resolve_role 성공 (b) quiescing 아님 (c) 데몬 non-paused 이면 그
+/// surface_id, 아니면 None.
 fn deliverable_master(daemon: &Arc<Daemon>) -> Option<u64> {
+    // pause(kill-switch) 게이트(§2.6 O5): pause 중엔 inbox 주입을 동결한다(적재·inbound 판정은
+    // 계속=유실 0). outbound 이벤트 발행 동결과 짝이며, resume 시 resume_flush가 드레인한다.
+    if daemon.paused.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
     let sid = {
         let roles = daemon.roles.lock().unwrap();
         roles.get("master").copied()?
@@ -1011,14 +1017,18 @@ fn outbound(daemon: &Arc<Daemon>, conn: &mut Connection, params: &Value, id: &Va
         params![channel, ts],
     );
     // 브리지가 구독할 전문 이벤트(channel.outbound.<ch>) — payload에 outbound_id·전문.
-    daemon.bus.publish(
-        &format!("channel.outbound.{channel}"),
-        "channel",
-        None,
-        json!({"outbound_id": oid, "channel": channel, "target": target, "kind": kind,
-               "body": body, "reply_to": reply_to, "idempotency_key": idempotency_key,
-               "retry_of": retry_of, "approval": approval_json(ap_feed, ap_nonce, ap_owner)}),
-    );
+    // pause(§2.6 O5) 중엔 발행을 동결한다(행은 pending 유지·유실 0). resume 시 resume_flush가
+    // 미확정(pending) 아웃바운드를 재발행해 브리지가 배달 지시를 다시 받는다.
+    if !daemon.paused.load(std::sync::atomic::Ordering::Relaxed) {
+        daemon.bus.publish(
+            &format!("channel.outbound.{channel}"),
+            "channel",
+            None,
+            json!({"outbound_id": oid, "channel": channel, "target": target, "kind": kind,
+                   "body": body, "reply_to": reply_to, "idempotency_key": idempotency_key,
+                   "retry_of": retry_of, "approval": approval_json(ap_feed, ap_nonce, ap_owner)}),
+        );
+    }
     ok_response(id, json!({"outbound_id": oid, "outcome": "pending"}))
 }
 
@@ -1313,7 +1323,13 @@ fn sweep_once(daemon: &Arc<Daemon>) {
         return;
     };
     let now = now();
-    sweep_outbound_timeouts(conn, now, outbound_unknown_secs());
+    // pause(§2.6 O5) 중엔 outbound 타임아웃 시계도 동결한다 — 배달을 의도적으로 얼린 동안
+    // pending을 unknown(terminal)으로 넘기면 resume_flush(=pending만 재발행)가 그 항목을 잃는다.
+    // deliver_new_inbox/redeliver_unacked는 deliverable_master의 pause 게이트로 자연 no-op이고,
+    // respawn은 pause와 무관하게 계속(inbound 판정에 브리지가 살아있어야 하므로).
+    if !daemon.paused.load(std::sync::atomic::Ordering::Relaxed) {
+        sweep_outbound_timeouts(conn, now, outbound_unknown_secs());
+    }
     prune_loopwin(conn, now);
     // new 배달 → un-acked 재배달(순서: 신규 우선, 그 다음 재배달).
     deliver_new_inbox(daemon, conn);
@@ -1330,6 +1346,38 @@ pub fn spawn_channel_sweep(daemon: Arc<Daemon>) {
             sweep_once(&daemon);
         }
     });
+}
+
+/// pause 해제(§2.6 O5) 시 동결분 방출 — `system.resume` 핸들러에서 `paused=false` 확정 **후** 호출.
+/// ① pause 중 발행이 동결된 pending 아웃바운드 이벤트를 채널별로 재발행(브리지가 배달 지시 재수신·
+///    outbound_id로 dedupe — at-least-once). ② pause 중 적재만 되고 주입 보류된 inbox를 드레인한다.
+/// 호출 전 이미 paused=false이므로 deliverable_master의 pause 게이트는 통과한다.
+pub fn resume_flush(daemon: &Arc<Daemon>) {
+    let mut guard = daemon.channels.lock().unwrap();
+    let Some(conn) = guard.as_mut() else {
+        return;
+    };
+    // ① 동결된 pending 아웃바운드 재발행(enabled 채널 한정 — stop된 채널의 잔여는 방출 안 함).
+    let channels: Vec<String> = conn
+        .prepare("SELECT channel FROM channels WHERE enabled=1")
+        .and_then(|mut s| {
+            s.query_map([], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .unwrap_or_default();
+    for ch in channels {
+        for mut ob in pending_outbound(conn, &ch) {
+            if let Some(obj) = ob.as_object_mut() {
+                obj.insert("channel".into(), json!(ch));
+            }
+            daemon
+                .bus
+                .publish(&format!("channel.outbound.{ch}"), "channel", None, ob);
+        }
+    }
+    // ② pause 중 보류된 inbox 드레인(신규 우선→un-acked 재배달, sweep_once와 동일 순서).
+    deliver_new_inbox(daemon, conn);
+    redeliver_unacked(daemon, conn);
 }
 
 // ── 테스트 ───────────────────────────────────────────────────────────────────
@@ -1775,5 +1823,148 @@ mod tests {
         // inbound → queued(주입 보류).
         let r = call(&d, "inbound", inbound_params("slack", "U1", "slack:1", "hi", "user"), own_pid());
         assert_eq!(r["result"]["action"], json!("queued"), "quiescing 중 주입 보류: {r}");
+    }
+
+    /// C1(가)-1: quiescing 중엔 보류(queued), 해제(비-quiescing 자기보고) 후엔 inbox가 드레인되어
+    /// 주입(injected)된다 — cycle-agent가 clear 전 quiescing 설정·resume 후 해제하는 계약의 봉합.
+    #[cfg(unix)]
+    #[test]
+    fn quiescing_release_then_drains() {
+        let d = tmp_daemon("quiesce_drain");
+        seed_registered(&d, "slack", "t");
+        call(&d, "allow", json!({"channel": "slack", "sender_id": "U1"}), None);
+        let surface = d
+            .create_surface(None, Some("sleep 30".into()), None, Some("master".into()), 24, 80)
+            .expect("surface");
+        let sid = surface.id;
+        d.roles.lock().unwrap().insert("master".into(), sid);
+        // quiescing 자기보고 → 주입 보류.
+        *surface.agent_status.lock().unwrap() = Some(crate::state::AgentStatus {
+            state: "quiescing".into(),
+            context_pct: None,
+            task: None,
+            updated_at: now(),
+        });
+        let r = call(&d, "inbound", inbound_params("slack", "U1", "slack:1", "hi", "user"), own_pid());
+        assert_eq!(r["result"]["action"], json!("queued"), "quiescing 중 보류: {r}");
+        let inbox_id = r["result"]["inbox_id"].as_i64().unwrap();
+        // quiescing 해제(cycle-agent resume) → deliver → injected.
+        *surface.agent_status.lock().unwrap() = Some(crate::state::AgentStatus {
+            state: "working".into(),
+            context_pct: None,
+            task: None,
+            updated_at: now(),
+        });
+        {
+            let mut g = d.channels.lock().unwrap();
+            let conn = g.as_mut().unwrap();
+            let delivered = deliver_new_inbox(&d, conn);
+            assert!(delivered.contains(&inbox_id), "해제 후 drain 배달: {delivered:?}");
+            let st: String = conn
+                .query_row("SELECT state FROM inbox WHERE id=?1", [inbox_id], |r| r.get(0))
+                .unwrap();
+            assert_eq!(st, "injected");
+        }
+        let _ = crate::governance::close_surface(&d, sid);
+    }
+
+    /// C1(가)-2: pause 중엔 (a) inbound가 master 가용해도 queued(주입 동결)·inbox 적재는 지속(유실 0)
+    /// (b) outbound 행은 pending 생성되나 channel.outbound.<ch> 이벤트는 미발행. resume 후 resume_flush가
+    /// (a) 보류 inbox를 드레인 (b) 동결 outbound를 재발행한다(§2.6 O5).
+    #[cfg(unix)]
+    #[test]
+    fn pause_freezes_outbound_event_and_inbox_then_resume_flush() {
+        use std::sync::atomic::Ordering;
+        let d = tmp_daemon("pause");
+        seed_registered(&d, "slack", "t");
+        call(&d, "allow", json!({"channel": "slack", "sender_id": "U1"}), None);
+        // 정상이라면 즉시 주입될 가용·비-quiescing master surface.
+        let surface = d
+            .create_surface(None, Some("sleep 30".into()), None, Some("master".into()), 24, 80)
+            .expect("surface");
+        let sid = surface.id;
+        d.roles.lock().unwrap().insert("master".into(), sid);
+        let mut rx = d.bus.subscribe();
+        // ── pause 진입 ──
+        d.paused.store(true, Ordering::Relaxed);
+        // 인바운드: master 가용해도 pause라 queued(주입 동결)·적재는 지속.
+        let inb = call(&d, "inbound", inbound_params("slack", "U1", "slack:1", "hi", "user"), own_pid());
+        assert_eq!(inb["result"]["action"], json!("queued"), "pause 중 주입 동결→queued: {inb}");
+        let inbox_id = inb["result"]["inbox_id"].as_i64().unwrap();
+        {
+            let g = d.channels.lock().unwrap();
+            let conn = g.as_ref().unwrap();
+            let st: String = conn
+                .query_row("SELECT state FROM inbox WHERE id=?1", [inbox_id], |r| r.get(0))
+                .unwrap();
+            assert_eq!(st, "new", "pause 중에도 inbox 적재는 지속(유실 0)");
+        }
+        // 아웃바운드: 행은 pending, 이벤트는 미발행.
+        let ob = call(&d, "outbound", json!({"channel": "slack", "target": "U1", "body": "x", "idempotency_key": "o1"}), None);
+        assert_eq!(ob["result"]["outcome"], json!("pending"));
+        let mut saw_outbound_evt = false;
+        while let Ok(ev) = rx.try_recv() {
+            if ev["name"].as_str() == Some("channel.outbound.slack") {
+                saw_outbound_evt = true;
+            }
+        }
+        assert!(!saw_outbound_evt, "pause 중 outbound 이벤트가 발행되면 안 된다");
+        // ── resume ──
+        d.paused.store(false, Ordering::Relaxed);
+        resume_flush(&d);
+        let mut republished = false;
+        while let Ok(ev) = rx.try_recv() {
+            if ev["name"].as_str() == Some("channel.outbound.slack")
+                && ev["payload"]["idempotency_key"].as_str() == Some("o1")
+            {
+                republished = true;
+            }
+        }
+        assert!(republished, "resume_flush가 동결된 outbound를 재발행해야 한다");
+        {
+            let g = d.channels.lock().unwrap();
+            let conn = g.as_ref().unwrap();
+            let st: String = conn
+                .query_row("SELECT state FROM inbox WHERE id=?1", [inbox_id], |r| r.get(0))
+                .unwrap();
+            assert_eq!(st, "injected", "resume 후 보류 inbox가 드레인되어 주입돼야 한다");
+        }
+        let _ = crate::governance::close_surface(&d, sid);
+    }
+
+    /// C1(가)-2 보강: pause 중엔 sweep의 outbound 타임아웃 시계도 동결된다 — 배달을 얼린 동안
+    /// pending을 unknown(terminal)으로 넘기면 resume_flush(pending만 재발행)가 항목을 잃기 때문.
+    #[test]
+    fn pause_freezes_outbound_timeout_clock() {
+        use std::sync::atomic::Ordering;
+        let d = tmp_daemon("pause_to");
+        seed_registered(&d, "slack", "t");
+        call(&d, "allow", json!({"channel": "slack", "sender_id": "U1"}), None);
+        let a = call(&d, "outbound", json!({"channel":"slack","target":"U1","body":"x","idempotency_key":"o1"}), None);
+        let oid = a["result"]["outbound_id"].as_i64().unwrap();
+        // created_ts를 타임아웃 창보다 훨씬 과거로 → 정상이라면 sweep이 unknown 전이.
+        {
+            let mut g = d.channels.lock().unwrap();
+            let conn = g.as_mut().unwrap();
+            conn.execute("UPDATE outbound SET created_ts=?2 WHERE id=?1", params![oid, now() - 100000.0]).unwrap();
+        }
+        // pause 중 sweep → 타임아웃 동결(pending 유지).
+        d.paused.store(true, Ordering::Relaxed);
+        sweep_once(&d);
+        {
+            let g = d.channels.lock().unwrap();
+            let conn = g.as_ref().unwrap();
+            let oc: String = conn.query_row("SELECT outcome FROM outbound WHERE id=?1", [oid], |r| r.get(0)).unwrap();
+            assert_eq!(oc, "pending", "pause 중엔 타임아웃 동결(pending 유지)");
+        }
+        // resume 후 sweep → 타임아웃 시계 재개 → unknown 전이.
+        d.paused.store(false, Ordering::Relaxed);
+        sweep_once(&d);
+        {
+            let g = d.channels.lock().unwrap();
+            let conn = g.as_ref().unwrap();
+            let oc: String = conn.query_row("SELECT outcome FROM outbound WHERE id=?1", [oid], |r| r.get(0)).unwrap();
+            assert_eq!(oc, "unknown", "resume 후엔 타임아웃 시계가 재개되어 unknown");
+        }
     }
 }

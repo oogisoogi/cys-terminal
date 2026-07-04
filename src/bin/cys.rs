@@ -422,6 +422,15 @@ enum Command {
         #[arg(long)]
         surface: Option<String>,
     },
+    /// Mark a surface quiescing(=채널 inbox 주입 보류) or release it (§2.2 S5) — cycle-agent가 clear 전후 호출
+    Quiesce {
+        /// 대상 surface(role 주소는 --to 대신 surface ref). 미지정 시 자기 surface.
+        #[arg(long)]
+        surface: Option<String>,
+        /// quiescing 해제(기본은 설정).
+        #[arg(long)]
+        off: bool,
+    },
     /// Launch an AI agent in a new role surface and auto-inject its directive
     LaunchAgent {
         /// Role: master / worker / cso / reviewer
@@ -1575,6 +1584,15 @@ fn run(command: Command) -> i32 {
         Command::PackRepairChannel { to, yes, expert_override } => {
             return run_pack_repair_channel(to, yes, expert_override);
         }
+
+        Command::Quiesce { surface, off } => target_surface(&surface, &None).and_then(|sid| {
+            request("surface.quiesce", json!({"surface_id": sid, "on": !off})).map(|_| {
+                println!(
+                    "surface:{sid} quiescing={}",
+                    if off { "off" } else { "on" }
+                );
+            })
+        }),
 
         Command::ClaimRole { role, surface } => target_surface(&surface, &None).and_then(|sid| {
             request("system.claim_role", json!({"role": role, "surface_id": sid}))
@@ -3923,6 +3941,12 @@ fn resolve_role_or_surface(
 
 /// T2-4 컨텍스트 사이클 집행기 — 게이트는 화면 마커가 아니라 파일 mtime+해시.
 #[allow(clippy::too_many_arguments)]
+/// cycle-agent가 대상 surface를 quiescing(=채널 inbox 주입 보류)으로 마킹/해제한다(§2.2 S5).
+/// clear 직전 on, resume 후(또는 실패해도) off로 호출해 clear·복원 구간의 채널 주입을 봉한다.
+fn set_surface_quiescing(sid: u64, on: bool) -> Result<(), String> {
+    request("surface.quiesce", json!({"surface_id": sid, "on": on})).map(|_| ())
+}
+
 fn run_cycle_agent(
     role: Option<String>,
     surface: Option<String>,
@@ -4105,29 +4129,40 @@ fn run_cycle_agent(
             eprintln!("[cycle 3/5] (검증자 미지정 — handshake 생략)");
         }
 
-        // 4) 입력 버퍼 정리 + clear
-        eprintln!("[cycle 4/5] 입력 버퍼 정리 + '{clear}'");
-        request("surface.send_key", json!({"surface_id": sid, "key": "C-u"}))?;
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        request(
-            "surface.send_text",
-            json!({"surface_id": sid, "text": clear, "quiet": true}),
-        )?;
-        request(
-            "surface.send_key",
-            json!({"surface_id": sid, "key": "Return"}),
-        )?;
-        std::thread::sleep(std::time::Duration::from_secs(4));
+        // S5(§2.2): clear 직전 대상 surface를 quiescing으로 마킹 → 채널 inbox 주입이 clear·복원
+        // 구간 동안 보류된다(C0 배달기가 이 상태를 읽음). autopilot 60% clear가 상시 조건이므로
+        // 이게 채널×clear 레이스의 실질 봉합이다.
+        set_surface_quiescing(sid, true)?;
+        let clear_resume = (|| -> Result<(), String> {
+            // 4) 입력 버퍼 정리 + clear
+            eprintln!("[cycle 4/5] 입력 버퍼 정리 + '{clear}'");
+            request("surface.send_key", json!({"surface_id": sid, "key": "C-u"}))?;
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            request(
+                "surface.send_text",
+                json!({"surface_id": sid, "text": clear, "quiet": true}),
+            )?;
+            request(
+                "surface.send_key",
+                json!({"surface_id": sid, "key": "Return"}),
+            )?;
+            std::thread::sleep(std::time::Duration::from_secs(4));
 
-        // 5) 디렉티브 재주입 + 재개 포인터
-        eprintln!("[cycle 5/5] 디렉티브 재주입 + 재개 포인터");
-        let directive = compose_directive(&role_name)?;
-        inject_text(sid, &directive)?;
-        std::thread::sleep(std::time::Duration::from_secs(2));
-        let resume = resume_text.unwrap_or_else(|| {
-            "[RESUME] 컨텍스트 순환 완료. _round/SESSION_STATE.md와 자기 TODO를 읽고 직전 작업을 이어가라.".into()
-        });
-        inject_text(sid, &resume)?;
+            // 5) 디렉티브 재주입 + 재개 포인터
+            eprintln!("[cycle 5/5] 디렉티브 재주입 + 재개 포인터");
+            let directive = compose_directive(&role_name)?;
+            inject_text(sid, &directive)?;
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let resume = resume_text.unwrap_or_else(|| {
+                "[RESUME] 컨텍스트 순환 완료. _round/SESSION_STATE.md와 자기 TODO를 읽고 직전 작업을 이어가라.".into()
+            });
+            inject_text(sid, &resume)?;
+            Ok(())
+        })();
+        // 재개 성공/실패와 무관하게 quiescing 해제 — 실패로 master가 quiescing에 갇혀 채널이
+        // 영구 보류되는 것을 막는다(master 자기보고 안전망과 별개의 결정론 해제).
+        let _ = set_surface_quiescing(sid, false);
+        clear_resume?;
         println!("cycle complete → surface:{sid} ({role_name})");
         Ok(())
     })();

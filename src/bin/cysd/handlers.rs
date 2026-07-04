@@ -2747,6 +2747,63 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             Reply::Single(ok_response(&id, json!({"surface_id": sid, "agent": agent})))
         }
 
+        // ─── C1(§2.2 S5): 대상 surface를 quiescing으로 마킹/해제 — cycle-agent가 clear 직전
+        // 설정·resume 후 해제한다. 채널 inbox 배달기(deliverable_master)가 이 상태를 게이트로
+        // 읽어 clear·복원 중 주입을 보류한다. 인가는 send_text와 동형(check_send_acl) — 사이클
+        // 집행자(master/cso)가 대상 노드에 이미 clear를 주입하는 권한과 같은 층위의 정당 proxy.
+        // (자기보고 status.set의 self-only와 별개 경로 — 대신 마킹하는 정당 사유가 있으므로.)
+        "surface.quiesce" => {
+            let Some(sid) = resolve_surface_id(&params) else {
+                return Reply::Single(err_response(
+                    &id,
+                    "invalid_params",
+                    "missing surface_id",
+                ));
+            };
+            let Some(surface) = daemon.get_surface(sid) else {
+                return Reply::Single(err_response(
+                    &id,
+                    "not_found",
+                    &format!("surface {sid} not found"),
+                ));
+            };
+            if let Err(e) = check_send_acl(daemon, caller_pid, &surface) {
+                return Reply::Single(err_response(&id, "acl_denied", &e));
+            }
+            let on = params.get("on").and_then(|v| v.as_bool()).unwrap_or(true);
+            {
+                let mut cur = surface.agent_status.lock().unwrap();
+                // context_pct·task는 보존하고 state만 전환한다.
+                let (context_pct, task) = cur
+                    .as_ref()
+                    .map(|s| (s.context_pct, s.task.clone()))
+                    .unwrap_or((None, None));
+                if on {
+                    *cur = Some(crate::state::AgentStatus {
+                        state: "quiescing".into(),
+                        context_pct,
+                        task,
+                        updated_at: crate::state::now_epoch(),
+                    });
+                } else if cur.as_ref().map(|s| s.state == "quiescing").unwrap_or(false) {
+                    // 아직 quiescing일 때만 해제(그 사이 master 자기보고가 있었으면 불간섭).
+                    *cur = Some(crate::state::AgentStatus {
+                        state: "working".into(),
+                        context_pct,
+                        task,
+                        updated_at: crate::state::now_epoch(),
+                    });
+                }
+            }
+            daemon.bus.publish(
+                "surface.quiescing",
+                "channel",
+                Some(sid),
+                json!({"surface_id": sid, "quiescing": on}),
+            );
+            Reply::Single(ok_response(&id, json!({"surface_id": sid, "quiescing": on})))
+        }
+
         // ─── T4-15 kill-switch: 큐 배달·스케줄 발화 동결 (직접 send는 통과 = 신경 차단) ───
         "system.pause" => {
             let reason = param_str(&params, "reason").unwrap_or_default();
@@ -2763,6 +2820,9 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             daemon.paused.store(false, Ordering::Relaxed);
             *daemon.pause_info.lock().unwrap() = None;
             daemon.persist_pause();
+            // §2.6 O5: pause 중 동결된 채널 아웃바운드 이벤트 재발행 + 보류 inbox 드레인.
+            // paused=false 확정 후 호출해야 deliverable_master의 pause 게이트를 통과한다.
+            crate::channels::resume_flush(daemon);
             daemon
                 .bus
                 .publish("autopilot.resumed", "system", None, json!({}));
