@@ -49,6 +49,17 @@ jobs:
         shell: bash
         run: bash scripts/secret-scan.sh --all
 
+      # 버전 SOT 6곳 일치 hard-gate — 드리프트인 채 발행 차단(v0.12.11에서 wxs 2곳 0.12.10 잔류
+      # 실증·2026-07-05). 태그 push면 태그=소스 버전까지 단언, workflow_dispatch(브랜치)면 상호 일치만.
+      - name: Version SOT check (drift hard-gate)
+        shell: bash
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            sh scripts/version-check.sh "$GITHUB_REF_NAME"
+          else
+            sh scripts/version-check.sh
+          fi
+
       # 프런트엔드 번들러(ui/build.sh가 bun 사용). beforeBuildCommand가 bun을 호출하므로 PATH 필수.
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
