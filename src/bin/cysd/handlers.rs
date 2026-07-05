@@ -1185,7 +1185,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     ));
                 }
             }
-            match governance::close_surface(daemon, sid) {
+            match governance::close_surface(daemon, sid, governance::CloseCause::OwnerClose) {
                 Ok(()) => {
                     Reply::Single(ok_response(&id, json!({"surface_id": sid, "closed": true})))
                 }
@@ -5318,7 +5318,7 @@ mod tests {
                 let t_b = std::thread::spawn(move || {
                     b_b.wait();
                     // 실제 close_surface(governance.rs) 경로: surfaces → roles 순.
-                    let _ = crate::governance::close_surface(&d_b, dummy);
+                    let _ = crate::governance::close_surface(&d_b, dummy, crate::governance::CloseCause::Reap);
                 });
 
                 t_a.join().unwrap();
@@ -5778,7 +5778,7 @@ mod tests {
         let master = make_surface(&daemon, Some("master"));
         assert!(daemon.tombstones.lock().unwrap().is_empty(), "초기 묘비는 비어야");
 
-        crate::governance::close_surface(&daemon, master).expect("close");
+        crate::governance::close_surface(&daemon, master, crate::governance::CloseCause::OwnerClose).expect("close");
 
         assert!(
             daemon.tombstones.lock().unwrap().contains("master"),
@@ -5799,7 +5799,7 @@ mod tests {
         let daemon = isolated_daemon();
         let w = make_surface(&daemon, Some("worker"));
         // 첫 worker는 dedup_worker_role에서 n=1 → "worker"로 등록됨.
-        crate::governance::close_surface(&daemon, w).expect("close");
+        crate::governance::close_surface(&daemon, w, crate::governance::CloseCause::OwnerClose).expect("close");
         assert!(
             daemon.tombstones.lock().unwrap().contains("worker"),
             "worker 묘비 미기록"
@@ -5817,7 +5817,7 @@ mod tests {
     fn w2a_claim_role_clears_tombstone() {
         let daemon = isolated_daemon();
         let cso = make_surface(&daemon, Some("cso"));
-        crate::governance::close_surface(&daemon, cso).expect("close");
+        crate::governance::close_surface(&daemon, cso, crate::governance::CloseCause::OwnerClose).expect("close");
         assert!(daemon.tombstones.lock().unwrap().contains("cso"));
         // 역할 없는 pane을 하나 세우고 claim_role("cso")로 사후 등록.
         let bare = make_surface(&daemon, None);
@@ -5851,7 +5851,7 @@ mod tests {
             "재등록 후 역할은 B가 소유해야"
         );
         // 옛 surface A를 닫음 — roles 맵은 A를 안 가리키므로 묘비 대상 아님.
-        crate::governance::close_surface(&daemon, a).expect("close");
+        crate::governance::close_surface(&daemon, a, crate::governance::CloseCause::OwnerClose).expect("close");
         assert!(
             !daemon.tombstones.lock().unwrap().contains("reviewer-codex"),
             "살아있는(B 소유) 역할이 옛 surface close로 묘비에 올랐다 — 부활 오차단"
@@ -5864,7 +5864,7 @@ mod tests {
     fn w2a_topology_rpc_exposes_tombstones() {
         let daemon = isolated_daemon();
         let m = make_surface(&daemon, Some("master"));
-        crate::governance::close_surface(&daemon, m).expect("close");
+        crate::governance::close_surface(&daemon, m, crate::governance::CloseCause::OwnerClose).expect("close");
         let req = Request {
             id: json!(1),
             method: "system.topology".into(),

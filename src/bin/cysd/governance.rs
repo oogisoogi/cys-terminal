@@ -227,7 +227,7 @@ fn reap_zombie_surfaces(
     for id in to_cleanup {
         zombie_miss.remove(&id);
         // 강제 정리: close_surface가 surface 등록 해제(이미 죽은 자식엔 kill/wait 무시).
-        if close_surface(daemon, id).is_ok() {
+        if close_surface(daemon, id, CloseCause::Reap).is_ok() {
             // 원장 제거: 이 surface가 소유한 스코프 항목을 원장에서 제거(좀비 잔존 차단).
             {
                 let mut ledger = daemon.ledger.lock().unwrap();
@@ -1110,7 +1110,7 @@ fn reap_exited_surfaces(daemon: &Arc<Daemon>) {
     }
     for (id, role) in to_reap {
         // 경쟁(이미 닫힘)은 Err — 무시. 성공 시에만 reaped 이벤트.
-        if close_surface(daemon, id).is_ok() {
+        if close_surface(daemon, id, CloseCause::Reap).is_ok() {
             daemon.bus.publish(
                 "surface.reaped",
                 "surface",
@@ -1221,9 +1221,20 @@ fn prune_surface_health_keys(
     hits.retain(|(sid, _), _| *sid != id);
 }
 
+/// close_surface 호출 사유 — 묘비 삽입 여부를 가른다.
+/// 묘비는 "오너가 의도적으로 폐역한 역할"에만 적용돼야 하고(좀비 부활 차단), watchdog가
+/// 크래시·EOF·동반사망을 회수하는 경우는 부활 대상이므로 묘비를 남기지 않는다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseCause {
+    /// 오너 의도적 닫기(UI 탭 닫기·surface.close RPC) — 역할을 묘비에 올려 auto-restore 좀비 부활 차단.
+    OwnerClose,
+    /// watchdog 회수(크래시·셸 EOF·데몬 재시작 동반사망·fresh TTL) — 부활 대상이므로 묘비 미삽입.
+    Reap,
+}
+
 /// Close a surface: kill the entire descendant process tree, then the shell itself.
 /// 고아 서버 누적(load 폭주의 원인)을 원천 차단하는 지점.
-pub fn close_surface(daemon: &Arc<Daemon>, id: u64) -> Result<(), String> {
+pub fn close_surface(daemon: &Arc<Daemon>, id: u64, cause: CloseCause) -> Result<(), String> {
     // 멤버십 제거 + 역할 정리를 surfaces 락 아래 한 임계영역에서 —
     // claim_role과 동일한 락 순서(surfaces → roles → surface.role)로 AB-BA 데드락 차단.
     let surface = {
@@ -1255,8 +1266,13 @@ pub fn close_surface(daemon: &Arc<Daemon>, id: u64) -> Result<(), String> {
         if master_released {
             *daemon.master_claimed_at.lock().unwrap() = None;
         }
+        // 묘비 삽입만 cause로 게이트 — role-map 정리·master_claimed_at 해제는 위에서 두 사유 모두
+        // 이미 수행됐다(reap된 surface도 역할 매핑을 놓아야 신규가 claim 가능). Reap은 부활 대상이라
+        // 묘비를 남기지 않는다(phoenix가 desired_roster로 되살린다).
         if let Some(role) = tombstone_role {
-            daemon.tombstones.lock().unwrap().insert(role);
+            if cause == CloseCause::OwnerClose {
+                daemon.tombstones.lock().unwrap().insert(role);
+            }
         }
         surface
     };
@@ -2016,5 +2032,151 @@ mod tests {
         // 비역할(스크래치·one-shot): 기본 10초 grace — 더 빨리 정리
         assert!(!exited_surface_due(false, 9), "비역할은 grace 내(9s)에 보존돼야");
         assert!(exited_surface_due(false, 10), "비역할은 grace 경계(10s)에서 회수돼야");
+    }
+
+    // ─────────── ★묘비 게이트: reap≠묘비, owner-close=묘비 (부활 불변식) ───────────
+
+    use super::{
+        close_surface, load_tombstones_from_disk, now_epoch, persist_topology,
+        reap_exited_surfaces, CloseCause, Daemon,
+    };
+    use std::sync::atomic::Ordering as AtomicOrdering;
+
+    /// reap 계열 테스트는 CYS_REAP_EXITED* env를 만지므로 직렬화(다른 env-터치 테스트와 충돌 방지).
+    static REAP_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// CYS_REAP_EXITED* env를 테스트 종료 시(패닉 포함) 이전 값으로 원복하는 가드 —
+    /// 없던 값은 remove, 있던 값은 원복. 프로세스 전역 env 누수 차단.
+    struct ReapEnvGuard {
+        prev: Vec<(&'static str, Option<String>)>,
+    }
+    impl ReapEnvGuard {
+        fn set(vars: &[(&'static str, &str)]) -> Self {
+            let prev = vars
+                .iter()
+                .map(|(k, v)| {
+                    let old = std::env::var(k).ok();
+                    std::env::set_var(k, v);
+                    (*k, old)
+                })
+                .collect();
+            ReapEnvGuard { prev }
+        }
+    }
+    impl Drop for ReapEnvGuard {
+        fn drop(&mut self) {
+            for (k, old) in &self.prev {
+                match old {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    /// 격리 데몬 — temp 소켓 디렉터리(개인 경로 하드코딩 금지).
+    fn drill_daemon(tag: &str) -> Arc<Daemon> {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, AtomicOrdering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "cys-govdrill-{}-{}-{}-{}",
+            tag,
+            std::process::id(),
+            now_epoch() as u64,
+            n
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        Daemon::new(dir.join("cysd.sock"))
+    }
+
+    /// 역할 보유 surface(live pid) 하나를 만들어 roles·surfaces에 등록하고 id 반환.
+    fn spawn_role_surface(daemon: &Arc<Daemon>, role: &str) -> u64 {
+        let s = daemon
+            .create_surface(None, Some("sleep 30".into()), None, Some(role.into()), 24, 80)
+            .expect("create surface");
+        daemon.roles.lock().unwrap().insert(role.into(), s.id);
+        daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        s.id
+    }
+
+    /// watchdog가 자력종료(exited) surface를 회수해도 역할을 묘비에 올리지 않는다 —
+    /// phoenix가 desired_roster로 되살려야 하므로. 역할 매핑 정리는 여전히 일어나야 한다.
+    #[test]
+    fn reap_exited_does_not_tombstone_role() {
+        let _g = REAP_ENV_LOCK.lock().unwrap();
+        let daemon = drill_daemon("reap-exited");
+        let id = spawn_role_surface(&daemon, "worker");
+        // exited 마킹 + stamp(과거로 둘 필요 없음 — grace 0으로 즉시 회수 대상).
+        let s = daemon.surfaces.lock().unwrap().get(&id).cloned().unwrap();
+        s.exited.store(true, AtomicOrdering::Relaxed);
+        *s.exited_at.lock().unwrap() = Some(std::time::Instant::now());
+        let _env = ReapEnvGuard::set(&[
+            ("CYS_REAP_EXITED", "1"),
+            ("CYS_REAP_EXITED_GRACE_SECS", "0"),
+        ]);
+        reap_exited_surfaces(&daemon);
+
+        assert!(
+            !daemon.tombstones.lock().unwrap().contains("worker"),
+            "reap된 역할이 묘비에 올랐다 — phoenix 부활이 영구 차단된다"
+        );
+        assert!(
+            daemon.roles.lock().unwrap().get("worker").is_none(),
+            "reap 후 역할 매핑이 남아 신규 claim을 막는다(정리 누락)"
+        );
+        // 디스크 라운드트립: topology.json에도 묘비가 없어야 phoenix가 되살린다.
+        persist_topology(&daemon);
+        assert!(
+            !load_tombstones_from_disk(&daemon.socket_path).contains("worker"),
+            "reap 묘비가 topology.json에 영속돼 재부팅 후 부활이 막힌다"
+        );
+    }
+
+    /// 오너 의도적 닫기는 여전히 묘비를 남기고 영속한다(좀비 부활 차단 불변식 보존).
+    #[test]
+    fn owner_close_still_tombstones() {
+        let daemon = drill_daemon("owner-close");
+        let id = spawn_role_surface(&daemon, "worker");
+        close_surface(&daemon, id, CloseCause::OwnerClose).expect("close");
+        assert!(
+            daemon.tombstones.lock().unwrap().contains("worker"),
+            "오너 close가 묘비를 남기지 않았다 — auto-restore 좀비 부활 위험"
+        );
+        // 수동 persist 없이 디스크를 읽어 close_surface 자체의 persist_topology side effect를 실검증.
+        assert!(
+            load_tombstones_from_disk(&daemon.socket_path).contains("worker"),
+            "오너 close 묘비가 topology.json에 영속되지 않았다"
+        );
+    }
+
+    /// 데몬 재시작 동반사망 재현: 4역할 노드를 모두 reap로 회수하면 묘비가 하나도 안 남아
+    /// phoenix가 4역할을 전부 자동부활할 수 있다(결정론 단위 재현).
+    #[test]
+    fn fleet_reap_leaves_roster_revivable() {
+        let daemon = drill_daemon("fleet-reap");
+        for role in ["cso", "worker", "reviewer-gemini", "reviewer-codex"] {
+            let id = spawn_role_surface(&daemon, role);
+            close_surface(&daemon, id, CloseCause::Reap).expect("reap close");
+        }
+        assert!(
+            daemon.tombstones.lock().unwrap().is_empty(),
+            "reap된 4역할 중 묘비가 남았다 — 함대 자동부활이 부분 차단된다"
+        );
+        // 4역할 매핑이 roles map에서 모두 제거돼야 phoenix가 desired_roster로 재claim 가능
+        // (worker 단일 케이스와 동일 불변식 확장).
+        {
+            let roles = daemon.roles.lock().unwrap();
+            for role in ["cso", "worker", "reviewer-gemini", "reviewer-codex"] {
+                assert!(
+                    roles.get(role).is_none(),
+                    "reap 후 역할 매핑이 남았다({role}) — 신규 claim을 막아 부활이 차단된다"
+                );
+            }
+        }
+        // 수동 persist 없이 디스크를 읽어 close_surface 자체의 persist_topology side effect를 실검증.
+        assert!(
+            load_tombstones_from_disk(&daemon.socket_path).is_empty(),
+            "topology.json에 reap 묘비가 영속돼 재부팅 후 4역할 부활이 막힌다"
+        );
     }
 }

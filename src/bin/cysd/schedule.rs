@@ -471,7 +471,7 @@ async fn fire_push(daemon: &Arc<Daemon>, job: &Job) -> Result<String, String> {
             let d = Arc::clone(daemon);
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_secs(ttl)).await;
-                let _ = crate::governance::close_surface(&d, sid);
+                let _ = crate::governance::close_surface(&d, sid, crate::governance::CloseCause::Reap);
             });
         }
         return Ok(format!("fresh-launched and pushed (surface:{sid})"));

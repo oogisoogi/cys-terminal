@@ -2832,7 +2832,7 @@ mod tests {
             assert_eq!(redel, 1, "재배달 표기(redelivered=1)");
         }
         // 정리: master surface의 sleep 30 회수.
-        crate::governance::close_surface(&d, surface.id);
+        let _ = crate::governance::close_surface(&d, surface.id, crate::governance::CloseCause::Reap);
     }
 
     #[cfg(unix)]
@@ -2899,7 +2899,7 @@ mod tests {
                 .unwrap();
             assert_eq!(st, "injected");
         }
-        let _ = crate::governance::close_surface(&d, sid);
+        let _ = crate::governance::close_surface(&d, sid, crate::governance::CloseCause::Reap);
     }
 
     /// MED-3: master가 배달 중 quiescing으로 전환되면 이후 주입은 try_send 없이 보류(false)된다.
@@ -2926,7 +2926,7 @@ mod tests {
         });
         assert_eq!(deliverable_master(&d), None, "quiescing master는 배달 불가");
         assert!(!inject_master(&d, sid, "[test] hi2"), "quiescing surface엔 주입 보류(false)");
-        let _ = crate::governance::close_surface(&d, sid);
+        let _ = crate::governance::close_surface(&d, sid, crate::governance::CloseCause::Reap);
     }
 
     /// C1(가)-2: pause 중엔 (a) inbound가 master 가용해도 queued(주입 동결)·inbox 적재는 지속(유실 0)
@@ -2990,7 +2990,7 @@ mod tests {
                 .unwrap();
             assert_eq!(st, "injected", "resume 후 보류 inbox가 드레인되어 주입돼야 한다");
         }
-        let _ = crate::governance::close_surface(&d, sid);
+        let _ = crate::governance::close_surface(&d, sid, crate::governance::CloseCause::Reap);
     }
 
     /// C1(가)-2 보강: pause 중엔 sweep의 outbound 타임아웃 시계도 동결된다 — 배달을 얼린 동안
