@@ -540,8 +540,8 @@ mod tests {
     fn claude_project_component_munges_path() {
         // 실측 munge 규칙: '/'와 특수문자 → '-', 영숫자·'-' 보존.
         assert_eq!(
-            claude_project_component("/Users/alice/Desktop/ProjX"),
-            "-Users-alice-Desktop-ProjX"
+            claude_project_component("/Users/user/Desktop/ProjX"),
+            "-Users-user-Desktop-ProjX"
         );
         assert_eq!(claude_project_component("/tmp/a.b_c"), "-tmp-a-b-c");
     }
