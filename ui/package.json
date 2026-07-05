@@ -3,7 +3,8 @@
   "private": true,
   "version": "0.12.9",
   "scripts": {
-    "build": "sh build.sh"
+    "build": "sh build.sh",
+    "test": "bun test"
   },
   "dependencies": {
     "@tauri-apps/plugin-notification": "^2.3.3",

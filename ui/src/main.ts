@@ -4,6 +4,7 @@
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
+import { imeStep, initialImeState, type ImeEvent } from "./ime";
 
 declare global {
   interface Window {
@@ -1532,45 +1533,37 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
     true,
   );
 
-  // ── WKWebView 한글 IME 조합 상태 머신 ──────────────────────────────────
-  // WKWebView는 composition 이벤트 없이 ①음절 첫 자모를 insertText로 커밋(xterm이 즉시
-  // 전송해버림 = 자모 유출) ②조합 진행을 insertReplacementText로 value 치환(xterm 미인지 =
-  // 완성 글자 유실)한다. 여기서 자모 유출을 차단하고 음절 확정 시 완성 글자만 보낸다.
-  let pendingHangul = "";
-  // 자모(31xx·11xx) + 완성형 음절(AC00-D7A3) — ★멀티문자 허용(2026-06-13): 고속 입력에서
-  // IME가 여러 음절을 한 insertText로 병합 커밋하는데, 단일 문자만 인정하면 그 묶음이
-  // input 핸들러에서 무시되고 onData(고속에서 발화 비결정)도 못 받쳐 통째로 유실된다
-  // — "4자 치면 2자" 절반 유실의 주 경로.
-  const isHangulText = (t: string) => /^[\u3131-\u318E\u1100-\u11FF\uAC00-\uD7A3]+$/.test(t);
-  // IME 계측(사람 단계 재현용): localStorage.cysImeDebug="1" 설정 시 이벤트 시퀀스를
-  // /tmp/cys-ime.log에 기록 — 유실 경로를 결정론으로 확정하는 채널. 평시 비용 0.
+  // ── WKWebView 한글 IME 조합 상태 머신 (판단 로직 = ime.ts 순수 리듀서 imeStep) ──
+  // WKWebView는 표준 composition 없이 음절 첫 자모를 insertText로 커밋하거나(자모 유출), 혼성 프로필에선
+  // 첫 자모를 insertText로 커밋한 뒤 나머지 조합을 표준 composition 이벤트로 진행한다.
+  // 자모 pending, 병합 커밋, 음절 확정 flush, 조합 흡수 자모 폐기(drop) 판단은 ime.ts 리듀서가 하고,
+  // 여기서는 DOM 이벤트를 리듀서에 배선만 한다. 계측: localStorage.cysImeDebug="1" 시 이벤트 시퀀스를
+  // log_ime로 기록(유실 경로를 결정론으로 확정하는 채널). 평시 비용 0.
   const imeDbg = localStorage.getItem("cysImeDebug") === "1";
   const dbg = (line: string) => {
     if (imeDbg) invoke("log_ime", { line: `[s${sid}] ${line}` }).catch(() => {});
   };
-  const flushPending = (why: string) => {
-    if (pendingHangul) {
-      dbg(`FLUSH(${why}) "${pendingHangul}"`);
-      sendRaw(pendingHangul);
-      pendingHangul = "";
+  let imeState = initialImeState();
+  const applyIme = (event: ImeEvent) => {
+    const { state, actions } = imeStep(imeState, event);
+    imeState = state;
+    for (const a of actions) {
+      if ("send" in a) sendRaw(a.send);
+      else dbg(a.debug);
     }
   };
 
   term.onData((data) => {
-    // 한글 음절: 이 WebKit은 조합을 표준 composition inputType(insertFromComposition)으로
-    // 확정하고, 그때 xterm이 완성 음절을 onData로 정확히 1회 발화한다 — 차단 없이 그대로
-    // PTY로 보낸다. (구 isHangulText 차단은 insertText 기반 상태머신을 전제했으나, 실기기
-    // WebKit은 insertCompositionText/insertFromComposition을 보내 그 머신이 작동한 적이
-    // 없었고, 차단만 살아 순수 한글 음절을 통째로 유실시켰다 — "너는 마스터다"→"는 다".)
-    flushPending("onData"); // (no-op 안전장치: 잔여 pending 있으면 순서 보존 후 전송)
-    sendRaw(data);
+    // 완성 음절은 그대로 PTY로 — 잔여 pending이 있으면 리듀서가 순서 보존 후 함께 전송(안전장치).
+    // Windows 등 비-WKWebView에선 input 핸들러 미배선이라 pending이 항상 비어 순수 send(data)와 동일.
+    applyIme({ kind: "onData", data });
   });
 
-  // ★F 수정: 위 IME 조합 상태 머신은 macOS WKWebView 전용 우회다. Windows WebView2 등 Chromium
-  // 계열은 xterm.js 네이티브 composition이 완성 음절을 onData로 정확히 1회 발화하므로, 이 우회를
-  // 함께 켜면 input 핸들러가 pendingHangul에 버퍼한 글자를 onData의 flushPending이 보내고
-  // sendRaw(data)가 다시 보내 **이중 전송**된다("너"→"너너" 전 글자 중복 — Windows 실측).
-  // ∴ WKWebView(AppleWebKit·비-Chromium)에서만 상태 머신을 붙인다(macOS 회귀0).
+  // ★F: 위 조합 상태 머신은 macOS WKWebView 전용 우회다. Windows WebView2 등 Chromium 계열은
+  // xterm.js 네이티브 composition이 완성 음절을 onData로 정확히 1회 발화하므로, 이 우회를 함께 켜면
+  // input 핸들러가 pending에 버퍼한 글자를 리듀서가 보내고 onData의 send(data)가 다시 보내
+  // 이중 전송된다("너"->"너너" 전 글자 중복 — Windows 실측).
+  // ∴ WKWebView(AppleWebKit, 비-Chromium)에서만 input/keydown/blur/composition 리스너를 붙인다(macOS 회귀 0).
   const _ua = navigator.userAgent;
   const isWKWebView = /AppleWebKit/.test(_ua) && !/Chrome|Chromium|Edg\//.test(_ua);
   if (isWKWebView) {
@@ -1578,41 +1571,22 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
     if (ta) {
       ta.addEventListener("input", (e) => {
         const ie = e as InputEvent;
-        dbg(`input ${ie.inputType} data="${ie.data ?? "∅"}" pending="${pendingHangul}"`);
-        if (ie.inputType === "insertText" && ie.data && isHangulText(ie.data)) {
-          // 직전 조합 확정 후 새 커밋을 '수정 가능 창'(pending)에 둔다. 병합 커밋
-          // (2음절+)은 마지막 음절만 수정 창에 — 앞 음절들은 확정분이므로 즉시 전송
-          // (replacement 재조합은 마지막 음절 단위로 온다).
-          flushPending("insertText");
-          if (ie.data.length > 1) {
-            dbg(`SEND(multi-head) "${ie.data.slice(0, -1)}"`);
-            sendRaw(ie.data.slice(0, -1));
-          }
-          pendingHangul = ie.data.slice(-1);
-        } else if (ie.inputType === "insertReplacementText" && ie.data) {
-          if (pendingHangul) {
-            pendingHangul = ie.data; // 조합 갱신 (하→한)
-          } else {
-            // 이미 전송된 직전 음절의 교정 — PTY 동기화: 백스페이스+재전송
-            dbg(`SEND(repl-sync) DEL+"${ie.data}"`);
-            sendRaw("\x7f" + ie.data);
-          }
-        } else if (ie.inputType === "deleteContentBackward" && pendingHangul) {
-          // 멀티 pending(병합 커밋 잔여)이면 마지막 글자만 — IME 부분 재조합 대응
-          pendingHangul = pendingHangul.slice(0, -1);
-          dbg(`del-backward pending="${pendingHangul}"`);
-        }
+        applyIme({ kind: "input", inputType: ie.inputType, data: ie.data });
       });
+      // 혼성 프로필(C) 방어: 자모 insertText 커밋 후 조합이 표준 composition으로 이어지면
+      // 리듀서가 흡수된 자모를 폐기한다. composition 3종 모두 배선(제5 프로필 진단 계측 포함).
+      ta.addEventListener("compositionstart", () => applyIme({ kind: "compositionstart" }));
+      ta.addEventListener("compositionupdate", () => applyIme({ kind: "compositionupdate" }));
+      ta.addEventListener("compositionend", () => applyIme({ kind: "compositionend" }));
       ta.addEventListener("keydown", (e) => {
-        if (imeDbg && e.keyCode !== 229) dbg(`keydown ${e.key}`);
-        // 일반 키(Enter·Space·화살표 등, IME 처리중 229 제외) 직전에 조합 확정
-        if (e.keyCode !== 229) flushPending("keydown");
+        // 일반 키(Enter·Space·화살표 등, IME 처리중 229 제외) 직전에 조합 확정(리듀서 flush).
+        applyIme({ kind: "keydown", keyCode: e.keyCode, key: e.key });
         // 조합 중이 아닐 때 textarea 잔여 value 정리 (IME value 누적 방지)
-        if (e.keyCode !== 229 && !pendingHangul && ta.value.length > 64) {
+        if (e.keyCode !== 229 && !imeState.pending && ta.value.length > 64) {
           (ta as HTMLTextAreaElement).value = "";
         }
       });
-      ta.addEventListener("blur", () => flushPending("blur"));
+      ta.addEventListener("blur", () => applyIme({ kind: "blur" }));
     }
   }
   el.addEventListener("mousedown", () => setFocus(sid));
