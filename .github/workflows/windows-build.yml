@@ -341,3 +341,39 @@ jobs:
           Get-Process cys,cysd -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
           if (-not $cleaned) { throw "T4-6: prev 잔해 미청소" }
           Write-Host "OK: T4 무중단 재설치 스모크 전행 통과 — 업데이트 중 데몬·세션 무사망 실증"
+
+      # ─────────────────────────────────────────────────────────────────────────
+      # T5 피닉스(불사조 무손실 복원) Windows 패리티 스모크 (S1~S5 실측).
+      # 경로/파이프 매핑·supervisor(schtasks)·재시작 프리미티브(identify→taskkill→파이프해제→retrigger→epoch delta)
+      # ·snapshot+독립 runbook(.ps1)·stub restore(M9 VERIFIED)·deploy --plan exit 계약을 결정론·자기완결로 검증한다.
+      # 스모크는 checkout 된 repo 경로에서 직접 실행(pack 임베드 비의존)하고 동봉 python3 + 설치된 cys/cysd 를 구동한다.
+      # 실패 시 throw(=게이트) — T4 관용과 정합. mac unix 하네스(javis_phoenix_harness.py)는 무접촉.
+      # ─────────────────────────────────────────────────────────────────────────
+      - name: T5 피닉스 Windows 패리티 스모크 (무손실 복원 S1~S5)
+        shell: pwsh
+        timeout-minutes: 12   # ★백스톱: 데몬 기동/재시작 폴링이 hang 해도 12분에 스텝 종료(6h 방지)
+        env:
+          PYTHONUTF8: '1'     # 한글 stdout cp1252 크래시 방지(RC-16 관례)
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $inst = Get-ChildItem "$env:LOCALAPPDATA" -Recurse -Filter cysd.exe -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq 'cysd.exe' } | Select-Object -First 1
+          if (-not $inst) { throw "T5: 설치된 cysd.exe 미발견" }
+          $dir = $inst.Directory.FullName
+          $cys = Join-Path $dir 'cys.exe'
+          $cysd = $inst.FullName
+          $py = Join-Path $dir 'runtime\python\python3.exe'
+          if (-not (Test-Path $py))  { throw "T5: 동봉 python3.exe 미발견: $py" }
+          if (-not (Test-Path $cys)) { throw "T5: 설치된 cys.exe 미발견: $cys" }
+          $smoke = Join-Path (Get-Location) 'cysjavis-pack\bin\javis_phoenix_win_smoke.py'
+          if (-not (Test-Path $smoke)) { throw "T5: 스모크 파일 미발견(checkout 경로): $smoke" }
+          Write-Host "cys=$cys"; Write-Host "cysd=$cysd"; Write-Host "py=$py"; Write-Host "smoke=$smoke"
+          # 사전 정리(이전 스텝 잔류 데몬) — 스모크는 테스트 전용 파이프(cys-phxsmoke-*)를 쓰지만 결정성 위해 정돈.
+          Get-Process cys,cysd -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          Start-Sleep 1
+          $env:PHOENIX_CYS = $cys
+          $env:PHOENIX_CYSD = $cysd
+          & $py $smoke
+          $code = $LASTEXITCODE
+          Get-Process cys,cysd -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          if ($code -ne 0) { throw "T5: 피닉스 Windows 패리티 스모크 실패 (exit=$code)" }
+          Write-Host "OK: T5 피닉스 Windows 패리티 스모크 통과 (경로매핑·schtasks·재시작·snapshot/ps1·stub restore·deploy plan)"

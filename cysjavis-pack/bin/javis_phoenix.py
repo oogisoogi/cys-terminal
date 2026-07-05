@@ -52,7 +52,21 @@ import sys
 import time
 
 HOME = os.path.expanduser("~")
-LIVE_STATE = os.path.realpath(os.path.join(HOME, ".local", "state", "cys"))
+
+# 플랫폼 분기(Windows 패리티) — 상태 디렉터리·소켓 규약이 Rust(src/lib.rs·state.rs)와 정합해야 한다.
+IS_WINDOWS = os.name == "nt"
+
+
+def _live_state_dir():
+    """라이브 상태 디렉터리 — unix: ~/.local/state/cys · Windows: %LOCALAPPDATA%\\cys
+    (Rust cys::socket_path / state.rs state_dir 의 기본 데몬 규약과 정합)."""
+    if IS_WINDOWS:
+        base = os.environ.get("LOCALAPPDATA") or os.path.join(HOME, "AppData", "Local")
+        return os.path.realpath(os.path.join(base, "cys"))
+    return os.path.realpath(os.path.join(HOME, ".local", "state", "cys"))
+
+
+LIVE_STATE = _live_state_dir()
 
 # 부활 저널의 단계(P4) — 순서 고정
 STAGES = ["spawn", "ready", "resume", "reinject", "g2_ack", "verify"]
@@ -104,9 +118,36 @@ def log(msg):
     sys.stdout.flush()
 
 
+_SNAP_MOD = None
+
+
+def _snap_mod():
+    """형제 파일 javis_state_snapshot 모듈 로드·캐시. Windows 파이프→state_dir 매핑 규칙의 단일 소스이며
+    (Rust state.rs 정합) phoenix 는 여기서 재사용한다(중복 구현 금지). mac 경로는 이 함수를 호출하지 않는다."""
+    global _SNAP_MOD
+    if _SNAP_MOD is None:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import javis_state_snapshot as _s
+        _SNAP_MOD = _s
+    return _SNAP_MOD
+
+
+def _win_pipe_slug(socket):
+    """Windows named pipe 슬러그 — 규칙 단일 소스는 javis_state_snapshot(중복 구현 금지)."""
+    return _snap_mod()._win_pipe_slug(socket)
+
+
+def _win_state_dir_for_socket(socket):
+    """Windows 소켓(named pipe)→상태 디렉터리 — 규칙 단일 소스는 javis_state_snapshot(중복 구현 금지)."""
+    return _snap_mod()._win_state_dir_for_socket(socket)
+
+
 def state_dir_for(socket):
-    """소켓 경로에서 데몬 상태 디렉터리(=소켓 부모)를 파생 — 하네스 격리 계약과 동일."""
+    """소켓 경로에서 데몬 상태 디렉터리를 파생. unix=소켓 부모(하네스 격리 계약과 동일) ·
+    Windows=named pipe 슬러그 매핑(Rust state_dir 규칙 — 파이프엔 파일시스템 부모가 없다)."""
     if socket:
+        if IS_WINDOWS:
+            return _win_state_dir_for_socket(socket)
         return os.path.realpath(os.path.dirname(socket))
     # 소켓 미지정 시 라이브 기본
     return LIVE_STATE
@@ -160,14 +201,16 @@ def get_boot_epoch(socket):
 
 
 def _atomic_write_json(path, obj):
-    """tmp+fsync+rename+dir fsync — javis_state_snapshot 과 동일한 원자성 규약."""
+    """tmp+fsync+replace+dir fsync — javis_state_snapshot 과 동일한 원자성 규약.
+    ★os.replace(os.rename 아님): 대상이 이미 존재해도 원자적 덮어쓰기. POSIX는 rename과 동일 동작(mac 무변경)이고
+    Windows는 os.rename 이 대상 존재 시 FileExistsError 로 죽어(저널은 반복 갱신됨) 반드시 replace 여야 한다."""
     d = os.path.dirname(path)
     tmp = os.path.join(d, ".tmp-%d-%s" % (os.getpid(), os.path.basename(path)))
-    with open(tmp, "w") as f:
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=1)
         f.flush()
         os.fsync(f.fileno())
-    os.rename(tmp, path)
+    os.replace(tmp, path)
     try:
         dfd = os.open(d, os.O_RDONLY)
         os.fsync(dfd)
@@ -491,10 +534,16 @@ def spawn_surrogate(socket, role, observed_sid, attempt=0, mode="resume"):
     ref = m.group(1) if m else None
     if not ref:
         return None, (r.stderr or r.stdout or "new-surface 실패")
-    # stub 명령 주입: (watch가 이길 시간을 주려 1.2s 지연) → ready 마커 + 세션 표식 → 생존.
+    # stub 명령 주입: (watch가 이길 시간을 주려 지연) → ready 마커 + 세션 표식 → 생존.
     # ※ printf %s / Python %s 충돌 회피 위해 문자열 결합으로 값 삽입(포맷 지정자 미사용).
-    cmdline = ("sleep 1.2; echo PHOENIX_STUB_READY role=" + role +
-               " SESSION=" + observed_sid + " SPAWNMODE=" + mode + " ENDMARK; exec sleep 3600")
+    # ★Windows(S6): surface 셸이 PowerShell 이라 bash 문법(exec) 불가 → PowerShell 형(Start-Sleep·Write-Output)으로 분기.
+    #   ready 마커 substring·SESSION= 추출은 양 셸 렌더가 동일하게 만족(마지막 Start-Sleep/exec 로 surface 생존 유지).
+    if IS_WINDOWS:
+        cmdline = ("Start-Sleep 1; Write-Output 'PHOENIX_STUB_READY role=" + role +
+                   " SESSION=" + observed_sid + " SPAWNMODE=" + mode + " ENDMARK'; Start-Sleep 3600")
+    else:
+        cmdline = ("sleep 1.2; echo PHOENIX_STUB_READY role=" + role +
+                   " SESSION=" + observed_sid + " SPAWNMODE=" + mode + " ENDMARK; exec sleep 3600")
     cys("send", "--surface", ref, cmdline, socket=socket, timeout=10)
     cys("send-key", "--surface", ref, "Return", socket=socket, timeout=10)
     return ref, "surrogate stub on %s (SESSION=%s mode=%s)" % (ref, observed_sid, mode)
@@ -1204,17 +1253,151 @@ def launchd_ensure(label, plist, running_pid=None):
 
 
 def cmd_launchd_status(args):
-    out = launchd_status(args.label, running_pid=args.pid)
-    out["honesty"] = ("managed=재부팅 자동기동 토대 intact · orphan=프로세스는 살아있으나 관리 이탈(재부팅되면 안 뜸) · "
-                      "unmanaged=등록 부재. 읽기 전용(launchctl list/print) — 데몬을 재시작·변경하지 않는다.")
+    out = supervisor_status(args.label, running_pid=args.pid)
+    out["honesty"] = ("managed=재부팅/로그온 자동기동 토대 intact · orphan=프로세스는 살아있으나 관리 이탈(재부팅되면 안 뜸) · "
+                      "unmanaged=등록 부재. 읽기 전용(mac launchctl list/print · win schtasks /Query) — 데몬을 재시작·변경하지 않는다.")
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return out
 
 
 def cmd_launchd_ensure(args):
-    out = launchd_ensure(args.label, args.plist, running_pid=args.pid)
+    out = supervisor_ensure(args.label, args.plist, running_pid=args.pid)
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return out
+
+
+# ------------------------------------------------------------------ supervisor 추상화(플랫폼 감독자)
+# S1(Windows 패리티): 재부팅/로그온 자동기동 토대의 '관리 상태'와 '재시작'을 플랫폼 중립으로 얇게 감싼다.
+#   · macOS: 기존 launchd_* 함수를 그대로 위임(무변경 동작 보장 — launchctl 경로·fake launchctl drill 불변).
+#   · Windows: schtasks(작업 스케줄러) 기반. supervisor_status=schtasks /Query, supervisor_ensure=`cys daemon install`
+#     (기존 Rust 로직 재사용 — schtasks 직접 조립 금지), 재시작=identify→taskkill /T /F→파이프 해제 폴링→재기동 유발.
+# ★Windows 데몬은 사망 시 자동 respawn 이 없다(schtasks ONLOGON — KeepAlive 대응 없음). 재기동 유발은
+#   managed 면 `schtasks /Run`, 비관리/실패면 `cys list`(CLI lazy-spawn 보완). 진짜 KeepAlive 패리티는 후속 사이클.
+
+def _schtasks(*args, timeout=10):
+    try:
+        return subprocess.run(["schtasks"] + [str(a) for a in args],
+                              capture_output=True, text=True, timeout=timeout)
+    except Exception as e:
+        class _R:
+            returncode = 127
+            stdout = ""
+            stderr = str(e)
+        return _R()
+
+
+def _schtasks_status(task, running_pid=None):
+    """schtasks 등록 상태 분류(읽기 전용) — launchd_status 의 Windows 대응. KeepAlive 대응 없음(keepalive=None).
+      managed   : `schtasks /Query /TN <task>` 존재(등록됨) — 로그온 자동기동 토대 intact
+      orphan    : 미등록 + 프로세스는 살아있음(running_pid) — 로그온 시 자동기동 안 됨(관리 이탈)
+      unmanaged : 미등록 + 프로세스도 없음(등록 자체 부재)."""
+    r = _schtasks("/Query", "/TN", task, timeout=8)
+    registered = (getattr(r, "returncode", 1) == 0)
+    if registered:
+        state = "managed"
+    elif running_pid:
+        state = "orphan"
+    else:
+        state = "unmanaged"
+    return {"label": task, "loaded": registered, "keepalive": None, "runatload": registered,
+            "state": state, "supervisor": "schtasks",
+            "evidence": "schtasks /Query /TN %s rc=%s" % (task, getattr(r, "returncode", None))}
+
+
+def _schtasks_ensure(task, running_pid=None):
+    """미관리/고아면 `cys daemon install`(기존 Rust schtasks 등록 로직 재사용)로 managed 복원. 멱등(이미 managed=noop).
+    ★schtasks XML 직접 조립 금지 — Rust 단일 소스(cys daemon install)만 사용."""
+    before = _schtasks_status(task, running_pid=running_pid)
+    if before["state"] == "managed":
+        return {"ensured": True, "action": "noop(이미 등록)", "before": before, "after": before}
+    r = cys("daemon", "install", socket=None, timeout=30)
+    after = _schtasks_status(task, running_pid=running_pid)
+    return {"ensured": after["state"] == "managed",
+            "action": "cys daemon install rc=%s" % getattr(r, "returncode", None),
+            "out": (getattr(r, "stdout", "") or getattr(r, "stderr", "") or "").strip()[:300],
+            "before": before, "after": after}
+
+
+def _win_identify_daemon_pid(socket):
+    """cys identify 결과 최상위 daemon_pid(handlers.rs system.identify) 획득 — taskkill 대상 pid.
+    ★데몬 생존 중에만 호출한다(kill 전). 획득 실패 시 None(호출측이 kill 생략하고 재기동만 시도)."""
+    r = cys("identify", socket=socket, timeout=8)
+    txt = getattr(r, "stdout", "") or ""
+    i = txt.find("{")
+    if i < 0:
+        return None
+    try:
+        d = json.loads(txt[i:])
+    except Exception:
+        return None
+    pid = d.get("daemon_pid")
+    if isinstance(pid, int):
+        return pid
+    for k in ("result", "caller"):  # 버전차 방어(감쌈 가능성)
+        v = d.get(k)
+        if isinstance(v, dict) and isinstance(v.get("daemon_pid"), int):
+            return v["daemon_pid"]
+    return None
+
+
+def _win_restart_daemon(socket, timeout):
+    """Windows 재시작 프리미티브(launchd kill 대역): identify→taskkill /T /F→★파이프 해제 폴링→재기동 유발.
+    공통 pong+boot-epoch delta 확증은 호출자(_deploy_restart)가 담당(플랫폼 무관). 반환 dict 는 res 에 병합된다.
+    ★파이프 해제 폴링(socket_death): named pipe first_pipe_instance(true) 단일인스턴스 경합 회피 —
+      새 cysd 가 bind 하기 전에 기존 데몬이 파이프를 놓을 때(ping 무응답)까지 기다린 뒤 재기동을 유발한다
+      (즉시 respawn vs 파이프 해제 race). taskkill /F 는 프로세스를 강제 종료하고 OS 가 종료 시 파이프 인스턴스를 파괴한다."""
+    sdst = _schtasks_status(SUPERVISOR_LABEL)
+    res = {"label": SUPERVISOR_LABEL, "supervisor_before": sdst}
+    pid = _win_identify_daemon_pid(socket)
+    res["daemon_pid"] = pid
+    if pid:
+        try:
+            kr = subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                                capture_output=True, text=True, timeout=15)
+            res["taskkill_rc"] = kr.returncode
+            res["taskkill_out"] = ((kr.stdout or "") + (kr.stderr or "")).strip()[:200]
+        except Exception as e:
+            res["taskkill_rc"] = 127
+            res["taskkill_out"] = str(e)[:200]
+    else:
+        res["taskkill_rc"] = None
+        res["taskkill_out"] = "cys identify 로 daemon_pid 미획득 — kill 생략(재기동만 시도)"
+    # ★파이프 해제(소켓 소멸) 폴링 — 재기동 유발 전 필수(단일인스턴스 경합 회피). ping 은 autostart 안 함(안전 프로브).
+    death = False
+    t0 = time.time()
+    while time.time() - t0 < min(8, timeout):
+        pr = cys("ping", socket=socket, timeout=4)
+        if not (getattr(pr, "returncode", 1) == 0 and "pong" in (getattr(pr, "stdout", "") or "")):
+            death = True
+            break
+        time.sleep(0.3)
+    res["socket_death_observed"] = death
+    # ★재기동 유발: managed=schtasks /Run(등록 태스크 기동) · 비관리/실패=cys list(형제 cysd lazy-spawn 보완).
+    if sdst.get("state") == "managed":
+        rr = _schtasks("/Run", "/TN", SUPERVISOR_LABEL, timeout=10)
+        res["retrigger"] = "schtasks /Run /TN %s rc=%s" % (SUPERVISOR_LABEL, getattr(rr, "returncode", None))
+        if getattr(rr, "returncode", 1) != 0:  # /Run 실패 시 CLI lazy-spawn 폴백
+            lr = cys("list", socket=socket, timeout=15)
+            res["retrigger"] += " → 폴백 cys list rc=%s" % getattr(lr, "returncode", None)
+    else:
+        lr = cys("list", socket=socket, timeout=15)   # list=lazy-spawn(형제 cysd 자동기동)
+        res["retrigger"] = "cys list(lazy-spawn) rc=%s" % getattr(lr, "returncode", None)
+    return res
+
+
+def supervisor_status(label, running_pid=None):
+    """플랫폼 감독자 관리 상태(재부팅/로그온 자동기동 토대). mac=launchd_status · win=_schtasks_status.
+    반환 dict 의 state(managed/orphan/unmanaged) 계약은 양 플랫폼 동일(deploy 게이트가 이 필드만 본다)."""
+    if IS_WINDOWS:
+        return _schtasks_status(label, running_pid=running_pid)
+    return launchd_status(label, running_pid=running_pid)
+
+
+def supervisor_ensure(label, plist=None, running_pid=None):
+    """미관리/고아면 managed 복원(멱등). mac=launchd_ensure(bootstrap) · win=_schtasks_ensure(cys daemon install)."""
+    if IS_WINDOWS:
+        return _schtasks_ensure(label, running_pid=running_pid)
+    return launchd_ensure(label, plist, running_pid=running_pid)
 
 
 # ------------------------------------------------------------------ deploy (Phase 3)
@@ -1226,6 +1409,10 @@ def cmd_launchd_ensure(args):
 
 # launchd 계열(라이브 재시작 경로) — src/launchd.rs 단일 소스(LAUNCHD_LABEL·plist 경로)와 정합.
 LAUNCHD_LABEL = "com.cysjavis.cysd"
+# supervisor 레이블 — mac=launchd label · win=schtasks 태스크명 'cysd'(Rust cys.rs DaemonAction TASK 와 정합).
+#   PHOENIX_SUPERVISOR_LABEL 오버라이드: 격리 스모크가 글로벌 'cysd' 태스크와 분리(예: 존재하지 않는 테스트 태스크명
+#   → schtasks 미등록=unmanaged → 재기동 유발이 커스텀 파이프의 cys list lazy-spawn 경로를 타게 함·교차오염 0).
+SUPERVISOR_LABEL = os.environ.get("PHOENIX_SUPERVISOR_LABEL") or ("cysd" if IS_WINDOWS else LAUNCHD_LABEL)
 
 
 def _launchd_plist_path():
@@ -1304,6 +1491,49 @@ def _render_deploy_runbook(roster):
     return "\n".join(lines) + "\n"
 
 
+def _render_deploy_runbook_ps1(roster):
+    """★Windows 독립 수동 복원 runbook(MANUAL_RESTORE.ps1) — 집행 계층(phoenix/데몬/hook) 비의존 자기완결 평문 PowerShell.
+    cys.exe + schtasks(작업 스케줄러)만으로 사람이 그대로 실행: 로그온 자동기동 토대 재등록 → cys list 로 데몬 기동
+    → cys ping 대기 → 역할별 순차 launch-agent + reinject 나열(§11.1 하한2 독립성 · §10.4 첫 행동=원장 대조).
+    ★Windows 데몬은 사망 시 자동 respawn 이 없다 — schtasks 등록은 '로그온 자동기동' 토대이고, CLI lazy-spawn(cys list)이 보완."""
+    lines = [
+        "# MANUAL_RESTORE.ps1 — 불사조 deploy '독립 수동 복원' 경로 (Windows · M1 출하 조건 · §11.1 하한2 독립성)",
+        "# 자동 부활(cys phoenix)이 불능일 때, 사람이 이 스냅샷 세대 안에서 직접 조직을 재건한다.",
+        "# 의존: cys.exe + schtasks 만 — phoenix/데몬/hook 등 집행 계층 로직에 의존하지 않는다(자기완결 평문).",
+        "# ★참석(attended) 경로 — 사람이 한 줄씩 확인하며 실행(§11.1 하한1: 유인 복구는 어떤 상태에서도 잠기지 않는다).",
+        "$ErrorActionPreference = 'Continue'",
+        "$Here = Split-Path -Parent $MyInvocation.MyCommand.Path",
+        "$Task = '%s'" % SUPERVISOR_LABEL,
+        'Write-Host "== 불사조 수동 복원 (deploy runbook · Windows · 세대 $Here) =="',
+        "",
+        "# 1) 데몬 로그온 자동기동 토대(작업 스케줄러) 재등록(§15 발견3). 사망 시 자동 respawn 은 미지원 — CLI 자동기동이 보완:",
+        "schtasks /Query /TN $Task 2>$null | Out-Null",
+        "if ($LASTEXITCODE -ne 0) {",
+        '  Write-Host "  작업 스케줄러 미등록 → cys daemon install"; cys daemon install',
+        "} else {",
+        '  Write-Host "  (이미 등록됨) schtasks /Run 으로 기동 시도"; schtasks /Run /TN $Task 2>$null | Out-Null',
+        "}",
+        "",
+        "# 2) 데몬 기동 유발(cys list = 형제 cysd lazy-spawn) + named pipe 응답 대기:",
+        "cys list 2>$null | Out-Null",
+        'Write-Host "데몬 named pipe 응답 대기..."',
+        "for ($i = 0; $i -lt 40; $i++) { if ((cys ping 2>$null) -match 'pong') { Write-Host '  pong OK'; break }; Start-Sleep -Milliseconds 500 }",
+        "",
+        "# 3) 역할별 노드 순차 재기동(동시 resume 폭주 방지 §10.4 — 한 줄씩 확인 후 실행):",
+    ]
+    for role in sorted(roster.keys()):
+        agent = (roster.get(role) or {}).get("agent") or "claude"
+        lines.append("cys launch-agent --role %s --agent %s   # 각성 확인 후: cys reinject --role %s"
+                     % (role, agent, role))
+    lines += [
+        "",
+        "Write-Host '★기동 후 첫 행동 = 원장 대조(G2), 작업 재개 아님(§10.4). 각 노드가 SESSION_STATE/자기 TODO 정합 후 대기.'",
+        "Write-Host '※ 이 폴더의 topology.json(세대 스냅샷 사본)에 역할·세션 상세가 있다 — 참조용.'",
+        "",
+    ]
+    return "\n".join(lines) + "\n"
+
+
 def _deploy_snapshot(socket, roster):
     """세대 스냅샷 + ★하한2① 독립 수동 runbook 동봉. 라이브=~/.cys/state-generations + default_sources(전 L1 선언상태),
     격리(--socket 하네스)=<phoenix_home>/state-generations + 소켓 상태 디렉터리의 L1 파일(자동 격리·hermetic)."""
@@ -1332,10 +1562,17 @@ def _deploy_snapshot(socket, roster):
     # 세대 디렉터리 안에 독립 runbook 동봉(자동 부활 불능 시 사람이 이 폴더에서 재건 — 하한2 독립성)
     gen_dir = os.path.join(gen_root, gen_name) if gen_name else os.path.join(phoenix_home(socket), "deploy-manual-fallback")
     os.makedirs(gen_dir, exist_ok=True)
-    runbook = os.path.join(gen_dir, "MANUAL_RESTORE.sh")
-    with open(runbook, "w") as f:
-        f.write(_render_deploy_runbook(roster))
-    os.chmod(runbook, 0o755)
+    if IS_WINDOWS:
+        # Windows 독립 수동 복원 = PowerShell(.ps1). utf-8-sig(BOM)로 써서 Windows PowerShell 5.1도 한글을 utf-8로 읽게 한다.
+        runbook = os.path.join(gen_dir, "MANUAL_RESTORE.ps1")
+        with open(runbook, "w", encoding="utf-8-sig") as f:
+            f.write(_render_deploy_runbook_ps1(roster))
+        # ★.ps1 은 PowerShell 로 실행 — 실행권한 비트(chmod) 개념 없음(생략).
+    else:
+        runbook = os.path.join(gen_dir, "MANUAL_RESTORE.sh")
+        with open(runbook, "w") as f:
+            f.write(_render_deploy_runbook(roster))
+        os.chmod(runbook, 0o755)
     return {"ok": bool(gen_name), "gen_root": gen_root, "gen": gen_name, "gen_dir": gen_dir,
             "runbook": runbook, "snapshot_log": buf.getvalue().strip()[:400]}
 
@@ -1355,6 +1592,10 @@ def _deploy_restart(socket, restart_hook, timeout):
         except subprocess.TimeoutExpired:
             res["hook_rc"] = 124
             res["hook_out"] = "TIMEOUT"
+    elif IS_WINDOWS:
+        # Windows 라이브 재시작(schtasks/taskkill) — launchd kill 대역. 공통 pong+epoch delta 확증은 아래 그대로.
+        res["path"] = "schtasks/taskkill(라이브)"
+        res.update(_win_restart_daemon(socket, timeout))
     else:
         res["path"] = "launchd(라이브)"
         res["label"] = LAUNCHD_LABEL
@@ -1387,8 +1628,9 @@ def _deploy_restart(socket, restart_hook, timeout):
     res["epoch_after"] = epoch_after
     res["boot_epoch_changed"] = (epoch_before is not None and epoch_after is not None and epoch_after != epoch_before)
     if not restart_hook:
-        res["launchd_after"] = launchd_status(LAUNCHD_LABEL)
-        # 관리 무결(KeepAlive intact) 확인 — orphan(관리 이탈)이면 재부팅 자동기동 토대가 약화됨(§15 발견3)
+        # 관리 무결(자동기동 토대 intact) 확인 — orphan(관리 이탈)이면 재부팅/로그온 자동기동 토대가 약화됨(§15 발견3).
+        # ★Windows 는 launchd_status(os.getuid 사용) 대신 supervisor_status(schtasks) — win 에서 os.getuid 미존재 크래시 회피.
+        res["launchd_after"] = supervisor_status(SUPERVISOR_LABEL)
         res["launchd_managed_intact"] = (res["launchd_after"].get("state") == "managed")
     return res
 
@@ -1445,7 +1687,7 @@ def cmd_deploy(args):
         record["honesty_note"] = (
             "★deploy 값만 신뢰하라(자기채점 금지·무출력=성공 해석 금지). COMPLETE=roster 전원 부활+세션 검증. "
             "DEGRADED=전원 부활했으나 일부 세션 미검증(escalation). 그 외(FAILED/APPLY_FAILED/RESTART_FAILED/"
-            "SNAPSHOT_FAILED/BREAKER_OPEN/NO_DAEMON/LAUNCHD_UNMANAGED)=정상 완료 아님(사람/master 개입).")
+            "SNAPSHOT_FAILED/BREAKER_OPEN/NO_DAEMON/SUPERVISOR_UNMANAGED)=정상 완료 아님(사람/master 개입).")
         try:
             _atomic_write_json(os.path.join(phoenix_home(socket), "deploy-%s.json" % ts), record)
         except Exception:
@@ -1478,23 +1720,25 @@ def cmd_deploy(args):
         if not (pong.returncode == 0 and "pong" in (pong.stdout or "")):
             _dmark(j, "preflight", "no_daemon", "데몬 pong 실패 — 배포 착수 거부", epoch=cur_epoch)
             _finish("NO_DAEMON", 6, {"alert": "대상 데몬이 응답하지 않는다(ping 실패). 데몬 기동 후 재시도."})
-        # ★launchd 관리 게이트(라이브 경로만·§15 발견3 고아 재발 방어): 데몬이 launchd 비관리(orphan)면
-        #   재시작 후 KeepAlive respawn 토대가 없어 '재시작=부활 불능'이 된다. 미관리면 기존 Phase11
-        #   launchd_ensure 로 재등록 시도(코드 복제 금지·재사용), 여전히 비관리면 LAUNCHD_UNMANAGED 로 거부.
-        if not restart_hook:  # hook 경로(격리)는 launchd 무관 — 라이브 launchd 경로에만 적용
-            ldst = launchd_status(LAUNCHD_LABEL)
-            if ldst.get("state") != "managed":
-                plist = _launchd_plist_path()
-                ens = launchd_ensure(LAUNCHD_LABEL, plist)  # ★기존 ensure 본체 재사용
+        # ★supervisor 관리 게이트(라이브 경로만·§15 발견3 고아 재발 방어): 데몬이 감독자(mac=launchd·win=schtasks)
+        #   비관리(orphan/unmanaged)면 재시작 자동기동 토대가 약화된다. 미관리면 supervisor_ensure 로 재등록 시도
+        #   (mac=launchd bootstrap · win=`cys daemon install` — 기존 로직 재사용·코드 복제 금지), 여전히 비관리면
+        #   SUPERVISOR_UNMANAGED(exit 8 계약 유지)로 거부. ★win 은 KeepAlive 대응이 없으나(사망 시 CLI lazy-spawn 보완)
+        #   로그온 자동기동 토대(schtasks)의 관리 무결은 동일하게 게이트한다.
+        if not restart_hook:  # hook 경로(격리)는 supervisor 무관 — 라이브 경로에만 적용
+            sdst = supervisor_status(SUPERVISOR_LABEL)
+            if sdst.get("state") != "managed":
+                plist = None if IS_WINDOWS else _launchd_plist_path()
+                ens = supervisor_ensure(SUPERVISOR_LABEL, plist)  # ★기존 ensure 본체 재사용(플랫폼 디스패치)
                 if not ens.get("ensured"):
-                    _dmark(j, "preflight", "launchd_unmanaged",
-                           "launchd 비관리(state=%s)·재등록 실패" % ldst.get("state"),
-                           epoch=cur_epoch, launchd_before=ldst, ensure=ens)
-                    _finish("LAUNCHD_UNMANAGED", 8, {"launchd_status": ldst, "ensure_attempt": ens,
-                            "alert": "대상 데몬이 launchd 관리 밖(state=%s)이라 재시작 후 KeepAlive respawn 토대가 없다 "
-                                     "(재시작=부활 불능). plist=%s 재등록 실패 — 수동으로 "
-                                     "`launchctl bootstrap gui/$(id -u) %s` 후 재시도(§15 발견3 재부팅 자동기동 토대)."
-                                     % (ldst.get("state"), plist, plist)})
+                    _dmark(j, "preflight", "supervisor_unmanaged",
+                           "supervisor 비관리(state=%s)·재등록 실패" % sdst.get("state"),
+                           epoch=cur_epoch, supervisor_before=sdst, ensure=ens)
+                    _finish("SUPERVISOR_UNMANAGED", 8, {"supervisor_status": sdst, "ensure_attempt": ens,
+                            "alert": "대상 데몬이 감독자 관리 밖(state=%s)이라 재시작 자동기동 토대가 없다. "
+                                     "재등록 실패 — mac: `launchctl bootstrap gui/$(id -u) %s` · win: `cys daemon install` "
+                                     "후 재시도(§15 발견3 재부팅/로그온 자동기동 토대)."
+                                     % (sdst.get("state"), plist)})
         # ★roster 조기·단조 영속 — restart 가 topology 를 소거해도 desired 로스터로 restore 가능(§12 침식 면역)
         roster, _tomb = observe_and_persist_roster(socket)
         restore_targets = sorted(r for r in roster if (include_master or r != "master"))
@@ -1618,14 +1862,10 @@ def cmd_deploy(args):
 
 def main():
     global CYS
-    # 플랫폼 가드(Phase12): 무손실 복원은 launchctl·cys launch-agent(unix) 의존 — 비-Mac/Unix(Windows)에서
-    # 호출되면 크래시 대신 정직한 안내로 clean exit. 온디맨드라 자동 실행은 없다.
-    if os.name == "nt":
-        print("불사조 무손실 복원(phoenix)은 현재 macOS/Unix 전용입니다 — "
-              "Windows 패리티는 예정되어 있습니다. "
-              "(phoenix restoration is macOS/Unix-only for now; Windows parity planned.)")
-        return
-    CYS = _which("cys") or "cys"
+    # ★Windows 패리티(S1~S5): 재부팅 자동기동 토대는 mac=launchd·win=schtasks 로 플랫폼 디스패치하고, 경로/소켓은
+    # named pipe→state_dir 매핑으로 해소한다. 과거 os.name=="nt" hard-gate 는 제거됐다 — 전 서브커맨드 Windows 동작.
+    # PHOENIX_CYS 오버라이드: 격리 스모크/CI 가 PATH 밖의 cys.exe 절대경로를 주입(하네스 PHOENIX_HARNESS_CYSD 관례와 정합).
+    CYS = os.environ.get("PHOENIX_CYS") or _which("cys") or "cys"
     ap = argparse.ArgumentParser(description="불사조 부활 저널 상태머신 MVP (M1 게이트)")
     ap.add_argument("--socket", help="대상 데몬 소켓(격리 하네스 소켓 권장 — 라이브 무접촉)")
     sub = ap.add_subparsers(dest="cmd", required=True)

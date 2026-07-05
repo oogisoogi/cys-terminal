@@ -52,11 +52,37 @@ GEN_ROOT = os.path.join(HOME, ".cys", "state-generations")
 #   (모든 사용자 동일 적용 — 개인 경로/계정 무첨가, HOME 파생 상대경로만).
 DECLARATIVE_BASENAMES = ["topology.json", "schedule_state.json", "autopilot.json", "event.seq"]
 
+IS_WINDOWS = os.name == "nt"
 
-def _dept_state_dirs(state_root, depts_json=None):
-    """부서 상태 디렉터리를 동적 발견한다 — 파일시스템 glob(cys-dept-*) ∪ depts.json 소켓 부모.
+# ── Windows named pipe → 상태 디렉터리 매핑 (Rust src/bin/cysd/state.rs::pipe_slug/state_dir 규칙의 단일 소스) ──
+# ★javis_phoenix.py 도 이 두 함수를 재사용한다(중복 구현 금지) — 규칙은 여기 한 곳에만 둔다.
+#   unix 는 소켓 부모가 곧 상태 dir 이지만 Windows 는 파이프에 파일시스템 부모가 없어 슬러그로 파생해야 한다:
+#   기본 데몬(`\\.\pipe\cys`)=%LOCALAPPDATA%\cys · 부서(`\\.\pipe\cys-dept-<n>`)=그 하위 슬러그 디렉터리.
+
+def _win_pipe_slug(socket):
+    """named pipe 경로에서 슬러그 추출 — 역/슬래시 마지막 컴포넌트의 안전문자(영숫자·-·_)만(state.rs::pipe_slug)."""
+    s = str(socket)
+    last = re.split(r"[\\/]", s)[-1] if s else ""
+    return "".join(c for c in last if c.isalnum() or c in "-_")
+
+
+def _win_state_dir_for_socket(socket, localappdata=None, home=HOME):
+    """Windows 소켓(named pipe)→상태 디렉터리(state.rs::state_dir). localappdata 주입 가능(테스트·주입용)."""
+    base = localappdata or os.environ.get("LOCALAPPDATA") or os.path.join(home, "AppData", "Local")
+    root = os.path.join(base, "cys")
+    slug = _win_pipe_slug(socket)
+    if not slug or slug == "cys":
+        return os.path.realpath(root)
+    return os.path.realpath(os.path.join(root, slug))
+
+
+def _dept_state_dirs(state_root, depts_json=None, windows=None, localappdata=None):
+    """부서 상태 디렉터리를 동적 발견한다 — 파일시스템 glob(cys-dept-*) ∪ depts.json 소켓 매핑.
     ★부서명 하드코딩 없음. registry(depts.json)가 stale(미등록 부서 존재)여도 파일시스템 truth 로 커버한다
-    (Phase7 실측: depts.json=dept-1 만인데 디스크엔 dept-1~5 존재 → glob 이 전부 잡는다)."""
+    (Phase7 실측: depts.json=dept-1 만인데 디스크엔 dept-1~5 존재 → glob 이 전부 잡는다).
+    ★Windows(권고#1): 부서 디렉터리는 %LOCALAPPDATA%\\cys 하위(cys-dept-*)이고 registry 소켓은 named pipe 라
+    부모 dirname 이 아니라 _win_state_dir_for_socket 슬러그 매핑으로 상태 dir 을 파생한다(unix=소켓 부모 그대로)."""
+    win = IS_WINDOWS if windows is None else windows
     dirs = set()
     try:
         for name in os.listdir(state_root):
@@ -73,20 +99,33 @@ def _dept_state_dirs(state_root, depts_json=None):
             for _name, meta in (reg.get("depts") or {}).items():
                 sock = (meta or {}).get("socket")
                 if sock:
-                    dirs.add(os.path.realpath(os.path.dirname(sock)))
+                    if win:
+                        dirs.add(os.path.realpath(_win_state_dir_for_socket(sock, localappdata=localappdata)))
+                    else:
+                        dirs.add(os.path.realpath(os.path.dirname(sock)))
         except Exception:
             pass
     return sorted(dirs)
 
 
-def default_sources(home=HOME, state_root=None, depts_json=None):
+def default_sources(home=HOME, state_root=None, depts_json=None, windows=None, localappdata=None):
     """세대 보관 소스를 동적 산출한다(정적 목록 대체). 메인 선언상태 + 루트 레지스트리 +
-    ★발견되는 모든 부서의 선언상태를 자동 포함 = '태어날 때부터 보호'(손 배선 0)."""
-    state_root = state_root or os.path.join(home, ".local", "state")
-    main_state = os.path.join(state_root, "cys")
+    ★발견되는 모든 부서의 선언상태를 자동 포함 = '태어날 때부터 보호'(손 배선 0).
+    ★Windows(권고#1): 메인 상태=%LOCALAPPDATA%\\cys, 부서=그 하위 cys-dept-*(state.rs 레이아웃). unix 는 종전대로
+    <state_root>/cys + <state_root>/cys-dept-*. windows/localappdata 주입으로 mac 에서도 win 분기 단위검증 가능."""
+    win = IS_WINDOWS if windows is None else windows
+    if win:
+        base = localappdata or os.environ.get("LOCALAPPDATA") or os.path.join(home, "AppData", "Local")
+        main_state = os.path.join(base, "cys")
+        dept_scan_root = main_state            # win: 부서는 cys 하위(state.rs 슬러그 레이아웃)
+    else:
+        state_root = state_root or os.path.join(home, ".local", "state")
+        main_state = os.path.join(state_root, "cys")
+        dept_scan_root = state_root             # unix: 부서는 state_root 형제(cys-dept-*)
     srcs = [os.path.join(main_state, b) for b in DECLARATIVE_BASENAMES]
-    srcs.append(os.path.join(home, ".cys", "depts.json"))
-    for dd in _dept_state_dirs(state_root, depts_json=depts_json):
+    depts_json = depts_json or os.path.join(home, ".cys", "depts.json")
+    srcs.append(depts_json)
+    for dd in _dept_state_dirs(dept_scan_root, depts_json=depts_json, windows=win, localappdata=localappdata):
         srcs.extend(os.path.join(dd, b) for b in DECLARATIVE_BASENAMES)
     # ★G1(d)(cokacdir 성찰 2026-07-04): 복원 SOT·노드 TODO·장기기억도 세대 보관에 포함 —
     #   SESSION_STATE.md 는 재부팅 복원의 단일 진실인데 세대 보관 대상에서 빠져 있었다.
@@ -116,7 +155,11 @@ def _sha256(path):
 
 
 def _fsync_path(path):
-    """파일 또는 디렉터리를 fsync 한다(디렉터리는 엔트리 durability 확보)."""
+    """파일 또는 디렉터리를 fsync 한다(디렉터리는 엔트리 durability 확보).
+    ★Windows(S5): 디렉터리 fsync 는 건너뛴다 — Win32 는 디렉터리 핸들 fsync 를 거부(os.open(dir) PermissionError)한다.
+    디렉터리 엔트리 durability 대신 os.rename(동일 볼륨 원자적 승격)에 의존한다(파일 fsync 는 그대로 수행)."""
+    if os.name == "nt" and os.path.isdir(path):
+        return
     flags = os.O_RDONLY
     if hasattr(os, "O_DIRECTORY") and os.path.isdir(path):
         flags |= os.O_DIRECTORY
@@ -354,12 +397,8 @@ def do_verify(gen_root=GEN_ROOT, gen=None):
 def do_self_test():
     """원자성/중단내성 실증. 격리 임시폴더에서만 수행(라이브 상태 불변)."""
     print("=== javis_state_snapshot self-test (격리 임시폴더) ===")
-    # 플랫폼 가드(Phase12): 중단내성 T2는 os.fork(POSIX 전용)로 크래시 주입 — Windows엔 os.fork 부재.
-    # 부분 실행으로 T2를 조용히 건너뛰면 false-green이 되므로, Windows에선 self-test 전체를 [SKIP](PASS 아님)한다.
-    if os.name == "nt":
-        print("  [SKIP] 중단내성 self-test는 os.fork(POSIX) 필요 — Windows 미지원(PASS 아님). "
-              "복원 능력 자체가 macOS/Unix 전용입니다.")
-        return 0
+    # ★Windows(S5): 중단내성 T2 만 os.fork(POSIX 전용)에 의존하므로 그 케이스만 [SKIP] 하고 T1·T3~T6 은 실 수행한다
+    # (블랜킷 skip 은 false-green 이라 폐기 — 원자성·GC·부서 커버리지는 Windows 에서도 실측 검증). 상세는 T2 블록 참조.
     workdir = tempfile.mkdtemp(prefix="cys-snaptest-")
     try:
         src_dir = os.path.join(workdir, "src")
@@ -381,20 +420,25 @@ def do_self_test():
         assert rc == 0, "T1: verify 실패"
         print("  [PASS] T1 정상 세대 생성 + manifest 해시 검증")
 
-        # T2: 중단 시뮬레이션 — 승격 직전 os._exit(자식 프로세스에서)
-        pid = os.fork()
-        if pid == 0:
-            # 자식: 크래시 훅으로 승격 직전 즉사
-            try:
-                do_snapshot(sources=sources, gen_root=gen_root, crash_hook="before_rename")
-            except BaseException:
-                pass
-            os._exit(0)
-        _, status = os.waitpid(pid, 0)
-        gens_after = list_generations(gen_root)
-        assert len(gens_after) == 1, f"T2: 중단인데 세대 증가 {len(gens_after)} (반파 승격 발생!)"
-        tmp_leftover = [n for n in os.listdir(gen_root) if n.startswith(TMP_PREFIX)]
-        print(f"  [PASS] T2 승격 직전 중단 → 최종 세대 미증가(반파 없음), .tmp 잔재 {len(tmp_leftover)}건")
+        # T2: 중단 시뮬레이션 — 승격 직전 os._exit(자식 프로세스에서).
+        # ★Windows(S5): os.fork 는 POSIX 전용 → 이 케이스만 [SKIP](PASS 아님·나머지는 실행). 원자성 자체는 T1/T3 가
+        #   os.rename(동일 볼륨 원자 승격)으로 커버하고, 승격 전 크래시의 반파 회피는 POSIX drill(mac CI)로 확증한다.
+        if os.name == "nt":
+            print("  [SKIP] T2 승격전-중단 내성은 os.fork(POSIX) 필요 — Windows 미지원(mac CI 가 확증). 나머지 케이스는 실행.")
+        else:
+            pid = os.fork()
+            if pid == 0:
+                # 자식: 크래시 훅으로 승격 직전 즉사
+                try:
+                    do_snapshot(sources=sources, gen_root=gen_root, crash_hook="before_rename")
+                except BaseException:
+                    pass
+                os._exit(0)
+            _, status = os.waitpid(pid, 0)
+            gens_after = list_generations(gen_root)
+            assert len(gens_after) == 1, f"T2: 중단인데 세대 증가 {len(gens_after)} (반파 승격 발생!)"
+            tmp_leftover = [n for n in os.listdir(gen_root) if n.startswith(TMP_PREFIX)]
+            print(f"  [PASS] T2 승격 직전 중단 → 최종 세대 미증가(반파 없음), .tmp 잔재 {len(tmp_leftover)}건")
 
         # T3: 잔재 청소 — 다음 스냅샷이 .tmp-* 잔재 청소
         do_snapshot(sources=sources, gen_root=gen_root)
@@ -466,14 +510,8 @@ def do_self_test():
 
 
 def main():
-    # 플랫폼 가드(Phase12): 무손실 복원 Phase0(스냅샷)은 원자성 확보에 디렉터리 fsync(_fsync_path의
-    # os.open, POSIX 전용)를 쓴다 — Windows는 디렉터리 fd 열기를 거부해 do_snapshot/do_gc가 크래시.
-    # 온디맨드라 자동실행은 없으나, 사용자 호출 시 크래시 대신 정직한 안내로 clean exit.
-    if os.name == "nt":
-        print("cys 상태 스냅샷(무손실 복원 Phase0)은 현재 macOS/Unix 전용입니다 — "
-              "Windows 패리티는 예정되어 있습니다. "
-              "(state snapshot restoration is macOS/Unix-only for now; Windows parity planned.)")
-        return 0
+    # ★Windows 패리티(S5): 과거 os.name=="nt" hard-gate 는 제거됐다 — 디렉터리 fsync 를 Windows 에서 건너뛰고
+    # (_fsync_path) os.rename(동일 볼륨 원자 승격)에 의존하므로 snapshot/list/gc/verify 가 Windows 에서 동작한다.
     ap = argparse.ArgumentParser(description="cys 상태 파일 세대 보관기 (무손실 복원 Phase 0)")
     sub = ap.add_subparsers(dest="cmd")
 
