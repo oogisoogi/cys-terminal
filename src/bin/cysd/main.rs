@@ -13,6 +13,7 @@ mod caps;
 mod channels;
 mod classifier;
 mod cost;
+mod deadman;
 mod events;
 mod governance;
 mod handlers;
@@ -202,26 +203,28 @@ async fn accept_loop(daemon: Arc<Daemon>, socket_path: &std::path::Path) {
     // 동시 기동 TOCTOU 차단: 점검-삭제-바인드를 flock으로 직렬화 — 늦게 뜬 데몬이
     // 살아있는 데몬의 소켓 파일을 unlink해 도달 불가 좀비로 만드는 경로를 막는다.
     // 락 파일은 데몬 수명 동안 보유한다.
+    // ★W3: 경합 시 단순 exit(1)이 아니라, 홀더가 hung(무응답 + heartbeat stale)이면 데드맨이
+    // 회수·인수한다. 건강한 홀더/구 락파일(pid 미상)은 fail-closed로 exit(무손실·오살상 차단).
     let lock_path = socket_path.with_extension("lock");
-    let _lock_file = match std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&lock_path)
+    let state_dir = socket_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let _lock_file = acquire_startup_lock(&lock_path, socket_path, &state_dir);
+
+    // ★W3 heartbeat: 승자만 주기적으로 mtime을 갱신한다 → 런타임이 wedge되면 interval 태스크가
+    // 진행하지 못해 자연히 stale이 되고, 다음 경합자의 데드맨이 dead로 판정할 수 있다.
+    // 기동 창(락 획득~첫 주기 touch)은 claim_lock의 동기 초기 touch가 방어한다.
     {
-        Ok(f) => {
-            use std::os::unix::io::AsRawFd;
-            if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-                eprintln!(
-                    "error: another cysd holds the startup lock ({})",
-                    lock_path.display()
-                );
-                std::process::exit(1);
+        let hb = deadman::heartbeat_path(&state_dir);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(deadman::HEARTBEAT_INTERVAL);
+            loop {
+                tick.tick().await;
+                deadman::touch_heartbeat(&hb);
             }
-            Some(f)
-        }
-        Err(_) => None, // 락 파일 생성 실패 — 기존 connect 점검만으로 진행
-    };
+        });
+    }
     // Refuse to start if a live daemon already owns the socket (중복 기동 방지 — 거버넌스 철학).
     if socket_path.exists() {
         if std::os::unix::net::UnixStream::connect(socket_path).is_ok() {
@@ -256,6 +259,84 @@ async fn accept_loop(daemon: Arc<Daemon>, socket_path: &std::path::Path) {
             }
             Err(e) => eprintln!("accept error: {e}"),
         }
+    }
+}
+
+/// ★W3 startup lock 획득 — 경합 시 데드맨 에스컬레이션(hung 홀더 회수·인수)까지 수행한다.
+/// 성공 시 락파일에 자기 pid 기록 + heartbeat 초기 touch 후 락 핸들 반환(데몬 수명 동안 보유).
+/// 락 파일 자체를 못 열면 None(기존 동작 — connect 점검만으로 진행).
+/// 회수 실패·건강한 홀더·구 락파일(pid 미상)은 fail-closed로 exit(1)(dedupe 로그).
+#[cfg(unix)]
+fn acquire_startup_lock(
+    lock_path: &std::path::Path,
+    socket_path: &std::path::Path,
+    state_dir: &std::path::Path,
+) -> Option<std::fs::File> {
+    use std::os::unix::io::AsRawFd;
+    let mut file = match std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(lock_path)
+    {
+        Ok(f) => f,
+        Err(_) => return None, // 락 파일 생성 실패 — 기존 connect 점검만으로 진행
+    };
+    let try_flock =
+        |f: &std::fs::File| unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 };
+
+    if try_flock(&file) {
+        deadman::claim_lock(&mut file, state_dir);
+        return Some(file);
+    }
+
+    // 경합: 현재 홀더 상태 진단(pid·소켓 응답·heartbeat 신선도) → 판정.
+    let holder_pid = deadman::read_holder_pid(lock_path);
+    let responded = deadman::probe_holder(socket_path, deadman::PROBE_TIMEOUT);
+    let hb_stale = deadman::heartbeat_stale(
+        &deadman::heartbeat_path(state_dir),
+        deadman::HEARTBEAT_STALE_THRESHOLD,
+    );
+    match deadman::judge_holder(holder_pid, responded, hb_stale) {
+        deadman::HolderVerdict::Dead => {
+            // 홀더 hung 확정 → 회수(SIGTERM→SIGKILL, cysd 검증 후) → 락 1회 재획득 시도.
+            let pid = holder_pid.expect("Dead 판정은 pid 존재를 함의");
+            if deadman::reclaim_from_dead_holder(pid, deadman::RECLAIM_GRACE, deadman::pid_is_cysd)
+                && try_flock(&file)
+            {
+                deadman::claim_lock(&mut file, state_dir);
+                eprintln!("[cysd] deadman: reclaimed startup lock from dead holder (pid {pid})");
+                return Some(file);
+            }
+            log_lock_loss(state_dir, lock_path, "dead-holder-reclaim-failed");
+            std::process::exit(1);
+        }
+        deadman::HolderVerdict::Healthy => {
+            log_lock_loss(state_dir, lock_path, "healthy-holder");
+            std::process::exit(1);
+        }
+        deadman::HolderVerdict::FailClosed => {
+            // 구 락파일(pid 미상) — 오살상 방지 위해 개입하지 않고 exit.
+            log_lock_loss(state_dir, lock_path, "unknown-holder-pid");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// ★W3 crashloop 로그 dedupe — 동일 사유 연속 패배는 N회당 1줄만(누적 카운트 병기).
+/// 상태는 state_dir 파일 기반(프로세스가 매번 새로 뜨므로 in-memory 불가).
+#[cfg(unix)]
+fn log_lock_loss(state_dir: &std::path::Path, lock_path: &std::path::Path, reason: &str) {
+    let state_path = state_dir.join("lockloss.state");
+    let prev = std::fs::read_to_string(&state_path).ok();
+    let (should_log, count, new_state) =
+        deadman::dedupe_loss_log(prev.as_deref(), reason, deadman::LOCK_LOSS_LOG_EVERY_N);
+    let _ = std::fs::write(&state_path, new_state);
+    if should_log {
+        eprintln!(
+            "error: another cysd holds the startup lock ({}) — reason={reason}, occurrence #{count}",
+            lock_path.display()
+        );
     }
 }
 

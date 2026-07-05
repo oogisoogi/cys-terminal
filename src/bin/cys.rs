@@ -1181,8 +1181,22 @@ fn spawn_detached_daemon(path: &std::path::Path) -> std::io::Result<()> {
     cmd.spawn().map(|_| ())
 }
 
+/// socket-ready 실측 폴링(최대 4초=40×100ms). launchd kickstart·sibling spawn 양 경로가 공유.
+fn poll_socket_ready() -> Option<ConnStream> {
+    for _ in 0..40 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if let Ok(s) = connect_raw() {
+            return Some(s);
+        }
+    }
+    None
+}
+
 /// 온보딩④: 연결 실패 시 형제 cysd를 자동 기동 후 재시도 — 신규 머신 zero-setup.
 /// 옵트아웃: CYS_NO_AUTOSTART=1. (데몬 중복 기동은 cysd 자체의 flock이 차단)
+/// ★W3: macOS에서 launchd가 cysd를 소유(적재)하면 sibling spawn 대신 launchctl kickstart로
+/// 위임한다 — 구형 CLI가 자기 옆 구형 cysd를 띄워 startup lock을 선점하고 launchd 신형과
+/// crashloop 하는 경로를 원천 차단. kickstart 실패·폴링 타임아웃 시에만 sibling fallback(개발 환경).
 fn connect() -> Result<ConnStream, String> {
     match connect_raw() {
         Ok(s) => Ok(s),
@@ -1196,6 +1210,23 @@ fn connect() -> Result<ConnStream, String> {
             {
                 return Err(first);
             }
+            // launchd 위임 우선(macOS·적재 시). 실패 시 아래 sibling 경로로 폴백.
+            #[cfg(target_os = "macos")]
+            {
+                if cys::launchd::should_delegate_autostart(cys::launchd::is_loaded()) {
+                    eprintln!("[cys] cysd not serving — delegating to launchd (launchctl kickstart)");
+                    if cys::launchd::kickstart() {
+                        if let Some(s) = poll_socket_ready() {
+                            return Ok(s);
+                        }
+                        eprintln!(
+                            "[cys] launchd kickstart did not yield a socket within 4s — falling back to sibling spawn"
+                        );
+                    } else {
+                        eprintln!("[cys] launchctl kickstart failed — falling back to sibling spawn");
+                    }
+                }
+            }
             let Some(daemon) = sibling_daemon_path() else {
                 return Err(format!("{first} (no sibling cysd to autostart)"));
             };
@@ -1203,13 +1234,8 @@ fn connect() -> Result<ConnStream, String> {
             if spawn_detached_daemon(&daemon).is_err() {
                 return Err(first);
             }
-            for _ in 0..40 {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                if let Ok(s) = connect_raw() {
-                    return Ok(s);
-                }
-            }
-            Err(format!("{first} (autostarted cysd did not come up within 4s)"))
+            poll_socket_ready()
+                .ok_or_else(|| format!("{first} (autostarted cysd did not come up within 4s)"))
         }
     }
 }

@@ -63,6 +63,31 @@ pub fn is_loaded() -> bool {
         .unwrap_or(false)
 }
 
+/// ★W3: CLI autostart가 launchd에 위임할지 판정(순수 함수). launchd가 cysd 서비스를 적재
+/// 중이면 sibling spawn 대신 `launchctl kickstart`로 위임한다 — 구형 CLI가 자기 옆 구형 cysd를
+/// 띄워 startup lock을 선점하고 launchd 신형(KeepAlive)과 crashloop 하는 경로를 원천 차단.
+pub fn should_delegate_autostart(loaded: bool) -> bool {
+    loaded
+}
+
+/// ★W3: `launchctl kickstart` 인자(순수 함수 — 테스트 가능). service target = gui/<uid>/<label>.
+/// 미가동이면 즉시 기동하고, throttle(crashloop 억제)로 대기 중이어도 강제 기동한다.
+pub fn kickstart_args(uid: u32) -> [String; 2] {
+    ["kickstart".to_string(), format!("gui/{uid}/{LAUNCHD_LABEL}")]
+}
+
+/// launchd에 적재된 cysd 서비스를 kickstart(미가동이면 기동). 성공 여부 반환.
+/// current uid로 gui 도메인 타깃을 구성한다(로그인 세션의 사용자 데몬).
+pub fn kickstart() -> bool {
+    let uid = unsafe { libc::getuid() };
+    let args = kickstart_args(uid);
+    std::process::Command::new("launchctl")
+        .args(args.iter().map(String::as_str))
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 /// plist 본문에서 ProgramArguments의 첫 `<string>`(=cysd 경로, XML 이스케이프된 형태)을 추출.
 /// stale drift(plist가 옛 cysd 경로를 가리킴) 감지에 쓴다. 순수 함수(테스트 가능).
 fn extract_program_path(content: &str) -> Option<String> {
@@ -258,6 +283,24 @@ mod tests {
         assert_eq!(extract_program_path(&plist).as_deref(), Some("/Users/x/a&amp;b/MacOS/cysd"));
         // 깨진 입력은 None.
         assert_eq!(extract_program_path("no program args here"), None);
+    }
+
+    #[test]
+    fn should_delegate_autostart_iff_launchd_loaded() {
+        // ★W3 (d): launchd 적재 시 위임(kickstart), 미적재 시 sibling spawn 경로.
+        assert!(should_delegate_autostart(true), "적재=위임");
+        assert!(!should_delegate_autostart(false), "미적재=sibling");
+    }
+
+    #[test]
+    fn kickstart_args_targets_gui_domain_label() {
+        // ★W3 (d): service target = gui/<uid>/<label> — 로그인 세션 사용자 데몬.
+        assert_eq!(
+            kickstart_args(501),
+            ["kickstart".to_string(), "gui/501/com.cysjavis.cysd".to_string()]
+        );
+        // uid는 그대로 반영(다른 사용자 오타깃 방지).
+        assert_eq!(kickstart_args(0)[1], "gui/0/com.cysjavis.cysd");
     }
 
     #[test]
