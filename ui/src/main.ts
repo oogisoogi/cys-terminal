@@ -1681,6 +1681,46 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
       ta.addEventListener("blur", () => flushPending("blur"));
     }
   }
+
+  // ── WKWebView 마우스 선택 폭주 수정 (버그 티켓 이슈#2 · "버튼 없이 이동만 해도 블록") ──
+  //   증상: pane 클릭(mousedown→mouseup) 후 버튼을 안 눌러도 커서 이동만으로 텍스트 선택이
+  //   계속 확장된다. 근본: 이 wry WKWebView는 클릭 뒤 mouseup 이벤트를 간헐 유실 → xterm.js
+  //   SelectionService의 드래그-선택 상태가 종료되지 않아 이후 mousemove가 전부 선택을 확장한다
+  //   (xterm은 mousedown에서 document에 mousemove/mouseup 리스너를 걸고 mouseup에서 해제하는데,
+  //   그 mouseup이 안 와서 리스너가 살아 있는 상태). 형태 기반이 아니라 "버튼 상태" 기반으로 막는다:
+  //   버튼이 안 눌린 채(mousemove의 e.buttons===0) 이동이 들어오면 = 드래그가 끝났어야 하는데
+  //   안 끝난 것 → xterm/네이티브가 알아듣도록 합성 mouseup을 던져 드래그 상태를 강제 종료한다.
+  //   가드: ①isWKWebView 한정(다른 웹뷰는 mouseup 정상 → 무영향) ②mousedown 이후 첫 button0
+  //   이동에서만 1회 발화(모든 hover 이동마다 던지지 않음 — 스팸/부작용 0) ③실제 드래그-선택은
+  //   e.buttons&1 이라 여기 안 걸림(정상 선택 보존). 합성 mouseup은 드래그 없을 때 무해(no-op).
+  if (isWKWebView) {
+    let pointerDownSeen = false;
+    termHost.addEventListener("mousedown", () => { pointerDownSeen = true; }, true);
+    termHost.addEventListener(
+      "mousemove",
+      (e) => {
+        if (e.buttons === 0 && pointerDownSeen) {
+          pointerDownSeen = false; // 에피소드당 1회 — 재무장은 다음 mousedown에서
+          const screen =
+            (termHost.querySelector(".xterm-screen") as HTMLElement | null) ?? termHost;
+          // 유실된 mouseup을 합성 — xterm document 리스너로 버블되어 드래그-선택을 종료시킨다.
+          screen.dispatchEvent(
+            new MouseEvent("mouseup", {
+              bubbles: true,
+              cancelable: true,
+              view: window,
+              button: 0,
+              buttons: 0,
+              clientX: e.clientX,
+              clientY: e.clientY,
+            }),
+          );
+        }
+      },
+      true,
+    );
+  }
+
   el.addEventListener("mousedown", () => setFocus(sid));
   term.textarea?.addEventListener("focus", () => setFocus(sid));
 
