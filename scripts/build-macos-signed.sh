@@ -86,27 +86,12 @@ env -u APPLE_ID -u APPLE_PASSWORD -u APPLE_TEAM_ID -u APPLE_API_KEY -u APPLE_API
 
 APP="target/release/bundle/macos/cys.app"
 DMG="target/release/bundle/dmg/cys_${VERSION}_aarch64.dmg"
-RTGIT="$APP/Contents/Resources/runtime/git"
 
-# ── git-core 빌트인 dedup (Tauri 역참조 되돌리기) ──
-# libexec/git-core 안에서 git-core/git 과 '바이트 동일'한 파일만 동일 디렉토리 심볼릭링크(git)로 치환.
-# 결정론: 크기 일치 → cmp 바이트 대조 통과분만(git-lfs·GCM .dll/.dylib·remote 헬퍼 등 비동일 파일 불가침).
-# bin/git 만 실본으로 남고 143개 빌트인은 argv[0] 디스패치로 정상(실측: init/add/commit/stash/log/직접호출 OK).
+# ── git-core 빌트인 dedup (Tauri 역참조 되돌리기) — 공유 스크립트로 통일 ──
+# 로직·기준점(libexec/git-core/git)·자기제외·동일디렉토리 링크·잔존 중복본 가드는
+# scripts/dedup-git-core.sh 단일 출처(.github/workflows/release.yml CI 경로와 공유 — 드리프트 방지).
 echo "== runtime/git dedup (git-core 빌트인 → 동일 디렉토리 git 심볼릭링크) =="
-# ★기준점은 bin/git 이 아니라 libexec/git-core/git — Tauri가 역참조하는 원본이 git-core/git 이고,
-#   위 inside-out 재서명이 bin/git·git-core/git 을 각각 서명해 CMS 블롭(타임스탬프)이 달라지므로
-#   bin/git 대조는 서명 빌드에서 0건이 된다(2026-07-04 풀런 실측). 링크도 동일 디렉토리 `git`으로
-#   (dugite 원본 타르볼 레이아웃과 동일). 기준 파일 자신은 스캔에서 제외(자기링크 방지).
-REF="$RTGIT/libexec/git-core/git"; REF_SIZE="$(stat -f '%z' "$REF")"
-DEDUP_BEFORE_KB="$(du -sk "$RTGIT" | awk '{print $1}')"; DEDUP_N=0
-while IFS= read -r -d '' f; do
-  if [ "$f" != "$REF" ] && [ "$(stat -f '%z' "$f")" = "$REF_SIZE" ] && cmp -s "$f" "$REF"; then
-    ln -sf "git" "$f"; DEDUP_N=$((DEDUP_N+1))
-  fi
-done < <(find "$RTGIT/libexec/git-core" -type f -print0)
-DEDUP_AFTER_KB="$(du -sk "$RTGIT" | awk '{print $1}')"
-echo "  ✓ 빌트인 ${DEDUP_N}개 링크화 · runtime/git $((DEDUP_BEFORE_KB/1024))MB → $((DEDUP_AFTER_KB/1024))MB"
-[ "$DEDUP_N" -ge 100 ] || { echo "  ✗ dedup 대상($DEDUP_N)이 비정상적으로 적음 — 트리 구조 확인 후 중단"; exit 1; }
+bash scripts/dedup-git-core.sh "$APP"
 
 # dedup은 Resources를 바꿔 Tauri가 봉인한 외부 앱 서명을 깬다 → 외부 앱 서명만 재봉인(--force · ★--deep 금지).
 # 중첩 Mach-O(pre-sign된 runtime bin/git·Tauri가 서명한 sidecar/framework/메인바이너리)는 그대로 유효하다.
