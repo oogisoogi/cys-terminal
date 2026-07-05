@@ -1670,9 +1670,21 @@ pub fn reconcile(daemon: &Arc<Daemon>) {
         // ① 고아 선-kill(구 토큰 브리지의 이중 연결·블랙홀 차단).
         if let Some(pid) = old_pid {
             if pid_alive(pid as u32) {
-                crate::governance::kill_group_or_pid(pid as u32, old_pgid.unwrap_or(pid) as i32);
+                // MED-4: killpg 직전 정체 재확인. 브리지는 setsid로 스폰돼 pgid==pid(세션 리더)이므로,
+                // 지금 관측한 pgid가 저장된 old_pgid와 일치(둘 다 Some & 상등)할 때만 kill한다.
+                // 재사용된 pid는 우리 세션 리더 pgid를 거의 공유하지 않음 → pgid 일치가 정체 프록시.
+                // 불일치=이미 죽은 브리지(스킵 안전·되살아난 무관 그룹 오살상 방지). old_pgid None(검증 불가)도 보수적 스킵.
+                let now_pgid = pgid_of(pid as u32);
+                match (old_pgid, now_pgid) {
+                    (Some(stored), Some(cur)) if stored as i32 == cur => {
+                        crate::governance::kill_group_or_pid(pid as u32, cur);
+                    }
+                    _ => {
+                        eprintln!("[cysd] channels: '{channel}' pid {pid} pgid mismatch (stored {old_pgid:?}, now {now_pgid:?}) — stale pid reuse, skip kill");
+                    }
+                }
             }
-            daemon.ledger.lock().unwrap().remove(&(pid as u32));
+            daemon.ledger.lock().unwrap().remove(&(pid as u32)); // stale 엔트리 정리(kill 여부 무관).
         }
         // ② 새 토큰으로 재스폰(bridge_cmd 있을 때만).
         let Some(cmd) = bridge_cmd else {
