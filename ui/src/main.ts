@@ -1559,6 +1559,14 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
   //   직접 타이핑한 낱자모(ㅋㅋㅋ)는 insertText→pendingHangul 머신 경로로 정상 전송된다.
   let sawNativeComposition = false;
   let pasting = false;
+  // ★2차 누출(2026-07-05 고속 타이핑 실측): WebKit이 다음 음절 초기 상태를 자모가 아닌
+  //   완성형 음절(느·그·지…)로 insertText 커밋하면 자모 필터를 통과해 이중 경로가 재현된다
+  //   ("치느는"·"게게" — 중간 조합 상태 겹침). ∴ 머신이 활성인 pane에서는 onData의 순수
+  //   한글(자모+음절)을 전부 차단해 머신을 한글의 유일 전송자로 만든다. machineActive는
+  //   keydown 229(IME 조합 — input 이벤트보다 항상 선행)에서 세팅되므로 첫 음절 경주 없음.
+  //   머신이 작동하지 않는 웹뷰(insertCompositionText형)에서는 latch가 false로 남아
+  //   차단이 걸리지 않는다 — 과거 "너는 마스터다"→"는 다" 통유실 회귀 원천 차단.
+  let machineActive = false;
   const isJamoOnly = (t: string) => /^[\u3131-\u318E\u1100-\u11FF]+$/.test(t);
   // 자모(31xx·11xx) + 완성형 음절(AC00-D7A3) — ★멀티문자 허용(2026-06-13): 고속 입력에서
   // IME가 여러 음절을 한 insertText로 병합 커밋하는데, 단일 문자만 인정하면 그 묶음이
@@ -1586,9 +1594,17 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
     //   "순수 자모" onData는 여기서 버린다. flushPending을 이 분기에서 부르지 않는 것이
     //   핵심 — 부르면 pending 음절이 자모 시점에 조기 전송되어 이중 경로가 재현된다.
     //   가드: WKWebView 한정 · 네이티브 composition 관측 시 해제 · 붙여넣기 통과.
-    if (isWKWebView && !sawNativeComposition && !pasting && isJamoOnly(data)) {
-      dbg(`DROP(onData-jamo) "${data}"`);
-      return;
+    if (isWKWebView && !sawNativeComposition && !pasting) {
+      if (isJamoOnly(data)) {
+        dbg(`DROP(onData-jamo) "${data}"`);
+        return;
+      }
+      // 2차: 머신 활성 pane에서는 음절 포함 순수 한글도 xterm 코어 emit을 차단
+      // (중간 조합 상태 "느"류 — 최종형은 머신 flush가 단일 전송한다)
+      if (machineActive && isHangulText(data)) {
+        dbg(`DROP(onData-hangul) "${data}"`);
+        return;
+      }
     }
     flushPending("onData"); // (no-op 안전장치: 잔여 pending 있으면 순서 보존 후 전송)
     sendRaw(data);
@@ -1626,6 +1642,7 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
         dbg(`input ${ie.inputType} data="${ie.data ?? "∅"}" pending="${pendingHangul}"`);
         if (sawNativeComposition) return; // 네이티브 composition 처리 위임 — insertText 머신 비활성
         if (ie.inputType === "insertText" && ie.data && isHangulText(ie.data)) {
+          machineActive = true; // keydown 229 미발화 변종 대비 이중 래치
           // 직전 조합 확정 후 새 커밋을 '수정 가능 창'(pending)에 둔다. 병합 커밋
           // (2음절+)은 마지막 음절만 수정 창에 — 앞 음절들은 확정분이므로 즉시 전송
           // (replacement 재조합은 마지막 음절 단위로 온다).
@@ -1650,6 +1667,9 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
         }
       });
       ta.addEventListener("keydown", (e) => {
+        // IME 조합 keydown(229)은 항상 input 이벤트보다 선행 — 머신 활성 래치를 여기서
+        // 세팅해 첫 음절부터 onData 한글 차단이 경주 없이 걸리게 한다.
+        if (e.keyCode === 229) machineActive = true;
         if (imeDbg && e.keyCode !== 229) dbg(`keydown ${e.key}`);
         // 일반 키(Enter·Space·화살표 등, IME 처리중 229 제외) 직전에 조합 확정
         if (e.keyCode !== 229) flushPending("keydown");
