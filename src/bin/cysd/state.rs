@@ -1303,6 +1303,11 @@ impl Daemon {
                         let mut probe = dsr_tail.clone();
                         probe.extend_from_slice(chunk);
                         let needs_dsr = probe.windows(4).any(|w| w == b"\x1b[6n");
+                        // attach 브로드캐스트 페이로드는 락 '밖'에서 복사한다 — send 자체는 아래
+                        // 불변식상 parser 락 안이어야 하지만, chunk 복사(최대 16KB)까지 락 안에서
+                        // 하면 대량출력 시 락 보유 시간이 memcpy만큼 늘어 read-screen·status·attach의
+                        // .screen() 접근을 불필요하게 블록한다. 복사를 앞당겨 락 임계영역은 send만 남긴다.
+                        let attach_payload = chunk.to_vec();
                         // 파서 반영(process)과 attach 브로드캐스트(out_tx.send)를 같은 parser 락
                         // 임계영역에 묶는다 — run_attach가 parser 락 아래에서 구독+스냅샷을 뜨므로,
                         // 이 둘이 분리되면(과거 버그) process 이후·send 이전에 구독한 attach가
@@ -1333,7 +1338,7 @@ impl Daemon {
                                     None
                                 }
                             };
-                            let _ = surf.out_tx.send(chunk.to_vec());
+                            let _ = surf.out_tx.send(attach_payload);
                             resp
                         };
                         if let Some(resp) = dsr_resp {
@@ -1443,8 +1448,11 @@ impl Daemon {
         if cut == 0 {
             return;
         }
-        let drained: Vec<u8> = st.carry.drain(..cut).collect();
-        let stripped = strip_ansi_escapes::strip(&drained);
+        // strip을 carry 슬라이스에서 직접 수행한 뒤 그 구간을 버린다 — 중간 `drained` Vec
+        // 할당(청크당 최대 cut바이트)을 제거한다. drain(..cut)은 반환 이터레이터 drop 시
+        // 해당 구간을 삭제하므로 collect 없이도 carry가 동일하게 전진한다(산출 불변).
+        let stripped = strip_ansi_escapes::strip(&st.carry[..cut]);
+        st.carry.drain(..cut);
         let text = String::from_utf8_lossy(&stripped);
         let mut completed: Vec<String> = Vec::new();
         for ch in text.chars() {
@@ -2432,8 +2440,8 @@ mod tests {
         if cut == 0 {
             return;
         }
-        let drained: Vec<u8> = st.carry.drain(..cut).collect();
-        let stripped = strip_ansi_escapes::strip(&drained);
+        let stripped = strip_ansi_escapes::strip(&st.carry[..cut]);
+        st.carry.drain(..cut);
         let text = String::from_utf8_lossy(&stripped);
         for ch in text.chars() {
             if st.pending_cr {
@@ -2659,6 +2667,122 @@ mod tests {
         // 종결 'm' 도착 → 컬러코드 strip, 잔여 본문 없음(개행 전이라 partial도 비음)
         ingest_step(&mut st2, b"m\n", &mut out2);
         assert_eq!(out2, vec!["x".to_string(), "".to_string()]);
+    }
+
+    // D5 개선 전(pre-refactor) ingest 라인분할을 그대로 재현한 참조 구현 —
+    // `drained` 중간 Vec를 collect한 뒤 strip한다. 개선 후 `ingest_step`(carry 슬라이스
+    // 직접 strip + drain)과 산출이 바이트 단위로 동일함을 증명하는 데만 쓴다.
+    fn ingest_step_pre_refactor(st: &mut IngestState, chunk: &[u8], out: &mut Vec<String>) {
+        st.carry.extend_from_slice(chunk);
+        let mut cut = st.carry.len();
+        if let Some(esc) = st.carry.iter().rposition(|&b| b == 0x1b) {
+            let tail = &st.carry[esc..];
+            if tail.len() < 128 && ansi_incomplete(tail) {
+                cut = esc;
+            }
+        }
+        cut = match std::str::from_utf8(&st.carry[..cut]) {
+            Ok(_) => cut,
+            Err(e) if e.error_len().is_none() => e.valid_up_to(),
+            Err(_) => cut,
+        };
+        if cut == 0 {
+            return;
+        }
+        let drained: Vec<u8> = st.carry.drain(..cut).collect();
+        let stripped = strip_ansi_escapes::strip(&drained);
+        let text = String::from_utf8_lossy(&stripped);
+        for ch in text.chars() {
+            if st.pending_cr {
+                st.pending_cr = false;
+                if ch == '\n' {
+                    out.push(std::mem::take(&mut st.partial));
+                    continue;
+                }
+                st.partial.clear();
+            }
+            match ch {
+                '\n' => out.push(std::mem::take(&mut st.partial)),
+                '\r' => st.pending_cr = true,
+                _ => {
+                    if st.partial.len() < 8192 {
+                        st.partial.push(ch);
+                    }
+                }
+            }
+        }
+    }
+
+    // D5 hard gate: strip 슬라이스 직접화 + drained 할당 제거가 산출을 1비트도 바꾸지
+    // 않는다. ANSI 색·커서이동·CRLF·단독CR·TAB·한글 멀티바이트·미완성 ESC/UTF-8 꼬리를
+    // 모두 섞은 표본을, 청크 경계를 어긋나게 쪼개 흘려도 개선 전후 라인 목록·carry·partial·
+    // pending_cr 상태가 완전히 일치해야 한다.
+    #[test]
+    fn ingest_refactor_output_bit_identical_to_pre_refactor() {
+        let mut sample: Vec<u8> = Vec::new();
+        sample.extend_from_slice("\x1b[31mRED\x1b[0m\tTAB\r\n".as_bytes()); // 색+TAB+CRLF
+        sample.extend_from_slice("progress 10%\rprogress 100%\n".as_bytes()); // 단독 CR 프레임 연결
+        sample.extend_from_slice("\x1b[2J\x1b[H가나다 한글 라인\n".as_bytes()); // 화면소거 CSI + 한글
+        sample.extend_from_slice("no-newline-partial".as_bytes()); // 개행 없는 꼬리(partial 보류)
+        sample.extend_from_slice("\x1b[1;32m더".as_bytes()); // SGR + 한글
+        sample.extend_from_slice(&"가".as_bytes()[..2]); // 미완성 멀티바이트 꼬리(0xea 0xb0)
+        let sample: &[u8] = &sample;
+        // 여러 청크 크기로 경계를 어긋나게 쪼개 상태기계 인터리빙을 커버
+        for split in [1usize, 2, 3, 5, 7, 13, 16, 64, sample.len()] {
+            let mut st_new = fresh();
+            let mut out_new = Vec::new();
+            let mut st_ref = fresh();
+            let mut out_ref = Vec::new();
+            for piece in sample.chunks(split.max(1)) {
+                ingest_step(&mut st_new, piece, &mut out_new);
+                ingest_step_pre_refactor(&mut st_ref, piece, &mut out_ref);
+            }
+            assert_eq!(out_new, out_ref, "split={split}: 완성 라인 목록 불일치");
+            assert_eq!(st_new.partial, st_ref.partial, "split={split}: partial 불일치");
+            assert_eq!(st_new.carry, st_ref.carry, "split={split}: carry 불일치");
+            assert_eq!(
+                st_new.pending_cr, st_ref.pending_cr,
+                "split={split}: pending_cr 불일치"
+            );
+        }
+    }
+
+    // D5 드레인 처리량 마이크로벤치 — 실 PTY 없이 ingest 라인분할만 직접 구동해 개선 전후
+    // 단일스레드 처리 시간을 비교한다(할당 제거 효과 측정). `cargo test -- --nocapture`로
+    // 수치 확인. 정확한 비율은 hard gate가 아니므로 assert는 회귀 안전(개선판이 참조판보다
+    // 크게 느리지 않음)만 건다.
+    #[test]
+    fn ingest_drain_throughput_bench() {
+        // ~4MB ANSI 혼합 데이터 생성(색코드 + 한글 + 개행)
+        let mut data: Vec<u8> = Vec::with_capacity(4 * 1024 * 1024);
+        let unit = "\x1b[31m로그\x1b[0m line item with some text 가나다라\n".as_bytes();
+        while data.len() < 4 * 1024 * 1024 {
+            data.extend_from_slice(unit);
+        }
+        let run = |f: &dyn Fn(&mut IngestState, &[u8], &mut Vec<String>)| -> (std::time::Duration, usize) {
+            let mut st = fresh();
+            let mut out = Vec::new();
+            let start = std::time::Instant::now();
+            for piece in data.chunks(16 * 1024) {
+                f(&mut st, piece, &mut out);
+                out.clear(); // 다운스트림 소비 흉내(scrollback으로 빠짐) — 메모리 성장 방지
+            }
+            (start.elapsed(), st.carry.len())
+        };
+        let (t_ref, _) = run(&ingest_step_pre_refactor);
+        let (t_new, _) = run(&ingest_step);
+        eprintln!(
+            "[D5 bench] {}MB ANSI-mixed | pre-refactor={:?} refactored={:?} (Δ={:.1}%)",
+            data.len() / (1024 * 1024),
+            t_ref,
+            t_new,
+            (t_new.as_secs_f64() - t_ref.as_secs_f64()) / t_ref.as_secs_f64() * 100.0
+        );
+        // 회귀 가드: 개선판이 참조판 대비 크게 느려지면(2배+) 실패 — 노이즈 허용 상한.
+        assert!(
+            t_new <= t_ref * 2,
+            "refactored ingest가 pre-refactor보다 2배+ 느림 (회귀): {t_new:?} vs {t_ref:?}"
+        );
     }
 
     #[test]
