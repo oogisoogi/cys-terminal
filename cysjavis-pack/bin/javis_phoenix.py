@@ -1334,11 +1334,24 @@ def _schtasks(*args, timeout=10):
         return _R()
 
 
+def _schtasks_has_restart_on_failure(task):
+    """schtasks /Query /XML 에 RestartOnFailure 존재 여부(=진짜 KeepAlive 켜짐 · Rust cys daemon install 이 심는 XML).
+    ★null 바이트 제거로 UTF-16/UTF-8 출력 모두에서 ASCII 태그를 안정 검출(UTF-16LE 는 ASCII 사이에 0x00 이 낀다)."""
+    try:
+        r = subprocess.run(["schtasks", "/Query", "/TN", task, "/XML"], capture_output=True, timeout=8)
+        raw = (r.stdout or b"").replace(b"\x00", b"")
+        return b"RestartOnFailure" in raw
+    except Exception:
+        return False
+
+
 def _schtasks_status(task, running_pid=None):
-    """schtasks 등록 상태 분류(읽기 전용) — launchd_status 의 Windows 대응. KeepAlive 대응 없음(keepalive=None).
+    """schtasks 등록 상태 분류(읽기 전용) — launchd_status 의 Windows 대응.
       managed   : `schtasks /Query /TN <task>` 존재(등록됨) — 로그온 자동기동 토대 intact
       orphan    : 미등록 + 프로세스는 살아있음(running_pid) — 로그온 시 자동기동 안 됨(관리 이탈)
-      unmanaged : 미등록 + 프로세스도 없음(등록 자체 부재)."""
+      unmanaged : 미등록 + 프로세스도 없음(등록 자체 부재).
+    ★keepalive: 등록됐고 XML 에 RestartOnFailure(진짜 KeepAlive·사망 시 자동 재기동)가 있으면 True, 없으면 False
+      (구버전 install=ONLOGON 만·재기동 없음). launchd_status(keepalive) 계약과 대칭."""
     r = _schtasks("/Query", "/TN", task, timeout=8)
     registered = (getattr(r, "returncode", 1) == 0)
     if registered:
@@ -1347,9 +1360,10 @@ def _schtasks_status(task, running_pid=None):
         state = "orphan"
     else:
         state = "unmanaged"
-    return {"label": task, "loaded": registered, "keepalive": None, "runatload": registered,
+    keepalive = _schtasks_has_restart_on_failure(task) if registered else False
+    return {"label": task, "loaded": registered, "keepalive": keepalive, "runatload": registered,
             "state": state, "supervisor": "schtasks",
-            "evidence": "schtasks /Query /TN %s rc=%s" % (task, getattr(r, "returncode", None))}
+            "evidence": "schtasks /Query /TN %s rc=%s restart_on_failure=%s" % (task, getattr(r, "returncode", None), keepalive)}
 
 
 def _schtasks_ensure(task, running_pid=None):
@@ -1771,8 +1785,8 @@ def cmd_deploy(args):
         # ★supervisor 관리 게이트(라이브 경로만·§15 발견3 고아 재발 방어): 데몬이 감독자(mac=launchd·win=schtasks)
         #   비관리(orphan/unmanaged)면 재시작 자동기동 토대가 약화된다. 미관리면 supervisor_ensure 로 재등록 시도
         #   (mac=launchd bootstrap · win=`cys daemon install` — 기존 로직 재사용·코드 복제 금지), 여전히 비관리면
-        #   SUPERVISOR_UNMANAGED(exit 8 계약 유지)로 거부. ★win 은 KeepAlive 대응이 없으나(사망 시 CLI lazy-spawn 보완)
-        #   로그온 자동기동 토대(schtasks)의 관리 무결은 동일하게 게이트한다.
+        #   SUPERVISOR_UNMANAGED(exit 8 계약 유지)로 거부. win 도 이제 진짜 KeepAlive(RestartOnFailure) 지원 —
+        #   로그온 자동기동 토대(schtasks)의 관리 무결은 동일하게 게이트하고, KeepAlive 부재는 경고만(구버전 install 호환).
         if not restart_hook:  # hook 경로(격리)는 supervisor 무관 — 라이브 경로에만 적용
             sdst = supervisor_status(SUPERVISOR_LABEL)
             if sdst.get("state") != "managed":
@@ -1787,6 +1801,13 @@ def cmd_deploy(args):
                                      "재등록 실패 — mac: `launchctl bootstrap gui/$(id -u) %s` · win: `cys daemon install` "
                                      "후 재시도(§15 발견3 재부팅/로그온 자동기동 토대)."
                                      % (sdst.get("state"), plist)})
+            elif sdst.get("keepalive") is not True:
+                # ★managed 지만 KeepAlive(win=RestartOnFailure·mac=KeepAlive) 부재 — 구버전 install 호환. hard fail 금지·경고만.
+                #   사망 시 감시자 자동 재기동이 없어 CLI lazy-spawn/사람 개입에 의존. `cys daemon install` 재실행 권장.
+                _dmark(j, "preflight", "keepalive_warn",
+                       "supervisor managed 이나 KeepAlive(자동 재기동) 부재(구버전 install 의심). 배포는 계속(경고) — "
+                       "`cys daemon install` 재실행으로 RestartOnFailure 갱신 권장.",
+                       epoch=cur_epoch, supervisor=sdst)
         # ★roster 조기·단조 영속 — restart 가 topology 를 소거해도 desired 로스터로 restore 가능(§12 침식 면역)
         roster, _tomb = observe_and_persist_roster(socket)
         restore_targets = sorted(r for r in roster if (include_master or r != "master"))

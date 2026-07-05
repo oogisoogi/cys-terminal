@@ -18,6 +18,8 @@ javis_phoenix_win_smoke.py — 불사조(무손실 복원) Windows 전용 경량
   ④ snapshot + 독립 runbook(.ps1) + LIVE default_sources LOCALAPPDATA 포착(권고#1)
   ⑤ stub restore E2E — 기존 --stub surrogate 백엔드로 M9 VERIFIED·COMPLETE
   ⑥ deploy --plan + exit code 계약 — 무실행·exit0·부작용 0
+  ⑦ ★진짜 KeepAlive respawn E2E — 실 cysd 스케줄러 태스크(RestartOnFailure): taskkill(crash)→유발 없이 스케줄러
+     자동 재기동(간격 PT1M)만 관측→pong+epoch delta. 정직 evidence(경과 시간)·정리 finally.
 
 mac(비-Windows)에서 실행 시: "Windows 전용" 정직 안내 후 exit 0(skip).
 
@@ -332,6 +334,66 @@ def case6_deploy_plan():
     check("⑥ stages 출력(무실행)", j.get("deploy") == "PLAN" and isinstance(j.get("stages"), list) and j.get("stages"), j.get("stages"))
 
 
+def case7_keepalive_respawn():
+    """★진짜 KeepAlive(RestartOnFailure) 실 respawn E2E — 실 cysd 스케줄러 태스크로 검증(실기 대표성).
+    cys daemon install(RestartOnFailure XML)→schtasks /Run 으로 데몬 기동(=태스크 action 인스턴스)→taskkill /F
+    (비정상 종료=action exit≠0)→★재기동 유발 없이 순수 스케줄러 RestartOnFailure(간격 PT1M)만 관측→pong+epoch delta.
+    정직 evidence: 경과 시간 기록. 정리(태스크 uninstall→데몬 kill)는 finally."""
+    _cp("⑦ keepalive setup")
+    default_pipe = r"\\.\pipe\cys"
+    task = "cysd"
+    installed = False
+    try:
+        # 클린 시작: 잔류 cysd 제거 + 기존 태스크 해제
+        subprocess.run(["taskkill", "/IM", "cysd.exe", "/F"], capture_output=True, timeout=15)
+        _PH.cys("daemon", "uninstall", socket=None, timeout=20)
+        time.sleep(1)
+        inst = _PH.cys("daemon", "install", socket=None, timeout=30)
+        installed = getattr(inst, "returncode", 1) == 0
+        check("⑦ cys daemon install(RestartOnFailure XML)", installed, (getattr(inst, "stdout", "") or getattr(inst, "stderr", ""))[:160])
+        check("⑦ 태스크에 RestartOnFailure(진짜 KeepAlive) 존재", _PH._schtasks_has_restart_on_failure(task))
+        if not installed:
+            return
+        # 데몬 기동 = schtasks /Run(태스크 action 인스턴스여야 kill 시 RestartOnFailure 발화 — lazy-spawn 아님)
+        _cp("⑦ schtasks /Run")
+        _PH._schtasks("/Run", "/TN", task, timeout=15)
+        up = False
+        for _ in range(60):
+            _cp("⑦ waiting daemon")
+            if _ping_pong(default_pipe):
+                up = True
+                break
+            time.sleep(0.4)
+        if not check("⑦ 태스크 데몬 기동(schtasks /Run → pong)", up):
+            return
+        epoch1 = _PH.get_boot_epoch(default_pipe)
+        pid = _PH._win_identify_daemon_pid(default_pipe)
+        check("⑦ daemon_pid 획득", isinstance(pid, int), pid)
+        # ★비정상 종료(crash 시뮬레이션): taskkill /F → action exit≠0 → 스케줄러 RestartOnFailure
+        _cp("⑦ taskkill (crash)")
+        if isinstance(pid, int):
+            subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True, text=True, timeout=15)
+        t0 = time.time()
+        # ★순수 관측: 재기동 유발(cys list·schtasks /Run) 없이 ping(autostart 안 함)만 폴링 — 되살리면 스케줄러 뿐.
+        revived = False
+        while time.time() - t0 < 240:   # 예산: PT1M 간격 + 기동 + 지터
+            _cp("⑦ waiting scheduler RestartOnFailure respawn")
+            if _ping_pong(default_pipe):
+                revived = True
+                break
+            time.sleep(3)
+        elapsed = time.time() - t0
+        epoch2 = _PH.get_boot_epoch(default_pipe)
+        check("⑦ 스케줄러 자동 재기동(유발 없이 pong 복귀)", revived, "elapsed=%.0fs" % elapsed)
+        check("⑦ boot-epoch delta(실제 새 세대·조용한 오복원 아님)",
+              epoch1 is not None and epoch2 is not None and epoch1 != epoch2, "%s->%s elapsed=%.0fs" % (epoch1, epoch2, elapsed))
+    finally:
+        _cp("⑦ teardown")
+        if installed:
+            _PH.cys("daemon", "uninstall", socket=None, timeout=20)  # ★태스크 먼저 제거(추가 respawn 차단)
+        subprocess.run(["taskkill", "/IM", "cysd.exe", "/F"], capture_output=True, timeout=15)
+
+
 def resolve_bins():
     import shutil
     cys = os.environ.get("PHOENIX_CYS") or shutil.which("cys") or shutil.which("cys.exe")
@@ -364,7 +426,8 @@ def run():
     _PH.CYS = CYS_BIN
 
     for fn in (case1_path_mapping, case2_schtasks, case3_restart_primitive,
-               case4_snapshot_runbook, case5_stub_restore, case6_deploy_plan):
+               case4_snapshot_runbook, case5_stub_restore, case6_deploy_plan,
+               case7_keepalive_respawn):
         try:
             fn()
         except Exception as e:

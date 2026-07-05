@@ -1043,6 +1043,118 @@ fn sibling_daemon_path() -> Option<std::path::PathBuf> {
         .filter(|p| p.exists())
 }
 
+// ── Windows 진짜 KeepAlive 패리티(작업 스케줄러 RestartOnFailure) 헬퍼 (mac launchd KeepAlive 대응) ──
+// schtasks 명령줄 플래그엔 RestartOnFailure(사망 시 재기동)가 없어 태스크 XML 로만 설정 가능하다.
+// 아래 함수는 전부 #[cfg(windows)] — mac 빌드에선 컴파일되지 않는다(dead_code 없음).
+
+#[cfg(windows)]
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+/// 현재 사용자 식별자("DOMAIN\\User") — 태스크 principal/trigger 의 UserId. whoami 우선(정확), env 폴백.
+#[cfg(windows)]
+fn current_user_id() -> Option<String> {
+    if let Ok(out) = std::process::Command::new("whoami").output() {
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !s.is_empty() {
+                return Some(s);
+            }
+        }
+    }
+    let user = std::env::var("USERNAME").ok()?;
+    match std::env::var("USERDOMAIN") {
+        Ok(d) if !d.is_empty() => Some(format!("{d}\\{user}")),
+        _ => Some(user),
+    }
+}
+
+/// cysd 작업 스케줄러 태스크 XML. LogonTrigger(현재 사용자) + RestartOnFailure(PT1M×10) +
+/// ★ExecutionTimeLimit PT0S(무제한 — 기본 72h 제한이 장수 데몬을 죽인다) + IgnoreNew(중복 인스턴스 억제) +
+/// 배터리 제약 해제 + StartWhenAvailable + LeastPrivilege(=schtasks /RL LIMITED 대응).
+#[cfg(windows)]
+fn cysd_task_xml(daemon: &std::path::Path, user_id: &str) -> String {
+    let cmd = xml_escape(&daemon.display().to_string());
+    let uid = xml_escape(user_id);
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>CYSJavis terminal daemon (cysd) — 로그온 자동기동 + 사망 시 자동 재기동(RestartOnFailure)</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <UserId>{uid}</UserId>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>{uid}</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <RestartOnFailure>
+      <Interval>PT1M</Interval>
+      <Count>10</Count>
+    </RestartOnFailure>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{cmd}</Command>
+    </Exec>
+  </Actions>
+</Task>"#
+    )
+}
+
+/// XML 을 UTF-16LE(BOM 포함)로 기록 — schtasks /Create /XML 이 요구하는 인코딩(UTF-16 관례).
+#[cfg(windows)]
+fn write_utf16le_bom(path: &std::path::Path, s: &str) -> std::io::Result<()> {
+    let mut bytes: Vec<u8> = vec![0xFF, 0xFE]; // UTF-16LE BOM
+    for u in s.encode_utf16() {
+        bytes.extend_from_slice(&u.to_le_bytes());
+    }
+    std::fs::write(path, bytes)
+}
+
+/// schtasks /Query /XML 출력에서 RestartOnFailure 존재 여부(=KeepAlive 켜짐). null 바이트 제거로
+/// UTF-16/UTF-8 출력 모두에서 ASCII 태그를 안정 검출(UTF-16LE 는 ASCII 사이에 0x00 이 낀다).
+#[cfg(windows)]
+fn task_has_restart_on_failure(task: &str) -> bool {
+    std::process::Command::new("schtasks")
+        .args(["/Query", "/TN", task, "/XML"])
+        .output()
+        .map(|o| {
+            let raw: Vec<u8> = o.stdout.iter().copied().filter(|&b| b != 0).collect();
+            String::from_utf8_lossy(&raw).contains("RestartOnFailure")
+        })
+        .unwrap_or(false)
+}
+
 /// 데몬을 분리 세션으로 기동 — CLI가 Ctrl-C로 죽어도 데몬은 살아남는다.
 fn spawn_detached_daemon(path: &std::path::Path) -> std::io::Result<()> {
     let mut cmd = std::process::Command::new(path);
@@ -4218,18 +4330,37 @@ fn run_daemon_cmd(action: DaemonAction) -> i32 {
                 DaemonAction::Install { takeover: _ } => {
                     let daemon = sibling_daemon_path()
                         .ok_or("cysd.exe not found next to cys.exe")?;
+                    // ★진짜 KeepAlive 패리티(mac launchd KeepAlive 대응): schtasks 명령줄 등록(ONLOGON뿐)엔
+                    // RestartOnFailure 플래그가 없어 사망 시 자동 재기동이 불가했다(구: "미지원"). 태스크 XML 로
+                    // RestartOnFailure(PT1M×10) + ExecutionTimeLimit PT0S(무제한·기본 72h 제한이 데몬을 죽인다) +
+                    // IgnoreNew(중복 억제) + 배터리 제약 해제로 전환한다.
+                    // ─ 종료코드 의미론(cysd/main.rs 소스 확인): graceful shutdown(콘솔 이벤트 → shutdown_cleanup →
+                    //   std::process::exit(0))=성공→스케줄러 재기동 없음 / taskkill /F(TerminateProcess·exit≠0)
+                    //   ·크래시=실패→RestartOnFailure 재기동. 즉 의도적 정지는 안 되살리고, 죽음만 되살린다.
+                    // ─ 상호작용①(install_update): stop_running_daemon 이 taskkill /F(exit≠0)로 데몬을 멈추면
+                    //   스케줄러가 PT1M 뒤 재기동을 시도할 수 있으나, 그 무렵 앱 ensure_daemon 이 새 cysd 를
+                    //   이미 띄워 파이프를 점유했으면 스케줄러 cysd 는 first_pipe_instance(true) 가드에 막혀 즉시
+                    //   종료한다(이중 데몬·자원누수 없음). 재시도는 Count 로 상한(장기 폭주 불가). 스케줄러 실패
+                    //   이력만 남는 cosmetic 사안 — 파이프 단일인스턴스 가드가 정합성을 보장한다.
+                    // ─ 상호작용②(phoenix deploy): _win_restart_daemon 의 taskkill 뒤 스케줄러가 먼저 재기동해도
+                    //   재기동 유발(/Run)은 IgnoreNew 라 무해하고, 최종 판정은 boot-epoch delta(어느 소스가
+                    //   되살렸든 새 세대면 성공)로 확증돼 정합.
+                    let user = current_user_id()
+                        .ok_or("현재 사용자(whoami/USERNAME) 확인 실패 — 태스크 XML principal 생성 불가")?;
+                    let xml = cysd_task_xml(&daemon, &user);
+                    let xml_path = std::env::temp_dir().join("cysd-task.xml");
+                    write_utf16le_bom(&xml_path, &xml).map_err(|e| format!("태스크 XML 기록 실패: {e}"))?;
                     let out = std::process::Command::new("schtasks")
-                        .args([
-                            "/Create", "/TN", TASK, "/TR",
-                            &format!("\"{}\"", daemon.display()),
-                            "/SC", "ONLOGON", "/RL", "LIMITED", "/F",
-                        ])
+                        .args(["/Create", "/XML"])
+                        .arg(&xml_path)
+                        .args(["/TN", TASK, "/F"])
                         .output()
                         .map_err(|e| e.to_string())?;
+                    let _ = std::fs::remove_file(&xml_path); // 임시 XML 정리
                     if !out.status.success() {
                         return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
                     }
-                    println!("작업 스케줄러 등록 완료 (로그온 시 자동 기동). 사망 시 자동 재기동은 미지원 — CLI 자동기동이 보완한다.");
+                    println!("작업 스케줄러 등록 완료 (로그온 시 자동 기동 + 사망 시 자동 재기동 지원 — RestartOnFailure PT1M×10·실행시간 무제한).");
                     Ok(())
                 }
                 DaemonAction::Uninstall => {
@@ -4249,8 +4380,12 @@ fn run_daemon_cmd(action: DaemonAction) -> i32 {
                         .output()
                         .map(|o| o.status.success())
                         .unwrap_or(false);
+                    // restart 정책 표시 — /Query /XML 에 RestartOnFailure 존재 여부(KeepAlive 켜짐).
+                    let restart_on_failure = registered && task_has_restart_on_failure(TASK);
                     let alive = connect_raw().is_ok();
-                    println!("registered={registered} socket_alive={alive}");
+                    println!(
+                        "registered={registered} restart_on_failure={restart_on_failure} socket_alive={alive}"
+                    );
                     Ok(())
                 }
             }

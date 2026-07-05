@@ -207,8 +207,14 @@ jobs:
             Rec 2 ($hookCmd -match '^bash "') "hookCmd=$hookCmd"
           } catch { Rec 1 $false "$_"; Rec 2 $false "$_" }
 
-          # ── T3-1b(autostart) daemon install → schtasks 등록(RC-1) ──
-          try { (Bx $cys @('daemon','install') 30000).Out | Out-Host; $q=(schtasks /Query /TN cysd 2>&1); Rec '1b' ($LASTEXITCODE -eq 0) "schtasks cysd" } catch { Rec '1b' $false "$_" }
+          # ── T3-1b(autostart) daemon install → schtasks 등록 + ★진짜 KeepAlive(RestartOnFailure·ExecutionTimeLimit PT0S) ──
+          try {
+            (Bx $cys @('daemon','install') 30000).Out | Out-Host
+            $q = (schtasks /Query /TN cysd 2>&1); $reg = ($LASTEXITCODE -eq 0)
+            $xml = (schtasks /Query /TN cysd /XML 2>&1) -join "`n"
+            $hasRof = ($xml -match 'RestartOnFailure'); $hasPt0 = ($xml -match 'PT0S')
+            Rec '1b' ($reg -and $hasRof -and $hasPt0) "cysd reg=$reg RestartOnFailure=$hasRof ExecTimeLimit_PT0S=$hasPt0"
+          } catch { Rec '1b' $false "$_" }
 
           # ── 데몬 기동(named pipe 바인드·RC-4 기본) — 바운드 ──
           $r = Bx $cys @('list') 30000; if ($r.Code -ne 0) { Start-Sleep 3; $r = Bx $cys @('list') 30000 }
@@ -343,15 +349,16 @@ jobs:
           Write-Host "OK: T4 무중단 재설치 스모크 전행 통과 — 업데이트 중 데몬·세션 무사망 실증"
 
       # ─────────────────────────────────────────────────────────────────────────
-      # T5 피닉스(불사조 무손실 복원) Windows 패리티 스모크 (S1~S5 실측).
+      # T5 피닉스(불사조 무손실 복원) Windows 패리티 스모크 (S1~S5 + 진짜 KeepAlive 실측).
       # 경로/파이프 매핑·supervisor(schtasks)·재시작 프리미티브(identify→taskkill→파이프해제→retrigger→epoch delta)
-      # ·snapshot+독립 runbook(.ps1)·stub restore(M9 VERIFIED)·deploy --plan exit 계약을 결정론·자기완결로 검증한다.
+      # ·snapshot+독립 runbook(.ps1)·stub restore(M9 VERIFIED)·deploy --plan exit 계약 + ★케이스⑦ 진짜 KeepAlive
+      # (RestartOnFailure: taskkill→스케줄러 자동 재기동→epoch delta·유발 없이 순수 관측)을 결정론·자기완결로 검증한다.
       # 스모크는 checkout 된 repo 경로에서 직접 실행(pack 임베드 비의존)하고 동봉 python3 + 설치된 cys/cysd 를 구동한다.
       # 실패 시 throw(=게이트) — T4 관용과 정합. mac unix 하네스(javis_phoenix_harness.py)는 무접촉.
       # ─────────────────────────────────────────────────────────────────────────
-      - name: T5 피닉스 Windows 패리티 스모크 (무손실 복원 S1~S5)
+      - name: T5 피닉스 Windows 패리티 스모크 (무손실 복원 S1~S5 + KeepAlive)
         shell: pwsh
-        timeout-minutes: 12   # ★백스톱: 데몬 기동/재시작 폴링이 hang 해도 12분에 스텝 종료(6h 방지)
+        timeout-minutes: 18   # ★백스톱: 케이스⑦ RestartOnFailure 는 스케줄러 간격 PT1M(최소)이라 ~3분 예산 — 여유 상향(hang은 스모크 롤링 워치독이 잡음)
         env:
           PYTHONUTF8: '1'     # 한글 stdout cp1252 크래시 방지(RC-16 관례)
         run: |
@@ -374,6 +381,8 @@ jobs:
           $env:PHOENIX_CYSD = $cysd
           & $py $smoke
           $code = $LASTEXITCODE
+          # ★케이스⑦ 정리: 실 cysd 스케줄러 태스크가 남으면 안 됨(스모크가 finally 로 uninstall 하나 방어적 재정리)
+          & $cys daemon uninstall 2>$null
           Get-Process cys,cysd -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
           if ($code -ne 0) { throw "T5: 피닉스 Windows 패리티 스모크 실패 (exit=$code)" }
-          Write-Host "OK: T5 피닉스 Windows 패리티 스모크 통과 (경로매핑·schtasks·재시작·snapshot/ps1·stub restore·deploy plan)"
+          Write-Host "OK: T5 피닉스 Windows 패리티 스모크 통과 (경로매핑·schtasks·재시작·snapshot/ps1·stub restore·deploy plan·★KeepAlive respawn)"
