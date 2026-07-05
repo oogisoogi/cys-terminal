@@ -98,7 +98,8 @@ pub fn open(socket_path: &Path) -> Option<Connection> {
             updated_ts    REAL NOT NULL,
             UNIQUE(channel, idempotency_key));
          CREATE INDEX IF NOT EXISTS ix_outbound_pending ON outbound(outcome, created_ts);
-         -- terminal 후 도착한 늦은 receipt(화해 레코드 — 상태 불변, 재전송 억제 근거).
+         -- terminal 후 도착한 늦은 receipt. LOW-4: 관측·감사 레코드로 남긴다(상태 불변 —
+         -- 능동 재전송 억제는 미구현. at-least-once 계약상 중복 허용, 상위 계층이 수동 참조).
          CREATE TABLE IF NOT EXISTS late_receipt(
             id           INTEGER PRIMARY KEY,
             outbound_id  INTEGER NOT NULL,
@@ -1455,7 +1456,7 @@ fn receipt(daemon: &Arc<Daemon>, conn: &mut Connection, params: &Value, id: &Val
         return err_response(id, "not_found", &format!("no outbound {oid}"));
     };
     if receipt_is_late(&current) {
-        // 이미 terminal — 상태 불변, late_receipt 화해 레코드 + 이벤트(§2.3).
+        // 이미 terminal — 상태 불변, late_receipt 관측·감사 레코드 + 이벤트(§2.3, 재전송 억제 미구현).
         let _ = conn.execute(
             "INSERT INTO late_receipt(outbound_id, outcome, platform_ref, detail, ts) VALUES(?1,?2,?3,?4,?5)",
             params![oid, outcome, platform_ref, detail, now()],
@@ -1563,8 +1564,9 @@ fn lockdown(daemon: &Arc<Daemon>, conn: &mut Connection, id: &Value) -> Value {
 /// `cys channel unlock` → lockdown 플래그 해제(meta lockdown="0") + channel.unlocked 이벤트.
 /// lockdown은 전 채널을 enabled=0으로 내리고 인바운드를 전면 차단하는데, 지금까지 "1" 쓰기만 있고
 /// "0" 복원 경로가 없어 1회 잠금이 영구 불능(DB 수동편집 외 복구 불가)이었다. 이 RPC가 그 유일한
-/// 해제 경로다. 터미널 전용 — lockdown 중에는 인바운드가 이미 차단이라 원격으로는 도달 불가하므로
-/// 자연히 로컬 cys CLI에서만 호출된다(pause resume와 동형·별도 인가 불요). 해제는 desired-state를
+/// 해제 경로다. LOW-2: 인가 경계는 인바운드 차단 논리가 아니라 소켓 0o600 same-UID 봉인이다
+/// (pause/resume 등 여타 RPC와 동일 신뢰층위 — 브리지는 lockdown 시 kill되고 소켓은 어차피 동일
+/// UID 전용). 긴급 unlock에 추가 인가(박사님 토큰/feed)를 원하면 별도 결합 — 현재는 미결합. 해제는 desired-state를
 /// 되돌리지 않는다(enabled는 그대로 0) — 채널 재개는 `cys channel start`로 명시한다(안전측).
 fn unlock(daemon: &Arc<Daemon>, conn: &mut Connection, id: &Value) -> Value {
     let was = lockdown_active(conn);
