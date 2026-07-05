@@ -23,6 +23,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 PASS, FAIL, WARN, FIXED, SKIP = "PASS", "FAIL", "WARN", "FIXED", "SKIP"
@@ -481,9 +482,14 @@ class Preflight:
         self.skips = set(skips)
         self.results = []
         self._init_pack_ran = None  # None=미시도, True/False=시도 결과
+        # report 모드 병렬화용 sink 격리: 병렬 워커 스레드는 자기 버퍼에 add() 하고
+        # run() 이 원래 순서로 재조립한다(직렬 경로는 sink=None 으로 self.results 직행).
+        self._local = threading.local()
 
     def add(self, cid, status, detail):
-        self.results.append({"id": cid, "status": status, "detail": detail})
+        sink = getattr(self._local, "sink", None)
+        target = self.results if sink is None else sink
+        target.append({"id": cid, "status": status, "detail": detail})
 
     def skipped(self, cid):
         if cid in self.skips:
@@ -3424,70 +3430,68 @@ class Preflight:
             self.add(cid, PASS, "doc-code SOT 대조 OK(경로형 토큰 %d건 실재)" % checked)
 
     def run(self):
-        self.c01_pack_dir()
-        self.c02_directives()
-        self.c03_content_pins()
-        self.c04_soul()
-        self.c05_agents()
-        self.c06_json_files()
-        self.c07_hook_script()
-        self.c08_hook_registered()
-        self.c09_round_core()
-        self.c10_todo_files()
-        self.c11_cys_binary()
-        self.c11b_cys_dept_path()
-        self.c12_daemon()
-        self.c13_claude_md()
-        self.c14_self()
-        self.c15_report_tool()
-        self.c16_report_schedule()
-        self.c17_route_engine()
-        # C25를 C18보다 먼저: C25의 --fix(파일 설치·색인 등재)가 정합을 만든 뒤 C18이
-        # verify해야 같은 런에서 FAIL/FIXED 플랩(NOT READY 헛사이클)이 없다(6차 R1).
-        self.c25_autopilot_memory()
-        self.c18_memory_engine()
-        self.c19_orchestra_engine()
-        self.c20_nlm_sot()
-        self.c21_harness_creator()
-        self.c22_work_skills()
-        self.c23_governance_conflict()
-        self.c24_korean_law_mcp()
-        self.c26_video_creator()
-        self.c27_appbuild()
-        self.c28_self_correction()
-        self.c29_harness_engineering()
-        self.c30_git()
-        self.c31_config_isolation()
-        self.c32_statusline()
-        self.c33_event_hooks()
-        self.c34_registry()
-        self.c35_select()
-        self.c36_verdict()
-        self.c37_adr_engine()
-        self.c38_silent_failure_catalog()
-        self.c39_prereq_orphan_lint()
-        self.c40_workflow_manifest()
-        self.c41_skillscan()
-        self.c42_mcpgate()
-        self.c43_serena()
-        self.c44_serena_eval()
-        self.c45_semver_selftest()
-        self.c46_bias_check()
-        self.c47_transcribe_channel()
-        self.c48_content_channel_deps()
-        self.c49_channel_health()
-        self.c50_channel_watch()
-        self.c51_cleanroom_vendor()
-        self.c52_license_gate()
-        self.c53_idempotency()
-        self.c54_loc_cap()
-        self.c55_grill_gate()
-        self.c56_dept_hook_leak()
-        self.c57_temp_hook_leak()
-        self.c58_trust_harden()
-        self.c60_gate_wiring()
-        self.c61_doc_code_sot()
+        # 의도된 호출 순서(불변식). C25를 C18보다 먼저: C25의 --fix(파일 설치·색인 등재)가
+        # 정합을 만든 뒤 C18이 verify해야 같은 런에서 FAIL/FIXED 플랩(NOT READY 헛사이클)이
+        # 없다(6차 R1). report 모드 병렬 실행도 결과를 이 순서 그대로 재조립한다.
+        # ★가드: 체크 함수는 self.results/self.planned를 읽지 말 것 — report 병렬 워커에선
+        # 결과가 thread-local sink에 있어 self.results가 비어 있다(읽으면 조용한 오답).
+        checks = [
+            self.c01_pack_dir, self.c02_directives, self.c03_content_pins,
+            self.c04_soul, self.c05_agents, self.c06_json_files,
+            self.c07_hook_script, self.c08_hook_registered, self.c09_round_core,
+            self.c10_todo_files, self.c11_cys_binary, self.c11b_cys_dept_path,
+            self.c12_daemon, self.c13_claude_md, self.c14_self,
+            self.c15_report_tool, self.c16_report_schedule, self.c17_route_engine,
+            self.c25_autopilot_memory, self.c18_memory_engine,
+            self.c19_orchestra_engine, self.c20_nlm_sot, self.c21_harness_creator,
+            self.c22_work_skills, self.c23_governance_conflict,
+            self.c24_korean_law_mcp, self.c26_video_creator, self.c27_appbuild,
+            self.c28_self_correction, self.c29_harness_engineering, self.c30_git,
+            self.c31_config_isolation, self.c32_statusline, self.c33_event_hooks,
+            self.c34_registry, self.c35_select, self.c36_verdict,
+            self.c37_adr_engine, self.c38_silent_failure_catalog,
+            self.c39_prereq_orphan_lint, self.c40_workflow_manifest,
+            self.c41_skillscan, self.c42_mcpgate, self.c43_serena,
+            self.c44_serena_eval, self.c45_semver_selftest, self.c46_bias_check,
+            self.c47_transcribe_channel, self.c48_content_channel_deps,
+            self.c49_channel_health, self.c50_channel_watch,
+            self.c51_cleanroom_vendor, self.c52_license_gate, self.c53_idempotency,
+            self.c54_loc_cap, self.c55_grill_gate, self.c56_dept_hook_leak,
+            self.c57_temp_hook_leak, self.c58_trust_harden, self.c60_gate_wiring,
+            self.c61_doc_code_sot,
+        ]
+        # --fix/dry/safe 는 공유 상태(repair_via_init_pack 메모이즈·settings.json 원자적
+        # 쓰기·planned 버퍼)를 갖는 변이 경로라 전면 직렬 유지. report 모드만 병렬화한다.
+        if self.mode != "report":
+            for check in checks:
+                check()
+            return self.results
+        # report 모드: 부작용0·공유 가변상태0(Phase 0 증명)인 독립 self-test 를 bounded pool
+        # 로 병렬 실행하고, 각 결과를 원래 인덱스에 되꽂아 run() 호출 순서로 재조립한다
+        # (출력 바이트 = 직렬과 동일). bounded=부팅 시점 자원 경합·resource_gate trip 방지.
+        import concurrent.futures
+        # IO 바운드(subprocess 대기 지배)라 최소 2 보장 — 저코어(≤7) 머신에서 워커=1이면
+        # 직렬+풀 오버헤드 순손실. 상한 4는 부팅 시점 자원 경합·resource_gate trip 방지.
+        max_workers = min(4, max(2, (os.cpu_count() or 4) // 4))
+        bufs = [None] * len(checks)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+            fut_index = {ex.submit(self._run_check_isolated, c): i
+                         for i, c in enumerate(checks)}
+            for fut in concurrent.futures.as_completed(fut_index):
+                bufs[fut_index[fut]] = fut.result()
+        for buf in bufs:
+            self.results.extend(buf)
         return self.results
+
+    def _run_check_isolated(self, check):
+        """병렬 워커: 이 체크의 add() 를 스레드-로컬 버퍼로 격리 수집해 반환한다."""
+        buf = []
+        self._local.sink = buf
+        try:
+            check()
+        finally:
+            self._local.sink = None
+        return buf
 
 
 def main():

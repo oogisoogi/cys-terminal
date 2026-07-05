@@ -11,13 +11,18 @@ INPUT=$(cat 2>/dev/null)
 # 인터프리터 해소 — Windows는 python3 명령이 없고 python/py만 있는 경우가 흔하다(미해소 시 graceful degrade).
 CYS_PY="$(command -v python3 || command -v python || command -v py || echo python3)"
 
-SOURCE=$(printf '%s' "$INPUT" | "$CYS_PY" -c "import json,sys
-try: print(json.load(sys.stdin).get('source','startup'))
-except Exception: print('startup')" 2>/dev/null)
+# JSON stdin 을 python 1회 스폰으로 source·cwd 동시 파싱(콜드스타트 절감 — 기존 2회 스폰 병합).
+# __CYS_END__ sentinel 로 cwd 공백 시에도 필드 경계를 결정론 보존($()가 후행 개행을 삭제해도
+# 마지막 줄이 sentinel 이라 두 read 가 정확히 source·cwd 를 집는다). 어떤 예외든 graceful(startup/'').
+_PARSED=$(printf '%s' "$INPUT" | "$CYS_PY" -c "import json,sys
+try:
+    d=json.load(sys.stdin)
+    print(d.get('source','startup')); print(d.get('cwd',''))
+except Exception:
+    print('startup'); print('')
+print('__CYS_END__')" 2>/dev/null)
+{ IFS= read -r SOURCE; IFS= read -r CWD; } <<< "$_PARSED"
 [ -z "$SOURCE" ] && SOURCE="startup"
-CWD=$(printf '%s' "$INPUT" | "$CYS_PY" -c "import json,sys
-try: print(json.load(sys.stdin).get('cwd',''))
-except Exception: print('')" 2>/dev/null)
 case "$CWD" in /*) ;; *) CWD="" ;; esac  # 절대경로만 상향탐색 (상대·빈값은 fallback으로 — 무한루프 방지)
 
 SOUL="${CYS_SOUL:-$HOME/.claude/soul.md}"
@@ -101,7 +106,9 @@ if [ "$SOURCE" != "compact" ] && [ -n "$STATE" ]; then
   command -v cygpath >/dev/null 2>&1 && CHK="$(cygpath -w "$CHK" 2>/dev/null || printf '%s' "$CHK")"
   if [ -f "$CHK" ]; then
     if command -v timeout >/dev/null 2>&1; then
-      CHK_OUT=$(timeout 25 "$CYS_PY" "$CHK" --state "$STATE" --round-dir "$(dirname "$STATE")" 2>/dev/null)
+      # outer timeout 은 checklist 내부 PREFLIGHT_TIMEOUT(30s)보다 커야 한다 — 작으면 preflight가
+      # 25~30s 걸릴 때 checklist 출력이 통째로 조용히 유실(G2 degrade). 40 = inner 30 + 여유.
+      CHK_OUT=$(timeout 40 "$CYS_PY" "$CHK" --state "$STATE" --round-dir "$(dirname "$STATE")" 2>/dev/null)
     else
       CHK_OUT=$("$CYS_PY" "$CHK" --state "$STATE" --round-dir "$(dirname "$STATE")" 2>/dev/null)
     fi
