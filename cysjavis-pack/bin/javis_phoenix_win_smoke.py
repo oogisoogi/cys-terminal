@@ -1,39 +1,43 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-javis_phoenix_win_smoke.py — 불사조(무손실 복원) Windows 전용 경량 스모크(S6)
+javis_phoenix_win_smoke.py — 불사조(무손실 복원) Windows 전용 경량 스모크(S6 · CI hang 수리판)
 
 목적: Windows 패리티(javis_phoenix.py S1~S5)를 windows-latest CI 러너에서 결정론·자기완결로 실측한다.
       unix 하네스(javis_phoenix_harness.py)는 macOS 검증 도구로 존치 — 이 스모크는 그와 별개(하네스 무접촉).
 
+★hang 방지(CI run 28733378888 케이스③ 12분 hang 수리):
+  · 모든 cys 호출은 phoenix.cys(=Windows 임시파일 캡처 _run_capture)로 라우팅 — detached cysd 파이프 상속 hang 소멸.
+  · 롤링 워치독(체크포인트마다 리셋·무진전 시 정직 비0 exit + 마지막 체크포인트) + 개별 subprocess hard timeout.
+  · 케이스③ 재기동은 lazy-spawn(cys list) 대신 throwaway schtasks 태스크 /Run(라이브 managed 경로와 동형·대표성↑).
+
 케이스(전부 결정론·자기완결·정리 포함):
-  ① 경로/파이프 매핑 단위검증 (_win_pipe_slug·_win_state_dir_for_socket — Rust state.rs 규칙 대조)
-  ② supervisor(schtasks) 실조작 — throwaway 태스크 create/query/delete + _schtasks_status 분류(실 schtasks·cysd 무접촉·정리)
-  ③ 재시작 프리미티브 E2E — 실 cysd(테스트 전용 파이프)→identify→taskkill→파이프 해제 폴링→재기동 유발→pong+boot-epoch delta
-  ④ snapshot + 독립 runbook(.ps1) — 실 세대 생성 + MANUAL_RESTORE.ps1 존재·자기완결
-  ⑤ stub restore E2E — 기존 --stub surrogate 백엔드로 M9 VERIFIED·COMPLETE(실 데몬·테스트 파이프)
+  ① 경로/파이프 매핑 단위검증
+  ② supervisor(schtasks) 실조작 — throwaway 태스크 create/query/delete(실 schtasks·cysd 무접촉·정리)
+  ③ 재시작 프리미티브 E2E — 테스트 데몬 기동→identify→taskkill→파이프 해제 폴링→★schtasks /Run 재기동→pong+boot-epoch delta
+  ④ snapshot + 독립 runbook(.ps1) + LIVE default_sources LOCALAPPDATA 포착(권고#1)
+  ⑤ stub restore E2E — 기존 --stub surrogate 백엔드로 M9 VERIFIED·COMPLETE
   ⑥ deploy --plan + exit code 계약 — 무실행·exit0·부작용 0
 
-mac(비-Windows)에서 실행 시: "Windows 전용" 정직 안내 후 exit 0(skip). 실 Windows 실측은 CI 러너.
+mac(비-Windows)에서 실행 시: "Windows 전용" 정직 안내 후 exit 0(skip).
 
-환경:
-  PHOENIX_CYS   — cys.exe 절대경로(미설정 시 PATH). PHOENIX_CYSD — cysd.exe 절대경로(미설정 시 cys.exe 형제 → PATH).
-  자기 stdout·phoenix 하위프로세스는 utf-8 로 고정(한글 stdout cp1252 크래시 방지·RC-16 관례).
+환경: PHOENIX_CYS(cys.exe)·PHOENIX_CYSD(cysd.exe) 미설정 시 PATH. 자기 stdout·phoenix 하위프로세스는 utf-8 고정.
 """
 
+import importlib.util
 import json
 import os
-import re
-import shutil
 import subprocess
 import sys
+import threading
 import time
 
 IS_WIN = os.name == "nt"
 HERE = os.path.dirname(os.path.abspath(__file__))
 PHOENIX = os.path.join(HERE, "javis_phoenix.py")
 
-# 한글 stdout utf-8 고정(standalone 실행 안전 — CI env 비의존)
+WATCHDOG_SECS = 120   # 체크포인트 무진전 상한(개별 subprocess timeout 보다 넉넉·전체는 CI 12분보다 작다)
+
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
@@ -42,6 +46,11 @@ except Exception:
 
 _FAILS = []
 _RESULTS = {}
+_LAST_CP = "init"
+_WD = None
+_PH = None          # phoenix 모듈(전역 — 워치독 evidence 접근)
+CYS_BIN = None
+CYSD_BIN = None
 
 
 def log(msg):
@@ -58,67 +67,84 @@ def check(name, cond, detail=""):
     return ok
 
 
+# ------------------------------------------------------------------ 워치독(정직 실패)
+
+def _wd_boom():
+    sys.stderr.write("[win-smoke][WATCHDOG] %ss 무진전 — 마지막 체크포인트=%r 에서 hang. 정직 비0 exit.\n"
+                     % (WATCHDOG_SECS, _LAST_CP))
+    sys.stderr.flush()
+    print(json.dumps({"win_smoke": "HANG", "last_checkpoint": _LAST_CP, "results": _RESULTS,
+                      "win_smoke_pass": False}, ensure_ascii=False, indent=2))
+    sys.stdout.flush()
+    os._exit(3)   # 조용한 hang 금지 — 어디서 멈췄는지 evidence 와 함께 비0
+
+
+def _cp(name):
+    """체크포인트 — 워치독 리셋(무진전 감시창 재시작). 진행이 멈추면 여기 마지막 이름이 evidence."""
+    global _WD, _LAST_CP
+    _LAST_CP = name
+    if _WD is not None:
+        _WD.cancel()
+    _WD = threading.Timer(WATCHDOG_SECS, _wd_boom)
+    _WD.daemon = True
+    _WD.start()
+
+
+def _wd_stop():
+    global _WD
+    if _WD is not None:
+        _WD.cancel()
+        _WD = None
+
+
+# ------------------------------------------------------------------ 실행 헬퍼(전부 바운드)
+
 def _phoenix_env(extra=None):
     env = dict(os.environ)
-    env["PYTHONUTF8"] = "1"            # 한글 stdout/파일 cp1252 크래시 방지(RC-16 관례)
+    env["PYTHONUTF8"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
+    for k in ("AITERM_SOCKET", "AITERM_SURFACE_ID"):
+        env.pop(k, None)
     if extra:
         env.update(extra)
     return env
 
 
-def resolve_bins():
-    cys = os.environ.get("PHOENIX_CYS") or shutil.which("cys") or shutil.which("cys.exe")
-    cysd = os.environ.get("PHOENIX_CYSD")
-    if not cysd and cys:
-        cand = os.path.join(os.path.dirname(cys), "cysd.exe")
-        cysd = cand if os.path.exists(cand) else (shutil.which("cysd") or shutil.which("cysd.exe"))
-    return cys, cysd
+def cyscall(pipe, *args, timeout=20):
+    """모든 cys 호출 = phoenix.cys(Windows 임시파일 캡처 _run_capture) 경유 — 파이프 상속 hang 소멸."""
+    return _PH.cys(*args, socket=pipe, timeout=timeout)
 
 
-def cys_cli(cys, pipe, *args, timeout=20):
-    cmd = [cys]
-    if pipe:
-        cmd += ["--socket", pipe]
-    cmd += [str(a) for a in args]
-    try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=_phoenix_env())
-    except subprocess.TimeoutExpired:
-        class _R:
-            returncode = 124
-            stdout = ""
-            stderr = "TIMEOUT"
-        return _R()
-
-
-def _ping_pong(cys, pipe):
-    r = cys_cli(cys, pipe, "ping", timeout=6)
+def _ping_pong(pipe, timeout=6):
+    r = cyscall(pipe, "ping", timeout=timeout)
     return getattr(r, "returncode", 1) == 0 and "pong" in (getattr(r, "stdout", "") or "")
 
 
-def spawn_test_daemon(cysd, pipe, wait=15.0):
-    """테스트 전용 파이프에 cysd 를 기동(CYS_SOCKET 오버라이드 — Rust lib.rs socket_path 존중). ping OK 까지 대기."""
+def run_phoenix(pipe, *args, timeout=90):
+    """phoenix.py 서브프로세스 실행(케이스⑤⑥) — _run_capture 로 바운드(직접자식 종료만 대기·hang 없음)."""
+    cmd = [sys.executable, PHOENIX, "--socket", pipe] + [str(a) for a in args]
+    return _PH._run_capture(cmd, _phoenix_env({"PHOENIX_CYS": CYS_BIN}), timeout)
+
+
+def spawn_test_daemon(pipe):
+    """테스트 전용 파이프에 cysd 직접 기동(CYS_SOCKET 오버라이드). 반환 Popen(추적·정리용)."""
     env = _phoenix_env({"CYS_SOCKET": pipe})
-    for k in ("AITERM_SOCKET", "AITERM_SURFACE_ID"):
-        env.pop(k, None)
-    CREATE_NO_WINDOW = 0x08000000
-    p = subprocess.Popen([cysd], env=env, stdin=subprocess.DEVNULL,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         creationflags=CREATE_NO_WINDOW)
-    return p
+    CREATE_NO_WINDOW = 0x08000000 if IS_WIN else 0
+    return subprocess.Popen([CYSD_BIN], env=env, stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            creationflags=CREATE_NO_WINDOW)
 
 
-def _win_state_dir(phoenix, pipe):
+def _state_dir(pipe):
     try:
-        return phoenix._win_state_dir_for_socket(pipe)
+        return _PH._win_state_dir_for_socket(pipe)
     except Exception:
         return None
 
 
-def teardown_daemon(cys, pipe, state_dir=None, tracked=None):
-    """테스트 데몬 정리 — identify→daemon_pid→taskkill /T /F(재기동된 detached 인스턴스 포함) + 추적 Popen + 상태dir 제거."""
+def teardown_daemon(pipe, state_dir=None, tracked=None):
     try:
-        r = cys_cli(cys, pipe, "identify", timeout=6)
+        r = cyscall(pipe, "identify", timeout=6)
         txt = getattr(r, "stdout", "") or ""
         i = txt.find("{")
         if i >= 0:
@@ -134,93 +160,112 @@ def teardown_daemon(cys, pipe, state_dir=None, tracked=None):
         except Exception:
             pass
     if state_dir:
+        import shutil
         shutil.rmtree(state_dir, ignore_errors=True)
 
 
 # ------------------------------------------------------------------ 케이스
 
-def case1_path_mapping(phoenix):
-    log("① 경로/파이프 매핑 단위검증")
+def case1_path_mapping():
+    _cp("① path mapping")
     cases = {r"\\.\pipe\cys": "cys", r"\\.\pipe\cys-dept-alpha": "cys-dept-alpha",
              "//./pipe/cys": "cys", r"\\.\pipe\cys_x.1": "cys_x1"}
     for pipe, exp in cases.items():
-        check("① slug %s" % exp, phoenix._win_pipe_slug(pipe) == exp, phoenix._win_pipe_slug(pipe))
+        check("① slug %s" % exp, _PH._win_pipe_slug(pipe) == exp, _PH._win_pipe_slug(pipe))
     la = os.environ.get("LOCALAPPDATA") or ""
-    d0 = phoenix._win_state_dir_for_socket(r"\\.\pipe\cys").replace("\\", "/")
-    dd = phoenix._win_state_dir_for_socket(r"\\.\pipe\cys-dept-alpha").replace("\\", "/")
+    d0 = _PH._win_state_dir_for_socket(r"\\.\pipe\cys").replace("\\", "/")
+    dd = _PH._win_state_dir_for_socket(r"\\.\pipe\cys-dept-alpha").replace("\\", "/")
     check("① default pipe->%LOCALAPPDATA%\\cys", d0.endswith("/cys") and la.replace("\\", "/").lower() in d0.lower(), d0)
     check("① dept pipe->...\\cys\\cys-dept-alpha", dd.endswith("/cys/cys-dept-alpha"), dd)
-    check("① state_dir_for(pipe) 디스패치", phoenix.state_dir_for(r"\\.\pipe\cys-dept-beta").replace("\\", "/").endswith("/cys/cys-dept-beta"))
 
 
-def case2_schtasks(phoenix):
-    log("② supervisor(schtasks) 실조작 — throwaway 태스크(cysd 무접촉·정리)")
+def case2_schtasks():
+    _cp("② schtasks")
     task = "phoenix-win-smoke-tmp"
-    # 정리 선행(이전 잔재)
-    phoenix._schtasks("/Delete", "/TN", task, "/F")
-    cr = phoenix._schtasks("/Create", "/TN", task, "/TR", "cmd /c exit", "/SC", "ONLOGON", "/RL", "LIMITED", "/F")
+    _PH._schtasks("/Delete", "/TN", task, "/F")
+    cr = _PH._schtasks("/Create", "/TN", task, "/TR", "cmd /c exit", "/SC", "ONLOGON", "/RL", "LIMITED", "/F")
     check("② schtasks /Create rc0", getattr(cr, "returncode", 1) == 0, getattr(cr, "stderr", ""))
-    st_managed = phoenix._schtasks_status(task)
-    check("② 등록됨->managed", st_managed.get("state") == "managed", st_managed)
-    dl = phoenix._schtasks("/Delete", "/TN", task, "/F")
-    check("② schtasks /Delete rc0", getattr(dl, "returncode", 1) == 0, getattr(dl, "stderr", ""))
-    st_unmanaged = phoenix._schtasks_status(task)
-    check("② 삭제후->unmanaged", st_unmanaged.get("state") == "unmanaged", st_unmanaged)
-    # 실 cysd 태스크 상태 조회(읽기 전용·무변경) — 감독자 status 가 크래시 없이 분류하는지
-    real = phoenix.supervisor_status("cysd")
-    check("② supervisor_status('cysd') 분류(읽기전용)", real.get("supervisor") == "schtasks" and real.get("state") in ("managed", "orphan", "unmanaged"), real)
+    check("② 등록됨->managed", _PH._schtasks_status(task).get("state") == "managed")
+    dl = _PH._schtasks("/Delete", "/TN", task, "/F")
+    check("② schtasks /Delete rc0", getattr(dl, "returncode", 1) == 0)
+    check("② 삭제후->unmanaged", _PH._schtasks_status(task).get("state") == "unmanaged")
+    real = _PH.supervisor_status("cysd")
+    check("② supervisor_status('cysd') 분류(읽기전용)",
+          real.get("supervisor") == "schtasks" and real.get("state") in ("managed", "orphan", "unmanaged"), real)
 
 
-def case3_restart_primitive(phoenix, cys, cysd):
-    log("③ 재시작 프리미티브 E2E (테스트 파이프·identify→taskkill→파이프해제→retrigger→pong+epoch delta)")
-    pipe = r"\\.\pipe\cys-phxsmoke-restart"
-    sd = _win_state_dir(phoenix, pipe)
+def case3_restart_primitive():
+    """★결정론화: 재기동을 lazy-spawn(cys list) 대신 throwaway schtasks 태스크 /Run 으로(라이브 managed 경로 동형)."""
+    _cp("③ restart setup")
+    import shutil
+    pipe = r"\\.\pipe\cys-phxsmoke-r3"
+    task = "phoenix-win-smoke-r3"
+    sd = _state_dir(pipe)
     tracked = None
+    bat = os.path.join(os.environ.get("TEMP") or ".", "cys_phxsmoke_r3.bat")
     try:
-        shutil.rmtree(sd, ignore_errors=True)
-        tracked = spawn_test_daemon(cysd, pipe)
+        if sd:
+            shutil.rmtree(sd, ignore_errors=True)
+        _PH._schtasks("/Delete", "/TN", task, "/F")
+        # 재기동 태스크: CYS_SOCKET=테스트파이프 로 cysd 를 detached 기동하는 bat(cysd 는 env 만 읽음 — argv 소켓 없음).
+        with open(bat, "w", encoding="ascii") as f:
+            f.write("@echo off\r\nset CYS_SOCKET=%s\r\nstart \"\" \"%s\"\r\n" % (pipe, CYSD_BIN))
+        cr = _PH._schtasks("/Create", "/TN", task, "/TR", bat, "/SC", "ONLOGON", "/RL", "LIMITED", "/F")
+        if not check("③ 재기동 태스크 등록(schtasks /Create)", getattr(cr, "returncode", 1) == 0, getattr(cr, "stderr", "")):
+            return
+        tracked = spawn_test_daemon(pipe)   # 초기 데몬 직접 기동(안정적) → identify 대상
         up = False
-        for _ in range(40):
-            if _ping_pong(cys, pipe):
+        for _ in range(50):
+            _cp("③ waiting initial daemon")
+            if _ping_pong(pipe):
                 up = True
                 break
             time.sleep(0.3)
         if not check("③ 테스트 데몬 기동(ping pong)", up):
             return
-        phoenix.CYS = cys
-        phoenix.SUPERVISOR_LABEL = "phoenix-smoke-none"   # 존재하지 않는 태스크→unmanaged→cys list lazy-spawn 경로(글로벌 cysd 무접촉)
-        epoch1 = phoenix.get_boot_epoch(pipe)
-        res = phoenix._win_restart_daemon(pipe, timeout=30)
+        _cp("③ restart primitive")
+        _PH.CYS = CYS_BIN
+        _PH.SUPERVISOR_LABEL = task          # managed → 재기동 유발이 schtasks /Run /TN <task> 경로를 타게
+        epoch1 = _PH.get_boot_epoch(pipe)
+        res = _PH._win_restart_daemon(pipe, timeout=30)   # 내부 폴링·retrigger 전부 바운드
         check("③ identify→daemon_pid 획득", isinstance(res.get("daemon_pid"), int), res.get("daemon_pid"))
         check("③ taskkill 수행(rc0)", res.get("taskkill_rc") == 0, res.get("taskkill_out"))
         check("③ 파이프 해제(socket_death) 관측 후 retrigger", res.get("socket_death_observed") is True, res.get("retrigger"))
-        # 부활 폴링(pong) + boot-epoch delta 확증(조용한 오복원 방어 — 새 세대여야 진짜 재시작)
+        check("③ retrigger=schtasks /Run(managed 경로)", "schtasks /Run" in (res.get("retrigger") or ""), res.get("retrigger"))
         revived = False
-        for _ in range(80):
-            if _ping_pong(cys, pipe):
+        for _ in range(100):
+            _cp("③ waiting revival")
+            if _ping_pong(pipe):
                 revived = True
                 break
             time.sleep(0.4)
-        epoch2 = phoenix.get_boot_epoch(pipe)
+        epoch2 = _PH.get_boot_epoch(pipe)
         check("③ 재기동 후 pong 복귀", revived)
-        check("③ boot-epoch delta(실제 새 세대 — 조용한 오복원 아님)",
+        check("③ boot-epoch delta(실제 새 세대·조용한 오복원 아님)",
               epoch1 is not None and epoch2 is not None and epoch1 != epoch2, "%s->%s" % (epoch1, epoch2))
     finally:
-        teardown_daemon(cys, pipe, state_dir=sd, tracked=tracked)
+        _cp("③ teardown")
+        teardown_daemon(pipe, state_dir=sd, tracked=tracked)
+        _PH._schtasks("/Delete", "/TN", task, "/F")
+        try:
+            os.remove(bat)
+        except OSError:
+            pass
 
 
-def case4_snapshot_runbook(phoenix, cys):
-    log("④ snapshot + 독립 runbook(.ps1) 자기완결")
+def case4_snapshot_runbook():
+    _cp("④ snapshot")
+    import shutil
     pipe = r"\\.\pipe\cys-phxsmoke-snap"
-    sd = _win_state_dir(phoenix, pipe)
+    sd = _state_dir(pipe)
     try:
         os.makedirs(sd, exist_ok=True)
         with open(os.path.join(sd, "topology.json"), "w", encoding="utf-8") as f:
             json.dump({"entries": [{"role": "worker", "agent": "claude", "session_id": "S1"},
                                    {"role": "cso", "agent": "claude", "session_id": "S2"}], "updated_at": 0}, f)
-        phoenix.CYS = cys
+        _PH.CYS = CYS_BIN
         roster = {"worker": {"agent": "claude"}, "cso": {"agent": "claude"}}
-        snap = phoenix._deploy_snapshot(pipe, roster)
+        snap = _PH._deploy_snapshot(pipe, roster)
         check("④ 세대 스냅샷 생성", snap.get("ok") and snap.get("gen"), snap.get("error") or snap.get("gen"))
         rb = snap.get("runbook") or ""
         check("④ runbook=MANUAL_RESTORE.ps1 존재", rb.endswith("MANUAL_RESTORE.ps1") and os.path.exists(rb), rb)
@@ -230,11 +275,10 @@ def case4_snapshot_runbook(phoenix, cys):
                          and all(("--role %s" % r) in body for r in roster)
                          and "javis_phoenix" not in body and "launchctl" not in body)
         check("④ runbook 자기완결(schtasks+cys만·집행/launchctl 미호출)", selfcontained)
-        # ★권고#1: LIVE default_sources 가 Windows 에서 %LOCALAPPDATA%\cys 의 데몬 L1 선언상태를 실제로 포착하는지
-        #   (unix ~/.local/state 로 조용히 새지 않음). 라이브 데몬 상태를 읽기만 하고 스냅샷은 만들지 않는다(소스 목록 단언).
-        import javis_state_snapshot as snap
+        # ★권고#1: LIVE default_sources 가 %LOCALAPPDATA%\cys L1 상태를 포착(unix ~/.local/state 로 미누출)
+        import javis_state_snapshot as snapmod
         la = (os.environ.get("LOCALAPPDATA") or "").replace("\\", "/").lower()
-        live_srcs = [s.replace("\\", "/").lower() for s in snap.default_sources()]
+        live_srcs = [s.replace("\\", "/").lower() for s in snapmod.default_sources()]
         main_ok = bool(la) and any(s == la + "/cys/topology.json" for s in live_srcs)
         no_unix_leak = not any("/.local/state/cys/topology.json" in s for s in live_srcs)
         check("④ 권고#1: LIVE default_sources 가 %LOCALAPPDATA%\\cys L1 상태 포착",
@@ -243,43 +287,44 @@ def case4_snapshot_runbook(phoenix, cys):
         shutil.rmtree(sd, ignore_errors=True)
 
 
-def case5_stub_restore(phoenix, cys, cysd):
-    log("⑤ stub restore E2E (surrogate 백엔드·M9 VERIFIED·COMPLETE)")
+def case5_stub_restore():
+    _cp("⑤ stub restore setup")
+    import shutil
     pipe = r"\\.\pipe\cys-phxsmoke-restore"
-    sd = _win_state_dir(phoenix, pipe)
+    sd = _state_dir(pipe)
     tracked = None
     try:
         shutil.rmtree(sd, ignore_errors=True)
-        tracked = spawn_test_daemon(cysd, pipe)
+        tracked = spawn_test_daemon(pipe)
         up = False
-        for _ in range(40):
-            if _ping_pong(cys, pipe):
+        for _ in range(50):
+            _cp("⑤ waiting daemon")
+            if _ping_pong(pipe):
                 up = True
                 break
             time.sleep(0.3)
-        # 데몬 기동 후 topology 시드(상태dir 은 데몬이 생성)
         os.makedirs(sd, exist_ok=True)
         with open(os.path.join(sd, "topology.json"), "w", encoding="utf-8") as f:
             json.dump({"entries": [{"role": "worker", "agent": "stub", "session_id": "SID-W-1",
                                     "cwd": sd, "title": "w"}], "updated_at": 0}, f)
         if not check("⑤ 테스트 데몬 기동", up):
             return
-        r = subprocess.run([sys.executable, PHOENIX, "--socket", pipe, "restore", "--ticket", "WS", "--stub"],
-                           capture_output=True, text=True, timeout=90, env=_phoenix_env({"PHOENIX_CYS": cys}))
+        _cp("⑤ restore")
+        r = run_phoenix(pipe, "restore", "--ticket", "WS", "--stub", timeout=90)
         txt = r.stdout or ""
         i = txt.find("{")
         j = json.loads(txt[i:]) if i >= 0 else {}
         check("⑤ phoenix_restore=VERIFIED", j.get("phoenix_restore") == "VERIFIED", j.get("phoenix_restore"))
         check("⑤ completeness=COMPLETE", j.get("completeness") == "COMPLETE", j.get("completeness"))
     finally:
-        teardown_daemon(cys, pipe, state_dir=sd, tracked=tracked)
+        _cp("⑤ teardown")
+        teardown_daemon(pipe, state_dir=sd, tracked=tracked)
 
 
-def case6_deploy_plan(cys):
-    log("⑥ deploy --plan + exit code 계약(무실행·exit0·부작용0)")
+def case6_deploy_plan():
+    _cp("⑥ deploy plan")
     pipe = r"\\.\pipe\cys-phxsmoke-plan"
-    r = subprocess.run([sys.executable, PHOENIX, "--socket", pipe, "deploy", "--plan", "--ticket", "PLAN", "--stub"],
-                       capture_output=True, text=True, timeout=30, env=_phoenix_env({"PHOENIX_CYS": cys}))
+    r = run_phoenix(pipe, "deploy", "--plan", "--ticket", "PLAN", "--stub", timeout=30)
     txt = r.stdout or ""
     i = txt.find("{")
     j = json.loads(txt[i:]) if i >= 0 else {}
@@ -287,34 +332,44 @@ def case6_deploy_plan(cys):
     check("⑥ stages 출력(무실행)", j.get("deploy") == "PLAN" and isinstance(j.get("stages"), list) and j.get("stages"), j.get("stages"))
 
 
+def resolve_bins():
+    import shutil
+    cys = os.environ.get("PHOENIX_CYS") or shutil.which("cys") or shutil.which("cys.exe")
+    cysd = os.environ.get("PHOENIX_CYSD")
+    if not cysd and cys:
+        cand = os.path.join(os.path.dirname(cys), "cysd.exe")
+        cysd = cand if os.path.exists(cand) else (shutil.which("cysd") or shutil.which("cysd.exe"))
+    return cys, cysd
+
+
 def run():
+    global _PH, CYS_BIN, CYSD_BIN
     if not IS_WIN:
         log("이 스모크는 Windows 전용입니다 — mac/Unix 에서는 skip(정직). 실측은 windows-latest CI 러너.")
-        log("(mac 무회귀·Windows 분기 단위검증은 javis_phoenix_harness.py phoenix-p12-deploy/p9-ci 및 별도 단위검증으로 수행)")
+        log("(mac 무회귀·Windows 분기 단위검증은 phoenix-p12-deploy/p9-ci 및 별도 단위검증으로 수행)")
         print(json.dumps({"win_smoke": "SKIP(non-windows)", "platform": os.name, "skipped": True},
                          ensure_ascii=False, indent=2))
         return 0
 
-    # phoenix 를 모듈로 임포트(직접호출 케이스 ①③④) + 서브프로세스(⑤⑥)
-    import importlib.util
     spec = importlib.util.spec_from_file_location("javis_phoenix", PHOENIX)
-    phoenix = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(phoenix)
+    _PH = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(_PH)
 
-    cys, cysd = resolve_bins()
-    log("cys=%s cysd=%s" % (cys, cysd))
-    if not cys or not cysd:
-        check("바이너리 해소(cys·cysd)", False, "cys=%s cysd=%s (PHOENIX_CYS/PHOENIX_CYSD 또는 PATH 필요)" % (cys, cysd))
+    CYS_BIN, CYSD_BIN = resolve_bins()
+    log("cys=%s cysd=%s" % (CYS_BIN, CYSD_BIN))
+    if not CYS_BIN or not CYSD_BIN:
+        check("바이너리 해소(cys·cysd)", False, "cys=%s cysd=%s" % (CYS_BIN, CYSD_BIN))
         print(json.dumps({"win_smoke": "FAIL", "failed": _FAILS, "results": _RESULTS}, ensure_ascii=False, indent=2))
         return 1
-    phoenix.CYS = cys
+    _PH.CYS = CYS_BIN
 
-    case1_path_mapping(phoenix)
-    case2_schtasks(phoenix)
-    case3_restart_primitive(phoenix, cys, cysd)
-    case4_snapshot_runbook(phoenix, cys)
-    case5_stub_restore(phoenix, cys, cysd)
-    case6_deploy_plan(cys)
+    for fn in (case1_path_mapping, case2_schtasks, case3_restart_primitive,
+               case4_snapshot_runbook, case5_stub_restore, case6_deploy_plan):
+        try:
+            fn()
+        except Exception as e:
+            check("%s 예외" % fn.__name__, False, repr(e))
+    _wd_stop()
 
     ok = not _FAILS
     print(json.dumps({"win_smoke": "PASS" if ok else "FAIL", "failed": _FAILS,

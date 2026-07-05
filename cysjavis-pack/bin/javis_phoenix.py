@@ -165,6 +165,51 @@ def phoenix_home(socket):
     return home
 
 
+class _CapR:
+    """subprocess 결과 대역(returncode/stdout/stderr) — _run_capture 반환형."""
+    def __init__(self, returncode=124, stdout="", stderr=""):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def _run_capture(cmd, env, timeout):
+    """★Windows hang 방지 캡처(CI run 28733378888 케이스③ 12분 hang 수리). 파이프 대신 임시파일로 stdout/stderr 를
+    받고 '직접 자식(cys.exe) 종료'만 기다린다 — 데몬을 스폰하지 않는 명령에도 안전하고, 스폰하는 명령(cys list)에서
+    치명적이다: `cys list` 는 detached cysd 를 스폰하는데 Rust spawn 이 bInheritHandles=TRUE 라, 파이썬 subprocess 가
+    cys.exe 에 물려준 inheritable 파이프 write 핸들을 cysd 가 상속해 계속 연다. 그러면 subprocess.run(capture_output=
+    True)+communicate() 는 EOF 를 영영 못 받아 hang 하고, timeout 후 정리 communicate() 는 timeout 이 없어 무한 대기한다
+    (=CI 12분 스텝 타임아웃). 임시파일 리다이렉트는 파이프 EOF 문제를 없애고, p.wait() 는 데몬이 아니라 cys.exe 종료만
+    기다린다(cys.exe 는 lazy-spawn 후 곧 종료). 크로스플랫폼(테스트는 mac 에서도 가능). 반환=_CapR."""
+    import tempfile
+    of = tempfile.TemporaryFile()
+    ef = tempfile.TemporaryFile()
+    r = _CapR()
+    try:
+        p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=of, stderr=ef, env=env)
+        try:
+            p.wait(timeout=timeout)
+            r.returncode = p.returncode
+        except subprocess.TimeoutExpired:
+            for killer in (lambda: p.kill(),):
+                try:
+                    killer()
+                except Exception:
+                    pass
+            try:
+                p.wait(timeout=5)
+            except Exception:
+                pass
+            r.returncode = 124
+        of.seek(0); ef.seek(0)
+        r.stdout = of.read().decode("utf-8", "replace")
+        se = ef.read().decode("utf-8", "replace")
+        r.stderr = se if se else ("TIMEOUT %ss" % timeout if r.returncode == 124 else "")
+    finally:
+        of.close(); ef.close()
+    return r
+
+
 def cys(*args, socket=None, timeout=25):
     cmd = [CYS]
     if socket:
@@ -172,6 +217,9 @@ def cys(*args, socket=None, timeout=25):
     cmd += [str(a) for a in args]
     env = dict(os.environ)
     env.pop("AITERM_SOCKET", None)
+    # ★Windows: 임시파일 캡처(_run_capture)로 detached cysd 파이프 상속 hang 회피. mac 은 기존 경로 유지(무회귀).
+    if IS_WINDOWS:
+        return _run_capture(cmd, env, timeout)
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
         return r
