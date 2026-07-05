@@ -6,6 +6,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import { imeStep, initialImeState, type ImeEvent } from "./ime";
 import { shellQuote, shellQuoteJoin } from "./shellquote";
+import { DEFAULT_BG, readableForeground } from "./theme";
 
 declare global {
   interface Window {
@@ -1239,6 +1240,24 @@ const nodeSig = new Map<string, NodeSig>(); // 키 = `${socket}#${surface_id}`
 let pendingApprovals = 0; // org.status feed.pending 집계
 const root = document.getElementById("root")!;
 
+// ---------- 배경 테마 커스텀 (cys-bg-color) ----------
+// 색 선택 시 앱 캔버스(--bg)·캔버스 글자(--canvas-text)·모든 pane xterm 테마를 동기 적용 → 화면 일치.
+// null = 기본(다크) 복원. 밝은 배경(휘도>0.5)이면 글자를 어둡게 자동 보정(가독).
+// ★크롬 글자 --text는 건드리지 않는다 — 상단바·모달 등 배경이 안 바뀌는 var(--bar) 표면 가독 유지.
+let bgColor: string | null = localStorage.getItem("cys-bg-color");
+const currentBg = (): string => bgColor ?? DEFAULT_BG;
+function applyBgColor(color: string | null): void {
+  bgColor = color;
+  const bg = color ?? DEFAULT_BG;
+  const fg = readableForeground(bg);
+  document.documentElement.style.setProperty("--bg", bg);
+  document.documentElement.style.setProperty("--canvas-text", fg);
+  for (const rt of panes.values()) rt.term.options.theme = { background: bg, foreground: fg };
+  if (color === null) localStorage.removeItem("cys-bg-color");
+  else localStorage.setItem("cys-bg-color", color);
+}
+applyBgColor(bgColor); // 마운트 시 저장된 배경색 복원(없으면 기본 유지)
+
 const current = (): Workspace => workspaces[activeWs];
 
 // 그룹의 anchor(부서) ws — anchorSocket이 일치하는 ws. 부서 그룹만 존재.
@@ -1510,7 +1529,8 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
     //   부재 시 xterm가 셀 폭을 CJK 전각폰트(Noto Sans KR)로 측정해 Latin 글자가 넓게 벌어진다(자간 이상).
     fontFamily: "Menlo, 'SF Mono', 'Cascadia Mono', Consolas, 'Apple SD Gothic Neo', 'Malgun Gothic', 'Noto Sans KR', monospace",
     fontSize,
-    theme: { background: "#0d1117", foreground: "#c9d1d9" },
+    // 배경 테마: 하드코딩 리터럴 대신 현재 색 상태 참조 — 새 pane도 커스텀 색으로 생성된다.
+    theme: { background: currentBg(), foreground: readableForeground(currentBg()) },
     scrollback: 5000,
   });
   const fit = new FitAddon();
@@ -2359,6 +2379,56 @@ function showCtxMenu(x: number, y: number, items: { label: string; action: () =>
   const r = menu.getBoundingClientRect();
   if (r.right > window.innerWidth) menu.style.left = `${window.innerWidth - r.width - 4}px`;
   if (r.bottom > window.innerHeight) menu.style.top = `${window.innerHeight - r.height - 4}px`;
+  window.addEventListener("mousedown", dismiss, true);
+  window.addEventListener("keydown", onKey, true);
+}
+
+// 배경 테마 팝오버 — 컬러피커 + 기본값 복원. showCtxMenu의 바깥클릭·Esc 닫기 패턴 재사용.
+// 컬러피커 input 이벤트마다 applyBgColor 라이브 적용(localStorage 영속은 applyBgColor 내부).
+function openThemePopover(anchor: HTMLElement) {
+  document.getElementById("theme-pop")?.remove();
+  const pop = document.createElement("div");
+  pop.id = "theme-pop";
+  const close = () => {
+    pop.remove();
+    window.removeEventListener("mousedown", dismiss, true);
+    window.removeEventListener("keydown", onKey, true);
+  };
+  const dismiss = (e?: Event) => {
+    if (e instanceof MouseEvent && pop.contains(e.target as globalThis.Node)) return;
+    close();
+  };
+  const onKey = (e: KeyboardEvent) => {
+    if (e.key === "Escape") close();
+  };
+
+  const row = document.createElement("label");
+  row.className = "theme-pop-row";
+  row.textContent = "배경색";
+  const picker = document.createElement("input");
+  picker.type = "color";
+  picker.value = currentBg();
+  picker.addEventListener("input", () => applyBgColor(picker.value));
+  row.appendChild(picker);
+
+  const reset = document.createElement("button");
+  reset.className = "theme-pop-reset";
+  reset.textContent = "기본값 복원";
+  reset.addEventListener("click", () => {
+    applyBgColor(null);
+    picker.value = DEFAULT_BG;
+  });
+
+  pop.append(row, reset);
+
+  // 앵커(테마 버튼) 하단에 배치 후 화면 밖으로 나가면 안쪽으로 보정.
+  const r = anchor.getBoundingClientRect();
+  pop.style.left = `${r.left}px`;
+  pop.style.top = `${r.bottom + 4}px`;
+  document.body.appendChild(pop);
+  const pr = pop.getBoundingClientRect();
+  if (pr.right > window.innerWidth) pop.style.left = `${window.innerWidth - pr.width - 4}px`;
+
   window.addEventListener("mousedown", dismiss, true);
   window.addEventListener("keydown", onKey, true);
 }
@@ -3648,6 +3718,9 @@ document.getElementById("cc-sessions-redact")!.addEventListener("click", (e) => 
   refreshSessions();
 });
 document.getElementById("btn-update")!.addEventListener("click", () => onUpdateButton());
+document.getElementById("btn-theme")!.addEventListener("click", (e) =>
+  openThemePopover(e.currentTarget as HTMLElement),
+);
 // 역할 분리(오너 2026-06-29 결정): "새 워크스페이스"(btn-ws-new) = 기본/현재 데몬의 일반 워크스페이스
 // (addWorkspace) — 부서가 아니다. 격리 부서 데몬 생성은 "+부서"(btn-ws-dept→addDeptWorkspace) 전담.
 // 새 ws를 master로 선언 시 공유 데몬 claim 충돌은 데몬 레벨 claim_denied(cysd handlers.rs·kill 없음)가

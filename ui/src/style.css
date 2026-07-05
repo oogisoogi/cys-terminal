@@ -4,7 +4,8 @@
   --border: #30363d;
   --hairline: #1c2128; /* pane 구분선 — 거의 안 보이는 미세 선 */
   --accent: #2f81f7;
-  --text: #c9d1d9;
+  --text: #c9d1d9; /* 크롬(상단바·사이드바·모달 등 var(--bar) 표면) 고정 글자 — 배경색 커스텀과 무관 */
+  --canvas-text: #c9d1d9; /* 캔버스(var(--bg) 표면) 글자 — applyBgColor가 배경 휘도 따라 전환 */
   --warn: #d29922;
   --error: #f85149;
   --ok: #3fb950;
@@ -12,7 +13,7 @@
 * { box-sizing: border-box; }
 html, body {
   margin: 0; height: 100%;
-  background: var(--bg); color: var(--text);
+  background: var(--bg); color: var(--canvas-text);
   font: 13px/1.4 -apple-system, "SF Pro", "Segoe UI", sans-serif;
   overflow: hidden;
 }
@@ -142,6 +143,29 @@ html, body {
   white-space: nowrap;
 }
 #ctx-menu .ctx-item:hover { background: var(--accent); color: #fff; }
+
+/* 배경 테마 팝오버 — btn-theme 하단. ctx-menu 톤(--bar/--border) 재사용. */
+#theme-pop {
+  position: fixed; z-index: 1000;
+  display: flex; flex-direction: column; gap: 8px;
+  padding: 10px; min-width: 160px;
+  background: var(--bar); border: 1px solid var(--border); border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, .4); font-size: 12px;
+}
+#theme-pop .theme-pop-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  color: var(--text);
+}
+#theme-pop input[type="color"] {
+  width: 40px; height: 24px; padding: 0; cursor: pointer;
+  background: none; border: 1px solid var(--border); border-radius: 4px;
+}
+#theme-pop .theme-pop-reset {
+  padding: 5px 8px; cursor: pointer;
+  background: var(--bar); color: var(--text);
+  border: 1px solid var(--border); border-radius: 6px;
+}
+#theme-pop .theme-pop-reset:hover { border-color: var(--accent); }
 
 #body-row { height: calc(100% - 38px); display: flex; }
 #root { flex: 1; display: flex; min-width: 0; }
@@ -395,7 +419,7 @@ body.pane-dragging .pane .pane-title { cursor: grabbing; }
 
 #ft-panel {
   width: 240px; border-right: 1px solid var(--border);
-  background: var(--bar); display: flex; flex-direction: column;
+  background: var(--bar); color: var(--text); display: flex; flex-direction: column;
 }
 #ft-panel[hidden] { display: none; }
 #ft-head {
@@ -437,7 +461,7 @@ body.pane-dragging .pane .pane-title { cursor: grabbing; }
 }
 .toast {
   max-width: 420px; padding: 10px 12px; border-radius: 8px;
-  background: var(--bar); border: 1px solid var(--border);
+  background: var(--bar); color: var(--text); border: 1px solid var(--border);
   font-size: 12px; box-shadow: 0 4px 16px rgba(0,0,0,.5);
 }
 .toast .toast-name { font-weight: 700; margin-right: 6px; }
@@ -457,7 +481,7 @@ body.pane-dragging .pane .pane-title { cursor: grabbing; }
 }
 .modal {
   max-width: 460px; padding: 20px 22px; border-radius: 10px;
-  background: var(--bar); border: 1px solid var(--border);
+  background: var(--bar); color: var(--text); border: 1px solid var(--border);
   box-shadow: 0 8px 32px rgba(0,0,0,.6);
 }
 .modal h3 { margin: 0 0 10px; font-size: 15px; }
@@ -465,7 +489,7 @@ body.pane-dragging .pane .pane-title { cursor: grabbing; }
 .modal-btns { display: flex; gap: 10px; justify-content: flex-end; }
 .modal-btns button {
   padding: 7px 16px; border-radius: 6px; border: 1px solid var(--border);
-  background: var(--bg); color: var(--fg); cursor: pointer; font-size: 13px;
+  background: var(--bg); color: var(--canvas-text); cursor: pointer; font-size: 13px;
 }
 .modal-btns .modal-yes { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
 
@@ -482,7 +506,7 @@ body.pane-dragging .pane .pane-title { cursor: grabbing; }
 }
 .palette-input {
   padding: 12px 14px; font-size: 14px; border: none; outline: none;
-  background: var(--bg); color: var(--text); border-bottom: 1px solid var(--border);
+  background: var(--bg); color: var(--canvas-text); border-bottom: 1px solid var(--border);
 }
 .palette-list { overflow-y: auto; padding: 4px; }
 .palette-item { padding: 7px 12px; border-radius: 6px; cursor: pointer; }
