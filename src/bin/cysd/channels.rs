@@ -1214,7 +1214,15 @@ fn deliverable_master(daemon: &Arc<Daemon>) -> Option<u64> {
 }
 
 /// master stdin에 봉투를 주입(bracketed paste + Return). schedule.rs inject와 동형.
+/// MED-3: `try_send` **직전에** paused·exited·quiescing을 재확인한다. 루프 상단 게이트
+/// (deliverable_master)는 최초 판정일 뿐이라, 매 주입 직전 재확인으로 mid-loop quiescing set
+/// (cycle-agent가 /clear 진입 직전 quiescing을 set하는 창)을 봉합한다(잔여 나노초 창은 self-heal —
+/// 배달 불가면 false 반환→호출부 break로 남은 행은 queued 유지). deliverable_master(daemon)==Some(sid)로
+/// sid 일치까지 확인해 master surface가 루프 중 교체된 경우도 방어한다.
 fn inject_master(daemon: &Arc<Daemon>, sid: u64, envelope: &str) -> bool {
+    if deliverable_master(daemon) != Some(sid) {
+        return false; // 주입 직전 재확인 실패(paused/exited/quiescing/surface 교체) → 보류(queued).
+    }
     let Some(surface) = daemon.get_surface(sid) else {
         return false;
     };
@@ -2658,6 +2666,33 @@ mod tests {
                 .unwrap();
             assert_eq!(st, "injected");
         }
+        let _ = crate::governance::close_surface(&d, sid);
+    }
+
+    /// MED-3: master가 배달 중 quiescing으로 전환되면 이후 주입은 try_send 없이 보류(false)된다.
+    /// 루프 상단 deliverable_master 게이트를 통과한 뒤 mid-loop로 quiescing set되는 TOCTOU 창을
+    /// inject_master의 주입-직전 재확인이 봉합함을 직접 단위검증(inject_master==false).
+    #[cfg(unix)]
+    #[test]
+    fn inject_master_reblocks_on_midloop_quiescing() {
+        let d = tmp_daemon("inject_recheck");
+        let surface = d
+            .create_surface(None, Some("sleep 30".into()), None, Some("master".into()), 24, 80)
+            .expect("surface");
+        let sid = surface.id;
+        d.roles.lock().unwrap().insert("master".into(), sid);
+        // 비-quiescing(agent_status None) → 주입 가능.
+        assert_eq!(deliverable_master(&d), Some(sid), "비-quiescing master는 배달 가능");
+        assert!(inject_master(&d, sid, "[test] hi"), "비-quiescing master엔 주입 성공");
+        // 루프 중 quiescing set(cycle-agent가 /clear 진입 직전) → 주입 직전 재확인이 false 반환.
+        *surface.agent_status.lock().unwrap() = Some(crate::state::AgentStatus {
+            state: "quiescing".into(),
+            context_pct: None,
+            task: None,
+            updated_at: now(),
+        });
+        assert_eq!(deliverable_master(&d), None, "quiescing master는 배달 불가");
+        assert!(!inject_master(&d, sid, "[test] hi2"), "quiescing surface엔 주입 보류(false)");
         let _ = crate::governance::close_surface(&d, sid);
     }
 
