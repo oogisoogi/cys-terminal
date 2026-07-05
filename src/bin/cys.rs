@@ -6320,8 +6320,11 @@ extern "C" fn scoped_cleanup_handler(sig: libc::c_int) {
 mod tests {
     use super::*;
 
-    // pack-update 통합테스트는 CYS_PACK_DIR/CYS_CONFIG_DIR 전역 env를 공유하므로 직렬화한다.
-    static PACK_UPDATE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // pack-update·compose 통합테스트는 동일 전역 env(ENV_PACK_DIR/ENV_CONFIG_DIR/ENV_SOCKET)를
+    // set/remove하므로 단일 뮤텍스로 직렬화한다. 옛 PACK_UPDATE_ENV_LOCK·COMPOSE_ENV_LOCK가 별개라
+    // 두 그룹이 병렬 교차하면 None 복원 시 remove_var가 실행 중 테스트를 실 ~/.cys/pack으로
+    // 폴백시켜 삭제하던 레이스를 차단한다(HIGH 감사).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn sha256_of(bytes: &[u8]) -> String {
         use sha2::{Digest, Sha256};
@@ -6735,7 +6738,7 @@ mod tests {
     /// LOW#1: pending이 있는데 데몬 미가동이면 graceful — Err 반환·pending 보존(소실 없음).
     #[test]
     fn pending_consume_graceful_when_daemon_absent() {
-        let _g = PACK_UPDATE_ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // 존재하지 않는 소켓으로 강제 + autostart 차단 → request 결정론적 실패(실데몬 비접촉).
         let saved_sock = std::env::var(cys::ENV_SOCKET).ok();
         let saved_noauto = std::env::var("CYS_NO_AUTOSTART").ok();
@@ -6770,7 +6773,7 @@ mod tests {
     /// ★오프라인 통합: 서명된 테스트 팩을 --from 코어로 적용 → .pack-version·파일·accepted 반영.
     #[test]
     fn pack_update_from_dir_applies_signed_pack() {
-        let _g = PACK_UPDATE_ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var(cys::pack::ENV_PACK_DIR).ok();
         let saved_cfg = std::env::var(cys::pack::ENV_CONFIG_DIR).ok();
         let td = std::env::temp_dir().join(format!("cys-pu-apply-{}", std::process::id()));
@@ -6836,7 +6839,7 @@ mod tests {
     /// ★오프라인 통합 거부 케이스: 위조 서명·만료·구버전·min_binary 초과.
     #[test]
     fn pack_update_from_dir_rejects_invalid() {
-        let _g = PACK_UPDATE_ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var(cys::pack::ENV_PACK_DIR).ok();
         let saved_cfg = std::env::var(cys::pack::ENV_CONFIG_DIR).ok();
         let td = std::env::temp_dir().join(format!("cys-pu-reject-{}", std::process::id()));
@@ -6908,7 +6911,7 @@ mod tests {
     /// 각 단계에서 state·accepted가 계약대로 영속되는지 검증.
     #[test]
     fn pack_update_pro_channel_e2e() {
-        let _g = PACK_UPDATE_ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var(cys::pack::ENV_PACK_DIR).ok();
         let saved_cfg = std::env::var(cys::pack::ENV_CONFIG_DIR).ok();
         let td = std::env::temp_dir().join(format!("cys-pu-pro-{}", std::process::id()));
@@ -6994,7 +6997,7 @@ mod tests {
     /// 못 막던 '미등재 파일 추가' 변조를 verify_no_extra_files(역방향)가 fail-closed로 차단한다.
     #[test]
     fn pack_update_from_dir_rejects_extra_unlisted_file() {
-        let _g = PACK_UPDATE_ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var(cys::pack::ENV_PACK_DIR).ok();
         let saved_cfg = std::env::var(cys::pack::ENV_CONFIG_DIR).ok();
         let td = std::env::temp_dir().join(format!("cys-pu-extra-{}", std::process::id()));
@@ -7156,15 +7159,15 @@ mod tests {
         assert_eq!(extract_bin("KEY=\"a b\" claude", "fallback"), "b\"");
     }
 
-    /// compose_directive 테스트들은 전역 ENV_PACK_DIR를 변경하므로 직렬화한다(병렬 레이스 방지).
-    static COMPOSE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // compose_directive 테스트들은 전역 ENV_PACK_DIR를 변경하므로 상단 ENV_LOCK으로 직렬화한다
+    // (pack-update 테스트와 동일 전역 env 공유 — 별개 락 병렬 교차 레이스 차단, HIGH 감사).
 
     /// ★불변식 박제: compose_directive는 디렉티브 → soul.md → 장기메모리 색인 → 스킬 색인
     /// 순서로 조립한다. 메모리 색인 누락은 "리뷰어·워커 장기기억 0" 결함의 재발이므로
     /// 섹션 존재와 순서를 기계 검증한다 (launch/reinject/cycle 공용 경로).
     #[test]
     fn compose_directive_includes_memory_index_after_soul() {
-        let _env = COMPOSE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let td = std::env::temp_dir().join(format!("cys-compose-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&td);
         for sub in ["directives", "memory", "skills/demo"] {
@@ -7208,7 +7211,7 @@ mod tests {
     /// 실측한다(추측 금지 — compose_directive 실출력에서 §1~§6 마커 존재/부재 검증).
     #[test]
     fn compose_directive_injects_rsi_only_for_master_worker() {
-        let _env = COMPOSE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let td = std::env::temp_dir().join(format!("cys-rsi-inject-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&td);
         std::fs::create_dir_all(td.join("directives")).unwrap();
@@ -7737,7 +7740,7 @@ mod tests {
     /// ★불변식 박제: 사용자 오버라이드가 있어도 안전핵 재선언이 조립 최후(last-word).
     #[test]
     fn compose_directive_safety_core_is_last_word() {
-        let _env = COMPOSE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let td = std::env::temp_dir().join(format!("cys-ovcompose-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&td);
         for sub in ["directives", "overrides"] {
@@ -7771,7 +7774,7 @@ mod tests {
     /// 오버라이드 파일 부재 시 오버라이드/안전핵 블록 모두 미등장(회귀 0).
     #[test]
     fn compose_directive_no_override_is_noop() {
-        let _env = COMPOSE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let td = std::env::temp_dir().join(format!("cys-ovnoop-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&td);
         std::fs::create_dir_all(td.join("directives")).unwrap();
@@ -7792,7 +7795,7 @@ mod tests {
 
     #[test]
     fn persona_set_writes_and_reset_deletes() {
-        let _env = COMPOSE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let td = std::env::temp_dir().join(format!("cys-persona-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&td);
         std::fs::create_dir_all(&td).unwrap();
@@ -7831,7 +7834,7 @@ mod tests {
     /// serde_json IndexMut의 비-Object 인덱싱 패닉을 fail-closed로 차단(load_overrides 원칙과 정합).
     #[test]
     fn persona_set_normalizes_non_object_params() {
-        let _env = COMPOSE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let td = std::env::temp_dir().join(format!("cys-persona-bad-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&td);
         std::fs::create_dir_all(td.join("overrides")).unwrap();
