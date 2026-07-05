@@ -231,23 +231,37 @@ fn redeliver_due(state: &str, injected_ts: Option<f64>, now: f64, ttl: f64) -> b
 /// 붙여넣기가 조기 종료되어 이후 바이트가 실제 키입력·조기 제출되는 경계 붕괴가 난다(state.rs 주입은
 /// `\x1b[200~{text}\x1b[201~`+`\r`). 여기서 미신뢰 text의 위험 바이트를 봉투 진입 전에 없앤다.
 /// 보존: HT(`\t`)·LF(`\n`)·인쇄 가능 문자(한글·이모지 등 U+0020 이상, DEL 제외). 제거: 그 외 C0(0x00-0x1F
-/// 중 \t·\n 제외 — CR·ESC 포함)·DEL(0x7F). 채널 전용 살균 — 공유 WriteReq::Inject·cys send 신뢰 경로는
-/// 절대 건드리지 않는다(회귀 방지·§C1).
+/// 중 \t·\n 제외 — CR·ESC 포함)·DEL(0x7F)·C1(0x80-0x9F, 8비트 CSI `\u{9b}`·NEL `\u{85}` 포함)·
+/// U+2028(LS)·U+2029(PS). 8비트 C1을 CSI로 해석하는 수신 터미널에서 bracketed-paste 조기 종료를 막는다.
+/// 화이트리스트가 아니라 범위검사면 C1·LS/PS가 새어 키입력 주입이 되므로 명시 제외한다(MED-1 감사).
+/// 채널 전용 살균 — 공유 WriteReq::Inject·cys send 신뢰 경로는 절대 건드리지 않는다(회귀 방지·§C1).
 fn sanitize_inbound_text(s: &str) -> String {
     s.chars()
-        .filter(|&c| c == '\n' || c == '\t' || (c >= ' ' && c != '\u{7f}'))
+        .filter(|&c| {
+            c == '\n'
+                || c == '\t'
+                || (c >= ' '
+                    && c != '\u{7f}'
+                    && !('\u{80}'..='\u{9f}').contains(&c)
+                    && c != '\u{2028}'
+                    && c != '\u{2029}')
+        })
         .collect()
 }
 
 /// 봉투 문자열: `[CH:<channel>|<sender>|<HH:MM>|#<inbox_id>] <text>` (+재배달 표기).
 fn envelope(channel: &str, sender: &str, ts: f64, inbox_id: i64, redelivered: bool, text: &str) -> String {
-    // C1: 채널에서 온 미신뢰 text를 봉투에 넣기 직전 살균(ESC/제어바이트 유입 0).
+    // C1: 채널에서 온 미신뢰 text·channel·sender를 봉투에 넣기 직전 동일 불변식으로 살균한다
+    // (ESC/C0/C1/LS/PS 유입 0). text만 살균하고 channel·sender는 미살균이면 같은 봉투에
+    // 제어시퀀스가 보간되는 경계 붕괴가 난다(LOW-1 감사). sender는 char 단위 truncate 전에 살균한다.
     let text = sanitize_inbound_text(text);
+    let channel = sanitize_inbound_text(channel);
+    let sender = sanitize_inbound_text(sender);
     let short: String = if sender.chars().count() > SENDER_MAXLEN {
         let head: String = sender.chars().take(SENDER_MAXLEN).collect();
         format!("{head}…")
     } else {
-        sender.to_string()
+        sender
     };
     let hhmm = {
         use chrono::TimeZone;
@@ -1969,6 +1983,30 @@ mod tests {
         assert!(!env.contains('\x1b'), "봉투에 ESC 유입: {env:?}");
         assert!(!env.contains('\r'), "봉투에 CR 유입: {env:?}");
         assert!(env.contains("#7"), "봉투 구조 보존: {env:?}");
+    }
+
+    // MED-1: 화이트리스트화 — 8비트 C1(CSI `\u{9b}`·NEL `\u{85}`)·LS/PS 제거, 정상문자 보존.
+    #[test]
+    fn sanitize_strips_c1_and_line_separators() {
+        // 8비트 CSI(`\u{9b}201~`) = 8비트 bracketed-paste 종료 → 제거.
+        assert_eq!(sanitize_inbound_text("\u{9b}201~rm -rf"), "201~rm -rf");
+        // NEL(`\u{85}`) 및 C1 경계(`\u{80}`·`\u{9f}`) 제거.
+        assert_eq!(sanitize_inbound_text("a\u{85}b\u{80}c\u{9f}d"), "abcd");
+        // 줄/문단 구분자(U+2028 LS·U+2029 PS) 제거.
+        assert_eq!(sanitize_inbound_text("x\u{2028}y\u{2029}z"), "xyz");
+        // 한글·이모지·탭·개행은 보존.
+        assert_eq!(sanitize_inbound_text("한글\t이모지🚀\n끝"), "한글\t이모지🚀\n끝");
+    }
+
+    // LOW-1: envelope의 sender·channel도 살균 — ESC/C1을 담은 sender/channel이 봉투에서 제거된다.
+    #[test]
+    fn envelope_sanitizes_sender_and_channel() {
+        let env = envelope("sl\x1back", "U\u{9b}201~1", 0.0, 3, false, "hi");
+        assert!(!env.contains('\x1b'), "봉투 channel에 ESC 유입: {env:?}");
+        assert!(!env.contains('\u{9b}'), "봉투 sender에 8비트 CSI 유입: {env:?}");
+        // 살균 후 정상 잔여 문자는 보존.
+        assert!(env.contains("slack"), "channel 정상문자 보존: {env:?}");
+        assert!(env.contains("#3"), "봉투 구조 보존: {env:?}");
     }
 
     // H2: lockdown → unlock → inbound 복원 + reconcile 재개(플래그 OFF).
