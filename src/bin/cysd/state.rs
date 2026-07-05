@@ -117,6 +117,11 @@ pub struct Surface {
     /// T5-2 직전 성공 ack 시각(epoch초) — 명령(send/key)이 성공 보고한 시점. surface_crashed
     /// 술어의 "성공 ack 후 N초 내 후행 실패" 윈도우 기준. None=아직 ack 없음.
     pub last_cmd_ack: Mutex<Option<f64>>,
+    /// (W4) 이 surface의 reader 스레드가 vt100 파서 패닉을 격리·재초기화한 누적 횟수.
+    /// process_chunk_isolated가 패닉을 잡을 때마다 증가 — status(org.status)에 노출한다.
+    pub parser_panics: AtomicU64,
+    /// (W4) 마지막 파서 패닉 발생 epoch초(없으면 None) — 상습 트리거 포렌식용 health 신호.
+    pub last_parser_panic: Mutex<Option<f64>>,
 }
 
 pub struct HealthRule {
@@ -330,6 +335,46 @@ pub fn live_worker_count(roles: &HashMap<String, u64>, is_alive: impl Fn(u64) ->
         .count()
 }
 
+/// (W4) PTY 청크를 vt100 파서에 반영하되, 파서 내부 인덱스 패닉을 격리한다.
+///
+/// vt100 0.15.2는 와이드(CJK·이모지) 문자의 선두 셀이 마지막 열에 놓인 상태에서 그 셀을
+/// 지우거나 덮어쓰면 `row.rs:89 clear_wide`가 `cells[col+1]`을 경계 밖 인덱싱해 패닉한다
+/// (좁은 pane으로의 resize가 선두 와이드 셀을 마지막 열로 밀어내는 경로 — 한국어 CLI 출력에서
+/// 실재, cysd.log 누적 29회). 이 패닉이 reader 스레드를 죽이면 해당 pane의 PTY 배수가 정지해
+/// pane 속 CLI가 write 블록으로 동결된다("절대 불사"의 죽음의 경로).
+///
+/// 패닉 시: 그 청크의 파싱만 포기하고, 오염 가능성 있는 파서를 폐기해 rows/cols만 보존한
+/// fresh `vt100::Parser`로 교체한 뒤 `panicked=true`를 반환한다. 호출부(reader 스레드)는
+/// 원시 바이트 broadcast·ingest 경로를 계속 태워 PTY 배수를 절대 멈추지 않는다.
+///
+/// `AssertUnwindSafe` 근거: `parser`(&mut)는 catch_unwind 경계를 넘는 유일한 상태인데, 패닉
+/// 발생 시 즉시 fresh Parser로 통째 교체해 불변식이 깨진 상태를 어떤 관찰 경로로도 노출하지
+/// 않는다. rows/cols는 process 이전에 포착해 재초기화에 쓰므로(패닉 후 파서 재접근 없음),
+/// 이중 패닉 위험도 없다. `set_size`(escape) 등으로 청크 내 크기 변경이 있었다 해도 패닉 시엔
+/// 그 청크 전체를 폐기하므로 이전 크기 보존이 정합적이다(다음 resize RPC가 최종 정정).
+fn process_chunk_isolated(
+    parser: &mut vt100::Parser,
+    chunk: &[u8],
+    needs_dsr: bool,
+) -> (Option<String>, bool) {
+    // rows/cols를 process '이전'에 포착 — 패닉 후 파서를 재접근하지 않고 fresh 재초기화에 쓴다.
+    let (rows, cols) = parser.screen().size();
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        parser.process(chunk);
+        needs_dsr.then(|| {
+            let (r, c) = parser.screen().cursor_position();
+            format!("\x1b[{};{}R", r + 1, c + 1)
+        })
+    }));
+    match res {
+        Ok(resp) => (resp, false),
+        Err(_) => {
+            *parser = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
+            (None, true)
+        }
+    }
+}
+
 #[cfg(test)]
 mod dedup_tests {
     use super::{dedup_worker_role, live_worker_count};
@@ -405,6 +450,69 @@ mod dedup_tests {
     }
 }
 
+#[cfg(test)]
+mod panic_isolation_tests {
+    use super::{process_chunk_isolated, SCROLLBACK_LINES};
+
+    /// row.rs:89 clear_wide OOB 재현 시퀀스: 와이드(CJK) 문자의 선두 셀을 26열 그리드 끝에 놓고
+    /// 25열로 축소하면 선두 와이드 셀이 마지막 열(index 24, len 25)로 밀린다. 그 셀을 덮어쓰면
+    /// vt100 0.15.2가 `cells[col+1]`=cells[25]를 경계 밖 인덱싱해 패닉한다(프로덕션 "len 25 index 25").
+    /// 좁은 pane으로의 resize + 한국어 CLI 출력이라는 실제 경로를 그대로 박제한다.
+    fn drive_row89_panic(parser: &mut vt100::Parser) -> bool {
+        process_chunk_isolated(parser, b"\x1b[1;25H", false);
+        process_chunk_isolated(parser, "\u{ac00}".as_bytes(), false); // '가'(wide)
+        parser.set_size(10, 25); // 축소 → 선두 와이드 셀이 마지막 열로
+        let (_, panicked) = process_chunk_isolated(parser, b"\x1b[1;25Ha", false);
+        panicked
+    }
+
+    #[test]
+    fn normal_chunk_does_not_report_panic() {
+        let mut p = vt100::Parser::new(10, 26, SCROLLBACK_LINES);
+        let (_, panicked) = process_chunk_isolated(&mut p, b"hello world", false);
+        assert!(!panicked, "정상 입력은 패닉을 발동하지 않는다");
+        assert!(p.screen().contents().contains("hello world"));
+    }
+
+    #[test]
+    fn row89_sequence_is_contained_not_propagated() {
+        // 격리가 없다면 이 시퀀스는 스레드를 죽인다 — catch_unwind가 panicked=true로 흡수해야 한다.
+        let mut p = vt100::Parser::new(10, 26, SCROLLBACK_LINES);
+        let panicked = drive_row89_panic(&mut p);
+        assert!(panicked, "row.rs:89 clear_wide OOB 시퀀스가 격리(패닉 흡수)를 발동해야 한다");
+    }
+
+    #[test]
+    fn reinit_preserves_rows_cols() {
+        let mut p = vt100::Parser::new(10, 26, SCROLLBACK_LINES);
+        assert!(drive_row89_panic(&mut p));
+        // 패닉 직전 크기(축소 후 10x25)를 fresh 파서가 그대로 보존해야 한다.
+        assert_eq!(p.screen().size(), (10, 25), "재초기화가 rows/cols를 보존해야 한다");
+    }
+
+    #[test]
+    fn parser_survives_and_processes_after_panic() {
+        // 격리 후 파서는 계속 동작 — 후속 청크가 정상 반영돼야 한다(reader 배수 지속의 파서측 보증).
+        let mut p = vt100::Parser::new(10, 26, SCROLLBACK_LINES);
+        assert!(drive_row89_panic(&mut p));
+        let (_, panicked) = process_chunk_isolated(&mut p, b"\x1b[2J\x1b[1;1Halive", false);
+        assert!(!panicked, "재초기화된 파서는 후속 청크를 패닉 없이 반영해야 한다");
+        assert!(
+            p.screen().contents().contains("alive"),
+            "재초기화 후 새 출력이 화면에 반영돼야 한다"
+        );
+    }
+
+    #[test]
+    fn dsr_response_survives_isolation() {
+        // needs_dsr 경로도 격리 헬퍼를 통과 — 정상 시 커서 위치 응답을 반환한다.
+        let mut p = vt100::Parser::new(10, 26, SCROLLBACK_LINES);
+        let (resp, panicked) = process_chunk_isolated(&mut p, b"\x1b[3;5H", true);
+        assert!(!panicked);
+        assert_eq!(resp.as_deref(), Some("\x1b[3;5R"));
+    }
+}
+
 pub struct Daemon {
     pub surfaces: Mutex<HashMap<u64, Arc<Surface>>>,
     pub next_id: AtomicU64,
@@ -465,6 +573,9 @@ pub struct Daemon {
     /// C0 채널 계층 저장소(channels.db) — desired-state·inbox·원장. 무결 필수라 open 실패 시
     /// None(채널 모듈 비활성) — 데몬은 계속 동작한다(순수 추가 계층).
     pub channels: Mutex<Option<rusqlite::Connection>>,
+    /// (W4) 전 surface reader 스레드의 vt100 파서 패닉 격리 누적 횟수(데몬 health 신호).
+    /// surface별 카운터(Surface::parser_panics)의 데몬 전체 합산 — status(org.status)에 노출한다.
+    pub parser_panics_total: AtomicU64,
 }
 
 /// T6 Control Center 소비 트래커 — in-memory(재시작 리셋, 가동시간 의미론과 동일).
@@ -854,6 +965,7 @@ impl Daemon {
             consumption: Mutex::new(Consumption::default()),
             analytics: Mutex::new(analytics_conn),
             channels: Mutex::new(channels_conn),
+            parser_panics_total: AtomicU64::new(0),
         });
         // 재시작에도 오늘 소비/비용/모델믹스/스파크라인 보존 — 최근 12h usage_records 리플레이.
         crate::analytics::seed_consumption(&daemon);
@@ -1245,6 +1357,8 @@ impl Daemon {
             // 그 외 deny-by-default none). claim_role이 역할 전이 시 동기 재도출한다.
             caps: Mutex::new(crate::caps::Caps::for_role(role.as_deref())),
             osc_carry: Mutex::new(Vec::new()),
+            parser_panics: AtomicU64::new(0),
+            last_parser_panic: Mutex::new(None),
         });
 
         // ★W2a: 이 create가 실제 등록한(dedup 후) 역할 — 아래에서 묘비 해제에 쓴다.
@@ -1348,27 +1462,26 @@ impl Daemon {
                         let dsr_resp = {
                             // poison된 락도 복구 — 단일 패닉이 데몬 전체를 마비시키지 않게 한다.
                             let mut parser = surf.parser.lock().unwrap_or_else(|e| e.into_inner());
-                            // vt100 0.15.2(row.rs:89 등) 내부 인덱스 패닉이 parser 락을 poison시켜
-                            // 데몬 요청처리 전체를 마비시키던 연쇄를 차단: process를 catch_unwind로 격리.
-                            let resp = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                                || {
-                                    parser.process(chunk);
-                                    needs_dsr.then(|| {
-                                        let (r, c) = parser.screen().cursor_position();
-                                        format!("\x1b[{};{}R", r + 1, c + 1)
-                                    })
-                                },
-                            )) {
-                                Ok(resp) => resp,
-                                Err(_) => {
-                                    eprintln!(
-                                        "[cysd] surface {} vt100 process panic contained ({} bytes)",
-                                        surf.id,
-                                        chunk.len()
-                                    );
-                                    None
-                                }
-                            };
+                            // (W4) vt100 0.15.2(row.rs:89 clear_wide 등) 내부 인덱스 패닉을 격리한다:
+                            // 패닉 시 그 청크 파싱만 포기하고 파서를 fresh로 재초기화(rows/cols 보존)한다.
+                            // reader 스레드는 죽지 않고, 아래 out_tx.send(원시 바이트 broadcast)와
+                            // 후속 ingest 경로는 계속 태워 PTY 배수를 절대 멈추지 않는다.
+                            let (resp, panicked) =
+                                process_chunk_isolated(&mut parser, chunk, needs_dsr);
+                            if panicked {
+                                // 재발 관측: surface별·데몬 전체 카운터 + 마지막 발생 시각(status 노출).
+                                surf.parser_panics.fetch_add(1, Ordering::Relaxed);
+                                *surf.last_parser_panic.lock().unwrap() = Some(now_epoch());
+                                daemon.parser_panics_total.fetch_add(1, Ordering::Relaxed);
+                                eprintln!(
+                                    "[cysd] surface {} vt100 파서 패닉 격리 — 청크 {} 바이트 파싱 포기, \
+                                     파서 재초기화(화면 스냅샷 소실). PTY 배수는 계속.",
+                                    surf.id,
+                                    chunk.len()
+                                );
+                            }
+                            // 원시 바이트 broadcast는 파서 반영·패닉 여부와 무관하게 항상 수행한다.
+                            // (파서 락 임계영역 내 send — run_attach 구독/스냅샷과의 직렬화 불변식 유지.)
                             let _ = surf.out_tx.send(attach_payload);
                             resp
                         };

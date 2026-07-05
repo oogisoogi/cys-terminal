@@ -2423,6 +2423,9 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                             .and_then(|u| serde_json::to_value(u).ok()),
                         "line_count": s.line_count.load(Ordering::Relaxed),
                         "created_at": s.created_at,
+                        // (W4) 파서 패닉 격리 재발 관측 — surface별 누적·마지막 발생 시각.
+                        "parser_panics": s.parser_panics.load(Ordering::Relaxed),
+                        "last_parser_panic": *s.last_parser_panic.lock().unwrap(),
                     })
                 })
                 .collect();
@@ -2469,7 +2472,9 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         json!({"since": since, "reason": reason})),
                     "daemon": {"version": env!("CARGO_PKG_VERSION"),
                                "started_at": daemon.started_at,
-                               "latest_seq": daemon.bus.latest_seq()},
+                               "latest_seq": daemon.bus.latest_seq(),
+                               // (W4) 데몬 전체 파서 패닉 격리 누적 — health 신호.
+                               "parser_panics": daemon.parser_panics_total.load(Ordering::Relaxed)},
                     "surfaces": list,
                     "feed": {"pending": pending, "oldest_pending_age_secs": oldest_age},
                     "health_recent": health_recent,
