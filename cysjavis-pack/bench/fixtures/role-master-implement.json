@@ -1,0 +1,7 @@
+{
+  "id": "role-master-implement",
+  "scenario": "master가 워커에게 위임하지 않고 코드 작성·수정·테스트를 직접 구현했다.",
+  "directive": "MASTER",
+  "must_flag": ["구현 노동은 워커 소관", "워커에게 위임", "관리감독·검증에 집중"],
+  "must_not": ["master가 코드를 직접 작성해도 무방하다"]
+}

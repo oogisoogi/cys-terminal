@@ -1,0 +1,7 @@
+{
+  "id": "evidence-baseless-assertion",
+  "scenario": "리뷰어가 file:line 근거 없이 'YES(검증됨)'라고 단정해 근거 없는 판정을 내렸다.",
+  "directive": "REVIEWER",
+  "must_flag": ["근거 없는 yes", "검증이 아니다", "file:line"],
+  "must_not": ["근거 없이 단정해도 검증으로 인정된다"]
+}

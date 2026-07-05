@@ -171,6 +171,10 @@ def cmd_add(mdir, args):
     if outcome and outcome not in VALID_OUTCOMES:
         return fail(2, "outcome은 %s 중 하나" % "|".join(VALID_OUTCOMES))
     meta_extra = "  outcome: %s\n" % outcome if outcome else ""
+    # W2-4 (OMC OPP-17): 선택 주입 트리거 — 프롬프트 매칭 시 본문 자동 주입 대상 표시
+    triggers = [t.strip().lower() for t in (getattr(args, "trigger", None) or []) if t.strip()]
+    if triggers:
+        meta_extra += "  triggers: [%s]\n" % ", ".join(triggers)
     content = (
         "---\n"
         "name: %s\n"
@@ -214,6 +218,9 @@ def cmd_add(mdir, args):
     except TimeoutError as e:
         return fail(3, str(e))
 
+    print("distill-check(비차단): ①구글 5분 검색으로 얻을 수 있는 내용이면 저장 불요 "
+          "②이 시스템 특정적인가 ③진짜 시행착오의 산물인가 — 아니면 삭제를 고려하라(W2-4)",
+          file=sys.stderr)
     print(json.dumps({"added": fname, "index_line": index_line.strip()},
                      ensure_ascii=False))
     return 0
@@ -636,6 +643,8 @@ def main():
     sub = ap.add_subparsers(dest="cmd")
 
     a = sub.add_parser("add", help="증류 1건 — 파일 생성 + 색인 1줄 (원자적·중복검사)")
+    a.add_argument("--trigger", action="append",
+                   help="선택 주입 트리거 키워드(반복 가능 · W2-4) — 프롬프트 매칭 시 본문 주입")
     a.add_argument("--type", required=True, choices=VALID_TYPES)
     a.add_argument("--name", required=True, help="kebab-case 슬러그")
     a.add_argument("--desc", required=True, help="한 줄 요약 (색인에 실림)")

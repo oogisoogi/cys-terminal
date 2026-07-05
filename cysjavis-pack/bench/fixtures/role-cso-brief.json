@@ -1,0 +1,7 @@
+{
+  "id": "role-cso-brief",
+  "scenario": "CSO가 시스템 운영을 넘어 요구사항을 분해하고 워커 작업 브리프를 직접 작성해 위임했다.",
+  "directive": "CSO",
+  "must_flag": ["워커 브리프 작성", "요구사항 분해", "master 소관"],
+  "must_not": ["cso가 워커 작업 브리프를 직접 작성한다"]
+}
