@@ -5,6 +5,7 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import { imeStep, initialImeState, type ImeEvent } from "./ime";
+import { shellQuote, shellQuoteJoin } from "./shellquote";
 
 declare global {
   interface Window {
@@ -1326,6 +1327,25 @@ const b64ToBytes = (b64: string): Uint8Array => {
   return out;
 };
 
+// Uint8Array → base64. 이미지(수백 KB)에서 fromCharCode(...전체)는 스택오버플로라 32KB 청크로 인코딩.
+const bytesToB64 = (bytes: Uint8Array): string => {
+  let bin = "";
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    bin += String.fromCharCode(...bytes.subarray(i, i + chunk));
+  }
+  return btoa(bin);
+};
+
+// 클립보드 이미지 MIME → 저장 파일 확장자. 미지·비표준은 png로 폴백.
+const imageExtFromMime = (mime: string): string => {
+  const m = mime.toLowerCase();
+  if (m === "image/jpeg" || m === "image/jpg") return "jpg";
+  if (m === "image/gif") return "gif";
+  if (m === "image/webp") return "webp";
+  return "png"; // image/png 및 기타
+};
+
 // surface도 번호 대신 이름 — 기본 자동 제목("surface N"·빈 문자열)이면 현재 디렉토리 경로 표시.
 const isAutoTitle = (t: string | null | undefined) => !t || /^surface \d+$/.test(t);
 const paneTitle = (title: string | null | undefined, liveCwd?: string | null) =>
@@ -1528,7 +1548,32 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
       const text = e.clipboardData?.getData("text") ?? "";
       e.preventDefault();
       e.stopPropagation();
-      if (text) term.paste(text);
+      if (text) {
+        term.paste(text);
+        return;
+      }
+      // ★이미지 붙여넣기(F): 텍스트가 없고 클립보드에 이미지 파일이 있으면 임시 파일로 저장한 뒤
+      // 그 경로를 셸 인용해 PTY로 타이핑한다(iTerm2 동작 — claude CLI 등이 경로로 이미지를 받게).
+      // items·getAsFile·type은 이벤트 동안만 유효하므로 동기로 읽고, 파일 바이트만 비동기로 처리한다.
+      const item = Array.from(e.clipboardData?.items ?? []).find(
+        (it) => it.kind === "file" && it.type.startsWith("image/"),
+      );
+      const file = item?.getAsFile();
+      if (!item || !file) return;
+      const mime = item.type;
+      file
+        .arrayBuffer()
+        .then((buf) =>
+          invoke("save_pasted_image", {
+            dataB64: bytesToB64(new Uint8Array(buf)),
+            ext: imageExtFromMime(mime),
+          }),
+        )
+        .then((path) => {
+          const isWin = /Windows/i.test(navigator.userAgent);
+          term.paste(shellQuote(path as string, isWin) + " ");
+        })
+        .catch((err) => toast("health", "이미지 붙여넣기 실패", String(err)));
     },
     true,
   );
@@ -1727,6 +1772,31 @@ function setFocus(sid: number) {
   for (const [id, rt] of panes) rt.el.classList.toggle("focused", id === key);
   panes.get(key)?.term.focus();
   updateFtRoot(); // 파일 트리가 열려 있으면 선택한 surface의 폴더로 전환
+}
+
+// 드롭 물리좌표(디바이스 픽셀)를 CSS px로 환산해 그 지점을 포함하는 pane 런타임을 찾는다.
+// 매칭 실패 시 포커스된 pane → 현재 ws 첫 pane 폴백. pane이 전무하면 undefined(호출측이 조용히 무시).
+function paneAtPhysicalPoint(pos?: { x: number; y: number }): PaneRuntime | undefined {
+  if (panes.size === 0) return undefined;
+  if (pos) {
+    const dpr = window.devicePixelRatio || 1;
+    const hit = document.elementFromPoint(pos.x / dpr, pos.y / dpr) as HTMLElement | null;
+    const paneEl = hit?.closest(".pane") as HTMLElement | null;
+    if (paneEl) {
+      for (const rt of panes.values()) if (rt.el === paneEl) return rt;
+    }
+  }
+  const sock = current()?.socket;
+  if (focusedSid != null) {
+    const rt = panes.get(paneKey(focusedSid, sock));
+    if (rt) return rt;
+  }
+  const firstSid = collectSids(current()?.tree ?? null)[0];
+  if (firstSid != null) {
+    const rt = panes.get(paneKey(firstSid, sock));
+    if (rt) return rt;
+  }
+  return undefined;
 }
 
 // ---------- render ----------
@@ -3257,6 +3327,22 @@ async function start() {
   }
 
   await listen("daemon-event", (e) => onDaemonEvent(e.payload as Record<string, unknown>));
+
+  // ── 파일 드래그&드롭 → 드롭한 pane의 PTY에 셸 인용 경로 타이핑(iTerm2 동작) ──
+  // dragDropEnabled 기본 활성이라 Tauri가 OS 드롭을 가로채 tauri://drag-drop로 준다(HTML5 drop 미발화).
+  // payload.position=물리 픽셀. 전역 listen은 target=Any라 창 라벨로 emit된 이 이벤트를 수신한다
+  // (검증: tauri 2.11 event/listener.rs match_any_or_filter — listener.target==Any면 emit 타겟 무관 매칭).
+  await listen("tauri://drag-drop", (e) => {
+    const p = (e.payload ?? {}) as { paths?: string[]; position?: { x: number; y: number } };
+    const paths = p.paths ?? [];
+    if (!paths.length) return;
+    const rt = paneAtPhysicalPoint(p.position);
+    if (!rt) return; // pane이 하나도 없으면 무시(에러 금지)
+    const isWin = /Windows/i.test(navigator.userAgent);
+    // 여러 파일이면 각각 셸 인용 후 공백 연결, 끝에 공백 1개(개행 없음 — 실행은 사용자 몫).
+    const data = shellQuoteJoin(paths, isWin) + " ";
+    invoke("send_input", { socket: rt.socket, surfaceId: rt.sid, data }).catch(() => {});
+  });
 
   // 바이너리 업데이트 진행률(install_update가 emit). chunk=이번 청크 바이트(누적 아님), total=전체(Option→null 가능).
   // UI에서 누적 합산해 지속형 토스트를 갱신한다. 성공 시 app.restart로 프로세스가 교체되므로 dismiss는 실패 경로(promptInstall catch)만.

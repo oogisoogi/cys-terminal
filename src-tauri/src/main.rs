@@ -405,6 +405,30 @@ async fn send_input(socket: Option<String>, surface_id: u64, data: String) -> Re
     .map(|_| ())
 }
 
+/// 클립보드 이미지 붙여넣기(F): base64 이미지를 임시 파일로 저장하고 절대경로를 반환한다.
+/// UI가 이 경로를 셸 인용해 PTY로 타이핑한다(iTerm2 동작 — 붙여넣기로 이미지 경로 주입).
+#[tauri::command]
+fn save_pasted_image(data_b64: String, ext: String) -> Result<String, String> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data_b64.as_bytes())
+        .map_err(|e| e.to_string())?;
+    // ext는 UI가 MIME에서 유도(png/jpg/gif/webp) — 경로 조작 방지로 영숫자만 통과, 아니면 png.
+    let safe_ext = if !ext.is_empty() && ext.chars().all(|c| c.is_ascii_alphanumeric()) {
+        ext.as_str()
+    } else {
+        "png"
+    };
+    let dir = std::env::temp_dir().join("cys-paste");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let path = dir.join(format!("paste-{ms}.{safe_ext}"));
+    std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
 /// 파일 트리 패널용 디렉토리 나열 — dirs 먼저, 이름순.
 #[tauri::command]
 fn list_dir(path: String) -> Result<Value, String> {
@@ -1728,6 +1752,7 @@ fn main() {
             learn_status,
             create_surface,
             send_input,
+            save_pasted_image,
             log_ime,
             rename_surface,
             resize_surface,
