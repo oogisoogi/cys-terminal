@@ -358,7 +358,7 @@ jobs:
       # ─────────────────────────────────────────────────────────────────────────
       - name: T5 피닉스 Windows 패리티 스모크 (무손실 복원 S1~S5 + KeepAlive)
         shell: pwsh
-        timeout-minutes: 18   # ★백스톱: 케이스⑦ RestartOnFailure 는 스케줄러 간격 PT1M(최소)이라 ~3분 예산 — 여유 상향(hang은 스모크 롤링 워치독이 잡음)
+        timeout-minutes: 20   # ★백스톱: 케이스⑦ RestartOnFailure 실전 재기동 지연 ~4분(예산 420s)+①~⑥ ~3분+오버헤드 → ~11-12분·여유 상향(hang은 스모크 롤링 워치독이 잡음)
         env:
           PYTHONUTF8: '1'     # 한글 stdout cp1252 크래시 방지(RC-16 관례)
         run: |

@@ -337,8 +337,10 @@ def case6_deploy_plan():
 def case7_keepalive_respawn():
     """★진짜 KeepAlive(RestartOnFailure) 실 respawn E2E — 실 cysd 스케줄러 태스크로 검증(실기 대표성).
     cys daemon install(RestartOnFailure XML)→schtasks /Run 으로 데몬 기동(=태스크 action 인스턴스)→taskkill /F
-    (비정상 종료=action exit≠0)→★재기동 유발 없이 순수 스케줄러 RestartOnFailure(간격 PT1M)만 관측→pong+epoch delta.
-    정직 evidence: 경과 시간 기록. 정리(태스크 uninstall→데몬 kill)는 finally."""
+    (비정상 종료=action exit≠0)→★재기동 유발 없이 순수 스케줄러 RestartOnFailure 만 관측.
+    ★1차 성공 기준 = boot-epoch delta(스케줄러가 실제로 새 세대를 띄웠다는 정직한 증거). pong 복귀 '시간'은 evidence
+    (Task Scheduler 실전 재기동 지연은 PT1M 설정보다 김·실측 ~4분). 예산 420s + grace 1회(경계 도착 보호).
+    정리(태스크 uninstall→데몬 kill)는 finally."""
     _cp("⑦ keepalive setup")
     default_pipe = r"\\.\pipe\cys"
     task = "cysd"
@@ -375,18 +377,34 @@ def case7_keepalive_respawn():
             subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True, text=True, timeout=15)
         t0 = time.time()
         # ★순수 관측: 재기동 유발(cys list·schtasks /Run) 없이 ping(autostart 안 함)만 폴링 — 되살리면 스케줄러 뿐.
-        revived = False
-        while time.time() - t0 < 240:   # 예산: PT1M 간격 + 기동 + 지터
+        #   ★판정 재정의(CI run 28736698338 교훈): Task Scheduler 실전 재기동 지연은 PT1M 설정보다 길다(실측 ~4분·
+        #   실패감지 주기 특성). pong 복귀 '시간'은 evidence 로만 기록하고, 1차 성공 기준은 boot-epoch delta(정직한
+        #   '새 세대' 증거)로 둔다. 예산 420s(4분 실측+여유). ★status(get_boot_epoch)는 autostart 하므로 데몬이
+        #   ping 으로 살아있음을 확인한 뒤에만 epoch 을 조회한다(우리가 status autostart 로 되살리는 오검출 방지).
+        BUDGET = 420
+        revived_pong = False
+        pong_elapsed = None
+        while time.time() - t0 < BUDGET:
             _cp("⑦ waiting scheduler RestartOnFailure respawn")
             if _ping_pong(default_pipe):
-                revived = True
+                revived_pong = True
+                pong_elapsed = time.time() - t0
                 break
             time.sleep(3)
+        # ★grace 1회(경계 직후 도착을 억울하게 놓치지 않게 — 이번 실패가 정확히 경계 +1~2s 였다)
+        if not revived_pong:
+            time.sleep(5)
+            if _ping_pong(default_pipe):
+                revived_pong = True
+                pong_elapsed = time.time() - t0
         elapsed = time.time() - t0
-        epoch2 = _PH.get_boot_epoch(default_pipe)
-        check("⑦ 스케줄러 자동 재기동(유발 없이 pong 복귀)", revived, "elapsed=%.0fs" % elapsed)
-        check("⑦ boot-epoch delta(실제 새 세대·조용한 오복원 아님)",
-              epoch1 is not None and epoch2 is not None and epoch1 != epoch2, "%s->%s elapsed=%.0fs" % (epoch1, epoch2, elapsed))
+        # 데몬이 (ping 으로) 살아있을 때만 epoch 조회(status autostart 로 우리가 되살리는 것 차단)
+        epoch2 = _PH.get_boot_epoch(default_pipe) if revived_pong else None
+        pong_ev = ("%.0fs" % pong_elapsed) if pong_elapsed is not None else "미관측"
+        # ★1차 판정 = boot-epoch delta(스케줄러가 실제로 새 세대를 띄웠다는 정직한 증거). pong 복귀 시간은 evidence.
+        check("⑦ 스케줄러 자동 재기동 = boot-epoch delta(새 세대·유발 없이 순수 관측)",
+              epoch1 is not None and epoch2 is not None and epoch1 != epoch2,
+              "epoch %s->%s · pong복귀=%s · elapsed=%.0fs(예산 %ds)" % (epoch1, epoch2, pong_ev, elapsed, BUDGET))
     finally:
         _cp("⑦ teardown")
         if installed:
