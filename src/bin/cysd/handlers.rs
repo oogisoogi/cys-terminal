@@ -1666,9 +1666,11 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 created_at: crate::state::now_epoch(),
                 resolved_at: None,
                 tier: tier.clone(),
-                // §3.2 자기승인 차단: 발행자 pid·pgid를 각인해 feed.reply에서 대조한다(M4 pgid 격상).
+                // §3.2 자기승인 차단: 발행자 pid·pgid·surface를 각인해 feed.reply에서 대조한다
+                // (M4 pgid 격상 + MED-2 surface 격상 — setsid pgid 탈출 fail-closed).
                 publisher_pid: caller_pid,
                 publisher_pgid: caller_pid.and_then(crate::state::pgid_of),
+                publisher_surface: caller_pid.and_then(|p| resolve_caller_surface(daemon, p)),
             };
             // waiter 등록을 항목 공개와 같은 임계영역에서 수행 — 항목이 다른 커넥션에
             // 보이는 순간 waiter가 이미 존재해, 빠른 feed.reply의 결정이 유실되지 않는다.
@@ -1745,7 +1747,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             // M7: 해소는 단일 경로(resolve_feed_item)에 위임한다. 위임 전 precheck로 ①존재 여부
             // ②already-resolved를 구분(resolve_feed_item은 둘 다 None)하고, 자기승인 판정용 발행자
             // pid/pgid를 캡처한다.
-            let (pub_pid, pub_pgid) = {
+            let (pub_pid, pub_pgid, pub_sid) = {
                 let items = daemon.feed_items.lock().unwrap();
                 match items.iter().find(|i| i.request_id == request_id) {
                     None => {
@@ -1762,15 +1764,25 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                             "item already resolved",
                         ))
                     }
-                    Some(item) => (item.publisher_pid, item.publisher_pgid),
+                    Some(item) => (item.publisher_pid, item.publisher_pgid, item.publisher_surface),
                 }
             };
-            // §3.2 표면정책 — 자기승인 차단(M4 pgid 격상): 발행자와 승인자가 pid 또는 pgid가 같고
-            // allow면 거부한다(HITL 우회 방지). 자기-거부(deny)·발행자 미상·타 노드(다른 pgid) 승인은
-            // 통과. 정책 파일로 끌 수 있으나 기본 ON(fail-safe).
+            // §3.2 표면정책 — 자기승인 차단(M4 pgid + MED-2 surface 격상): 발행자와 승인자가 pid·pgid·
+            // surface가 같거나, setsid/detached로 어떤 surface에도 귀속 안 된 외부 승인이면 거부한다
+            // (HITL 우회·pgid 탈출 fail-closed 방지). 자기-거부(deny)·발행자 미상·타 노드(다른 surface)
+            // 승인은 통과. 정책 파일로 끌 수 있으나 기본 ON(fail-safe).
+            // resolve_caller_surface는 내부에서 surfaces 락을 잡으므로 위 임계영역 밖에서 호출한다.
             let caller_pgid = caller_pid.and_then(crate::state::pgid_of);
-            if crate::state::is_self_approval(pub_pid, pub_pgid, caller_pid, caller_pgid, &decision)
-                && crate::state::deny_self_approve_policy()
+            let caller_sid = caller_pid.and_then(|p| resolve_caller_surface(daemon, p));
+            if crate::state::is_self_approval(
+                pub_pid,
+                pub_pgid,
+                pub_sid,
+                caller_pid,
+                caller_pgid,
+                caller_sid,
+                &decision,
+            ) && crate::state::deny_self_approve_policy()
             {
                 return Reply::Single(err_response(
                     &id,

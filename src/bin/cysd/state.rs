@@ -209,6 +209,12 @@ pub struct FeedItem {
     /// None=미상(구 영속 라인·windows·해소 실패)이면 이 경로로는 차단하지 않는다. serde default 하위호환.
     #[serde(default)]
     pub publisher_pgid: Option<u32>,
+    /// 발행자 소속 surface(resolve_caller_surface·start-time 검증). feed.reply의 caller surface와
+    /// 같으면 pgid가 달라도 자기승인이다(setsid/detached로 새 pid·pgid를 만들어도 surface 귀속은
+    /// 유지되므로 pgid 탈출을 fail-closed로 막는다·MED-2 감사). None=미상(구 영속 라인·데몬 발행).
+    /// 인메모리 Vec이라 마이그레이션 불요. serde default 하위호환.
+    #[serde(default)]
+    pub publisher_surface: Option<u64>,
 }
 
 pub struct Config {
@@ -583,15 +589,23 @@ pub fn pgid_of(_pid: u32) -> Option<u32> {
     None
 }
 
-/// 자기승인 판정(순수·M4) — decision="allow"이고 발행자와 승인자가 **(pid 동일 OR pgid 동일)**이면
-/// 자기승인이다. pgid 격상으로 push/reply가 별개 CLI 프로세스라도 같은 프로세스 그룹(=같은 노드)이면
-/// 잡는다. master가 워커 feed를 승인하는 정상 흐름은 pgid가 달라 통과한다(같을 때만 차단). 정책
-/// 게이트(deny_self_approve_policy)는 호출자가 AND로 결합한다(순수 테스트 가능하게 분리).
+/// 자기승인 판정(순수·MED-2 surface 격상) — decision="allow"일 때 아래 중 하나면 자기승인이다:
+///  1. pid 동일 OR pgid 동일(M4 기존) — push/reply가 별개 CLI라도 같은 노드면 pgid로 잡는다.
+///  2. pub_sid가 Some일 때:
+///     - caller가 같은 surface(caller_sid == pub_sid) → pgid가 달라도 자기승인(발행자 surface에서 승인).
+///     - caller가 외부 프로세스(caller_pid.is_some())인데 어떤 surface에도 귀속 안 됨(caller_sid.is_none())
+///       → **fail-closed 차단**: `setsid cys feed reply`로 새 세션/그룹을 만들어 pid·pgid 매칭을 탈출한
+///       경로다. 정당한 승인은 항상 master surface에서 와 귀속되므로 미귀속=탈출로 본다.
+/// caller_pid.is_none()(데몬 내부 흐름)은 규칙 2가 caller_pid.is_some()을 명시하므로 걸리지 않는다.
+/// master가 워커 feed를 승인하는 정상 흐름은 caller_sid=Some(master)≠pub_sid라 통과한다.
+/// 정책 게이트(deny_self_approve_policy)는 호출자가 AND로 결합한다(순수 테스트 가능하게 분리).
 pub fn is_self_approval(
     pub_pid: Option<u32>,
     pub_pgid: Option<u32>,
+    pub_sid: Option<u64>,
     caller_pid: Option<u32>,
     caller_pgid: Option<u32>,
+    caller_sid: Option<u64>,
     decision: &str,
 ) -> bool {
     if decision != "allow" {
@@ -599,7 +613,20 @@ pub fn is_self_approval(
     }
     let pid_match = pub_pid.is_some() && pub_pid == caller_pid;
     let pgid_match = pub_pgid.is_some() && pub_pgid == caller_pgid;
-    pid_match || pgid_match
+    if pid_match || pgid_match {
+        return true;
+    }
+    if pub_sid.is_some() {
+        // 같은 surface → 자기승인(pgid 달라도).
+        if caller_sid.is_some() && caller_sid == pub_sid {
+            return true;
+        }
+        // 외부 프로세스인데 surface 미귀속 = setsid/detached 탈출 → fail-closed.
+        if caller_pid.is_some() && caller_sid.is_none() {
+            return true;
+        }
+    }
+    false
 }
 
 /// Windows named pipe 경로(`\\.\pipe\<name>`)에서 `<name>` 슬러그를 추출한다(RC-13).
@@ -845,6 +872,7 @@ impl Daemon {
             tier: None, // 데몬 자동 알림은 무태그(=D·미러 제외) — 채널 스팸 차단.
             publisher_pid: None, // 데몬 발행 — 외부 caller 없음(자기승인 판정 비적용).
             publisher_pgid: None,
+            publisher_surface: None,
         };
         self.feed_items.lock().unwrap().push(item.clone());
         self.persist_feed_item(&item);
@@ -1866,18 +1894,47 @@ mod tests {
     // ── M4: 자기승인 pgid 격상 순수 판정 — 같은 pgid(별개 CLI 프로세스)면 차단, 다른 pgid는 허용 ──
     #[test]
     fn is_self_approval_pgid_promotion() {
-        // 같은 pid → 차단(allow).
-        assert!(is_self_approval(Some(100), None, Some(100), None, "allow"));
+        // 같은 pid → 차단(allow). (pub_sid·caller_sid None)
+        assert!(is_self_approval(Some(100), None, None, Some(100), None, None, "allow"));
         // 다른 pid이지만 같은 pgid(push/reply가 별개 프로세스·같은 노드) → 차단.
-        assert!(is_self_approval(Some(100), Some(50), Some(200), Some(50), "allow"));
-        // 다른 pid·다른 pgid(master가 워커 feed 승인) → 통과.
-        assert!(!is_self_approval(Some(100), Some(50), Some(200), Some(60), "allow"));
+        assert!(is_self_approval(Some(100), Some(50), None, Some(200), Some(50), None, "allow"));
+        // 다른 pid·다른 pgid(master가 워커 feed 승인)·pub_sid None → 통과.
+        assert!(!is_self_approval(Some(100), Some(50), None, Some(200), Some(60), None, "allow"));
         // deny는 항상 통과(자기 요청 취소는 무해).
-        assert!(!is_self_approval(Some(100), Some(50), Some(100), Some(50), "deny"));
-        // 발행자 pid·pgid 미상(구 라인) → 차단 근거 없음 → 통과.
-        assert!(!is_self_approval(None, None, Some(100), Some(50), "allow"));
-        // pgid만 미상이고 pid 불일치 → 통과(pgid None은 매칭 안 함).
-        assert!(!is_self_approval(Some(100), None, Some(200), Some(50), "allow"));
+        assert!(!is_self_approval(Some(100), Some(50), None, Some(100), Some(50), None, "deny"));
+        // 발행자 pid·pgid·sid 미상(구 라인) → 차단 근거 없음 → 통과.
+        assert!(!is_self_approval(None, None, None, Some(100), Some(50), None, "allow"));
+        // pgid만 미상이고 pid 불일치·pub_sid None → 통과(pgid None은 매칭 안 함).
+        assert!(!is_self_approval(Some(100), None, None, Some(200), Some(50), None, "allow"));
+    }
+
+    // ── MED-2: 자기승인 surface 격상 — 같은 surface·setsid 탈출 fail-closed·master 정상흐름 통과 ──
+    #[test]
+    fn is_self_approval_surface_promotion() {
+        // ① 같은 surface(caller_sid==pub_sid), pgid는 달라도 → 차단.
+        assert!(is_self_approval(
+            Some(100), Some(50), Some(7), Some(200), Some(60), Some(7), "allow"
+        ));
+        // ② 다른 surface(master가 워커 feed 승인·caller_sid=master≠pub_sid) → 통과.
+        assert!(!is_self_approval(
+            Some(100), Some(50), Some(7), Some(200), Some(60), Some(9), "allow"
+        ));
+        // ③ pub_sid=Some, caller_pid=Some, caller_sid=None(setsid/detached 탈출) → 차단(fail-closed).
+        assert!(is_self_approval(
+            Some(100), Some(50), Some(7), Some(200), Some(60), None, "allow"
+        ));
+        // ④ caller_pid=None(데몬 내부 흐름) → 통과(fail-closed 미적용).
+        assert!(!is_self_approval(
+            Some(100), Some(50), Some(7), None, None, None, "allow"
+        ));
+        // ⑤ deny는 surface 일치라도 항상 통과.
+        assert!(!is_self_approval(
+            Some(100), Some(50), Some(7), Some(200), Some(60), Some(7), "deny"
+        ));
+        // ⑥ 기존 pid/pgid 매칭은 surface 무관하게 유지(pid 동일).
+        assert!(is_self_approval(
+            Some(100), None, Some(7), Some(100), None, Some(9), "allow"
+        ));
     }
 
     // ── T6b.1 회귀 핀(codex): mac -lc PATH 프리픽스는 POSIX single-quote로 특수문자 리터럴화 ──
@@ -2693,6 +2750,7 @@ mod tests {
             tier: None,
             publisher_pid: None,
             publisher_pgid: None,
+            publisher_surface: None,
         }
     }
 

@@ -2223,6 +2223,7 @@ mod tests {
             tier: Some("c".into()),
             publisher_pid: None,
             publisher_pgid: None,
+            publisher_surface: None,
         });
         // 이미 sent된 approval_prompt(feed F1·nonce 미소각).
         {
@@ -2776,6 +2777,7 @@ mod tests {
             tier: Some("c".into()),
             publisher_pid: None,
             publisher_pgid: None,
+            publisher_surface: None,
         });
     }
 
