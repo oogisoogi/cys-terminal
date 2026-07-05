@@ -53,6 +53,12 @@ jobs:
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
 
+      # UI 회귀 게이트 — 한글 IME 리듀서(ui/src/ime.ts) 프로필 A/B/C/Windows 시퀀스 테스트.
+      # 실패=릴리스 차단. 배경: WKWebView 프로필별 자모 유출·이중전송 재발 방지(fix/ime-hybrid-profile).
+      - name: UI 회귀 테스트 (bun test)
+        shell: bash
+        run: cd ui && bun test
+
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:

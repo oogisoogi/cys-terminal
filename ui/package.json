@@ -1,9 +1,10 @@
 {
   "name": "aiterm-ui",
   "private": true,
-  "version": "0.12.8",
+  "version": "0.12.10",
   "scripts": {
-    "build": "sh build.sh"
+    "build": "sh build.sh",
+    "test": "bun test"
   },
   "dependencies": {
     "@tauri-apps/plugin-notification": "^2.3.3",

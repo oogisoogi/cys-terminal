@@ -51,6 +51,16 @@ tar xzf "$TMP/uv.tgz" -C "$RT/uv" --strip-components=1   # uv-<triple>/{uv,uvx} 
 # ── node + npm/npx (공식 tarball · Developer ID 서명본) ──
 curl -fL -o "$TMP/node.txz" "https://nodejs.org/dist/v${NODE_VER}/node-v${NODE_VER}-darwin-${NODE_ARCH}.tar.xz"
 tar xJf "$TMP/node.txz" -C "$RT/node" --strip-components=1   # bin/{node,npm,npx}·lib
+# ── 무손실 트림 (성능>속도 Pareto: 기능·정보 불변, '불필요 입증분'만 제거 — 의심분은 보존) ──
+# node/include(≈53MB) = C 애드온 컴파일용 헤더(node_api·v8·gyp). 제거 근거 3중: ①런타임에 로드되지
+#   않음(순수 빌드타임 헤더) ②node-gyp는 헤더를 nodejs.org/~/.cache/node-gyp 에서 받지 이 디렉토리를
+#   보지 않음(코드베이스에 --nodedir 사용 0건 실측) ③타깃 소비자=순정 맥(개발도구 없음)엔 C++ 컴파일러가
+#   없어 네이티브 애드온 빌드 자체가 불가 → 헤더가 원천적으로 무용. 우리가 쓰는 npx 도구
+#   (kordoc·pdfjs-dist·playwright·hyperframes·@playwright/mcp)는 전부 순수 JS/사전빌드본이라 컴파일 없음.
+#   ※헤더는 런타임에 사람에게 보여지는 '정보'가 아니므로 정보-불변 게이트에도 저촉 없음.
+rm -rf "$RT/node/include"
+# ※npm/docs·npm/man(≈2.6MB)은 게이트 전부 통과했으나(`npm help` exit 0) `npm help <주제>` 출력 콘텐츠가
+#   바뀌어 '정보 불변' 엄격 해석에 걸릴 여지가 있어 retention 원칙으로 보존 — 오너 명시 승인 시 추가 트림.
 
 printf 'Bundled runtimes and their licenses (macOS):\n- CPython (python-build-standalone): PSF License (https://github.com/astral-sh/python-build-standalone)\n- git (desktop/dugite-native): GPLv2 (https://github.com/desktop/dugite-native)\n- uv (astral-sh): Apache-2.0 OR MIT (https://github.com/astral-sh/uv)\n- Node.js (+npm/npx): MIT (https://nodejs.org)\nWritten offer for corresponding source: contact the distributor.\n' > "$RT/LICENSES/BUNDLED-RUNTIMES.txt"
 ls -la "$RT/python/bin/python3" "$RT/git/bin/git" "$RT/uv/uv" "$RT/node/bin/node"
