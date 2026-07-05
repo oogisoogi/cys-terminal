@@ -354,7 +354,7 @@ def self_test():
     assert parse_ps_line('too few fields') is None
 
     reg = parse_cys_list(
-        'surface:393\trole=master\tpid=66798\texited=false\tsurface 393\t/Users/cys\n'
+        'surface:393\trole=master\tpid=66798\texited=false\tsurface 393\t/wd\n'
         'surface:395\trole=worker\tpid=28438\texited=false\tworker\t/x')
     assert reg == {66798: 'surface:393', 28438: 'surface:395'}
 
