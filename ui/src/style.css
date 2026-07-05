@@ -132,6 +132,14 @@ html, body {
 .ws-group-body { display: flex; flex-direction: column; gap: 2px; }
 .ws-tab.in-group { margin-left: 10px; } /* 멤버 들여쓰기 */
 
+/* 드래그 순서 변경(startWsDrag·startGroupDrag) — 소스 흐리게 + 삽입 위치 표시선 */
+.ws-tab.ws-dragging, .ws-group.ws-dragging { opacity: .4; }
+.ws-drop-indicator {
+  position: fixed; height: 2px; background: var(--accent);
+  border-radius: 1px; z-index: 1200; pointer-events: none; /* 히트테스트 방해 차단 */
+}
+body.ws-reordering { cursor: grabbing; -webkit-user-select: none; user-select: none; }
+
 #ctx-menu {
   position: fixed; z-index: 1000; min-width: 120px;
   background: var(--bar); border: 1px solid var(--border); border-radius: 6px;

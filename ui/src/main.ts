@@ -7,6 +7,7 @@ import { isPermissionGranted, requestPermission, sendNotification } from "@tauri
 import { imeStep, initialImeState, type ImeEvent } from "./ime";
 import { shellQuote, shellQuoteJoin } from "./shellquote";
 import { DEFAULT_BG, readableForeground } from "./theme";
+import { reorderWorkspace, reorderGroup } from "./reorder";
 
 declare global {
   interface Window {
@@ -1894,9 +1895,152 @@ function attachDividerDrag(
   });
 }
 
+// ---------- 사이드바 드래그 순서 변경 (ws 탭·그룹 섹션) ----------
+// HTML5 draggable API는 Tauri wry/WKWebView가 가로채 신뢰 불가 → attachDividerDrag처럼
+// mousedown + window mousemove/mouseup로 직접 구현. 배열 변형은 reorder.ts 순수 함수가 담당,
+// 여기선 히트테스트·삽입 표시선·render()만.
+
+// 삽입 위치 표시선(fixed) — 앵커 rect의 위/아래 모서리에 2px 라인. pointer-events:none로 히트테스트 방해 차단.
+function makeDropLine(): HTMLElement {
+  const el = document.createElement("div");
+  el.className = "ws-drop-indicator";
+  el.hidden = true;
+  document.body.appendChild(el);
+  return el;
+}
+function placeDropLine(el: HTMLElement, left: number, edgeY: number, width: number) {
+  el.hidden = false;
+  el.style.left = `${left}px`;
+  el.style.top = `${edgeY - 1}px`;
+  el.style.width = `${width}px`;
+}
+// 실제 드래그(임계 초과) 뒤에 뒤따르는 합성 click을 1회 삼킨다(그룹 name focus 등 오발 방지).
+// click이 안 오면 setTimeout으로 자기청소 → 미래의 무관한 click을 먹지 않는다.
+function suppressNextClick() {
+  const h = (ev: Event) => {
+    ev.stopPropagation();
+    ev.preventDefault();
+    cleanup();
+  };
+  const cleanup = () => window.removeEventListener("click", h, true);
+  window.addEventListener("click", h, true);
+  setTimeout(cleanup, 0);
+}
+
+// ws 탭 드래그: ungrouped·그룹 body 내 재정렬 + 그룹 간 이동. 4px 임계 후에만 드래그 시작.
+function startWsDrag(e0: MouseEvent, srcId: number) {
+  const start = { x: e0.clientX, y: e0.clientY };
+  let dragging = false;
+  let line: HTMLElement | null = null;
+  let drop: { destGroupId: number | undefined; anchorId: number | null; before: boolean } | null = null;
+
+  const move = (e: MouseEvent) => {
+    if (!dragging) {
+      if (Math.abs(e.clientX - start.x) + Math.abs(e.clientY - start.y) < 4) return; // 클릭과 구분
+      dragging = true;
+      // 소스 노드는 mousedown 시 ws 전환 render()로 교체됐을 수 있어 id로 재조회
+      document.querySelector(`#ws-tabs .ws-tab[data-ws-id="${srcId}"]`)?.classList.add("ws-dragging");
+      line = makeDropLine();
+      document.body.classList.add("ws-reordering");
+    }
+    const el = document.elementFromPoint(e.clientX, e.clientY) as HTMLElement | null;
+    drop = null;
+    const overTab = el?.closest<HTMLElement>(".ws-tab[data-ws-id]");
+    if (overTab && Number(overTab.dataset.wsId) !== srcId) {
+      const r = overTab.getBoundingClientRect();
+      const before = e.clientY < r.top + r.height / 2; // 커서가 상반부면 앞
+      const anchor = workspaces.find((w) => w.id === Number(overTab.dataset.wsId));
+      drop = { destGroupId: anchor?.groupId, anchorId: anchor!.id, before };
+      placeDropLine(line!, r.left, before ? r.top : r.bottom, r.width);
+    } else if (overTab) {
+      line!.hidden = true; // 소스 자기 위 = no-op
+    } else {
+      const sec = el?.closest<HTMLElement>(".ws-group[data-group-id]");
+      if (sec) {
+        // 그룹 헤더·body 빈 영역 위 → 그 그룹 끝에 추가
+        drop = { destGroupId: Number(sec.dataset.groupId), anchorId: null, before: false };
+        const r = sec.getBoundingClientRect();
+        placeDropLine(line!, r.left, r.bottom, r.width);
+      } else if (el?.closest("#ws-tabs")) {
+        // ungrouped 빈 영역 → ungrouped 끝에 추가
+        drop = { destGroupId: undefined, anchorId: null, before: false };
+        const bar = document.getElementById("ws-tabs")!;
+        const tabs = bar.querySelectorAll<HTMLElement>(":scope > .ws-tab[data-ws-id]");
+        const lastR = (tabs[tabs.length - 1] ?? bar).getBoundingClientRect();
+        placeDropLine(line!, lastR.left, tabs.length ? lastR.bottom : lastR.top, lastR.width);
+      } else {
+        line!.hidden = true;
+      }
+    }
+  };
+  const up = () => {
+    window.removeEventListener("mousemove", move, true);
+    window.removeEventListener("mouseup", up, true);
+    line?.remove();
+    document.body.classList.remove("ws-reordering");
+    document.querySelector(`#ws-tabs .ws-tab[data-ws-id="${srcId}"]`)?.classList.remove("ws-dragging");
+    if (dragging) suppressNextClick();
+    if (dragging && drop) {
+      // activeWs는 인덱스 — 배열 변형 전 활성 ws의 id를 잡아 변형 후 재계산(엉뚱한 탭 활성화 방지).
+      // reorderWorkspace는 새 배열(그룹 이동 시 src는 클론)을 돌려주므로 참조가 아닌 id로 찾는다.
+      const actId = workspaces[activeWs]?.id;
+      const next = reorderWorkspace(workspaces, srcId, drop.destGroupId, drop.anchorId, drop.before);
+      workspaces.splice(0, workspaces.length, ...next); // 배열 identity 유지(코드베이스가 splice로 변형)
+      activeWs = Math.max(0, workspaces.findIndex((w) => w.id === actId));
+      render(); // saveLayout 직접 호출 금지 — render가 부른다(멤버0 그룹 해체도 normalizeGroups가)
+    }
+  };
+  window.addEventListener("mousemove", move, true);
+  window.addEventListener("mouseup", up, true);
+}
+
+// 그룹 섹션 드래그: groups 배열 순서 변경. pinned/unpinned tier 분리는 reorderGroup이 클램프.
+function startGroupDrag(e0: MouseEvent, srcId: number) {
+  const start = { x: e0.clientX, y: e0.clientY };
+  let dragging = false;
+  let line: HTMLElement | null = null;
+  let drop: { anchorId: number; before: boolean } | null = null;
+
+  const move = (e: MouseEvent) => {
+    if (!dragging) {
+      if (Math.abs(e.clientX - start.x) + Math.abs(e.clientY - start.y) < 4) return;
+      dragging = true;
+      document.querySelector(`#ws-tabs .ws-group[data-group-id="${srcId}"]`)?.classList.add("ws-dragging");
+      line = makeDropLine();
+      document.body.classList.add("ws-reordering");
+    }
+    const el = document.elementFromPoint(e.clientX, e.clientY) as HTMLElement | null;
+    const head = el?.closest<HTMLElement>(".ws-group-head");
+    drop = null;
+    const sec = head?.closest<HTMLElement>(".ws-group[data-group-id]");
+    if (head && sec && Number(sec.dataset.groupId) !== srcId) {
+      const r = head.getBoundingClientRect();
+      const before = e.clientY < r.top + r.height / 2;
+      drop = { anchorId: Number(sec.dataset.groupId), before };
+      placeDropLine(line!, r.left, before ? r.top : r.bottom, r.width);
+    } else {
+      line!.hidden = true;
+    }
+  };
+  const up = () => {
+    window.removeEventListener("mousemove", move, true);
+    window.removeEventListener("mouseup", up, true);
+    line?.remove();
+    document.body.classList.remove("ws-reordering");
+    document.querySelector(`#ws-tabs .ws-group[data-group-id="${srcId}"]`)?.classList.remove("ws-dragging");
+    if (dragging) suppressNextClick();
+    if (dragging && drop) {
+      groups = reorderGroup(groups, srcId, drop.anchorId, drop.before);
+      render(); // 그룹 순서만 바뀌므로 activeWs 재계산 불요
+    }
+  };
+  window.addEventListener("mousemove", move, true);
+  window.addEventListener("mouseup", up, true);
+}
+
 // ---------- 정렬: 역할(role) 기반 고정 배치 ----------
 // 현재 워크스페이스의 살아있는 surface를 역할별 표준 자리로 재배치한다:
-//   · 왼쪽 끝 컬럼  = master(위) / cso(아래), 세로 5:1
+//   · 왼쪽 끝 컬럼  = master(위) / cso(아래), 세로 4:1
 //   · 가운데        = worker·미분류 surface를 같은 폭 컬럼으로 균등 분배(좌→우 순서 보존)
 //   · 오른쪽 끝 컬럼 = reviewer-gemini(agy, 위) / reviewer-codex(codex, 아래), 세로 1:1
 // 트리 위상만 새로 짜고 attachDividerDrag는 건드리지 않으므로 수동 크기 조절은 그대로 보존된다
@@ -1925,8 +2069,8 @@ function roleLayout(sids: number[], roleOf: Map<number, string | null>): Node {
   const pane = (sid: number): Node => ({ type: "pane", sid });
 
   const columns: Node[] = [];
-  // 왼쪽 끝: master(위) / cso(아래) = 5:1 (누락 시 있는 쪽이 컬럼 전체)
-  if (master != null && cso != null) columns.push({ type: "split", dir: "col", ratio: 5 / 6, a: pane(master), b: pane(cso) });
+  // 왼쪽 끝: master(위) / cso(아래) = 4:1 (누락 시 있는 쪽이 컬럼 전체)
+  if (master != null && cso != null) columns.push({ type: "split", dir: "col", ratio: 4 / 5, a: pane(master), b: pane(cso) });
   else if (master != null) columns.push(pane(master));
   else if (cso != null) columns.push(pane(cso));
   // 가운데: worker·미분류 균등 컬럼
@@ -2018,6 +2162,7 @@ function buildTab(ws: Workspace): HTMLElement {
   const color = WS_COLORS[ws.id % WS_COLORS.length];
   const tab = document.createElement("div");
   tab.className = "ws-tab" + (workspaces.indexOf(ws) === activeWs ? " active" : "");
+  tab.dataset.wsId = String(ws.id); // 드래그 히트테스트용(startWsDrag)
   tab.style.borderLeftColor = color; // ws 고유색은 좌측 바 (사이드바 항목 식별)
   const titleRow = document.createElement("div");
   titleRow.className = "ws-title-row";
@@ -2071,6 +2216,7 @@ function buildTab(ws: Workspace): HTMLElement {
   tab.addEventListener("mousedown", (e) => {
     // 우클릭은 전환하지 않음 — render()가 탭 DOM을 재생성하면 컨텍스트 메뉴가 죽은 엘리먼트를 잡는다
     if (e.button !== 0 || e.target === close) return;
+    if ((e.target as HTMLElement)?.isContentEditable) return; // rename 편집 중엔 전환·드래그 금지
     const i = workspaces.indexOf(ws); // 그룹 재배열로 시각 순서≠배열 순서 — 실시간 위치로 전환
     if (i !== activeWs) {
       activeWs = i;
@@ -2078,6 +2224,7 @@ function buildTab(ws: Workspace): HTMLElement {
       const first = collectSids(current().tree)[0];
       if (first != null) setFocus(first);
     }
+    startWsDrag(e, ws.id); // 4px 임계 초과 시에만 재정렬 드래그(단순 클릭은 위 전환만)
   });
   const startRename = () => {
     // WKWebView에서 prompt()는 무동작 — 인라인 편집
@@ -2150,6 +2297,7 @@ function buildTab(ws: Workspace): HTMLElement {
 function buildGroupSection(g: GroupMeta): HTMLElement {
   const sec = document.createElement("div");
   sec.className = "ws-group" + (g.collapsed ? " collapsed" : "");
+  sec.dataset.groupId = String(g.id); // 드래그 히트테스트용(startWsDrag·startGroupDrag)
 
   const head = document.createElement("div");
   head.className = "ws-group-head" + (g.pinned ? " pinned" : "");
@@ -2194,6 +2342,13 @@ function buildGroupSection(g: GroupMeta): HTMLElement {
   });
 
   head.append(chevron, name, count, add);
+  head.addEventListener("mousedown", (e) => {
+    if (e.button !== 0) return;
+    const t = e.target as HTMLElement;
+    // 접기(chevron)·추가(+)·이름편집(rename 중)은 클릭 동작 보존 — 드래그 시작 금지
+    if (t === chevron || t === add || t?.isContentEditable) return;
+    startGroupDrag(e, g.id); // 4px 임계 초과 시에만 그룹 순서 드래그(단순 클릭은 name focus 보존)
+  });
   head.addEventListener("contextmenu", (e) => {
     e.preventDefault();
     showCtxMenu(e.clientX, e.clientY, groupCtxItems(g));

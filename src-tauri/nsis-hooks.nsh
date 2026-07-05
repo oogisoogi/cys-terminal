@@ -73,6 +73,15 @@ cys_done:
   Sleep 500
 !macroend
 
+!macro NSIS_HOOK_POSTINSTALL
+  ; 바탕화면 바로가기 자동 생성(2026-07-05 박사님 지시). Tauri NSIS 템플릿은 일반 GUI 설치에서
+  ; 마침 페이지 체크박스(사용자 클릭)에만 의존해 자동 생성이 아니다 — 템플릿 내장 함수를 직접 호출해
+  ; 설치 완료 시 항상 생성한다. 함수 내부 가드를 그대로 재사용: 업데이트(/UPDATE)·무바로가기(/NS)
+  ; 모드는 스킵, 기존 .lnk는 타겟만 갱신(멱등 — silent/passive의 템플릿 자체 호출과 중복돼도 무해).
+  ; 제거는 템플릿 uninstaller가 "$DESKTOP\<제품명>.lnk"를 지우므로 별도 처리 불요.
+  Call CreateOrUpdateDesktopShortcut
+!macroend
+
 !macro NSIS_HOOK_PREUNINSTALL
   ; 제거(uninstall)는 의도적 전면 종료 — 세션 보존 대상이 아니다. lame-duck(.prev*)까지 정리.
   nsExec::Exec 'taskkill /F /T /IM cys-app.exe'
