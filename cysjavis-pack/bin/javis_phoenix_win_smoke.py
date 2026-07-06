@@ -529,25 +529,52 @@ def case8_real_autorestore():
         env = _phoenix_env({"CYS_SOCKET": pipe})
         env.pop("PHOENIX_CYS", None)
         CREATE_NO_WINDOW = 0x08000000 if IS_WIN else 0
+        # ★진단(CI 28778120380 head=''): cysd stderr 를 파일로 포착한다 — resolve_phoenix_source ABORT·자동복원
+        #   skip·디스크폴백 거부 등은 cysd stderr 로만 드러나는데 과거 DEVNULL 이라 원인 불가시였다(auto-restore
+        #   triggered/finished/ABORTED 라인 추적).
+        cysd_err_path = os.path.join(sd, "cysd.stderr.log")
+        cysd_err = open(cysd_err_path, "w", encoding="utf-8", errors="replace")
         tracked = subprocess.Popen([CYSD_BIN], env=env, stdin=subprocess.DEVNULL,
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                   stdout=subprocess.DEVNULL, stderr=cysd_err,
                                    creationflags=CREATE_NO_WINDOW)
         _cp("⑧ waiting cold-boot auto-restore log")
         log_path = os.path.join(sd, "phoenix-restore.log")
+        # open_restore_log 는 primary 실패 시 %TEMP%\cys-phoenix-restore.log 로 폴백한다 — 그 경로도 확인.
+        temp_fallback = os.path.join(os.environ.get("TEMP") or os.environ.get("TMP") or ".",
+                                     "cys-phoenix-restore.log")
         content = ""
-        for _ in range(80):  # ~40s(콜드부트 스폰 + phoenix 관측·정착 여유)
+        for _ in range(120):  # ~60s(콜드부트 임베드추출+self-test+phoenix 관측 여유 상향)
             _cp("⑧ waiting cold-boot auto-restore log")
             if os.path.exists(log_path):
                 content = open(log_path, encoding="utf-8", errors="replace").read()
                 if "phoenix auto-restore @ epoch=" in content and "[phoenix]" in content:
                     break
             time.sleep(0.5)
+        # 진단 수집: primary 비었으면 cysd stderr·temp 폴백을 함께 노출(다음 판정에 원인 직결).
+        try:
+            cysd_err.flush()
+        except Exception:
+            pass
+        err_tail = ""
+        if os.path.exists(cysd_err_path):
+            err_tail = open(cysd_err_path, encoding="utf-8", errors="replace").read()[-500:]
+        tmp_tail = ""
+        if os.path.exists(temp_fallback):
+            tmp_tail = open(temp_fallback, encoding="utf-8", errors="replace").read()[-300:]
+        diag = "head=%r | cysd.stderr(tail)=%r | temp_fallback=%r" % (content[:120], err_tail, tmp_tail)
         check("⑧ 실경로 auto-restore 로그 생성(cysd 자체 스폰)",
-              "phoenix auto-restore @ epoch=" in content, "head=%r" % content[:160])
+              "phoenix auto-restore @ epoch=" in content, diag)
         check("⑧ phoenix 실제 실행(주입 없이 python+cys 해석 성공·[phoenix] 출력)",
               "[phoenix]" in content, "tail=%r" % content[-300:])
-        check("⑧ 첫 스폰 단절 흔적 없음(FileNotFoundError/실행 불가 아님)",
-              ("FileNotFoundError" not in content) and ("실행 불가" not in content), "tail=%r" % content[-300:])
+        # ★첫 스폰 단절 흔적 없음: content 뿐 아니라 cysd stderr 도 본다(ABORTED/FileNotFoundError/실행 불가).
+        _spawn_ok = (("FileNotFoundError" not in content) and ("실행 불가" not in content)
+                     and ("ABORTED" not in err_tail) and ("FileNotFoundError" not in err_tail))
+        check("⑧ 첫 스폰 단절 흔적 없음(FileNotFoundError/실행 불가/ABORTED 아님)", _spawn_ok,
+              "err=%r" % err_tail)
+        try:
+            cysd_err.close()
+        except Exception:
+            pass
     finally:
         _cp("⑧ teardown")
         teardown_daemon(pipe, state_dir=sd, tracked=tracked)

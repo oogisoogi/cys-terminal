@@ -3054,7 +3054,13 @@ def main():
     # ★W1/B3·§5-1: cys 실행 경로를 여기서(소켓 인지 후) 해석한다 — PHOENIX_CYS > which('cys') > 표준경로
     #   폴백(identity-check·STRICT/하네스 금지). 리터럴 'cys' 최종 폴백 제거로 FileNotFoundError 침묵사를 차단.
     #   미해석/불일치는 _resolve_cys 내부에서 die(exit 6)로 정직 정지한다(라이브 실증 2026-07-06 근원 수리).
-    CYS = _resolve_cys(args.socket)
+    # ★W5(⑥ 수리·CI run 28778120380 실증): `deploy --plan` 은 계획만 출력하고 sys.exit(0) 하는 **무실행** 경로라
+    #   cys 를 전혀 호출하지 않는다. 그런데 _resolve_cys 는 identity 프로브(subprocess `cys status/phoenix-identity`)를
+    #   돌리는데, 데몬이 없는 환경(스모크 ⑥)에서 Windows 는 이 프로브가 12s×재시도로 지연돼 --plan 이 30s 타임아웃
+    #   (exit 124)됐다. 무실행 서브커맨드는 CYS 해석을 lazy 로 건너뛴다(실 subprocess 필요 경로는 모두 CYS 해석 후에
+    #   실행되므로 무영향). die 경로(cys 부재)도 --plan 에선 부적절(계획 출력에 cys 불요)이라 함께 해소된다.
+    _no_exec_plan = args.cmd == "deploy" and getattr(args, "plan", False)
+    CYS = None if _no_exec_plan else _resolve_cys(args.socket)
     {
         "restore": cmd_restore, "reconcile": cmd_reconcile, "status": cmd_status,
         "roster": cmd_roster, "inherit": cmd_inherit, "tombstone": cmd_tombstone,
