@@ -1,13 +1,19 @@
 # 릴리스 절차 (cys 터미널)
 
-버전: `0.2.0` · 두 배포 경로 — **GitHub 릴리스** + **설치파일(macOS DMG / Windows MSI)**.
+> **현행 표준 절차(2026-07 정정)**: 릴리스는 **release.yml 자동화**가 정본이다 —
+> ①버전 범프(아래 §0 4곳)+`cargo build`(Cargo.lock)+로컬 `bash scripts/secret-scan.sh --all` clean 확인
+> ②main push ③`git tag vX.Y.Z && git push origin vX.Y.Z`(태그=오너 직접·가드)
+> ④CI 4잡(mac signed·mac x86 sidecar·**windows NSIS**·pack) green + windows-build.yml T5 green
+> ⑤릴리스 자산·`latest.json`(tauri v2 — darwin-aarch64·darwin-x86_64·windows-x86_64 3키) 실측 확인.
+> Windows 인스톨러는 **NSIS**다(`src-tauri/tauri.windows.conf.json targets:["nsis"]`) — 아래 §2·부록의
+> 수동 MSI/WiX 경로는 **legacy(폐기·참고용)**이며 따르지 마라.
 
-## 0. 버전 위치 (범프 시 모두 갱신)
+## 0. 버전 위치 (범프 시 모두 갱신 — 실측 4곳)
 
 - `Cargo.toml` / `src-tauri/Cargo.toml` — `version`
 - `src-tauri/tauri.conf.json` — `version`
 - `ui/package.json` — `version`
-- `dist-win/cys.wxs` / `dist-win/cys-x64.wxs` — `Version="..."`
+- ~~`dist-win/cys.wxs` / `dist-win/cys-x64.wxs`~~ (legacy MSI — NSIS 전환으로 폐기)
 
 ## 1. macOS 빌드 (DMG + 앱 번들 + 업데이트 아티팩트)
 
@@ -82,7 +88,7 @@ bash scripts/build-macos-signed.sh  # env 검증 → tauri build(자동 공증) 
 - [ ] **HITL 미리보기 보존** — 제품 모드도 입력 모달·validate_ir 게이트·미리보기 확인을 우회하지 않는다("1클릭"이라도 게이트 제거는 REJECT).
 - [ ] **청중 프로파일 확인** — `~/.cys/profile.json` audience가 대상 청중과 일치(민감 스킬은 카탈로그 미포함=암묵 차단).
 
-## 2. Windows 빌드 (MSI + ZIP)
+## 2. [LEGACY·폐기] Windows 수동 빌드 (MSI + ZIP) — 현행은 CI NSIS, 따르지 말 것
 
 > Windows 머신(또는 Parallels Win11 ARM64)에서 수행. 코어는 검증 완료.
 
