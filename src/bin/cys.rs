@@ -4290,7 +4290,9 @@ fn run_launch_agent_opts(
             if let Some(sid) = created {
                 // close 결과를 정직히 보고한다 — 실패를 'closed'로 거짓 보고하면 role이
                 // 좀비 surface에 점유된 채 남아 재기동이 claim_denied로 막힌다(이번 회귀의 근원).
-                match request("surface.close", json!({"surface_id": sid})) {
+                // ★W2/P0-6: cause="reap" — launch 실패 롤백은 역할을 묘비화하지 않는다(부활 대상 유지). 과거
+                // 고정 OwnerClose 라 실패한 worker launch 1회가 역할을 영구 오묘비화하던 우회로를 끊는다.
+                match request("surface.close", json!({"surface_id": sid, "cause": "reap"})) {
                     Ok(_) => eprintln!(
                         "[launch-agent] failed surface {} closed (role 점유 해제)",
                         surface_ref(sid)

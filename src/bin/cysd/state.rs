@@ -1394,6 +1394,12 @@ impl Daemon {
         // tombstones는 리프 락 — surfaces/roles 락 해제 후 획득(락 순서 무변경).
         if let Some(rr) = registered_role {
             self.tombstones.lock().unwrap().remove(&rr);
+            // ★W2/P1-2: master 역할로 (재)기동되면 master_claimed_at 스탬프 — 부활 master 가 approval.sign
+            //   동결(master_unstable 거부) 상태로 깨어나 자율주행 게이트가 마비되던 결함 해소. claim_role
+            //   경로(handlers.rs)의 승계 스탬프와 동일 의미(새 보유자=쿨다운 시작). tombstones 와 동일 리프 락.
+            if rr == "master" {
+                *self.master_claimed_at.lock().unwrap() = Some(now_epoch());
+            }
         }
         if role.is_some() {
             crate::governance::persist_topology(self);
@@ -2151,6 +2157,25 @@ mod tests {
             )
             .unwrap();
         assert!(!s2.env_injected, "env 미주입 surface는 env_injected=false → Windows node-recover fail-closed");
+    }
+
+    /// ★W2/P1-2: master 역할로 surface 를 (재)기동하면 master_claimed_at 이 스탬프돼 approval.sign 이 즉시
+    /// 가능해야 한다(부활 master 동결 해제). 비-master 역할은 master_claimed_at 을 건드리지 않는다.
+    #[test]
+    fn create_surface_master_stamps_claimed_at() {
+        let daemon = Daemon::new(isolated_sock("p1-2-master"));
+        assert!(daemon.master_claimed_at.lock().unwrap().is_none(), "기동 직후 None");
+        // 비-master → 스탬프 없음
+        daemon
+            .create_surface_with_env(None, Some("sleep 30".into()), None, Some("worker".into()), 24, 80, &[], None)
+            .unwrap();
+        assert!(daemon.master_claimed_at.lock().unwrap().is_none(), "worker 생성은 master_claimed_at 무영향");
+        // master 부활 → 스탬프(approval.sign 동결 해제)
+        daemon
+            .create_surface_with_env(None, Some("sleep 30".into()), None, Some("master".into()), 24, 80, &[], None)
+            .unwrap();
+        assert!(daemon.master_claimed_at.lock().unwrap().is_some(),
+                "master 부활 시 master_claimed_at 스탬프돼야 approval.sign 가능(P1-2)");
     }
 
     /// (W1-6 a·d) 계정 config_dir 영속 라운드트립 + 구 topology 하위호환.

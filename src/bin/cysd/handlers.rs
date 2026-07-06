@@ -141,6 +141,15 @@ fn resolve_surface_id(params: &Value) -> Option<u64> {
     }
 }
 
+/// ★W2/P0-6: surface.close 의 cause 파라미터 파싱 — "reap"=Reap(묘비 미생성·부활 대상), 그 외/부재=OwnerClose
+/// (묘비 생성·좀비 부활 차단). 미지 값은 안전측 OwnerClose(오타로 부활 폭주 방지). 순수 함수(테스트 가능).
+fn close_cause_from_params(params: &Value) -> governance::CloseCause {
+    match params.get("cause").and_then(|v| v.as_str()) {
+        Some("reap") => governance::CloseCause::Reap,
+        _ => governance::CloseCause::OwnerClose,
+    }
+}
+
 /// 단순 글롭 매칭: '*'만 와일드카드, 나머지는 리터럴 (역할 패턴용 — reviewer-*)
 pub fn glob_match(pattern: &str, value: &str) -> bool {
     let mut re = String::from("^");
@@ -1185,10 +1194,16 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     ));
                 }
             }
-            match governance::close_surface(daemon, sid, governance::CloseCause::OwnerClose) {
-                Ok(()) => {
-                    Reply::Single(ok_response(&id, json!({"surface_id": sid, "closed": true})))
-                }
+            // ★W2/P0-6: cause 파라미터 — 기본 OwnerClose(묘비 생성·좀비 부활 차단)이나, launch-agent 롤백처럼
+            // "생성 실패로 되돌리는" 발신처는 cause="reap"을 보내 묘비를 남기지 않는다(실패한 launch 는 부활
+            // 대상이지 의도적 폐역이 아니다 — 롤백이 역할을 오묘비화하던 P0-6 우회로 차단). 미지 값은 안전측
+            // OwnerClose(묘비)로 폴백(오타로 부활 폭주하지 않게).
+            let cause = close_cause_from_params(&params);
+            match governance::close_surface(daemon, sid, cause) {
+                Ok(()) => Reply::Single(ok_response(
+                    &id,
+                    json!({"surface_id": sid, "closed": true, "cause": format!("{cause:?}")}),
+                )),
                 Err(e) => Reply::Single(err_response(&id, "not_found", &e)),
             }
         }
@@ -3255,6 +3270,17 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ★W2/P0-6: cause 파싱 — "reap"=Reap, 그 외/부재/미지 값=안전측 OwnerClose(묘비).
+    #[test]
+    fn close_cause_reap_vs_owner() {
+        use governance::CloseCause;
+        assert_eq!(close_cause_from_params(&json!({"cause": "reap"})), CloseCause::Reap);
+        assert_eq!(close_cause_from_params(&json!({"cause": "owner"})), CloseCause::OwnerClose);
+        assert_eq!(close_cause_from_params(&json!({"cause": "typo-xyz"})), CloseCause::OwnerClose);
+        assert_eq!(close_cause_from_params(&json!({})), CloseCause::OwnerClose);
+        assert_eq!(close_cause_from_params(&json!({"cause": 5})), CloseCause::OwnerClose);
+    }
 
     #[test]
     fn glob_literal_and_star() {
