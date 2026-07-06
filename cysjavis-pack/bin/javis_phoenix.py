@@ -156,6 +156,15 @@ def _extract_version(text):
 #   (같은 version 문자열의 다른 빌드·다른 embedded pack·다른 protocol 이 통과). 3필드 전건 일치를 요구한다.
 _IDENTITY_FIELDS = ("build_id", "embedded_pack_hash", "protocol_version")
 
+# ★W1(gate2): 해석된 cys 의 identity 검증 상태(결과 JSON `cys_identity` 로 노출).
+#   "verified"=3중 대조 match · "degraded-unverified"=inconclusive 채택(데몬 미도달 등 — 검증 통과 아님·정직 분리).
+#   mismatch 는 채택 자체가 없다(exit 6). None=미해석(직접 함수 호출 등).
+_CYS_IDENTITY = None
+
+# 재시도 파라미터(gate2 fix 2a·gemini): 데몬 소켓 기동 직후 status 미도달(inconclusive) 레이스 해소.
+_IDENTITY_RETRY_TRIES = int(os.environ.get("PHOENIX_IDENTITY_RETRY_TRIES", "2"))
+_IDENTITY_RETRY_SLEEP = float(os.environ.get("PHOENIX_IDENTITY_RETRY_SLEEP", "1.0"))
+
 
 def _cys_self_identity(candidate):
     """후보 cys 자신의 3필드 self-report(`cys phoenix-identity` — 데몬 불요·컴파일타임 상수). 실패=None."""
@@ -206,12 +215,68 @@ def _cys_identity_check(candidate, socket):
     return ("match", None, "build_id=%s proto=%s" % (self_id.get("build_id"), self_id.get("protocol_version")))
 
 
+def _identity_with_retry(candidate, socket):
+    """★gate2 fix 2a(gemini): inconclusive 는 데몬 소켓 기동 직후 status 미도달 레이스일 수 있으므로,
+    1s 간격 재시도 후 재대조한다(mismatch·match 는 즉시 확정 — 재시도 불요). 최종 (status, field, detail)."""
+    status, field, detail = _cys_identity_check(candidate, socket)
+    tries = 0
+    while status == "inconclusive" and tries < _IDENTITY_RETRY_TRIES:
+        tries += 1
+        time.sleep(_IDENTITY_RETRY_SLEEP)
+        status, field, detail = _cys_identity_check(candidate, socket)
+    return status, field, detail
+
+
+def _accept_with_identity(socket, candidate, source_label, allow_inconclusive):
+    """★gate2 fix 1·2: 후보 cys 를 3중 identity 계약으로 채택/거부한다(PHOENIX_CYS·PATH·표준경로 공통 경로).
+      · match        → 채택(_CYS_IDENTITY='verified')
+      · mismatch     → 어디서든 즉사(exit 6·불일치 필드 명시) — 적극적 모순은 availability 명분으로 통과 불가
+      · inconclusive → allow_inconclusive 면 채택하되 **'검증 통과'가 아니라 degraded availability exception**으로
+                       분리 기록(_CYS_IDENTITY='degraded-unverified'·저널+stderr). 아니면 exit 6.
+    ★fix 2c(provenance): 'Rust 가 주입했다'는 출처를 env 토큰으로 증명하는 방식은 채택하지 않는다 — env 토큰은
+       위조 가능해 shadowing 을 못 막는다(같은 토큰을 심으면 우회). 정직한 해법은 검증 실패를 숨기지 않고
+       degraded 로 분리 보고하는 것(availability 는 지키되 'verified' 라 거짓말하지 않는다)."""
+    global _CYS_IDENTITY
+    status, field, detail = _identity_with_retry(candidate, socket)
+    if status == "match":
+        _CYS_IDENTITY = "verified"
+        sys.stderr.write("[phoenix] cys 채택(%s): %s — 3중 identity match(%s)\n" % (source_label, candidate, detail))
+        sys.stderr.flush()
+        return candidate
+    if status == "mismatch":
+        _resolve_die(socket, "cys(%s=%s) identity 3중 대조 불일치 — 불일치 필드=%s (%s). "
+                     "다른 빌드/팩/프로토콜 스큐 차단·exit 6." % (source_label, candidate, field, detail), 6)
+    # inconclusive
+    if not allow_inconclusive:
+        _resolve_die(socket, "cys(%s=%s) identity inconclusive(%s) — positive proof 요구 경로라 채택 거부·exit 6. "
+                     "PHOENIX_CYS 로 이 데몬과 동일 빌드의 cys 를 명시하라." % (source_label, candidate, field), 6)
+    _CYS_IDENTITY = "degraded-unverified"
+    _resolve_journal_mark(socket, "degraded",
+                          "cys(%s=%s) identity inconclusive(%s) — availability 위해 채택하되 '검증 통과' 아님"
+                          "(degraded-unverified 분리 보고)." % (source_label, candidate, field))
+    sys.stderr.write("[phoenix] ★degraded availability exception: cys(%s=%s) identity **unverified(degraded)** — "
+                     "재시도 후에도 inconclusive(%s). 채택하되 3중 대조 미완(검증 통과 아님).\n"
+                     % (source_label, candidate, field))
+    sys.stderr.flush()
+    return candidate
+
+
 def _resolve_journal_start(socket):
     """★gemini major: _resolve_cys die 전에 저널 뼈대(ticket=resolve·타임스탬프·stage=resolve_cys)를 먼저
     생성한다 — die 로 무단 종료해도 저널에 시도 이력이 남게 하는 관측 사각 제거. best-effort."""
     try:
         j = load_journal(socket, "resolve")
         jevent(j, "*", "resolve_cys", "start", "cys 실행 경로 해석 시작")
+        save_journal(socket, "resolve", j)
+    except Exception:
+        pass
+
+
+def _resolve_journal_mark(socket, status, msg):
+    """resolve 저널에 이벤트 1건 기록(degraded 채택 등 — die 아닌 경로). best-effort."""
+    try:
+        j = load_journal(socket, "resolve")
+        jevent(j, "*", "resolve_cys", status, msg[:280])
         save_journal(socket, "resolve", j)
     except Exception:
         pass
@@ -230,33 +295,25 @@ def _resolve_die(socket, msg, code):
 
 
 def _resolve_cys(socket):
-    """cys 실행 경로 해석(§5-1 W1). 우선순위: PHOENIX_CYS > which('cys') > 표준경로 폴백(조건부).
-    ★리터럴 'cys' 최종 폴백은 제거됨 — PATH 미해석을 침묵 통과시켜 첫 subprocess 에서 FileNotFoundError→
-    이유 없는 exit 1 침묵사를 유발한 근원(라이브 실증 2026-07-06). 미해석은 즉시 exit 6(정직 정지).
-    ★codex major: PHOENIX_CYS 도 무검증 수용 금지 — 실행가능(X_OK)+3중 identity 계약 적용. 불일치=exit 6.
-    채택 규칙:
-      · PHOENIX_CYS(명시)  → X_OK 필수. identity mismatch=exit 6. match/inconclusive(데몬 미도달)=채택(X_OK 통과).
-      · PHOENIX_STRICT_CYS=1 → 표준경로 폴백 금지(미해석=즉시 exit 6). E2E 게이트가 Rust env 주입 자체를 검증.
-      · 하네스(--socket 또는 PHOENIX_FORBID_LIVE=1) → 표준경로 폴백 금지(테스트 독립성).
-      · 표준경로 폴백(라이브·PATH 미해석) → positive proof 요구: X_OK + identity **match**만 채택(mismatch·inconclusive=exit 6).
-    실패·채택 모두 저널·stderr(→cysd phoenix-restore.log)에 기록한다."""
+    """cys 실행 경로 해석(§5-1 W1). 우선순위: PHOENIX_CYS > which('cys') > 표준경로 폴백.
+    ★리터럴 'cys' 최종 폴백은 제거됨 — PATH 미해석 침묵 통과가 FileNotFoundError→exit 1 침묵사 근원(2026-07-06).
+    ★gate2: 모든 실행 경로(PHOENIX_CYS·_which PATH·표준경로)에 3중 identity 계약을 적용한다 — 어느 경로든
+       mismatch=exit 6. inconclusive 정책만 경로별 차등:
+      · PHOENIX_CYS(명시)·_which PATH 후보 → X_OK + identity. inconclusive 는 재시도 후 degraded-unverified 로
+        채택(분리 보고) — 하네스·격리·비데몬 서브커맨드에서 데몬 미도달 inconclusive 가 정상 존재하므로.
+      · 표준경로 폴백(PATH·PHOENIX_CYS 모두 미해석) → positive proof 요구: **match 만** 채택(inconclusive=exit 6).
+      · PHOENIX_STRICT_CYS=1 / 하네스(--socket·PHOENIX_FORBID_LIVE) → 표준경로 폴백 자체 금지(미해석=exit 6).
+    실패·채택·degraded 전부 저널·stderr(→cysd phoenix-restore.log)에 기록한다."""
     _resolve_journal_start(socket)
     explicit = os.environ.get("PHOENIX_CYS")
     if explicit:
         if not (os.path.isfile(explicit) and os.access(explicit, os.X_OK)):
             _resolve_die(socket, "PHOENIX_CYS(%s) 실행 불가(파일 부재/실행권한 없음) — 무검증 수용 금지·exit 6." % explicit, 6)
-        status, field, detail = _cys_identity_check(explicit, socket)
-        if status == "mismatch":
-            _resolve_die(socket, "PHOENIX_CYS(%s) identity 3중 대조 불일치 — 불일치 필드=%s (%s). "
-                         "다른 빌드/팩/프로토콜 스큐 차단·exit 6." % (explicit, field, detail), 6)
-        if status == "inconclusive":
-            sys.stderr.write("[phoenix] PHOENIX_CYS(%s) identity inconclusive(%s) — X_OK 통과로 채택"
-                             "(데몬 미도달 시 3중 대조 불가).\n" % (explicit, field))
-            sys.stderr.flush()
-        return explicit
+        return _accept_with_identity(socket, explicit, "PHOENIX_CYS", allow_inconclusive=True)
     found = _which("cys")
     if found:
-        return found
+        # ★gate2 fix 1(BLOCKING): PATH 후보도 identity gate 를 우회하지 않는다(과거엔 곧바로 return).
+        return _accept_with_identity(socket, found, "PATH(which)", allow_inconclusive=True)
     # 여기부터 표준경로 폴백 — PATH·PHOENIX_CYS 모두 cys 미해석.
     strict = os.environ.get("PHOENIX_STRICT_CYS") == "1"
     harness = bool(socket) or os.environ.get("PHOENIX_FORBID_LIVE") == "1"
@@ -268,14 +325,8 @@ def _resolve_cys(socket):
                      "(테스트 독립성·exit 6). 격리 실행은 PHOENIX_CYS 로 대상 cys 를 명시하라.", 6)
     for c in _CYS_STD_PATHS:
         if os.path.isfile(c) and os.access(c, os.X_OK):
-            status, field, detail = _cys_identity_check(c, socket)
-            if status == "match":
-                sys.stderr.write("[phoenix] cys 표준경로 폴백 채택: %s (PATH 미해석 — 3중 identity match·%s)\n" % (c, detail))
-                sys.stderr.flush()
-                return c
-            # 폴백 후보는 positive proof 요구 — mismatch·inconclusive 모두 거부(불일치 필드 명시).
-            _resolve_die(socket, "cys 표준경로 폴백 후보(%s) identity %s(field=%s · %s) — 채택 거부·exit 6. "
-                         "PHOENIX_CYS 로 이 데몬과 동일 빌드의 cys 를 명시하라." % (c, status, field, detail), 6)
+            # 표준경로는 PATH-미해석 추측 후보 — positive proof(match) 요구(inconclusive 도 거부).
+            return _accept_with_identity(socket, c, "표준경로", allow_inconclusive=False)
     _resolve_die(socket, "cys 실행 경로 미해석(PHOENIX_CYS·PATH·표준경로 %s 모두 실패) — 리터럴 폴백 제거됨"
                  "(침묵사 방지·exit 6)." % _CYS_STD_PATHS, 6)
 
@@ -1223,6 +1274,7 @@ def run_restore(socket, ticket="default", stub=False, no_breaker=False, roles=No
         "target_roles": target_roles,
         "per_role_outcome": outcomes,
         "c6_stale_surfaces": c6_stale,     # ★C6 S0: 탐지된 죽은 surface 잔재(회수 미실행·묘비 0 — W2에서 Reap 활성화)
+        "cys_identity": _CYS_IDENTITY,     # ★gate2: 해석된 cys 의 3중 identity 검증 상태(verified|degraded-unverified|None)
         "journal": journal_path(socket, ticket),
         "honesty_note": honesty,
     }
