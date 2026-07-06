@@ -245,7 +245,7 @@ async fn accept_loop(daemon: Arc<Daemon>, socket_path: &std::path::Path) {
     // ★W2 콜드부트 자동 복원: 소켓 바인드·수신 준비가 끝난 '이후'에만 1회 발화한다(자식
     // phoenix가 이 데몬 소켓으로 즉시 RPC할 수 있어야 하므로 바인드 성공이 선행 조건).
     // raw `cys restore`가 아니라 phoenix를 태워 desired_roster·묘비·회로차단기·저널을 경유한다.
-    spawn_auto_restore();
+    spawn_auto_restore(&state_dir);
 
     loop {
         match listener.accept().await {
@@ -349,19 +349,44 @@ enum AutoRestore {
     /// phoenix 스크립트 부재(구 배포·미설치) — 조용히 skip(로그 1줄).
     PhoenixMissing(std::path::PathBuf),
     /// 스폰 대상: `python3 <phoenix> restore --auto`.
+    /// ★W1/B3(§5-1): env 에 PHOENIX_CYS(exe 옆 cys 절대경로)·PATH(runtime 선두주입)를 주입한다 —
+    /// GUI/데몬 최소 PATH(/usr/bin:/bin:…)에서 phoenix 가 `cys` 를 못 찾아 FileNotFoundError→exit 1
+    /// 침묵사하던 라이브 결함(2026-07-06 실증)의 근원 수리. 순수 판정이라 단위 테스트로 env 를 검증한다.
     Ready {
         program: String,
         args: Vec<String>,
+        env: Vec<(String, String)>,
     },
 }
 
-fn decide_auto_restore(pack_dir: &std::path::Path, opted_out: bool) -> AutoRestore {
+/// ★W1/B3: exe_dir·current_path 를 인자로 받는 순수 함수(부수효과 없음·env 주입까지 단위 테스트 가능).
+fn decide_auto_restore(
+    pack_dir: &std::path::Path,
+    opted_out: bool,
+    exe_dir: &std::path::Path,
+    current_path: &str,
+) -> AutoRestore {
     if opted_out {
         return AutoRestore::OptedOut;
     }
     let phoenix = pack_dir.join("bin").join("javis_phoenix.py");
     if !phoenix.exists() {
         return AutoRestore::PhoenixMissing(phoenix);
+    }
+    let mut env: Vec<(String, String)> = Vec::new();
+    // PHOENIX_CYS: 데몬 exe 옆 동봉 cys 절대경로. 실존할 때만 주입한다(없으면 phoenix 의 which→표준경로
+    // 폴백에 맡긴다 — 존재하지 않는 경로를 강제 주입해 재차 FileNotFoundError 를 만들지 않는다).
+    let cys_name = if cfg!(windows) { "cys.exe" } else { "cys" };
+    let cys_path = exe_dir.join(cys_name);
+    if cys_path.is_file() {
+        env.push((
+            "PHOENIX_CYS".to_string(),
+            cys_path.to_string_lossy().into_owned(),
+        ));
+    }
+    // PATH 선두주입 — pane 자식(state.rs)과 동일 유틸 재사용(중복 구현 금지). 이미 포함이면 None(무주입).
+    if let Some(newp) = cys::runtime_prefixed_path(exe_dir, current_path) {
+        env.push(("PATH".to_string(), newp));
     }
     AutoRestore::Ready {
         program: "python3".to_string(),
@@ -370,16 +395,25 @@ fn decide_auto_restore(pack_dir: &std::path::Path, opted_out: bool) -> AutoResto
             "restore".to_string(),
             "--auto".to_string(),
         ],
+        env,
     }
 }
 
 /// 콜드부트 auto-restore를 detached 스폰한다(env에 CYS_NO_AUTOSTART=1 — 자식 CLI가 라이벌
 /// 데몬을 autostart하는 재귀를 차단). 대기 스레드가 자식을 reap해 좀비 잔존을 막는다.
-fn spawn_auto_restore() {
+/// ★W1: PHOENIX_CYS·PATH 주입(§5-1 침묵사 근원 수리) · stdout/stderr 를 null 대신 phoenix-restore.log 로
+/// 캡처(P0-5 사후 진단 불가 수리) · exit 계약 처리(5·6=재시도 금지, 그 외 비0=60s 후 1회 재시도).
+fn spawn_auto_restore(state_dir: &std::path::Path) {
     let opted_out = cys::env_compat("CYS_NO_AUTORESTORE")
         .map(|v| v == "1")
         .unwrap_or(false);
-    match decide_auto_restore(&cys::pack::pack_dir(), opted_out) {
+    // exe_dir(데몬 바이너리 디렉터리) — PHOENIX_CYS·PATH 계산 기준.
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+    let current_path = std::env::var("PATH").unwrap_or_default();
+    let exe_dir_ref = exe_dir.as_deref().unwrap_or_else(|| std::path::Path::new("."));
+    match decide_auto_restore(&cys::pack::pack_dir(), opted_out, exe_dir_ref, &current_path) {
         AutoRestore::OptedOut => {
             eprintln!("[cysd] auto-restore skipped (CYS_NO_AUTORESTORE=1)");
         }
@@ -389,21 +423,111 @@ fn spawn_auto_restore() {
                 p.display()
             );
         }
-        AutoRestore::Ready { program, args } => {
+        AutoRestore::Ready { program, args, env } => {
+            let log_path = state_dir.join("phoenix-restore.log");
             std::thread::spawn(move || {
-                let status = std::process::Command::new(&program)
-                    .args(&args)
-                    .env("CYS_NO_AUTOSTART", "1")
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status();
-                match status {
-                    Ok(s) => eprintln!("[cysd] auto-restore finished (exit={:?})", s.code()),
-                    Err(e) => eprintln!("[cysd] auto-restore spawn failed: {e}"),
-                }
+                loop_auto_restore(&program, &args, &env, &log_path);
             });
             eprintln!("[cysd] auto-restore triggered (phoenix restore --auto)");
+        }
+    }
+}
+
+/// auto-restore 자식을 실행하고 exit 계약에 따라 처리한다. 비0(단 5·6 제외)은 60초 후 정확히 1회 재시도한다
+/// — 재시도의 멱등성은 phoenix 의 lease·liveness 재산정에 맡긴다(수동 복원이 이미 끝났으면 재시도는 NOOP·중복 스폰 0).
+fn loop_auto_restore(
+    program: &str,
+    args: &[String],
+    env: &[(String, String)],
+    log_path: &std::path::Path,
+) {
+    let mut attempt = 0u32;
+    loop {
+        let code = run_auto_restore_once(program, args, env, log_path);
+        match code {
+            Some(0) => {
+                eprintln!("[cysd] auto-restore finished (exit=0)");
+                return;
+            }
+            Some(5) => {
+                eprintln!("[cysd] auto-restore BREAKER_OPEN (exit=5) — 재시도 금지(크래시루프 정지·사람 승인 필요)");
+                return;
+            }
+            Some(6) => {
+                eprintln!("[cysd] auto-restore CORRUPT/identity (exit=6) — 재시도 금지(사람 개입 필요)");
+                return;
+            }
+            other => {
+                if attempt >= 1 {
+                    eprintln!(
+                        "[cysd] auto-restore finished (exit={other:?}) — 재시도 소진(1회). phoenix-restore.log 참조"
+                    );
+                    return;
+                }
+                attempt += 1;
+                eprintln!(
+                    "[cysd] auto-restore non-zero (exit={other:?}) — 60s 후 1회 재시도 (lease/liveness 재산정에 위임)"
+                );
+                std::thread::sleep(std::time::Duration::from_secs(60));
+            }
+        }
+    }
+}
+
+/// 자식 1회 실행 — stdout/stderr 를 phoenix-restore.log 에 append(타임스탬프 헤더). exit code 반환(None=스폰 실패).
+fn run_auto_restore_once(
+    program: &str,
+    args: &[String],
+    env: &[(String, String)],
+    log_path: &std::path::Path,
+) -> Option<i32> {
+    use std::io::Write;
+    // append 모드로 로그 파일을 연다(실패해도 null 로 폴백 — 로그 못 쓴다고 복원을 막지 않는다).
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args).env("CYS_NO_AUTOSTART", "1");
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let (out_target, err_target) = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+    {
+        Ok(mut f) => {
+            let epoch = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let _ = writeln!(
+                f,
+                "\n===== phoenix auto-restore @ epoch={epoch} (pid cysd={}) =====",
+                std::process::id()
+            );
+            let err_f = f.try_clone().ok();
+            (
+                std::process::Stdio::from(f),
+                err_f.map(std::process::Stdio::from),
+            )
+        }
+        Err(e) => {
+            eprintln!("[cysd] auto-restore log open failed ({e}) — stdio null 폴백");
+            (std::process::Stdio::null(), None)
+        }
+    };
+    cmd.stdin(std::process::Stdio::null()).stdout(out_target);
+    match err_target {
+        Some(t) => {
+            cmd.stderr(t);
+        }
+        None => {
+            cmd.stderr(std::process::Stdio::null());
+        }
+    }
+    match cmd.status() {
+        Ok(s) => Some(s.code().unwrap_or(-1)),
+        Err(e) => {
+            eprintln!("[cysd] auto-restore spawn failed: {e}");
+            None
         }
     }
 }
@@ -1405,7 +1529,10 @@ mod auto_restore_tests {
         let bin = dir.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
         std::fs::write(bin.join("javis_phoenix.py"), "#!/usr/bin/env python3\n").unwrap();
-        assert_eq!(decide_auto_restore(&dir, true), AutoRestore::OptedOut);
+        assert_eq!(
+            decide_auto_restore(&dir, true, &bin, "/usr/bin:/bin"),
+            AutoRestore::OptedOut
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1414,7 +1541,7 @@ mod auto_restore_tests {
     fn missing_phoenix_skips() {
         let dir = std::env::temp_dir().join(format!("cys-ar-missing-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        match decide_auto_restore(&dir, false) {
+        match decide_auto_restore(&dir, false, &dir, "/usr/bin:/bin") {
             AutoRestore::PhoenixMissing(p) => {
                 assert!(p.ends_with("bin/javis_phoenix.py"), "부재 경로: {}", p.display())
             }
@@ -1431,11 +1558,70 @@ mod auto_restore_tests {
         std::fs::create_dir_all(&bin).unwrap();
         let ph = bin.join("javis_phoenix.py");
         std::fs::write(&ph, "#!/usr/bin/env python3\n").unwrap();
-        match decide_auto_restore(&dir, false) {
-            AutoRestore::Ready { program, args } => {
+        match decide_auto_restore(&dir, false, &bin, "/usr/bin:/bin") {
+            AutoRestore::Ready { program, args, .. } => {
                 assert_eq!(program, "python3");
                 assert_eq!(args[0], ph.to_string_lossy());
                 assert_eq!(&args[1..], &["restore".to_string(), "--auto".to_string()]);
+            }
+            other => panic!("expected Ready, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★W1/B3: exe 옆에 cys 가 실존하면 PHOENIX_CYS 를 그 절대경로로 주입하고, exe_dir 가 PATH 에 없으면
+    /// PATH 를 선두주입한다(GUI/데몬 최소 PATH 침묵사 근원 수리). "python3" 문자열 단언만으로는 불충분(D4).
+    #[test]
+    fn ready_injects_phoenix_cys_and_path_env() {
+        let dir = std::env::temp_dir().join(format!("cys-ar-env-{}", std::process::id()));
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("javis_phoenix.py"), "#!/usr/bin/env python3\n").unwrap();
+        // exe_dir 에 실행가능 cys 스텁을 둔다(PHOENIX_CYS 주입 조건 = 파일 실존).
+        let cys_name = if cfg!(windows) { "cys.exe" } else { "cys" };
+        let cys_path = bin.join(cys_name);
+        std::fs::write(&cys_path, "#!/bin/sh\n").unwrap();
+        // GUI/데몬 최소 PATH 모사 — exe_dir 미포함이라 선두주입이 일어나야 한다.
+        match decide_auto_restore(&dir, false, &bin, "/usr/bin:/bin:/usr/sbin:/sbin") {
+            AutoRestore::Ready { env, .. } => {
+                let cys_env = env
+                    .iter()
+                    .find(|(k, _)| k == "PHOENIX_CYS")
+                    .map(|(_, v)| v.clone());
+                assert_eq!(
+                    cys_env.as_deref(),
+                    Some(cys_path.to_string_lossy().as_ref()),
+                    "PHOENIX_CYS 는 exe 옆 cys 절대경로여야 한다"
+                );
+                let path_env = env
+                    .iter()
+                    .find(|(k, _)| k == "PATH")
+                    .map(|(_, v)| v.clone())
+                    .expect("PATH 선두주입이 있어야 한다(exe_dir 미포함 PATH)");
+                assert!(
+                    path_env.starts_with(bin.to_string_lossy().as_ref()),
+                    "PATH 는 exe_dir 선두여야 한다: {path_env}"
+                );
+            }
+            other => panic!("expected Ready, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★W1/B3: exe 옆에 cys 가 없으면 PHOENIX_CYS 를 주입하지 않는다(존재하지 않는 경로 강제 주입으로
+    /// 재차 FileNotFoundError 를 만들지 않는다 — phoenix 의 which→표준경로 폴백에 위임).
+    #[test]
+    fn ready_omits_phoenix_cys_when_absent() {
+        let dir = std::env::temp_dir().join(format!("cys-ar-nocys-{}", std::process::id()));
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("javis_phoenix.py"), "#!/usr/bin/env python3\n").unwrap();
+        match decide_auto_restore(&dir, false, &bin, "/usr/bin:/bin") {
+            AutoRestore::Ready { env, .. } => {
+                assert!(
+                    !env.iter().any(|(k, _)| k == "PHOENIX_CYS"),
+                    "cys 부재 시 PHOENIX_CYS 무주입이어야 한다: {env:?}"
+                );
             }
             other => panic!("expected Ready, got {other:?}"),
         }
