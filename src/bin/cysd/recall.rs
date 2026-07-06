@@ -88,6 +88,10 @@ pub fn spawn_writer(daemon_socket: PathBuf) -> Sender<LineRecord> {
     let (tx, rx): (Sender<LineRecord>, Receiver<LineRecord>) = std::sync::mpsc::channel();
     let path = state_dir(&daemon_socket).join("transcripts.db");
     std::thread::spawn(move || {
+      // ★P0-5(D3/W5): recall 쓰기 스레드 본문을 catch_unwind 로 감싼다 — 어떤 panic 도 삼키지 않고 stderr 에
+      //   기록하고 스레드 자연 종료(무한 재스폰 금지). last_prune Instant 언더플로(위 수리)처럼 부트 스레드가
+      //   침묵사(P0-5)하던 클래스의 구조 방어. AssertUnwindSafe: 패닉 후 공유상태 재사용 없음(로그만).
+      let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
         let Ok(conn) = open_db(&path) else {
             eprintln!("[recall] cannot open {}", path.display());
             return;
@@ -110,7 +114,7 @@ pub fn spawn_writer(daemon_socket: PathBuf) -> Sender<LineRecord> {
                 Ok(rows)
             })
             .unwrap_or_default();
-        let mut last_prune = std::time::Instant::now() - Duration::from_secs(86400);
+        let mut last_prune: Option<std::time::Instant> = None; // ★None=즉시 due(Instant 뺄셈 언더플로 panic 제거)
         let mut buf: Vec<LineRecord> = Vec::new();
         loop {
             // 첫 레코드는 블로킹 대기, 이후 1초 또는 200건까지 모아 배치
@@ -177,6 +181,15 @@ pub fn spawn_writer(daemon_socket: PathBuf) -> Sender<LineRecord> {
             let _ = conn.execute_batch("COMMIT");
             maybe_prune(&conn, &mut chains, &mut last_prune);
         }
+      }));
+      if let Err(panic) = outcome {
+          let msg = panic
+              .downcast_ref::<&str>()
+              .map(|s| (*s).to_string())
+              .or_else(|| panic.downcast_ref::<String>().cloned())
+              .unwrap_or_else(|| "unknown panic payload".to_string());
+          eprintln!("[recall] ★쓰기 스레드 panic 포착(P0-5 침묵사 차단·재스폰 안 함): {msg}");
+      }
     });
     tx
 }
@@ -186,12 +199,18 @@ pub fn spawn_writer(daemon_socket: PathBuf) -> Sender<LineRecord> {
 fn maybe_prune(
     conn: &Connection,
     chains: &mut std::collections::HashMap<u64, (u64, [u8; 32])>,
-    last_prune: &mut std::time::Instant,
+    last_prune: &mut Option<std::time::Instant>,
 ) {
-    if last_prune.elapsed() < Duration::from_secs(6 * 3600) {
-        return;
+    // ★P0-5(D3/W5·CI 28780215417 실증): 과거 `Instant::now() - Duration::from_secs(86400)`(24h 전) 초기화는
+    //   Windows CI VM 처럼 **부팅<24h** 이면 Instant(부팅 원점 단조시계) 언더플로로 panic("overflow when
+    //   subtracting duration from instant") → recall 부트 스레드 침묵사. Option<Instant> 로 대체 — None=한 번도
+    //   prune 안 함=즉시 due(원래 "첫 prune 즉시 발동" 의도 보존)·Instant 뺄셈 0(non-panicking).
+    if let Some(t) = last_prune {
+        if t.elapsed() < Duration::from_secs(6 * 3600) {
+            return;
+        }
     }
-    *last_prune = std::time::Instant::now();
+    *last_prune = Some(std::time::Instant::now());
     let days: f64 = std::env::var("CYS_RECALL_RETAIN_DAYS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -898,7 +917,7 @@ mod tests {
         // maybe_prune 실행: last_prune을 6h+ 과거로 둬 debounce 게이트를 통과시킨다.
         let mut chains: std::collections::HashMap<u64, (u64, [u8; 32])> =
             std::collections::HashMap::new();
-        let mut last_prune = std::time::Instant::now() - Duration::from_secs(7 * 3600);
+        let mut last_prune: Option<std::time::Instant> = None; // ★prune 발동(즉시 due·Instant 뺄셈 제거)
         {
             let _g = RETAIN_ENV_LOCK.lock().unwrap();
             std::env::set_var("CYS_RECALL_RETAIN_DAYS", "30");
@@ -1132,7 +1151,7 @@ mod tests {
         let mut chains: std::collections::HashMap<u64, (u64, [u8; 32])> =
             std::collections::HashMap::new();
         // last_prune이 방금(now) → debounce 미경과 → 즉시 반환, 삭제 없음
-        let mut last_prune = std::time::Instant::now();
+        let mut last_prune: Option<std::time::Instant> = Some(std::time::Instant::now()); // ★최근 prune=미발동
         {
             let _g = RETAIN_ENV_LOCK.lock().unwrap();
             std::env::set_var("CYS_RECALL_RETAIN_DAYS", "30");
@@ -1191,7 +1210,7 @@ mod tests {
         let run_prune = |writer: &Connection| {
             let mut chains: std::collections::HashMap<u64, (u64, [u8; 32])> =
                 std::collections::HashMap::new();
-            let mut last_prune = std::time::Instant::now() - Duration::from_secs(7 * 3600);
+            let mut last_prune: Option<std::time::Instant> = None; // ★prune 발동(즉시 due·Instant 뺄셈 제거)
             let _g = RETAIN_ENV_LOCK.lock().unwrap();
             std::env::set_var("CYS_RECALL_RETAIN_DAYS", "30");
             maybe_prune(writer, &mut chains, &mut last_prune);
@@ -1323,7 +1342,7 @@ mod tests {
         .unwrap();
         let mut chains: std::collections::HashMap<u64, (u64, [u8; 32])> =
             std::collections::HashMap::new();
-        let mut last_prune = std::time::Instant::now() - Duration::from_secs(7 * 3600);
+        let mut last_prune: Option<std::time::Instant> = None; // ★prune 발동(즉시 due·Instant 뺄셈 제거)
         {
             let _g = RETAIN_ENV_LOCK.lock().unwrap();
             std::env::set_var("CYS_RECALL_RETAIN_DAYS", "0");
