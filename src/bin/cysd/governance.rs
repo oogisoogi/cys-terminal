@@ -726,10 +726,27 @@ pub fn persist_topology(daemon: &Arc<Daemon>) {
         v.sort();
         v
     };
+    // ★W2/A-S1: 묘비 집합이 직전 영속본과 달라졌을 때만 tombstones_rev 를 +1(단조 카운터). phoenix 의
+    // 조건부 replace(rev ≥ 마지막으로 본 rev) 게이트 근거 — 부분절단/조작으로 묘비만 빈 파일은 rev 부재/역행으로
+    // 걸러진다. rev 관리를 이 단일 지점에 집중(각 mutation 사이트 계장 대신)해 "묘비 변경=rev 증가"를 정확히 반영.
+    {
+        let mut last = daemon.last_persisted_tombstones.lock().unwrap();
+        if *last != tombstones {
+            daemon
+                .tombstones_rev
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            *last = tombstones.clone();
+        }
+    }
+    let rev = daemon.tombstones_rev.load(std::sync::atomic::Ordering::SeqCst);
     let dir = crate::state::state_dir(&daemon.socket_path);
-    let content = serde_json::to_string_pretty(
-        &json!({"updated_at": now_epoch(), "entries": entries, "tombstones": tombstones}),
-    )
+    let content = serde_json::to_string_pretty(&json!({
+        "schema_version": 1,          // ★A-S1 스키마 마커 — 이 키 부재=legacy topology(phoenix 는 경고+진행)
+        "tombstones_rev": rev,        // ★A-S1 단조 카운터
+        "updated_at": now_epoch(),
+        "entries": entries,
+        "tombstones": tombstones,
+    }))
     .unwrap_or_default();
     // ★원자 쓰기 — SIGTERM/크래시가 쓰기 도중 끼어도 topology.json은 옛 완본 또는 새 완본만
     // 남는다. 비원자 write면 torn write가 깨진 JSON을 남기고 load_topology가 빈 배열로 폴백해
@@ -774,20 +791,75 @@ pub fn load_topology(daemon: &Arc<Daemon>) -> serde_json::Value {
         .unwrap_or_else(|| json!([]))
 }
 
-/// ★W2a: topology.json에서 묘비 집합을 직접 읽는다(데몬 기동 시 in-메모리 tombstones seed용).
-/// 구 topology(tombstones 필드 부재)·부재·손상은 전부 빈 집합으로 폴백(기존 동작 하위호환).
+fn _tombs_from_value(v: &serde_json::Value) -> std::collections::HashSet<String> {
+    v["tombstones"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|e| e.as_str().map(String::from)).collect())
+        .unwrap_or_default()
+}
+
+/// ★W2/P0-3: 세대 스냅샷(~/.cys/state-generations/<gen>/topology.json)의 최신 tombstones 폴백.
+/// 손상 topology 복구용 — best-effort(스냅샷 부재/없음=빈 집합).
+fn tombstones_from_latest_generation() -> std::collections::HashSet<String> {
+    let root = cys::home_dir().join(".cys").join("state-generations");
+    let mut gens: Vec<String> = match std::fs::read_dir(&root) {
+        Ok(rd) => rd
+            .flatten()
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| n.len() >= 16 && n.as_bytes()[8] == b'T')
+            .collect(),
+        Err(_) => return std::collections::HashSet::new(),
+    };
+    gens.sort();
+    for g in gens.iter().rev() {
+        let p = root.join(g).join("topology.json");
+        if let Ok(s) = std::fs::read_to_string(&p) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+                return _tombs_from_value(&v);
+            }
+        }
+    }
+    std::collections::HashSet::new()
+}
+
+/// ★W2/P0-3: topology.json에서 묘비 집합을 읽는다(데몬 기동 시 in-메모리 tombstones seed용).
+/// **부재=빈 집합(fresh 정상)**. **손상(파싱 실패)=조용한 빈집합 금지** — `.corrupt-<ts>` isolate(파일 보존)
+/// + 세대 스냅샷 tombstones 폴백. 손상을 빈집합으로 흘리면 폐역 역할이 부활(P0-3)하므로, 스냅샷으로 복구를
+/// 시도하고 원본은 isolate 해 소실을 디스크에 확정하지 않는다(.corrupt prune 상한은 W3).
 pub fn load_tombstones_from_disk(socket_path: &std::path::Path) -> std::collections::HashSet<String> {
+    let dir = crate::state::state_dir(socket_path);
+    let p = dir.join("topology.json");
+    let s = match std::fs::read_to_string(&p) {
+        Ok(s) => s,
+        Err(_) => return std::collections::HashSet::new(), // 부재 = fresh install 정상
+    };
+    match serde_json::from_str::<serde_json::Value>(&s) {
+        Ok(v) => _tombs_from_value(&v), // valid(구 topology tombstones 키 부재=빈집합·하위호환)
+        Err(e) => {
+            // 손상 — isolate + 세대 스냅샷 폴백(조용한 소실 금지).
+            let ts = now_epoch() as u64;
+            let corrupt = dir.join(format!("topology.json.corrupt-{ts}"));
+            let _ = std::fs::rename(&p, &corrupt);
+            let recovered = tombstones_from_latest_generation();
+            eprintln!(
+                "[cysd] ★P0-3 topology.json 손상({e}) — {} isolate + 세대 스냅샷 tombstones 폴백({}개 복구)",
+                corrupt.display(),
+                recovered.len()
+            );
+            recovered
+        }
+    }
+}
+
+/// ★W2/A-S1: topology.json 의 tombstones_rev 를 읽어 기동 카운터를 시드(재시작 넘어 단조성 유지).
+/// 필드 부재(legacy·fresh install)·부재·손상은 0(phoenix 는 epoch 변경으로 rebase 처리 — gemini R3).
+pub fn load_tombstones_rev_from_disk(socket_path: &std::path::Path) -> u64 {
     let dir = crate::state::state_dir(socket_path);
     std::fs::read_to_string(dir.join("topology.json"))
         .ok()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        .and_then(|v| v["tombstones"].as_array().cloned())
-        .map(|a| {
-            a.iter()
-                .filter_map(|e| e.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default()
+        .and_then(|v| v["tombstones_rev"].as_u64())
+        .unwrap_or(0)
 }
 
 fn check_load(daemon: &Daemon, last_alert: &mut f64) {
@@ -2037,8 +2109,8 @@ mod tests {
     // ─────────── ★묘비 게이트: reap≠묘비, owner-close=묘비 (부활 불변식) ───────────
 
     use super::{
-        close_surface, load_tombstones_from_disk, now_epoch, persist_topology,
-        reap_exited_surfaces, CloseCause, Daemon,
+        close_surface, load_tombstones_from_disk, load_tombstones_rev_from_disk, now_epoch,
+        persist_topology, reap_exited_surfaces, CloseCause, Daemon,
     };
     use std::sync::atomic::Ordering as AtomicOrdering;
 
@@ -2130,6 +2202,92 @@ mod tests {
             !load_tombstones_from_disk(&daemon.socket_path).contains("worker"),
             "reap 묘비가 topology.json에 영속돼 재부팅 후 부활이 막힌다"
         );
+    }
+
+    /// ★W2/A-S1: tombstones_rev 는 묘비 집합이 실제 바뀔 때만 +1(단조), 무변경 persist 는 불변.
+    /// topology.json 에 schema_version:1 + tombstones_rev 영속, disk 시드 라운드트립.
+    #[test]
+    fn tombstones_rev_increments_only_on_change() {
+        use std::sync::atomic::Ordering;
+        let daemon = drill_daemon("rev");
+        let rev0 = daemon.tombstones_rev.load(Ordering::SeqCst);
+        // 묘비 무변경 persist 2회 → rev 불변
+        persist_topology(&daemon);
+        persist_topology(&daemon);
+        assert_eq!(daemon.tombstones_rev.load(Ordering::SeqCst), rev0, "무변경 persist 는 rev 불변");
+        // 오너 close(묘비 삽입) → persist side-effect → rev +1
+        let id = spawn_role_surface(&daemon, "worker");
+        close_surface(&daemon, id, CloseCause::OwnerClose).expect("close");
+        let rev1 = daemon.tombstones_rev.load(Ordering::SeqCst);
+        assert_eq!(rev1, rev0 + 1, "묘비 삽입 시 rev +1");
+        // 재persist(무변경) → rev 불변
+        persist_topology(&daemon);
+        assert_eq!(daemon.tombstones_rev.load(Ordering::SeqCst), rev1, "재persist 무변경 rev 불변");
+        // topology.json 에 schema_version + tombstones_rev 영속
+        let content = std::fs::read_to_string(
+            crate::state::state_dir(&daemon.socket_path).join("topology.json"),
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(v["schema_version"], 1);
+        assert_eq!(v["tombstones_rev"].as_u64(), Some(rev1));
+        // disk 시드 라운드트립
+        assert_eq!(load_tombstones_rev_from_disk(&daemon.socket_path), rev1);
+    }
+
+    /// ★W2/C3(데몬측 원자화): close 의 엔트리 제거 + 묘비 삽입이 **단일 persist_topology** 로 원자화된다
+    /// (중간 persist 없음). 디스크 topology 한 파일에 entry 부재 + 묘비 존재가 함께 나타나야 한다(TOCTOU 차단).
+    #[test]
+    fn close_persists_entry_removal_and_tombstone_atomically() {
+        let daemon = drill_daemon("c3-atomic");
+        let id = spawn_role_surface(&daemon, "worker");
+        close_surface(&daemon, id, CloseCause::OwnerClose).expect("close");
+        let content = std::fs::read_to_string(
+            crate::state::state_dir(&daemon.socket_path).join("topology.json"),
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let has_worker = v["entries"]
+            .as_array()
+            .map(|a| a.iter().any(|e| e["role"] == "worker"))
+            .unwrap_or(false);
+        let tombs: Vec<String> = v["tombstones"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        assert!(!has_worker, "close 후 topology entries 에 worker 잔존(원자화 실패)");
+        assert!(tombs.contains(&"worker".to_string()), "close 후 topology tombstones 에 worker 부재(원자화 실패)");
+    }
+
+    /// ★W2/P0-3: 손상 topology.json 은 조용한 빈집합이 아니라 `.corrupt-<ts>` isolate(원본 보존) — 폐역 역할
+    /// 소실을 디스크에 확정하지 않는다. 격리 dir(스냅샷 없음)에선 빈 폴백이되 원본은 isolate.
+    #[test]
+    fn corrupt_topology_isolated_not_silently_empty() {
+        let daemon = drill_daemon("p0-3");
+        let dir = crate::state::state_dir(&daemon.socket_path);
+        std::fs::write(dir.join("topology.json"), "{ corrupt ]]] not json").unwrap();
+        let tombs = load_tombstones_from_disk(&daemon.socket_path);
+        assert!(tombs.is_empty(), "격리 dir 스냅샷 없음 → 빈 폴백");
+        let corrupt_isolated = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().starts_with("topology.json.corrupt-"));
+        assert!(corrupt_isolated, "손상 topology 가 .corrupt-* 로 isolate 되지 않음(조용한 소실)");
+        assert!(!dir.join("topology.json").exists(), "손상 원본이 isolate 안 되고 그대로 남음");
+    }
+
+    /// ★W2/P0-3: 부재(fresh install)는 손상과 구분 — isolate 없이 빈집합(정상 부팅).
+    #[test]
+    fn missing_topology_is_empty_not_corrupt() {
+        let daemon = drill_daemon("p0-3-missing");
+        let dir = crate::state::state_dir(&daemon.socket_path);
+        let _ = std::fs::remove_file(dir.join("topology.json"));
+        let tombs = load_tombstones_from_disk(&daemon.socket_path);
+        assert!(tombs.is_empty());
+        let has_corrupt = std::fs::read_dir(&dir)
+            .map(|rd| rd.flatten().any(|e| e.file_name().to_string_lossy().contains(".corrupt-")))
+            .unwrap_or(false);
+        assert!(!has_corrupt, "부재(fresh)를 손상으로 오판해 isolate 하면 안 된다");
     }
 
     /// 오너 의도적 닫기는 여전히 묘비를 남기고 영속한다(좀비 부활 차단 불변식 보존).

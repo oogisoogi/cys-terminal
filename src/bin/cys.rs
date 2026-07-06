@@ -248,7 +248,21 @@ enum Command {
         cols: u16,
     },
     /// Close a surface and force-kill its entire descendant process tree
-    CloseSurface { surface: String },
+    CloseSurface {
+        surface: String,
+        /// ★W2/C6: Reap 사유로 닫는다(묘비 미생성·부활 대상 유지) — 죽은 surface 잔재 회수용.
+        /// 기본(플래그 없음)=OwnerClose(묘비 생성·의도적 폐역).
+        #[arg(long)]
+        reap: bool,
+    },
+    /// ★W2/A-S3: 역할을 topology 묘비에 심는다(의도적 폐역). 데몬이 묘비 유일 작성자(단일 작성자 원칙).
+    #[command(name = "tombstone")]
+    Tombstone {
+        role: String,
+        /// 폐역 해제(재편입 가능).
+        #[arg(long)]
+        remove: bool,
+    },
     /// Subscribe to the daemon event stream (push; no polling)
     Events {
         #[arg(long)]
@@ -1807,14 +1821,32 @@ fn run(command: Command) -> i32 {
                 .map(|_| println!("OK"))
         }),
 
-        Command::CloseSurface { surface } => parse_surface_ref(&surface)
+        Command::CloseSurface { surface, reap } => parse_surface_ref(&surface)
             .ok_or_else(|| format!("invalid surface ref: {surface}"))
             .and_then(|sid| {
-                request("surface.close", json!({"surface_id": sid})).map(|r| {
-                    println!("closed {} (descendants killed)", surface);
+                // ★W2/C6: --reap → cause="reap"(묘비 미생성). 기본=OwnerClose(묘비).
+                let params = if reap {
+                    json!({"surface_id": sid, "cause": "reap"})
+                } else {
+                    json!({"surface_id": sid})
+                };
+                request("surface.close", params).map(|r| {
+                    println!("closed {} (descendants killed{})", surface,
+                             if reap { ", reap" } else { "" });
                     let _ = r;
                 })
             }),
+
+        Command::Tombstone { role, remove } => {
+            request("tombstone.set", json!({"role": role, "remove": remove})).map(|r| {
+                let rev = r["tombstones_rev"].as_u64().unwrap_or(0);
+                println!(
+                    "tombstone {} {} (rev={rev})",
+                    role,
+                    if remove { "removed" } else { "set" }
+                );
+            })
+        }
 
         Command::Events { after_seq, names, categories, filter, reconnect, cursor_file } => {
             stream_events(after_seq, names, categories, filter, reconnect, cursor_file)
@@ -4290,7 +4322,9 @@ fn run_launch_agent_opts(
             if let Some(sid) = created {
                 // close 결과를 정직히 보고한다 — 실패를 'closed'로 거짓 보고하면 role이
                 // 좀비 surface에 점유된 채 남아 재기동이 claim_denied로 막힌다(이번 회귀의 근원).
-                match request("surface.close", json!({"surface_id": sid})) {
+                // ★W2/P0-6: cause="reap" — launch 실패 롤백은 역할을 묘비화하지 않는다(부활 대상 유지). 과거
+                // 고정 OwnerClose 라 실패한 worker launch 1회가 역할을 영구 오묘비화하던 우회로를 끊는다.
+                match request("surface.close", json!({"surface_id": sid, "cause": "reap"})) {
                     Ok(_) => eprintln!(
                         "[launch-agent] failed surface {} closed (role 점유 해제)",
                         surface_ref(sid)

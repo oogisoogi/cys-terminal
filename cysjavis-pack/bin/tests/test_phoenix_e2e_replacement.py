@@ -38,6 +38,7 @@ if not (CYSD and CYS):
 os.environ["PHOENIX_HARNESS_CYSD"] = CYSD
 os.environ["PATH"] = DBG + ":" + os.environ.get("PATH", "")
 os.environ["PHOENIX_CYS"] = CYS  # 하네스 self 대조용(cysd 는 자체 주입)
+os.environ["CYS_NO_AUTORESTORE"] = "0"  # ★E1 은 cysd auto-restore 를 검증하므로 명시 활성화(하네스 기본=비활성)
 
 HARNMOD = os.path.join(HERE, "..", "javis_phoenix_harness.py")
 spec = importlib.util.spec_from_file_location("h", HARNMOD)
