@@ -560,11 +560,21 @@ fn pause_resume_allowed(daemon: &Daemon, caller: Caller) -> bool {
     }
 }
 
-/// surface.close 게이트(creator-gate 후보①): 허용 조건은 ① Internal ② Peer{surface==sid}(자기 close)
-/// ③ Peer{pid==creator_pid && peer_start_time(pid)==creator_start && live agent 부재}(launch-agent
-/// 롤백 자기제한 — 부팅 성공 즉시 인가 소멸). 그 외(Anonymous·비creator Peer{None}·Peer{타 surface})
-/// 전건 deny. 반환 true=allow.
+/// surface.close 게이트(creator-gate 후보①): 허용 조건은 ⓪ 대상이 이미 exited(잔재 정리) ① Internal
+/// ② Peer{surface==sid}(자기 close) ③ Peer{pid==creator_pid && peer_start_time(pid)==creator_start
+/// && live agent 부재}(launch-agent 롤백 자기제한 — 부팅 성공 즉시 인가 소멸). 그 외(Anonymous·비
+/// creator Peer{None}·Peer{타 surface})는 라이브 surface에 한해 deny. 반환 true=allow.
 fn close_allowed(daemon: &Daemon, caller: Caller, sid: u64) -> bool {
+    // ⓪ 이미 exited(자력종료)된 죽은 surface의 close는 안전한 잔재 회수(reap)다 — 죽일 라이브
+    //    프로세스 트리도, 하이재킹할 라이브 pane도 없어 WP-3의 위협모델(워커 pane이 라이브 master/타
+    //    노드를 강제 종료·ACL 우회)이 성립하지 않는다. 발신자 무관 허용해 CSO/tooling의
+    //    `cys close-surface --reap`(Peer{None}·비creator 일시 CLI) 정당 잔재회수를 게이트가 막지 않게
+    //    한다. exited는 데몬만 stamp하므로(셸 EOF) 위조 불가. 게이트는 라이브 surface 방어만 유지.
+    if let Some(s) = daemon.get_surface(sid) {
+        if s.exited.load(Ordering::Relaxed) {
+            return true;
+        }
+    }
     match caller {
         Caller::Internal => true,
         Caller::Peer { surface: Some(cs), .. } => cs == sid, // 자기 close만(타 surface deny)
@@ -5311,6 +5321,46 @@ mod tests {
             Some(victim),
             "거부됐는데 victim의 role 매핑이 정리됐다"
         );
+    }
+
+    /// C6 회귀: 이미 exited된 잔재 surface는 발신자 무관 close 허용(reap). `cys close-surface --reap`
+    /// (비creator Peer{None}·일시 CLI)이 exited 잔재를 회수하는 정당 경로를 WP-3 게이트가 막던 회귀를
+    /// 봉인 해제한다. 라이브 surface 게이트(위협모델)는 불변임을 대조로 함께 박제.
+    #[test]
+    fn close_allows_reap_of_exited_surface() {
+        let daemon = claim_daemon();
+        let reaper = make_surface(&daemon, Some("worker-1"));
+        let stale = make_surface(&daemon, Some("ghost"));
+        let reaper_pid = 993_202_u32;
+        bind_caller(&daemon, reaper_pid, reaper);
+        // stale 을 자력종료(exited) 상태로 — 데몬만 stamp하는 실제 경로를 테스트에서 재현.
+        daemon
+            .get_surface(stale)
+            .unwrap()
+            .exited
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        // 비creator 발신(reaper pane)이 exited 잔재를 --reap → 허용(죽은 surface·라이브 위협 없음).
+        let resp = close_surface_rpc(&daemon, stale, Some(reaper_pid));
+        assert_eq!(
+            resp["ok"],
+            json!(true),
+            "exited 잔재 reap이 막혔다 (C6 회귀·응답: {resp})"
+        );
+        assert!(
+            !daemon.surfaces.lock().unwrap().contains_key(&stale),
+            "reap 통과했는데 stale surface가 맵에 남았다"
+        );
+
+        // 대조: 라이브 surface는 여전히 비소유 close deny(게이트 약화 아님·위협모델 불변).
+        let live = make_surface(&daemon, Some("master"));
+        let resp2 = close_surface_rpc(&daemon, live, Some(reaper_pid));
+        assert_eq!(
+            resp2["ok"],
+            json!(false),
+            "라이브 surface에 대한 비소유 close가 통과했다(게이트 약화·응답: {resp2})"
+        );
+        assert_eq!(resp2["error"]["code"], json!("close_denied"));
     }
 
     /// 대조군 ①: 자기 surface close는 통과 (cs == sid). 정상 종료 경로 박제.
