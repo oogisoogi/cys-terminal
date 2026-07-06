@@ -17,6 +17,66 @@ const SCROLLBACK_LINES: usize = 10_000;
 pub const DEFAULT_ROWS: u16 = 35;
 pub const DEFAULT_COLS: u16 = 120;
 
+// ★D3(W5): Windows Job Object — PTY 자식 동반사망(KILL_ON_JOB_CLOSE). unix 는 setsid+killpg/SIGKILL 로 이미
+//   동반사망이 성립하지만 Windows 는 자식이 데몬 사후 생존해 잔존/중복 노드가 됐다(P2-9). 데몬 소유 Job 에
+//   자식을 편입하면 데몬 프로세스 종료 시 OS 가 Job 핸들을 닫아 편입된 전 자식·손자를 강제 종료한다.
+#[cfg(windows)]
+pub(crate) mod winjob {
+    use std::sync::OnceLock;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
+        JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+    };
+
+    // 데몬 소유 Job(프로세스 수명 = 핸들 수명, 명시 close 없음 → 프로세스 종료 시 OS 가 닫아 KILL 발동).
+    //   HANDLE(=*mut c_void)은 !Send 이므로 usize 로 보관한다(핸들 값 자체는 프로세스 전역 유효).
+    static JOB: OnceLock<usize> = OnceLock::new();
+
+    fn job() -> HANDLE {
+        (*JOB.get_or_init(|| unsafe {
+            let h = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if !h.is_null() {
+                let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+                info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                SetInformationJobObject(
+                    h,
+                    JobObjectExtendedLimitInformation,
+                    (&info as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                );
+            }
+            h as usize
+        })) as HANDLE
+    }
+
+    /// PTY 자식(pid)을 데몬 소유 Job(KILL_ON_JOB_CLOSE)에 편입 — 데몬 사후 자식·손자 동반사망(mac SIGKILL 대칭).
+    /// ★post-spawn 편입: portable-pty(ConPTY)가 pseudoconsole 핸드셰이크를 위해 자식을 즉시 실행해야 하므로
+    /// CREATE_SUSPENDED→resume 은 ConPTY 계약과 충돌한다 — 채택하지 않았다. 편입 이후 자식이 만드는 손자는
+    /// Job 을 상속(자동 편입)하고, 편입 직전 sub-ms 창의 손자만 이론적 이탈(에이전트 실무상 무해). best-effort
+    /// (실패해도 스폰을 죽이지 않는다 — 잔존 위험은 unix 대비로만 존재, 가용성 우선).
+    pub fn assign_child(pid: u32) {
+        if pid == 0 {
+            return;
+        }
+        unsafe {
+            let j = job();
+            if j.is_null() {
+                return;
+            }
+            let proc = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid);
+            if !proc.is_null() {
+                AssignProcessToJobObject(j, proc);
+                CloseHandle(proc);
+            }
+        }
+    }
+}
+
 /// PTY 쓰기 요청 — surface별 전용 writer 스레드가 순서대로 소비한다.
 pub enum WriteReq {
     /// 그대로 쓰기 (키 입력·텍스트·DSR 응답)
@@ -1296,6 +1356,9 @@ impl Daemon {
             .spawn_command(builder)
             .map_err(|e| format!("spawn failed: {e}"))?;
         let pid = child.process_id().unwrap_or(0);
+        // ★D3(W5): 스폰 직후 자식을 데몬 소유 Job 에 편입 — 데몬 사후 동반사망(Windows P2-9). unix 는 no-op.
+        #[cfg(windows)]
+        winjob::assign_child(pid);
         drop(pair.slave);
 
         let reader = pair

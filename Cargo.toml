@@ -60,4 +60,6 @@ windows-sys = { version = "0.59", features = [
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_System_Pipes",
+    "Win32_System_JobObjects",  # ★D3(W5): Job Object(KILL_ON_JOB_CLOSE) — PTY 자식 동반사망
+    "Win32_System_Threading",   # ★D3(W5): OpenProcess(자식 pid → Job 편입)
 ] }

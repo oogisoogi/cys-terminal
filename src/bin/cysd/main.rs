@@ -1863,6 +1863,40 @@ mod auto_restore_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// ★D4(W5): 인터프리터 해석 — 동봉 runtime python3 이 실존하면 program 은 **그 절대경로**여야 한다
+    /// ("python3" 리터럴 폴백이 아니라). 순정 Windows(python3 부재)·mac CLT 미설치 소비자에서 첫 스폰 단절
+    /// (P0-7·P1-9)을 절대경로로 끊는 핵심. 기존 present_phoenix_builds_auto_restore_command 는 **번들 부재
+    /// 폴백**만 검증(program=="python3")했다 — 그 리터럴 단언만으로는 절대경로 해석 결함을 통과시킨다(설계 D4 지적).
+    #[test]
+    fn ready_prefers_bundled_python_absolute_path() {
+        let dir = std::env::temp_dir().join(format!("cys-ar-bundlepy-{}", std::process::id()));
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("javis_phoenix.py"), "#!/usr/bin/env python3\n").unwrap();
+        // exe_dir(bin) 기준 동봉 runtime python 디렉터리에 python3 실행파일을 둔다(runtime_bin_dirs SOT 와 일치).
+        //   mac: <exe_dir>/runtime/python/bin/python3 · win: <exe_dir>/runtime/python/python3.exe
+        let (py_dir, py_name) = if cfg!(windows) {
+            (bin.join("runtime").join("python"), "python3.exe")
+        } else {
+            (bin.join("runtime").join("python").join("bin"), "python3")
+        };
+        std::fs::create_dir_all(&py_dir).unwrap();
+        let py_path = py_dir.join(py_name);
+        std::fs::write(&py_path, "#!/bin/sh\n").unwrap();
+        match decide_auto_restore(&dir, false, &bin, "/usr/bin:/bin", "sock:test") {
+            AutoRestore::Ready { program, .. } => {
+                assert_eq!(
+                    program,
+                    py_path.to_string_lossy(),
+                    "동봉 python3 실존 시 program 은 절대경로여야 한다(리터럴 'python3' 아님)"
+                );
+                assert_ne!(program, "python3", "리터럴 폴백이면 D4 결함(절대경로 미해석)");
+            }
+            other => panic!("expected Ready, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// ★W1/B3: exe 옆에 cys 가 실존하면 PHOENIX_CYS 를 그 절대경로로 주입하고, exe_dir 가 PATH 에 없으면
     /// PATH 를 선두주입한다(GUI/데몬 최소 PATH 침묵사 근원 수리). "python3" 문자열 단언만으로는 불충분(D4).
     #[test]

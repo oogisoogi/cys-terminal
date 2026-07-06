@@ -860,28 +860,53 @@ def _is_ephemeral_role(role, entry=None):
     return _ephemeral_verdict(role, entry) == "ephemeral"
 
 
-def _acquire_roster_lock(socket, tag="roster", tries=40, sleep=0.05):
-    """★P1-7(W3): desired/dept read-modify-write 직렬화 lock(restore lease 와 동형 flock). reconcile·roster·
-    inherit·restore 가 동시에 desired/dept 를 RMW 하면 lost update(방금 병합한 역할이 다른 writer 에 덮임)가
-    난다 — `<phoenix_home>/<tag>.lock` 에 flock(LOCK_EX|NB) 을 tries×sleep 동안 재시도해 직렬화한다. 끝내 못
-    잡으면 fail-open(핸들 보유·경고) — 무한 블록/행 금지·가용성 우선(Windows msvcrt 는 W5). 반환 handle|None."""
-    try:
-        p = os.path.join(phoenix_home(socket), "%s.lock" % tag)
-        f = open(p, "w")
-    except Exception:
-        return None
+def _try_lock_nb(f):
+    """★D2(W5): 비차단 배타 락 1회 시도(unix·Windows 통합). 반환 True(획득)·False(다른 보유)·None(락 기구
+    미가용=fail-open). unix=fcntl.flock(LOCK_EX|NB) · Windows=msvcrt.locking(LK_NBLCK, byte0). 둘 다 프로세스
+    사망 시 OS 가 자동 해제(stale lock 없음). Windows 는 seek(0)로 동일 바이트 영역을 잠가 상호배제를 보장한다."""
     if IS_WINDOWS:
-        return f  # msvcrt 직렬화는 W5 — 여기선 핸들 보유만(fail-open)
+        try:
+            import msvcrt
+        except Exception:
+            return None
+        try:
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+            return True
+        except OSError:
+            return False          # 다른 프로세스가 byte0 보유 — 경합
+        except Exception:
+            return None           # 예기치 못한 실패 → fail-open
     try:
         import fcntl
     except Exception:
-        return f  # fcntl 미가용 → fail-open
+        return None
+    try:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError:
+        return False
+    except Exception:
+        return None
+
+
+def _acquire_roster_lock(socket, tag="roster", tries=40, sleep=0.05):
+    """★P1-7(W3): desired/dept read-modify-write 직렬화 lock. reconcile·roster·inherit·restore 가 동시에
+    desired/dept 를 RMW 하면 lost update 가 난다 — `<phoenix_home>/<tag>.lock` 에 비차단 배타 락을 tries×sleep
+    동안 재시도해 직렬화한다. ★D2(W5): unix flock·Windows msvcrt 통합(_try_lock_nb) — 과거 Windows fail-open
+    (P1-8)을 제거. 끝내 못 잡거나 락 기구 미가용이면 fail-open(핸들 보유·경고) — 무한 블록/행 금지. 반환 handle|None."""
+    try:
+        p = os.path.join(phoenix_home(socket), "%s.lock" % tag)
+        f = open(p, "a+")  # 무truncate·생성·byte0 락 대상(Windows msvcrt 영역 일치)
+    except Exception:
+        return None
     for _ in range(max(1, tries)):
-        try:
-            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        r = _try_lock_nb(f)
+        if r is True:
             return f
-        except OSError:
-            time.sleep(sleep)
+        if r is None:
+            return f  # 락 기구 미가용 → fail-open(가용성)
+        time.sleep(sleep)  # r is False(다른 보유) → 재시도
     log("★P1-7: roster RMW lock(%s) 확보 실패(경합 지속) — fail-open 진행(가용성)." % tag)
     return f  # 못 잡아도 핸들 보유(fail-open·무한 블록 금지)
 
@@ -1497,22 +1522,18 @@ def _acquire_restore_lease(socket):
     오케스트레이션이 동시에 restore를 돌려 같은 역할을 이중 스폰하는 TOCTOU를 차단한다.
     반환 (ok, handle): ok=False 는 '다른 restore가 진행 중 → 중복 skip'. ok=True 면 진행하되
     handle(열린 파일객체)를 함수 끝까지 살려 락을 유지해야 한다(fail-open 시 handle=None).
-    unix=fcntl.flock(LOCK_EX|NB) · Windows/기타=best-effort(핸들 보유만·flock 부재는 fail-open)."""
+    ★D2(W5): unix flock·Windows msvcrt 통합(_try_lock_nb) — 과거 Windows 전면 fail-open(P1-8: auto+수동
+    restore 이중 스폰)을 제거. 락 기구 미가용만 fail-open."""
     try:
         lease_path = os.path.join(phoenix_home(socket), "restore.lease")
-        f = open(lease_path, "w")
+        f = open(lease_path, "a+")  # 무truncate·생성·byte0 락 대상(Windows msvcrt 영역 일치)
     except Exception:
         return True, None  # 락 파일 생성 실패 = 게이트 없이 진행(가용성 우선 fail-open)
-    if not IS_WINDOWS:
-        try:
-            import fcntl
-            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            f.close()
-            return False, None  # 다른 restore 보유 중 — 중복 인지 skip
-        except Exception:
-            pass  # fcntl 미가용 등 → fail-open(핸들 보유)
-    return True, f
+    r = _try_lock_nb(f)
+    if r is False:
+        f.close()
+        return False, None  # 다른 restore 보유 중 — 중복 인지 skip
+    return True, f          # True(획득) 또는 None(락 기구 미가용=fail-open) → 핸들 보유하고 진행
 
 
 def _release_lease(handle):
