@@ -5374,6 +5374,19 @@ fn run_restore(cwd: Option<String>, include_master: bool, no_resume: bool) -> i3
 }
 
 /// T2-7 디렉티브 드리프트 감지·재주입: --check면 각성 핑 먼저, 무응답 시에만 재주입
+/// Tier R check-path 빈 셸 게이트(순수 함수·단위테스트 대상). surface_entry(topology) 엔트리에서
+/// live agent 부재를 판정한다: live agent = agent 등록 present ∧ !exited ∧ agent_alive(데몬이
+/// agent_seen ∧ !agent_exit_notified로 산출). 부재(빈 셸·크래시투셸·미부팅)면 true(=check-ping과
+/// fall-through 주입을 둘 다 skip). 실 topology 엔트리는 exited/agent/agent_alive를 항상 포함한다;
+/// 조회 자체 실패는 상위 surface_entry(sid)? 가 이미 처리하므로 이 게이트가 새 조회를 하지 않는다.
+/// forced reinject(check=false)에는 호출하지 않는다 — CEO 강제주입 skip 금지.
+fn reinject_check_should_skip_bare_shell(entry: &Value) -> bool {
+    let agent_present = entry["agent"].is_string();
+    let not_exited = entry["exited"].as_bool() != Some(true);
+    let agent_live = entry["agent_alive"].as_bool() == Some(true);
+    !(agent_present && not_exited && agent_live)
+}
+
 fn run_reinject(
     role: Option<String>,
     surface: Option<String>,
@@ -5388,6 +5401,14 @@ fn run_reinject(
             .or_else(|| entry["role"].as_str().map(String::from))
             .ok_or("role 미상 — --role 지정 필요")?;
         if check {
+            // ── Tier R gate(에러①): 빈 셸(라이브 에이전트 부재)이면 핑·fall-through 주입 둘 다 skip. ──
+            // 크래시투셸(exited=true)·미부팅 bare 셸에 디렉티브 전문을 뿌리는 소음/오염을 차단한다.
+            // 블록 최상단 early-return이라 핑(inject_text) 前에 빠져나가 fall-through 주입도 안 일어난다.
+            // forced reinject(check=false)는 이 블록 밖이라 CEO 강제주입이 유지된다(skip 금지).
+            if reinject_check_should_skip_bare_shell(&entry) {
+                println!("빈 셸(라이브 에이전트 부재) — check reinject skip (surface:{sid})");
+                return Ok(());
+            }
             // 마커를 핑 텍스트에 통째로 넣지 않는다 — 주입 텍스트의 터미널 에코가
             // wait_for에 매칭되는 false ACK(자기-에코 오탐)를 차단 (토큰 분리 조합 지시)
             let marker = format!("DIRECTIVE-ACK-{}", std::process::id());
@@ -8718,5 +8739,23 @@ mod tests {
         assert!(e.contains("digest 불일치"), "digest 거부 사유 아님: {e}");
         assert!(!staging.join("soul.md").exists(), "digest 거부인데 전개됨(전개 前 거부 위반)");
         let _ = std::fs::remove_dir_all(&td);
+    }
+
+    // ── Tier R reinject gate ─────────────────────────────────────────────────────
+    /// check-path 빈 셸 게이트는 live agent 부재일 때만 skip 판정한다(forced는 이 함수 미호출).
+    #[test]
+    fn reinject_bare_shell_gate_skips_only_when_no_live_agent() {
+        // live agent(등록·미종료·관측됨) → 진행(skip=false), 기존 ACK 핑 경로 유지.
+        let live = json!({"agent": "claude", "exited": false, "agent_alive": true});
+        assert!(!reinject_check_should_skip_bare_shell(&live), "live agent인데 skip");
+        // 순수 빈 셸(agent 미등록) → skip(디렉티브 전문 뿌리기 차단).
+        let bare = json!({"agent": null, "exited": false, "agent_alive": null});
+        assert!(reinject_check_should_skip_bare_shell(&bare), "빈 셸인데 진행");
+        // 크래시투셸(agent 등록됐으나 exited) → skip.
+        let crashed = json!({"agent": "claude", "exited": true, "agent_alive": false});
+        assert!(reinject_check_should_skip_bare_shell(&crashed), "크래시투셸인데 진행");
+        // agent 등록됐으나 아직 미관측(agent_alive=false) → skip.
+        let unseen = json!({"agent": "claude", "exited": false, "agent_alive": false});
+        assert!(reinject_check_should_skip_bare_shell(&unseen), "미관측 agent인데 진행");
     }
 }
