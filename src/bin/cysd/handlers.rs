@@ -1,7 +1,7 @@
 //! Method dispatch: NDJSON request → handler → single response or stream upgrade.
 
 use crate::governance;
-use crate::state::{Caller, Daemon, FeedItem, HealthRule, LedgerEntry, DEFAULT_COLS, DEFAULT_ROWS};
+use crate::state::{Daemon, FeedItem, HealthRule, LedgerEntry, DEFAULT_COLS, DEFAULT_ROWS};
 use cys::{err_response, ok_response, parse_surface_ref, surface_ref, Request};
 use serde_json::{json, Value};
 use std::sync::atomic::Ordering;
@@ -510,115 +510,12 @@ fn learn_state_dir() -> std::path::PathBuf {
     cys::pack::pack_dir().join("round").join("learn")
 }
 
-// ─── WP-3 v3 파괴계 게이트 규칙(핸들러별 개별 규칙·균일규칙 금지) ─────────────────────────────
-// 공통 철학: **현행 정확한 곳은 불변, fail-open만 국소 봉인**. Anonymous(피어 미식별)는 파괴계에서
-// deny, Internal(데몬 신뢰)은 allow, Peer{surface:None}(외부 오케스트레이션 CLI)은 핸들러별 판단.
-
-/// 자기범위 게이트(status.set·usage.register/report·queue.clear): 현행 역방향(Peer가 타 surface로
-/// 해석되면 deny)을 보존하고 Anonymous fail-open만 추가 봉인한다. Internal·Peer{surface==sid}·
-/// Peer{surface:None}(외부 CLI)는 허용(무손상). 반환 true=deny.
-fn self_scope_denied(caller: Caller, sid: u64) -> bool {
-    match caller {
-        Caller::Anonymous => true,
-        Caller::Peer { surface: Some(cs), .. } => cs != sid,
-        Caller::Internal | Caller::Peer { surface: None, .. } => false,
-    }
-}
-
-/// reinject.mark 게이트: pane(Peer로 해석됨)은 자기 마커 set 금지(디렉티브 재주입 영구회피·context
-/// 오염 차단·현행 역방향 보존)이고 Anonymous도 deny(peer_pid-suppression 구멍 봉인). 컨트롤러
-/// (Internal·Peer{surface:None} = cys pack-update/restore·데몬 내부)만 허용. 반환 true=deny.
-fn reinject_mark_denied(caller: Caller) -> bool {
-    matches!(
-        caller,
-        Caller::Peer { surface: Some(_), .. } | Caller::Anonymous
-    )
-}
-
-/// ledger.kill 게이트(owner 한정): 원장 항목 소유 surface(등록자) 또는 Internal만 kill 허용.
-/// entry_owner=None(원장 미등재 pid = 임의 pid kill 분기)은 Internal만 허용(외부 임의 kill 차단).
-/// 반환 true=allow.
-fn ledger_kill_allowed(caller: Caller, entry_owner: Option<u64>) -> bool {
-    match caller {
-        Caller::Internal => true,
-        Caller::Peer { surface: Some(cs), .. } => entry_owner == Some(cs),
-        Caller::Anonymous | Caller::Peer { surface: None, .. } => false,
-    }
-}
-
-/// pause/resume 게이트(kill-switch 계열): master/cso 역할 Peer 또는 Internal만 허용. Anonymous·
-/// 비특권 Peer·역할 미상은 deny. 반환 true=allow.
-fn pause_resume_allowed(daemon: &Daemon, caller: Caller) -> bool {
-    match caller {
-        Caller::Internal => true,
-        Caller::Peer { surface: Some(cs), .. } => daemon
-            .get_surface(cs)
-            .and_then(|s| s.role.lock().unwrap().clone())
-            .map(|r| r == "master" || r == "cso")
-            .unwrap_or(false),
-        _ => false,
-    }
-}
-
-/// surface.close 게이트(creator-gate 후보①): 허용 조건은 ⓪ 대상이 이미 exited(잔재 정리) ① Internal
-/// ② Peer{surface==sid}(자기 close) ③ Peer{pid==creator_pid && peer_start_time(pid)==creator_start
-/// && live agent 부재}(launch-agent 롤백 자기제한 — 부팅 성공 즉시 인가 소멸). 그 외(Anonymous·비
-/// creator Peer{None}·Peer{타 surface})는 라이브 surface에 한해 deny. 반환 true=allow.
-fn close_allowed(daemon: &Daemon, caller: Caller, sid: u64) -> bool {
-    // ⓪ 이미 exited(자력종료)된 죽은 surface의 close는 안전한 잔재 회수(reap)다 — 죽일 라이브
-    //    프로세스 트리도, 하이재킹할 라이브 pane도 없어 WP-3의 위협모델(워커 pane이 라이브 master/타
-    //    노드를 강제 종료·ACL 우회)이 성립하지 않는다. 발신자 무관 허용해 CSO/tooling의
-    //    `cys close-surface --reap`(Peer{None}·비creator 일시 CLI) 정당 잔재회수를 게이트가 막지 않게
-    //    한다. exited는 데몬만 stamp하므로(셸 EOF) 위조 불가. 게이트는 라이브 surface 방어만 유지.
-    if let Some(s) = daemon.get_surface(sid) {
-        if s.exited.load(Ordering::Relaxed) {
-            return true;
-        }
-    }
-    match caller {
-        Caller::Internal => true,
-        Caller::Peer { surface: Some(cs), .. } => cs == sid, // 자기 close만(타 surface deny)
-        Caller::Peer { pid, surface: None } => {
-            // creator-gate: 이 surface를 만든 바로 그 프로세스(롤백 경로)만, 그것도 부팅 전에만.
-            let Some(s) = daemon.get_surface(sid) else {
-                return false;
-            };
-            let creator_pid = *s.creator_pid.lock().unwrap();
-            let creator_start = *s.creator_start.lock().unwrap();
-            let pid_matches = creator_pid == Some(pid);
-            // pid 재활용 핀: 현재 pid의 start_time이 생성 시 기록과 동일해야(재활용 위조 차단).
-            let start_pinned = creator_start.is_some() && peer_start_time(pid) == creator_start;
-            // 자기제한: agent가 아직 안 뜬(롤백 대상) surface에만. agent_seen이면 인가 소멸.
-            let agent_absent = s.agent_meta.lock().unwrap().is_none()
-                || !s.agent_seen.load(Ordering::Relaxed);
-            pid_matches && start_pinned && agent_absent
-        }
-        Caller::Anonymous => false,
-    }
-}
-
-/// WP-3 소켓 경계 변환(단일 지점) — 소켓 피어 pid를 Caller 3상태로 승격한다. From 금지 규약의
-/// 유일한 정당 변환 지점(main.rs 프로덕션 경계·테스트 시뮬레이션이 이 함수를 공유). peer_pid Some =
-/// Peer{surface=조상추적 해석}, None = Anonymous(피어 pid 확보 실패 = 파괴계 deny 대상).
-pub fn caller_from_socket(daemon: &Daemon, peer_pid: Option<u32>) -> crate::state::Caller {
-    match peer_pid {
-        Some(pid) => crate::state::Caller::Peer {
-            pid,
-            surface: resolve_caller_surface(daemon, pid),
-        },
-        None => crate::state::Caller::Anonymous,
-    }
-}
-
-pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller: crate::state::Caller) -> Reply {
-    // 시밍(shim): pid 기반 소비처(publisher_pid·pgid_of·check_send_acl/check_caps_gate·로그 payload)는
-    // 기존 caller_pid(Option<u32>)를 그대로 쓴다. 3상태 판별이 필요한 파괴계 게이트만 `caller`를 매치한다.
-    let caller_pid = caller.pid();
+pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> Reply {
     let id = req.id.clone();
     let params = req.params;
     // C0 채널 계층: channel.* RPC는 channels 모듈이 전담(단일 위임 — dispatch match 비대화 방지).
     if let Some(sub) = req.method.strip_prefix("channel.") {
-        return crate::channels::handle(daemon, sub, &params, &id, caller);
+        return crate::channels::handle(daemon, sub, &params, &id, caller_pid);
     }
     match req.method.as_str() {
         "system.ping" => Reply::Single(ok_response(&id, json!("pong"))),
@@ -785,12 +682,6 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller: crate::state::Caller
                             .lock()
                             .unwrap()
                             .insert(key, (s.id, crate::state::now_epoch()));
-                    }
-                    // WP-3 creator-gate 기록: Peer 발신이면 creator_pid + 그 프로세스 start_time을 새긴다
-                    // (launch-agent 롤백 자기close 인가 근거·인메모리 전용). Internal/Anonymous는 미기록.
-                    if let Caller::Peer { pid, .. } = caller {
-                        *s.creator_pid.lock().unwrap() = Some(pid);
-                        *s.creator_start.lock().unwrap() = peer_start_time(pid);
                     }
                     Reply::Single(ok_response(
                         &id,
@@ -1284,24 +1175,24 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller: crate::state::Caller
             // 확정한다(client 자기신고 surface_id 불신). 발신이 surface로 해석되면 자기 surface
             // (cs == sid)만 닫을 수 있다. 익명 발신(caller_pid None = 데몬 내부 node-recover·오케스트
             // 레이터 경로)은 통과 — pane은 peer pid가 항상 자기 surface로 해석되므로 익명을 위조할 수 없다.
-            // WP-3 creator-gate: Internal·자기close(Peer{cs==sid})·creator 롤백(부팅 전 자기제한)만
-            // 허용하고 Anonymous·비creator 외부·타 surface Peer는 전건 deny(현행 Peer{None} fail-open의
-            // 임의 close 구멍 봉인). 부팅 실패 고아는 데몬 watchdog reap이 안전망(governance).
-            if !close_allowed(daemon, caller, sid) {
-                daemon.bus.publish(
-                    "surface.close_denied",
-                    "surface",
-                    Some(sid),
-                    json!({"requested_surface": sid,
-                           "caller_surface": caller.surface(), "caller_pid": caller_pid}),
-                );
-                return Reply::Single(err_response(
-                    &id,
-                    "close_denied",
-                    &format!(
-                        "surface.close denied: only the surface itself, its pre-boot creator (rollback), or an internal caller may close surface {sid}"
-                    ),
-                ));
+            let caller_sid = caller_pid.and_then(|p| resolve_caller_surface(daemon, p));
+            if let Some(cs) = caller_sid {
+                if cs != sid {
+                    daemon.bus.publish(
+                        "surface.close_denied",
+                        "surface",
+                        Some(sid),
+                        json!({"requested_surface": sid,
+                               "caller_surface": cs, "caller_pid": caller_pid}),
+                    );
+                    return Reply::Single(err_response(
+                        &id,
+                        "close_denied",
+                        &format!(
+                            "surface.close denied: caller (surface {cs}) may only close its own surface, not surface {sid}"
+                        ),
+                    ));
+                }
             }
             // ★W2/P0-6: cause 파라미터 — 기본 OwnerClose(묘비 생성·좀비 부활 차단)이나, launch-agent 롤백처럼
             // "생성 실패로 되돌리는" 발신처는 cause="reap"을 보내 묘비를 남기지 않는다(실패한 launch 는 부활
@@ -1692,31 +1583,6 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller: crate::state::Caller
                     &id,
                     "invalid_params",
                     &format!("pid out of valid range (1..=2147483647): {pid}"),
-                ));
-            }
-            // WP-3 owner 게이트(A-4): 원장 소유 surface(등록자) 또는 Internal만 kill. 먼저 소유자를
-            // peek 인가한 뒤에만 remove+kill한다. 미등재 pid(임의 kill 분기)는 Internal만 — Anonymous·
-            // 비소유 Peer의 임의 SIGKILL을 봉인한다(데몬 watchdog은 governance 직접호출이라 무관).
-            let entry_owner = daemon
-                .ledger
-                .lock()
-                .unwrap()
-                .get(&(pid as u32))
-                .and_then(|e| e.surface_id);
-            if !ledger_kill_allowed(caller, entry_owner) {
-                daemon.bus.publish(
-                    "ledger.kill_denied",
-                    "ledger",
-                    entry_owner,
-                    json!({"pid": pid, "caller_surface": caller.surface(),
-                           "caller_pid": caller_pid}),
-                );
-                return Reply::Single(err_response(
-                    &id,
-                    "kill_denied",
-                    &format!(
-                        "ledger.kill denied: only the registering surface (owner) or an internal caller may kill pid {pid}"
-                    ),
                 ));
             }
             let entry = daemon.ledger.lock().unwrap().remove(&(pid as u32));
@@ -2170,22 +2036,24 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller: crate::state::Caller
             // 발신이 surface로 해석되면 자기 surface(cs == sid)에만 자기 상태를 쓸 수 있다 — 상태는
             // 순수 자기보고라 타인 대리 보고 정당 경로가 없다. 익명 발신(caller_pid None = 데몬 내부)은
             // 통과(pane은 peer pid가 항상 자기 surface로 해석되므로 익명을 위조할 수 없다).
-            // WP-3: 현행 역방향(Peer 타 surface deny) 보존 + Anonymous fail-open 봉인(self_scope_denied).
-            if self_scope_denied(caller, sid) {
-                daemon.bus.publish(
-                    "status.set_denied",
-                    "system",
-                    Some(sid),
-                    json!({"requested_surface": sid,
-                           "caller_surface": caller.surface(), "caller_pid": caller_pid}),
-                );
-                return Reply::Single(err_response(
-                    &id,
-                    "status_denied",
-                    &format!(
-                        "status.set denied: caller may only report its own status (surface {sid}); anonymous/cross-surface callers rejected"
-                    ),
-                ));
+            let caller_sid = caller_pid.and_then(|p| resolve_caller_surface(daemon, p));
+            if let Some(cs) = caller_sid {
+                if cs != sid {
+                    daemon.bus.publish(
+                        "status.set_denied",
+                        "system",
+                        Some(sid),
+                        json!({"requested_surface": sid,
+                               "caller_surface": cs, "caller_pid": caller_pid}),
+                    );
+                    return Reply::Single(err_response(
+                        &id,
+                        "status_denied",
+                        &format!(
+                            "status.set denied: caller (surface {cs}) may only report its own status, not surface {sid}"
+                        ),
+                    ));
+                }
             }
             let state = param_str(&params, "state").unwrap_or_else(|| "working".into());
             // C0(§2.2): "quiescing" = master surface가 clear·복원·cycle-agent 진행 중이라
@@ -2279,21 +2147,23 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller: crate::state::Caller
             // context 오염을 유발한다(설계 §7-⑪ step2 'self-declared 신뢰 금지 — cysd-인증 발신만',
             // claim_role·set_meta·send ACL과 동일한 '임의 surface 무인증 쓰기' 부류). 발신 pane은
             // 커널 peer pid로만 확정한다. 발신이 surface로 해석되면(=노드 pane) 거부한다.
-            // 정당 발신(cys pack-update·cys restore)은 일시적 CLI라 surface로 해석되지 않고
-            // (Peer{surface:None}), 데몬 내부 발신도 Internal — 둘 다 통과한다. WP-3: 현행 역방향
-            // (pane=Peer{surface:Some} deny) 보존 + Anonymous를 deny로 좁힘(peer_pid-suppression 구멍 봉인).
-            if reinject_mark_denied(caller) {
+            // 정당 발신(cys pack-update·cys restore)은 일시적 CLI라 caller_pid가 surface로
+            // 해석되지 않고(caller_sid None), 데몬 내부 발신도 caller_pid None — 둘 다 통과한다.
+            let caller_sid = caller_pid.and_then(|p| resolve_caller_surface(daemon, p));
+            if let Some(cs) = caller_sid {
                 daemon.bus.publish(
                     "reinject.mark_denied",
                     "system",
                     Some(sid),
                     json!({"requested_surface": sid,
-                           "caller_surface": caller.surface(), "caller_pid": caller_pid}),
+                           "caller_surface": cs, "caller_pid": caller_pid}),
                 );
                 return Reply::Single(err_response(
                     &id,
                     "reinject_denied",
-                    "reinject.mark denied: only the cysd-mediated controller (internal or resolved-external CLI) may set reinject markers; node panes and anonymous callers are rejected",
+                    &format!(
+                        "reinject.mark denied: node panes may not set reinject markers; only the cysd-mediated controller (anonymous/non-pane caller) may (caller surface {cs})"
+                    ),
                 ));
             }
             *surface.pack_reinject.lock().unwrap() = Some(crate::state::PackReinject {
@@ -2325,22 +2195,24 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller: crate::state::Caller
             // 소유 게이트 — status.set과 동형: 발신 pane은 자기 surface에만 등록할 수 있다.
             // 없으면 워커가 타 pane에 가짜 트랜스크립트를 등록해 master/CSO가 보는 컨텍스트
             // 수치를 위조(60% 사이클 오발·억제)할 수 있다.
-            // WP-3: 현행 역방향 보존 + Anonymous fail-open 봉인(self_scope_denied).
-            if self_scope_denied(caller, sid) {
-                daemon.bus.publish(
-                    "usage.register_denied",
-                    "usage",
-                    Some(sid),
-                    json!({"requested_surface": sid,
-                           "caller_surface": caller.surface(), "caller_pid": caller_pid}),
-                );
-                return Reply::Single(err_response(
-                    &id,
-                    "usage_denied",
-                    &format!(
-                        "usage.register denied: caller may only register its own transcript (surface {sid}); anonymous/cross-surface callers rejected"
-                    ),
-                ));
+            let caller_sid = caller_pid.and_then(|p| resolve_caller_surface(daemon, p));
+            if let Some(cs) = caller_sid {
+                if cs != sid {
+                    daemon.bus.publish(
+                        "usage.register_denied",
+                        "usage",
+                        Some(sid),
+                        json!({"requested_surface": sid,
+                               "caller_surface": cs, "caller_pid": caller_pid}),
+                    );
+                    return Reply::Single(err_response(
+                        &id,
+                        "usage_denied",
+                        &format!(
+                            "usage.register denied: caller (surface {cs}) may only register its own transcript, not surface {sid}"
+                        ),
+                    ));
+                }
             }
             let Some(path) = param_str(&params, "transcript") else {
                 return Reply::Single(err_response(&id, "invalid_params", "missing transcript"));
@@ -2389,22 +2261,24 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller: crate::state::Caller
             };
             // 소유 게이트 — usage.register와 동형: 발신 pane은 자기 surface에만 보고할 수 있다.
             // 없으면 워커가 타 pane의 ctx·rate 배지를 위조해 60% 사이클을 오발·억제할 수 있다.
-            // WP-3: 현행 역방향 보존 + Anonymous fail-open 봉인(self_scope_denied).
-            if self_scope_denied(caller, sid) {
-                daemon.bus.publish(
-                    "usage.report_denied",
-                    "usage",
-                    Some(sid),
-                    json!({"requested_surface": sid,
-                           "caller_surface": caller.surface(), "caller_pid": caller_pid}),
-                );
-                return Reply::Single(err_response(
-                    &id,
-                    "usage_denied",
-                    &format!(
-                        "usage.report denied: caller may only report its own usage (surface {sid}); anonymous/cross-surface callers rejected"
-                    ),
-                ));
+            let caller_sid = caller_pid.and_then(|p| resolve_caller_surface(daemon, p));
+            if let Some(cs) = caller_sid {
+                if cs != sid {
+                    daemon.bus.publish(
+                        "usage.report_denied",
+                        "usage",
+                        Some(sid),
+                        json!({"requested_surface": sid,
+                               "caller_surface": cs, "caller_pid": caller_pid}),
+                    );
+                    return Reply::Single(err_response(
+                        &id,
+                        "usage_denied",
+                        &format!(
+                            "usage.report denied: caller (surface {cs}) may only report its own usage, not surface {sid}"
+                        ),
+                    ));
+                }
             }
             // used_percentage는 f64 — 반올림 후 0~100 클램프. rate 부재(무료·세션 첫 응답 전)는 빈 벡터.
             let ctx_pct = param_f64(&params, "ctx_pct").map(|v| v.round().clamp(0.0, 100.0) as u8);
@@ -2951,28 +2825,24 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller: crate::state::Caller
             //   없음 = caller_sid None — 이미 메타가 있는 surface에 동일 에이전트 재등록).
             // 차단 대상은 오직 '발신 pane이 자기 소유 아닌, 이미 살아있는 타 노드의 메타를 덮어쓰는'
             // 단일 케이스다.
-            // WP-3: agent_meta.is_none() 카브아웃 보존(갓 만든 자식 초기화는 교차호출 허용) — 단
-            // ★live meta 덮어쓰기(is_some)만★ Internal·자기(Peer{cs==sid})로 좁힌다. 그 결과
-            // Anonymous와 Peer-external(Peer{surface:None})의 live meta 덮어쓰기가 새로 봉인되고
-            // (허위 DEAD·생존게이트 오판 차단), 타 pane 덮어쓰기(Peer{cs!=sid})의 현행 deny도 보존된다.
-            let overwriting_live = surface.agent_meta.lock().unwrap().is_some();
-            let allowed_for_live =
-                matches!(caller, Caller::Internal) || caller.surface() == Some(sid);
-            if overwriting_live && !allowed_for_live {
-                daemon.bus.publish(
-                    "meta.set_denied",
-                    "system",
-                    Some(sid),
-                    json!({"agent": agent, "requested_surface": sid,
-                           "caller_surface": caller.surface(), "caller_pid": caller_pid}),
-                );
-                return Reply::Single(err_response(
-                    &id,
-                    "meta_denied",
-                    &format!(
-                        "set_meta denied: only the surface itself or an internal caller may overwrite the live agent meta of surface {sid}"
-                    ),
-                ));
+            let caller_sid = caller_pid.and_then(|p| resolve_caller_surface(daemon, p));
+            if let Some(cs) = caller_sid {
+                if cs != sid && surface.agent_meta.lock().unwrap().is_some() {
+                    daemon.bus.publish(
+                        "meta.set_denied",
+                        "system",
+                        Some(sid),
+                        json!({"agent": agent, "requested_surface": sid,
+                               "caller_surface": cs, "caller_pid": caller_pid}),
+                    );
+                    return Reply::Single(err_response(
+                        &id,
+                        "meta_denied",
+                        &format!(
+                            "set_meta denied: caller (surface {cs}) may not overwrite the live agent meta of another surface {sid}"
+                        ),
+                    ));
+                }
             }
             *surface.agent_meta.lock().unwrap() = Some((agent.clone(), agent_bin));
             surface.agent_seen.store(false, Ordering::Relaxed);
@@ -3043,15 +2913,6 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller: crate::state::Caller
 
         // ─── T4-15 kill-switch: 큐 배달·스케줄 발화 동결 (직접 send는 통과 = 신경 차단) ───
         "system.pause" => {
-            // WP-3(A-5): kill-switch 계열 — master/cso 역할 Peer 또는 Internal만. 발신자는 in-pane
-            // 실행 권고(detached/launchd는 Peer{None}→deny). 실 kill-switch는 데몬 내부 paused 플래그.
-            if !pause_resume_allowed(daemon, caller) {
-                return Reply::Single(err_response(
-                    &id,
-                    "pause_denied",
-                    "system.pause denied: only a master/cso surface or an internal caller may pause",
-                ));
-            }
             let reason = param_str(&params, "reason").unwrap_or_default();
             daemon.paused.store(true, Ordering::Relaxed);
             *daemon.pause_info.lock().unwrap() = Some((crate::state::now_epoch(), reason.clone()));
@@ -3063,14 +2924,6 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller: crate::state::Caller
         }
 
         "system.resume" => {
-            // WP-3(A-5): pause와 동형 게이트 — master/cso Peer 또는 Internal만.
-            if !pause_resume_allowed(daemon, caller) {
-                return Reply::Single(err_response(
-                    &id,
-                    "resume_denied",
-                    "system.resume denied: only a master/cso surface or an internal caller may resume",
-                ));
-            }
             daemon.paused.store(false, Ordering::Relaxed);
             *daemon.pause_info.lock().unwrap() = None;
             daemon.persist_pause();
@@ -3150,22 +3003,24 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller: crate::state::Caller
             // pane은 커널 peer pid로만 확정한다(client 자기신고 surface_id 불신). 자기 surface(cs == sid)
             // 만 비울 수 있다. 익명 발신(caller_pid None = 데몬 내부 경로)은 통과 — pane은 peer pid가
             // 항상 자기 surface로 해석되므로 익명을 위조할 수 없다.
-            // WP-3: 현행 역방향 보존 + Anonymous fail-open 봉인(self_scope_denied).
-            if self_scope_denied(caller, sid) {
-                daemon.bus.publish(
-                    "queue.clear_denied",
-                    "queue",
-                    Some(sid),
-                    json!({"requested_surface": sid,
-                           "caller_surface": caller.surface(), "caller_pid": caller_pid}),
-                );
-                return Reply::Single(err_response(
-                    &id,
-                    "clear_denied",
-                    &format!(
-                        "queue.clear denied: caller may only clear its own surface queue (surface {sid}); anonymous/cross-surface callers rejected"
-                    ),
-                ));
+            let caller_sid = caller_pid.and_then(|p| resolve_caller_surface(daemon, p));
+            if let Some(cs) = caller_sid {
+                if cs != sid {
+                    daemon.bus.publish(
+                        "queue.clear_denied",
+                        "queue",
+                        Some(sid),
+                        json!({"requested_surface": sid,
+                               "caller_surface": cs, "caller_pid": caller_pid}),
+                    );
+                    return Reply::Single(err_response(
+                        &id,
+                        "clear_denied",
+                        &format!(
+                            "queue.clear denied: caller (surface {cs}) may only clear its own surface queue, not surface {sid}"
+                        ),
+                    ));
+                }
             }
             let dropped: Vec<String> = surface.pending_queue.lock().unwrap().drain(..).collect();
             if !dropped.is_empty() {
@@ -3457,16 +3312,6 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller: crate::state::Caller
 mod tests {
     use super::*;
 
-    /// WP-3 테스트 편의: Option<u32> caller_pid를 소켓 경계 규칙으로 Caller로 승격한다.
-    /// Some(pid)=caller_from_socket(=프로덕션 경계와 동일 해석), None=데몬 내부 시뮬레이션이라
-    /// Internal(구 None fail-open 보존 — 파괴계 신뢰). 익명 발신 테스트는 Caller::Anonymous를 직접 쓴다.
-    fn tc(daemon: &Arc<Daemon>, caller_pid: Option<u32>) -> Caller {
-        match caller_pid {
-            Some(pid) => caller_from_socket(daemon, Some(pid)),
-            None => Caller::Internal,
-        }
-    }
-
     /// ★W2/P0-6: cause 파싱 — "reap"=Reap, 그 외/부재/미지 값=안전측 OwnerClose(묘비).
     #[test]
     fn close_cause_reap_vs_owner() {
@@ -3686,7 +3531,7 @@ mod tests {
                 method: "health.add_rule".into(),
                 params: json!({ "name": "redeploy_rule", "pattern": format!("p{}", i % 7) }),
             };
-            let Reply::Single(resp) = dispatch(&daemon, req, Caller::Internal) else {
+            let Reply::Single(resp) = dispatch(&daemon, req, None) else {
                 panic!("expected single reply");
             };
             assert_eq!(resp["ok"], json!(true), "add_rule 실패: {resp}");
@@ -3714,7 +3559,7 @@ mod tests {
                 method: "health.add_rule".into(),
                 params: json!({ "name": format!("uniq_{i}"), "pattern": "x" }),
             };
-            let _ = dispatch(&daemon, req, Caller::Internal);
+            let _ = dispatch(&daemon, req, None);
         }
         let len = daemon.health_rules.lock().unwrap().len();
         assert!(
@@ -3797,7 +3642,7 @@ mod tests {
                 "human": true
             }),
         };
-        let reply = dispatch(&daemon, req, caller_from_socket(&daemon, Some(reviewer_pid)));
+        let reply = dispatch(&daemon, req, Some(reviewer_pid));
         let Reply::Single(resp) = reply else {
             panic!("expected single reply");
         };
@@ -3816,7 +3661,7 @@ mod tests {
             method: "surface.send_text".into(),
             params: json!({ "surface_id": worker.id, "text": "x\n" }),
         };
-        let Reply::Single(resp2) = dispatch(&daemon, req2, caller_from_socket(&daemon, Some(reviewer_pid))) else {
+        let Reply::Single(resp2) = dispatch(&daemon, req2, Some(reviewer_pid)) else {
             panic!("expected single reply");
         };
         assert_eq!(resp2["error"]["code"], json!("acl_denied"));
@@ -3881,7 +3726,7 @@ mod tests {
             method: "surface.send_text".into(),
             params: json!({ "surface_id": worker.id, "text": "x\n", "human": true }),
         };
-        let Reply::Single(resp) = dispatch(&daemon, req, caller_from_socket(&daemon, Some(reviewer_pid))) else {
+        let Reply::Single(resp) = dispatch(&daemon, req, Some(reviewer_pid)) else {
             panic!("expected single reply");
         };
         assert_eq!(
@@ -3942,7 +3787,7 @@ mod tests {
             method: "surface.send_text".into(),
             params: json!({ "surface_id": worker.id, "text": "x", "quiet": true }),
         };
-        let Reply::Single(resp) = dispatch(&daemon, req_blocked, caller_from_socket(&daemon, Some(sender_pid))) else {
+        let Reply::Single(resp) = dispatch(&daemon, req_blocked, Some(sender_pid)) else {
             panic!("expected single reply");
         };
         assert_eq!(
@@ -3957,7 +3802,7 @@ mod tests {
             method: "surface.send_text".into(),
             params: json!({ "surface_id": worker.id, "text": "x", "quiet": true, "authoritative": true }),
         };
-        let Reply::Single(resp2) = dispatch(&daemon, req_auth, caller_from_socket(&daemon, Some(sender_pid))) else {
+        let Reply::Single(resp2) = dispatch(&daemon, req_auth, Some(sender_pid)) else {
             panic!("expected single reply");
         };
         assert_ne!(
@@ -3988,7 +3833,7 @@ mod tests {
             method: "surface.send_text".into(),
             params: json!({ "surface_id": worker.id, "text": "x", "quiet": true, "authoritative": true }),
         };
-        let Reply::Single(respw) = dispatch(&daemon, req_w, caller_from_socket(&daemon, Some(wsender_pid))) else {
+        let Reply::Single(respw) = dispatch(&daemon, req_w, Some(wsender_pid)) else {
             panic!("expected single reply");
         };
         assert_eq!(
@@ -4004,7 +3849,7 @@ mod tests {
             method: "surface.send_text".into(),
             params: json!({ "surface_id": worker.id, "text": "x", "quiet": true, "authoritative": true }),
         };
-        let Reply::Single(respe) = dispatch(&daemon, req_ext, Caller::Internal) else {
+        let Reply::Single(respe) = dispatch(&daemon, req_ext, None) else {
             panic!("expected single reply");
         };
         assert_eq!(
@@ -4059,7 +3904,7 @@ mod tests {
             method: "surface.send_text".into(),
             params: json!({ "surface_id": master.id, "text": "hi\n", "human": true }),
         };
-        let Reply::Single(resp) = dispatch(&daemon, req, caller_from_socket(&daemon, Some(reviewer_pid))) else {
+        let Reply::Single(resp) = dispatch(&daemon, req, Some(reviewer_pid)) else {
             panic!("expected single reply");
         };
         assert_eq!(
@@ -4134,7 +3979,7 @@ mod tests {
             method: "surface.send_text".into(),
             params: json!({ "surface_id": s.id, "text": "go", "clear_first": true }),
         };
-        let Reply::Single(resp) = dispatch(&daemon, req, caller_from_socket(&daemon, Some(caller))) else {
+        let Reply::Single(resp) = dispatch(&daemon, req, Some(caller)) else {
             panic!("expected single reply");
         };
         assert_eq!(
@@ -4152,7 +3997,7 @@ mod tests {
             method: "surface.send_text".into(),
             params: json!({ "surface_id": s.id, "text": "go", "clear_first": true }),
         };
-        let Reply::Single(resp) = dispatch(&daemon, req, caller_from_socket(&daemon, Some(caller))) else {
+        let Reply::Single(resp) = dispatch(&daemon, req, Some(caller)) else {
             panic!("expected single reply");
         };
         assert_eq!(
@@ -4187,7 +4032,7 @@ mod tests {
             method: "surface.send_text".into(),
             params: json!({ "surface_id": s.id, "text": "go", "clear_first": true, "queued": true }),
         };
-        let Reply::Single(resp) = dispatch(&daemon, req, caller_from_socket(&daemon, Some(caller))) else {
+        let Reply::Single(resp) = dispatch(&daemon, req, Some(caller)) else {
             panic!("expected single reply");
         };
         assert_eq!(
@@ -4205,7 +4050,7 @@ mod tests {
             method: "system.claim_role".into(),
             params: json!({ "role": role, "surface_id": surface_id }),
         };
-        let Reply::Single(resp) = dispatch(daemon, req, tc(daemon, caller_pid)) else {
+        let Reply::Single(resp) = dispatch(daemon, req, caller_pid) else {
             panic!("expected single reply");
         };
         resp
@@ -4412,7 +4257,7 @@ mod tests {
             method: "surface.create".into(),
             params,
         };
-        let Reply::Single(resp) = dispatch(daemon, req, tc(daemon, caller_pid)) else {
+        let Reply::Single(resp) = dispatch(daemon, req, caller_pid) else {
             panic!("expected single reply");
         };
         resp
@@ -4435,7 +4280,7 @@ mod tests {
             method: "surface.create".into(),
             params,
         };
-        let Reply::Single(resp) = dispatch(daemon, req, tc(daemon, caller_pid)) else {
+        let Reply::Single(resp) = dispatch(daemon, req, caller_pid) else {
             panic!("expected single reply");
         };
         resp
@@ -4675,7 +4520,7 @@ mod tests {
             method: "system.resolve_role".into(),
             params: json!({ "role": role }),
         };
-        let Reply::Single(resp) = dispatch(daemon, req, Caller::Internal) else {
+        let Reply::Single(resp) = dispatch(daemon, req, None) else {
             panic!("expected single reply");
         };
         resp
@@ -4739,7 +4584,7 @@ mod tests {
             method: "surface.set_meta".into(),
             params: json!({ "surface_id": surface_id, "agent": agent }),
         };
-        let Reply::Single(resp) = dispatch(daemon, req, tc(daemon, caller_pid)) else {
+        let Reply::Single(resp) = dispatch(daemon, req, caller_pid) else {
             panic!("expected single reply");
         };
         resp
@@ -4845,7 +4690,7 @@ mod tests {
             params: json!({ "surface_id": surface_id, "state": state,
                             "context": context, "task": task }),
         };
-        let Reply::Single(resp) = dispatch(daemon, req, tc(daemon, caller_pid)) else {
+        let Reply::Single(resp) = dispatch(daemon, req, caller_pid) else {
             panic!("expected single reply");
         };
         resp
@@ -4930,7 +4775,7 @@ mod tests {
             params: json!({"surface_id": node, "pack_version": "0.4.2",
                            "directive_hash": "abc123"}),
         };
-        let Reply::Single(resp) = dispatch(&daemon, req, Caller::Internal) else {
+        let Reply::Single(resp) = dispatch(&daemon, req, None) else {
             panic!("expected single reply");
         };
         assert_eq!(resp["ok"], json!(true), "reinject.mark 실패: {resp}");
@@ -5006,7 +4851,7 @@ mod tests {
             method: "usage.register".into(),
             params: json!({ "surface_id": surface_id, "transcript": transcript }),
         };
-        let Reply::Single(resp) = dispatch(daemon, req, tc(daemon, caller_pid)) else {
+        let Reply::Single(resp) = dispatch(daemon, req, caller_pid) else {
             panic!("expected single reply");
         };
         resp
@@ -5097,7 +4942,7 @@ mod tests {
             method: "usage.report".into(),
             params,
         };
-        let Reply::Single(resp) = dispatch(daemon, req, tc(daemon, caller_pid)) else {
+        let Reply::Single(resp) = dispatch(daemon, req, caller_pid) else {
             panic!("expected single reply");
         };
         resp
@@ -5284,7 +5129,7 @@ mod tests {
             method: "surface.close".into(),
             params: json!({ "surface_id": surface_id }),
         };
-        let Reply::Single(resp) = dispatch(daemon, req, tc(daemon, caller_pid)) else {
+        let Reply::Single(resp) = dispatch(daemon, req, caller_pid) else {
             panic!("expected single reply");
         };
         resp
@@ -5321,46 +5166,6 @@ mod tests {
             Some(victim),
             "거부됐는데 victim의 role 매핑이 정리됐다"
         );
-    }
-
-    /// C6 회귀: 이미 exited된 잔재 surface는 발신자 무관 close 허용(reap). `cys close-surface --reap`
-    /// (비creator Peer{None}·일시 CLI)이 exited 잔재를 회수하는 정당 경로를 WP-3 게이트가 막던 회귀를
-    /// 봉인 해제한다. 라이브 surface 게이트(위협모델)는 불변임을 대조로 함께 박제.
-    #[test]
-    fn close_allows_reap_of_exited_surface() {
-        let daemon = claim_daemon();
-        let reaper = make_surface(&daemon, Some("worker-1"));
-        let stale = make_surface(&daemon, Some("ghost"));
-        let reaper_pid = 993_202_u32;
-        bind_caller(&daemon, reaper_pid, reaper);
-        // stale 을 자력종료(exited) 상태로 — 데몬만 stamp하는 실제 경로를 테스트에서 재현.
-        daemon
-            .get_surface(stale)
-            .unwrap()
-            .exited
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-
-        // 비creator 발신(reaper pane)이 exited 잔재를 --reap → 허용(죽은 surface·라이브 위협 없음).
-        let resp = close_surface_rpc(&daemon, stale, Some(reaper_pid));
-        assert_eq!(
-            resp["ok"],
-            json!(true),
-            "exited 잔재 reap이 막혔다 (C6 회귀·응답: {resp})"
-        );
-        assert!(
-            !daemon.surfaces.lock().unwrap().contains_key(&stale),
-            "reap 통과했는데 stale surface가 맵에 남았다"
-        );
-
-        // 대조: 라이브 surface는 여전히 비소유 close deny(게이트 약화 아님·위협모델 불변).
-        let live = make_surface(&daemon, Some("master"));
-        let resp2 = close_surface_rpc(&daemon, live, Some(reaper_pid));
-        assert_eq!(
-            resp2["ok"],
-            json!(false),
-            "라이브 surface에 대한 비소유 close가 통과했다(게이트 약화·응답: {resp2})"
-        );
-        assert_eq!(resp2["error"]["code"], json!("close_denied"));
     }
 
     /// 대조군 ①: 자기 surface close는 통과 (cs == sid). 정상 종료 경로 박제.
@@ -5400,7 +5205,7 @@ mod tests {
             method: "queue.clear".into(),
             params: json!({ "surface_id": surface_id }),
         };
-        let Reply::Single(resp) = dispatch(daemon, req, tc(daemon, caller_pid)) else {
+        let Reply::Single(resp) = dispatch(daemon, req, caller_pid) else {
             panic!("expected single reply");
         };
         resp
@@ -5509,7 +5314,7 @@ mod tests {
 
         for (method, key) in [("surface.list", "surfaces"), ("org.status", "surfaces")] {
             let req = Request { id: json!(1), method: method.into(), params: json!({}) };
-            let Reply::Single(resp) = dispatch(&daemon, req, Caller::Internal) else {
+            let Reply::Single(resp) = dispatch(&daemon, req, None) else {
                 panic!("expected single reply for {method}");
             };
             assert_eq!(resp["ok"], json!(true), "{method} 실패: {resp}");
@@ -5624,7 +5429,7 @@ mod tests {
             method: "ledger.register".into(),
             params: json!({ "pid": 424242, "scoped": true, "surface_id": reviewer }),
         };
-        let Reply::Single(resp) = dispatch(&daemon, req, caller_from_socket(&daemon, Some(reviewer_pid))) else {
+        let Reply::Single(resp) = dispatch(&daemon, req, Some(reviewer_pid)) else {
             panic!("expected single reply");
         };
         assert_eq!(
@@ -5650,7 +5455,7 @@ mod tests {
             method: "ledger.register".into(),
             params: json!({ "pid": 424243, "scoped": true, "surface_id": worker }),
         };
-        let Reply::Single(resp) = dispatch(&daemon, req, caller_from_socket(&daemon, Some(worker_pid))) else {
+        let Reply::Single(resp) = dispatch(&daemon, req, Some(worker_pid)) else {
             panic!("expected single reply");
         };
         assert_eq!(
@@ -5678,7 +5483,7 @@ mod tests {
             params: json!({ "pid": 424244, "scoped": true, "surface_id": w }),
         };
         // caller_pid=None → resolve 실패 → deny-by-default
-        let Reply::Single(resp) = dispatch(&daemon, req, Caller::Internal) else {
+        let Reply::Single(resp) = dispatch(&daemon, req, None) else {
             panic!("expected single reply");
         };
         assert_eq!(
@@ -5704,7 +5509,7 @@ mod tests {
             method: "system.claim_role".into(),
             params: json!({ "role": "reviewer-gemini", "surface_id": sid }),
         };
-        let Reply::Single(resp) = dispatch(&daemon, req, caller_from_socket(&daemon, Some(caller))) else {
+        let Reply::Single(resp) = dispatch(&daemon, req, Some(caller)) else {
             panic!("expected single reply");
         };
         assert_eq!(resp["ok"], json!(true), "self-claim 허용 (응답: {resp})");
@@ -5762,7 +5567,7 @@ mod tests {
         // 갓 claim: claimed_at = now → now - claimed_at ≈ 0 < 60 → 거부.
         *daemon.master_claimed_at.lock().unwrap() = Some(crate::state::now_epoch());
 
-        let Reply::Single(resp) = dispatch(&daemon, approval_sign_req(), caller_from_socket(&daemon, Some(caller))) else {
+        let Reply::Single(resp) = dispatch(&daemon, approval_sign_req(), Some(caller)) else {
             panic!("expected single reply");
         };
         assert_eq!(resp["ok"], json!(false), "갓 claim한 master 서명이 통과됨 (응답: {resp})");
@@ -5793,7 +5598,7 @@ mod tests {
         *daemon.master_claimed_at.lock().unwrap() =
             Some(crate::state::now_epoch() - 120.0);
 
-        let Reply::Single(resp) = dispatch(&daemon, approval_sign_req(), caller_from_socket(&daemon, Some(caller))) else {
+        let Reply::Single(resp) = dispatch(&daemon, approval_sign_req(), Some(caller)) else {
             panic!("expected single reply");
         };
         assert_eq!(
@@ -5824,7 +5629,7 @@ mod tests {
         let _sid = setup_master(&daemon, caller);
         *daemon.master_claimed_at.lock().unwrap() = None;
 
-        let Reply::Single(resp) = dispatch(&daemon, approval_sign_req(), caller_from_socket(&daemon, Some(caller))) else {
+        let Reply::Single(resp) = dispatch(&daemon, approval_sign_req(), Some(caller)) else {
             panic!("expected single reply");
         };
         assert_eq!(resp["ok"], json!(false), "master 부재인데 서명 통과됨 (응답: {resp})");
@@ -5855,7 +5660,7 @@ mod tests {
         *daemon.master_claimed_at.lock().unwrap() =
             Some(crate::state::now_epoch() - 120.0);
 
-        let Reply::Single(resp) = dispatch(&daemon, approval_sign_req(), caller_from_socket(&daemon, Some(caller))) else {
+        let Reply::Single(resp) = dispatch(&daemon, approval_sign_req(), Some(caller)) else {
             panic!("expected single reply");
         };
         assert_eq!(resp["ok"], json!(false), "비-master 발신이 서명에 성공함 (응답: {resp})");
@@ -5890,7 +5695,7 @@ mod tests {
             params: json!({"kind": "permission", "title": "t", "body": "b",
                            "request_id": "f_c", "wait": false, "tier": "c"}),
         };
-        let Reply::Single(resp) = dispatch(&daemon, req, Caller::Internal) else {
+        let Reply::Single(resp) = dispatch(&daemon, req, None) else {
             panic!("expected single reply");
         };
         assert_eq!(resp["ok"], json!(true), "{resp}");
@@ -5910,7 +5715,7 @@ mod tests {
             method: "feed.reply".into(),
             params: json!({"request_id": "f_c", "decision": "allow"}),
         };
-        let _ = dispatch(&daemon, rr, Caller::Internal);
+        let _ = dispatch(&daemon, rr, None);
         let mut resolved_tier = None;
         while let Ok(ev) = rx.try_recv() {
             if ev["name"].as_str() == Some("feed.item.resolved")
@@ -5928,7 +5733,7 @@ mod tests {
             params: json!({"kind": "permission", "title": "t", "body": "b",
                            "request_id": "f_x", "wait": false, "tier": "x"}),
         };
-        let _ = dispatch(&daemon, req_x, Caller::Internal);
+        let _ = dispatch(&daemon, req_x, None);
         let mut tier_x = None;
         while let Ok(ev) = rx.try_recv() {
             if ev["name"].as_str() == Some("feed.item.created")
@@ -5946,7 +5751,7 @@ mod tests {
             params: json!({"kind": "permission", "title": "t", "body": "b",
                            "request_id": "f_none", "wait": false}),
         };
-        let _ = dispatch(&daemon, req_none, Caller::Internal);
+        let _ = dispatch(&daemon, req_none, None);
         let mut tier_none = None;
         while let Ok(ev) = rx.try_recv() {
             if ev["name"].as_str() == Some("feed.item.created")
@@ -5981,7 +5786,7 @@ mod tests {
                 method: "feed.push".into(),
                 params: json!({"kind":"permission","title":"t","body":"b","request_id":rid}),
             };
-            let Reply::Single(resp) = dispatch(&daemon, req, caller_from_socket(&daemon, Some(pid))) else {
+            let Reply::Single(resp) = dispatch(&daemon, req, Some(pid)) else {
                 panic!("push single expected");
             };
             assert_eq!(resp["ok"], json!(true), "push 실패: {resp}");
@@ -5992,7 +5797,7 @@ mod tests {
                 method: "feed.reply".into(),
                 params: json!({"request_id":rid,"decision":decision}),
             };
-            let Reply::Single(resp) = dispatch(&daemon, req, caller_from_socket(&daemon, Some(pid))) else {
+            let Reply::Single(resp) = dispatch(&daemon, req, Some(pid)) else {
                 panic!("reply single expected");
             };
             resp
@@ -6026,7 +5831,7 @@ mod tests {
                 method: "feed.push".into(),
                 params: json!({"kind":"permission","title":"t","body":"b","request_id":"f_anon"}),
             };
-            let _ = dispatch(&daemon, req, Caller::Internal); // caller_pid None → publisher_pid None
+            let _ = dispatch(&daemon, req, None); // caller_pid None → publisher_pid None
         }
         let r4 = reply("f_anon", "allow", publisher);
         assert_eq!(r4["ok"], json!(true), "발행 pid 미상인데 자기승인 판정이 걸림: {r4}");
@@ -6093,7 +5898,7 @@ mod tests {
             method: "system.claim_role".into(),
             params: json!({"role": "cso", "surface_id": bare}),
         };
-        let Reply::Single(resp) = dispatch(&daemon, req, caller_from_socket(&daemon, Some(993_401_u32))) else {
+        let Reply::Single(resp) = dispatch(&daemon, req, Some(993_401_u32)) else {
             panic!("expected single reply");
         };
         assert_eq!(resp["ok"], json!(true), "claim_role 실패: {resp}");
@@ -6136,7 +5941,7 @@ mod tests {
             method: "system.topology".into(),
             params: json!({}),
         };
-        let Reply::Single(resp) = dispatch(&daemon, req, Caller::Internal) else {
+        let Reply::Single(resp) = dispatch(&daemon, req, None) else {
             panic!("expected single reply");
         };
         let tombs = resp["result"]["tombstones"].as_array().expect("tombstones array");
@@ -6144,145 +5949,5 @@ mod tests {
             tombs.iter().any(|t| t.as_str() == Some("master")),
             "system.topology가 묘비를 노출하지 않는다: {resp}"
         );
-    }
-
-    // ═══ WP-3 v3 A-6: 파괴계 Caller 3상태 게이트 (Anonymous→DENY vs Internal/Peer-owner→ALLOW 분리) ═══
-
-    /// 해석 불가 외부 CLI(Peer{surface:None}) 시뮬레이션 — 캐시에 None 고정(sysinfo 비의존·결정론).
-    fn bind_external(daemon: &Arc<Daemon>, pid: u32) {
-        daemon
-            .caller_cache
-            .lock()
-            .unwrap()
-            .insert(pid, (None, crate::state::now_epoch(), None));
-    }
-
-    #[test]
-    fn wp3_self_scope_denied_rule() {
-        let sid = 5u64;
-        assert!(self_scope_denied(Caller::Anonymous, sid), "Anonymous 통과");
-        assert!(!self_scope_denied(Caller::Internal, sid), "Internal 거부");
-        assert!(
-            !self_scope_denied(Caller::Peer { pid: 1, surface: Some(sid) }, sid),
-            "Peer-owner 거부"
-        );
-        assert!(
-            self_scope_denied(Caller::Peer { pid: 1, surface: Some(9) }, sid),
-            "Peer 타 surface 통과(역방향 파손)"
-        );
-        assert!(
-            !self_scope_denied(Caller::Peer { pid: 1, surface: None }, sid),
-            "Peer-external 거부(fail-open 파손)"
-        );
-    }
-
-    #[test]
-    fn wp3_reinject_mark_denied_rule() {
-        assert!(reinject_mark_denied(Caller::Anonymous), "Anonymous 통과(구멍)");
-        assert!(
-            reinject_mark_denied(Caller::Peer { pid: 1, surface: Some(3) }),
-            "pane 통과(역방향 파손)"
-        );
-        assert!(!reinject_mark_denied(Caller::Internal), "Internal 거부");
-        assert!(
-            !reinject_mark_denied(Caller::Peer { pid: 1, surface: None }),
-            "컨트롤러(Peer None) 거부"
-        );
-    }
-
-    #[test]
-    fn wp3_ledger_kill_allowed_rule() {
-        assert!(ledger_kill_allowed(Caller::Internal, Some(3)), "Internal 거부");
-        assert!(
-            ledger_kill_allowed(Caller::Peer { pid: 1, surface: Some(3) }, Some(3)),
-            "owner 거부"
-        );
-        assert!(
-            !ledger_kill_allowed(Caller::Peer { pid: 1, surface: Some(9) }, Some(3)),
-            "비owner 통과"
-        );
-        assert!(!ledger_kill_allowed(Caller::Anonymous, Some(3)), "Anonymous 통과");
-        assert!(
-            !ledger_kill_allowed(Caller::Peer { pid: 1, surface: None }, None),
-            "미등재 external 통과"
-        );
-        assert!(ledger_kill_allowed(Caller::Internal, None), "미등재 Internal 거부");
-    }
-
-    #[test]
-    fn wp3_pause_resume_gate_rule() {
-        let daemon = claim_daemon();
-        let master = make_surface(&daemon, Some("master"));
-        let worker = make_surface(&daemon, Some("worker-1"));
-        assert!(pause_resume_allowed(&daemon, Caller::Internal), "Internal 거부");
-        assert!(
-            pause_resume_allowed(&daemon, Caller::Peer { pid: 1, surface: Some(master) }),
-            "master 거부"
-        );
-        assert!(
-            !pause_resume_allowed(&daemon, Caller::Peer { pid: 1, surface: Some(worker) }),
-            "worker 통과"
-        );
-        assert!(!pause_resume_allowed(&daemon, Caller::Anonymous), "Anonymous 통과");
-        assert!(
-            !pause_resume_allowed(&daemon, Caller::Peer { pid: 1, surface: None }),
-            "Peer-external 통과"
-        );
-    }
-
-    /// close creator-gate: 롤백(부팅 전 creator)만 허용, 부팅 성공(agent live) 후 인가 소멸(자기제한),
-    /// 비creator external·Anonymous는 deny, Internal·자기 close는 allow.
-    #[test]
-    fn wp3_close_creator_gate() {
-        // ① 부팅 전 creator 롤백 close → 허용.
-        let daemon = claim_daemon();
-        let sid = make_surface(&daemon, Some("worker-1"));
-        let creator = std::process::id(); // 실 pid — peer_start_time 조회 가능
-        {
-            let s = daemon.get_surface(sid).unwrap();
-            *s.creator_pid.lock().unwrap() = Some(creator);
-            *s.creator_start.lock().unwrap() = peer_start_time(creator);
-        }
-        bind_external(&daemon, creator); // creator를 Peer{surface:None}로 해석
-        let r = close_surface_rpc(&daemon, sid, Some(creator));
-        assert_eq!(r["ok"], json!(true), "부팅 전 creator 롤백 close가 막혔다: {r}");
-
-        // ② 부팅 성공(agent live) 후 → creator라도 deny(자기제한).
-        let sid2 = make_surface(&daemon, Some("worker-2"));
-        {
-            let s = daemon.get_surface(sid2).unwrap();
-            *s.creator_pid.lock().unwrap() = Some(creator);
-            *s.creator_start.lock().unwrap() = peer_start_time(creator);
-            *s.agent_meta.lock().unwrap() = Some(("claude".into(), "claude".into()));
-            s.agent_seen.store(true, Ordering::Relaxed);
-        }
-        let r = close_surface_rpc(&daemon, sid2, Some(creator));
-        assert_eq!(r["error"]["code"], json!("close_denied"), "부팅 후 creator close 허용됨(자기제한 실패): {r}");
-
-        // ③ 비creator external(Peer{None}) → deny.
-        let stranger = 977_777_u32;
-        bind_external(&daemon, stranger);
-        let r = close_surface_rpc(&daemon, sid2, Some(stranger));
-        assert_eq!(r["error"]["code"], json!("close_denied"), "비creator external close 허용됨: {r}");
-
-        // ④ Anonymous → deny.
-        let Reply::Single(r) = dispatch(
-            &daemon,
-            Request { id: json!(1), method: "surface.close".into(), params: json!({"surface_id": sid2}) },
-            Caller::Anonymous,
-        ) else {
-            panic!("expected single");
-        };
-        assert_eq!(r["error"]["code"], json!("close_denied"), "Anonymous close 허용됨: {r}");
-
-        // ⑤ Internal → allow(데몬 신뢰).
-        let Reply::Single(r) = dispatch(
-            &daemon,
-            Request { id: json!(1), method: "surface.close".into(), params: json!({"surface_id": sid2}) },
-            Caller::Internal,
-        ) else {
-            panic!("expected single");
-        };
-        assert_eq!(r["ok"], json!(true), "Internal close가 막혔다: {r}");
     }
 }

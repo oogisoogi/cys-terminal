@@ -98,43 +98,6 @@ struct IngestState {
     partial: String,
 }
 
-/// 발신자 판별자(WP-3 v3) — 균일규칙 금지·3상태 명시. **변환은 소켓 경계(main.rs) 단일 지점에서만**
-/// 수행하고 From 구현은 두지 않는다(암묵 변환 차단·명시 생성 강제). 프로덕션에서 Internal은
-/// 발생하지 않으며(데몬 내부 dispatch = 0·유일 프로덕션 발신 = 소켓 경계), 테스트·개념 완결성용이다.
-/// - `Internal`: 데몬 자기호출(소켓 밖). 신뢰.
-/// - `Peer{pid, surface}`: 소켓 피어 pid 확보. surface = 조상추적으로 해석된 발신 surface
-///   (None = 미해석 = 외부 오케스트레이션 CLI: cys pack-update/restore 등).
-/// - `Anonymous`: 소켓 연결이나 피어 pid 확보 실패(일시적 getsockopt 실패 등). 파괴계 게이트 = deny.
-///
-/// PLATFORM-INVARIANT: Peer 인증(peer_pid)은 파괴계 게이트의 하드 전제다. 미지원 플랫폼은
-/// main.rs의 compile_error!가 빌드를 세운다(조용한 런타임 벽돌화 대신 시끄러운 빌드 실패).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Caller {
-    /// 데몬 자기호출. 프로덕션에는 내부 dispatch가 0이라 실제로 구성되지 않고(소켓 경계만이 유일
-    /// 발신), 테스트 시뮬레이션·개념 완결성용이다. dead_code 경고를 그 사실로 억제한다.
-    #[allow(dead_code)]
-    Internal,
-    Peer { pid: u32, surface: Option<u64> },
-    Anonymous,
-}
-
-impl Caller {
-    /// 발신 pid(Peer만 Some) — publisher_pid·pgid_of 등 pid 소비처용.
-    pub fn pid(self) -> Option<u32> {
-        match self {
-            Caller::Peer { pid, .. } => Some(pid),
-            _ => None,
-        }
-    }
-    /// 해석된 발신 surface(Peer with surface만 Some).
-    pub fn surface(self) -> Option<u64> {
-        match self {
-            Caller::Peer { surface, .. } => surface,
-            _ => None,
-        }
-    }
-}
-
 pub struct Surface {
     pub id: u64,
     pub title: Mutex<String>,
@@ -143,12 +106,6 @@ pub struct Surface {
     pub cwd: String,
     pub pid: u32,
     pub created_at: f64,
-    /// WP-3 close creator-gate(후보①): 이 surface를 생성한 소켓 피어의 pid + 그 프로세스 start_time.
-    /// launch-agent 롤백(생성 실패 시 동일 프로세스가 close)만 인가하기 위한 인메모리 전용 기록
-    /// (초단위 grace라 데몬 재시작 생존 불요·topology 미영속·스키마 마이그레이션 0). surface.create가
-    /// Peer 발신일 때만 채운다. creator_start는 pid 재활용 핀(peer_start_time 대조)이다.
-    pub creator_pid: Mutex<Option<u32>>,
-    pub creator_start: Mutex<Option<u64>>,
     /// RC-3 잔여(T2.1): 이 surface가 create_surface_with_env로 **env 주입**되어 생성됐는가.
     /// Windows node-recover가 기존 pane 재사용 전, pane env에 CLAUDE_CONFIG_DIR 등이 실려있는지
     /// (=순수 cmd 재기동이 안전한지) 판정하는 근거. env 미주입 pane(수동·구세션) 재사용 시 fail-closed.
@@ -1437,8 +1394,6 @@ impl Daemon {
             cwd: cwd_str,
             pid,
             created_at: now_epoch(),
-            creator_pid: Mutex::new(None), // WP-3: surface.create 핸들러가 Peer 발신일 때 사후 기록.
-            creator_start: Mutex::new(None),
             env_injected: !env.is_empty(), // RC-3 잔여(T2.1): env 주입 여부 기록(node-recover 안전 판정)
             exited: AtomicBool::new(false),
             exited_at: Mutex::new(None),
