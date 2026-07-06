@@ -1208,6 +1208,35 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             }
         }
 
+        // ★W2/A-S3: 명시적 묘비 set — 데몬이 topology 묘비의 유일 작성자(단일 작성자 원칙). phoenix tombstone CLI 가
+        // desired 직접 쓰기 대신 이 RPC 로 topology 묘비를 심는다(옵션A). remove=true 면 폐역 해제. persist 로 rev 증가.
+        "tombstone.set" => {
+            let Some(role) = param_str(&params, "role") else {
+                return Reply::Single(err_response(&id, "invalid_params", "missing role"));
+            };
+            let remove = params.get("remove").and_then(|v| v.as_bool()).unwrap_or(false);
+            {
+                let mut tombs = daemon.tombstones.lock().unwrap();
+                if remove {
+                    tombs.remove(&role);
+                } else {
+                    tombs.insert(role.clone());
+                    // 폐역이면 role-map 에서도 제외(살아있는 surface 는 close_surface 가 별도 처리 — 여기선 선언만).
+                    daemon.roles.lock().unwrap().remove(&role);
+                }
+            }
+            governance::persist_topology(daemon); // 엔트리+묘비+rev 단일 영속(단조 카운터 증가)
+            let rev = daemon
+                .tombstones_rev
+                .load(std::sync::atomic::Ordering::SeqCst);
+            let mut tv: Vec<String> = daemon.tombstones.lock().unwrap().iter().cloned().collect();
+            tv.sort();
+            Reply::Single(ok_response(
+                &id,
+                json!({"role": role, "removed": remove, "tombstones_rev": rev, "tombstones": tv}),
+            ))
+        }
+
         // 사후 역할 등록: 이미 떠 있는 세션이 자기 surface를 역할 주소로 등록 ("너는 마스터이다" 경로)
         "system.claim_role" => {
             let Some(role) = param_str(&params, "role") else {

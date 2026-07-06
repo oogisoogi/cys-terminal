@@ -584,6 +584,109 @@ def _snapshot_roster_entries(socket):
     return {}
 
 
+# ---------------- A-S3 tombstone intent 저널 (다운타임 폴백) ----------------
+# 데몬이 topology 묘비 유일 작성자(옵션A). CLI 폐역은 데몬 RPC 경유가 정석이나, 데몬 다운타임엔 append-only
+# intent 저널에 기록하고 observe 가 replace **이전** 멱등 적용 → 데몬 복귀 후 RPC 재동기 → **갱신 rev 담긴
+# topology.json 디스크 영속을 phoenix 가 로드 확인한 후에만 절단**(gemini R3: RPC 응답 시점 절단 금지·TOCTOU).
+
+def _intent_journal_path(socket):
+    return os.path.join(phoenix_home(socket), "tombstone-intents.jsonl")
+
+
+def _append_tombstone_intent(socket, role, remove):
+    """다운타임 폴백 — intent 를 append-only jsonl 에 flock 로 기록(C2 정책: 원자 append·부분절단 내성)."""
+    p = _intent_journal_path(socket)
+    line = json.dumps({"op": "remove" if remove else "add", "role": role, "ts": _now()}, ensure_ascii=False)
+    try:
+        with open(p, "a", encoding="utf-8") as f:
+            if not IS_WINDOWS:
+                try:
+                    import fcntl
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                except Exception:
+                    pass
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
+def _read_tombstone_intents(socket):
+    """intent jsonl 파싱 → [{op, role, ts}]. 손상 라인은 skip(부분절단·조작 내성)."""
+    p = _intent_journal_path(socket)
+    out = []
+    if os.path.exists(p):
+        try:
+            with open(p, encoding="utf-8") as f:
+                for ln in f:
+                    ln = ln.strip()
+                    if not ln:
+                        continue
+                    try:
+                        out.append(json.loads(ln))
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+    return out
+
+
+def _apply_intents_to_tombstones(intents, tombstones):
+    """intent 를 기록 순서대로 tombstones 집합에 멱등 적용(add→추가·remove→제거)."""
+    for it in intents:
+        role = it.get("role")
+        if not role:
+            continue
+        if it.get("op") == "remove":
+            tombstones.discard(role)
+        else:
+            tombstones.add(role)
+    return tombstones
+
+
+def _truncate_tombstone_intents(socket):
+    """intent 저널 절단(소화 완료). ★gemini R3: 호출측이 topology.json 디스크 영속(갱신 rev·묘비 반영) 확인 후에만."""
+    p = _intent_journal_path(socket)
+    try:
+        if os.path.exists(p):
+            os.remove(p)
+    except Exception:
+        pass
+
+
+def _resync_intents_if_daemon_up(socket, intents):
+    """★A-S3: 데몬 복귀 시 미소화 intent 를 RPC(cys tombstone) 로 재동기하고, topology.json 을 다시 로드해
+    intent 효과가 **디스크에 영속**(add 역할이 topology 묘비에 존재·remove 역할이 부재)됐음을 확인한 후에만
+    절단한다(gemini R3 TOCTOU: RPC 응답 직후 데몬이 topology 영속 전 크래시하면 묘비 소실 — 그 전에 절단 금지).
+    반환: True(절단됨)/False(보류)."""
+    if not intents:
+        return False
+    for it in intents:
+        role = it.get("role")
+        if not role:
+            continue
+        args = ["tombstone", role]
+        if it.get("op") == "remove":
+            args.append("--remove")
+        r = cys(*args, socket=socket, timeout=12)
+        if getattr(r, "returncode", 1) != 0:
+            return False  # 데몬 미도달/RPC 실패 — 다음 observe 에서 재시도(절단 보류)
+    # ★영속 확인: topology.json 재로드 → intent 효과가 디스크에 반영됐는지.
+    topo2 = read_topology(socket)
+    if "_error" in topo2 or "schema_version" not in topo2:
+        return False  # 손상/legacy — 확인 불가, 절단 보류
+    topo_tombs = set(t for t in topo2.get("tombstones", []) if isinstance(t, str))
+    for it in intents:
+        role = it.get("role")
+        if not role:
+            continue
+        if it.get("op") == "remove" and role in topo_tombs:
+            return False  # remove 미반영
+        if it.get("op") != "remove" and role not in topo_tombs:
+            return False  # add 미반영
+    _truncate_tombstone_intents(socket)  # 디스크 영속 확인 완료 → 절단
+    return True
+
+
 def _is_ephemeral_role(role, entry=None):
     """★P2-1: fresh/ephemeral 역할 판정 — 부활 대상에서 제외한다(일회성 역할이 상설 부활로 축적되는 유령 부활 차단).
     ① entry 의 source 플래그(source∈{fresh,ephemeral}) = 미래 유입 차단(데몬이 topology 엔트리에 기록).
@@ -625,6 +728,12 @@ def observe_and_persist_roster(socket):
         log("★A-S2: desired_roster 의 state_dir_tag(%s)가 현재 canonical(%s)과 불일치 — 이물 파일, write 거부(교차오염 차단)."
             % (prev.get("state_dir_tag"), cur_tag))
 
+    # ★A-S3: 데몬 복귀 시 미소화 intent 를 RPC 재동기·topology 디스크 영속 확인 후에만 절단(gemini R3 TOCTOU).
+    #   재동기 전에 intent 를 읽어둔다 — 절단됐으면 이후 replace 는 topology(이미 반영)만 보면 되고,
+    #   절단 보류면 아래에서 replace 결과에 intent 를 멱등 재적용(다운타임 CLI 폐역이 즉시 반영되게).
+    _intents = _read_tombstone_intents(socket)
+    _intents_truncated = _resync_intents_if_daemon_up(socket, _intents)
+
     topo = read_topology(socket)
     has_marker = "schema_version" in topo               # A-S1 마커(신 데몬)
     topo_rev = topo.get("tombstones_rev")
@@ -656,6 +765,11 @@ def observe_and_persist_roster(socket):
         for t in topo_tombs:
             tombstones.add(t)
         log("★A-S1: legacy topology(schema_version 부재) — 조건부 replace 생략, add-merge 유지·부활 정상 진행.")
+
+    # ★A-S3: 미절단(=데몬이 아직 소화 못한) intent 를 replace 결과에 멱등 재적용 — 다운타임 CLI 폐역/해제가
+    #   데몬 복귀·영속 확인 전에도 즉시 반영되게(절단됐으면 topology 에 이미 반영돼 재적용 무해).
+    if _intents and not _intents_truncated:
+        _apply_intents_to_tombstones(_intents, tombstones)
 
     # 우선순위: 기존 desired < 세대 스냅샷 < 현재 topology (최신 관측이 메타를 갱신). ★P2-1: ephemeral 제외(미래 유입 차단).
     for role, e in _snapshot_roster_entries(socket).items():
@@ -1470,25 +1584,33 @@ def cmd_tombstone(args):
     폐역을 구분해, 폐역된 대상은 부활/보호 집합에서 빠진다. --dept 면 부서 dept_roster 에 적용(Phase7 대칭)."""
     socket = args.socket
     is_dept = getattr(args, "dept", False)
+    name = args.role
     if is_dept:
+        # 부서(dept)는 phoenix 소유 dept_roster.json 이 진실(데몬 topology 무관) — 기존 파일 경로 유지.
         roster, tombstones = load_dept_roster(socket)
         path = dept_roster_path(socket)
-        kind = "dept"
+        if args.remove:
+            tombstones.discard(name); action = "폐역 해제(재편입 가능)"
+        else:
+            tombstones.add(name); roster.pop(name, None); action = "폐역(보호집합에서 제외)"
+        _atomic_write_json(path, {"roster": roster, "tombstones": sorted(tombstones), "updated_at": _now()})
+        out = {"tombstone": name, "kind": "dept", "action": action, "via": "dept_roster",
+               "tombstones": sorted(tombstones), "remaining": sorted(roster.keys())}
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return out
+    # ★A-S3: role 폐역은 desired 직접 쓰기 대신 **데몬 RPC 경유**(옵션A 단일 작성자=데몬). RPC 성공=topology 묘비.
+    #   실패(데몬 다운타임)=intent 저널 폴백 → observe 가 replace 이전 멱등 적용·데몬 복귀 후 재동기+영속 확인 후 절단.
+    rpc_args = ["tombstone", name] + (["--remove"] if args.remove else [])
+    r = cys(*rpc_args, socket=socket, timeout=12)
+    if getattr(r, "returncode", 1) == 0:
+        action = ("폐역 해제(RPC·데몬 topology)" if args.remove else "폐역(RPC·데몬 topology 묘비)")
+        out = {"tombstone": name, "kind": "role", "action": action, "via": "daemon-rpc",
+               "rpc_out": (getattr(r, "stdout", "") or "").strip()[:200]}
     else:
-        roster, tombstones = load_desired_roster(socket)
-        path = desired_roster_path(socket)
-        kind = "role"
-    name = args.role
-    if args.remove:
-        tombstones.discard(name)
-        action = "폐역 해제(재편입 가능)"
-    else:
-        tombstones.add(name)
-        roster.pop(name, None)
-        action = "폐역(보호집합에서 제외 — 부활 안 함)"
-    _atomic_write_json(path, {"roster": roster, "tombstones": sorted(tombstones), "updated_at": _now()})
-    out = {"tombstone": name, "kind": kind, "action": action, "tombstones": sorted(tombstones),
-           "remaining": sorted(roster.keys())}
+        _append_tombstone_intent(socket, name, args.remove)
+        action = ("폐역 해제(intent 저널·데몬 down)" if args.remove else "폐역(intent 저널·데몬 down)")
+        out = {"tombstone": name, "kind": "role", "action": action, "via": "intent-journal",
+               "note": "데몬 미도달 — intent 저널 기록. observe 가 replace 이전 멱등 적용·데몬 복귀 후 재동기·영속 확인 후 절단."}
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return out
 

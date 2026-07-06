@@ -255,6 +255,14 @@ enum Command {
         #[arg(long)]
         reap: bool,
     },
+    /// ★W2/A-S3: 역할을 topology 묘비에 심는다(의도적 폐역). 데몬이 묘비 유일 작성자(단일 작성자 원칙).
+    #[command(name = "tombstone")]
+    Tombstone {
+        role: String,
+        /// 폐역 해제(재편입 가능).
+        #[arg(long)]
+        remove: bool,
+    },
     /// Subscribe to the daemon event stream (push; no polling)
     Events {
         #[arg(long)]
@@ -1828,6 +1836,17 @@ fn run(command: Command) -> i32 {
                     let _ = r;
                 })
             }),
+
+        Command::Tombstone { role, remove } => {
+            request("tombstone.set", json!({"role": role, "remove": remove})).map(|r| {
+                let rev = r["tombstones_rev"].as_u64().unwrap_or(0);
+                println!(
+                    "tombstone {} {} (rev={rev})",
+                    role,
+                    if remove { "removed" } else { "set" }
+                );
+            })
+        }
 
         Command::Events { after_seq, names, categories, filter, reconnect, cursor_file } => {
             stream_events(after_seq, names, categories, filter, reconnect, cursor_file)
