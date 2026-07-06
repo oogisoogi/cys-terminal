@@ -117,6 +117,24 @@ def main():
     check("⑧ A-S2: 정상 경로는 canonical state_dir_tag 기록", bool(out.get("state_dir_tag")),
           "tag=%s" % out.get("state_dir_tag"))
 
+    # ⑨ P2-1 결정표 tri-state(codex W2 minor): -fresh-<숫자>=ephemeral · -fresh-<비숫자>=ephemeral(부분문자열) ·
+    #    'fresh' 포함하나 -fresh- 아님=ambiguous · 비-fresh=normal · source flag=ephemeral.
+    ver = m._ephemeral_verdict
+    check("⑨ -fresh-<숫자> → ephemeral", ver("worker-fresh-123") == "ephemeral")
+    check("⑨ -fresh-<비숫자> → ephemeral(부분문자열)", ver("worker-fresh-abc") == "ephemeral", ver("worker-fresh-abc"))
+    check("⑨ fresh 포함·비패턴 → ambiguous", ver("worker-freshness") == "ambiguous", ver("worker-freshness"))
+    check("⑨ 비-fresh → normal(보존)", ver("cso") == "normal")
+    check("⑨ source flag → ephemeral", ver("x", {"source": "fresh"}) == "ephemeral")
+
+    # ⑩ ambiguous(worker-freshx) → 부활 보류(tombstones 추가·엔트리 보존)·escalation. ephemeral(worker-fresh-9)=제거.
+    out = _run(td, "s10", {"roster": {"worker-freshx": {"role": "worker-freshx"}, "worker-fresh-9": {"role": "worker-fresh-9"},
+                                      "cso": {"role": "cso"}}, "tombstones": [], "tombstones_rev": 0, "daemon_epoch": "sa:E1"},
+               {"schema_version": 1, "tombstones_rev": 0, "tombstones": [], "entries": []})
+    r10 = set((out.get("roster") or {}).keys()); t10 = set(out.get("tombstones") or [])
+    check("⑩ ambiguous 부활 보류(tombstones+엔트리 보존)·ephemeral 제거·normal 보존",
+          "worker-freshx" in r10 and "worker-freshx" in t10 and "worker-fresh-9" not in r10 and "cso" in r10,
+          "roster=%s tombstones=%s" % (sorted(r10), sorted(t10)))
+
     import shutil; shutil.rmtree(td, ignore_errors=True)
     npass = sum(1 for c in _results if c)
     print("\n=== %d/%d PASS ===" % (npass, len(_results)))

@@ -17,6 +17,7 @@ def check(n, c, d=""):
 
 m.live_role_surfaces = lambda socket: {}
 m._snapshot_roster_entries = lambda socket: {}
+_ORIG_CYS = m.cys  # 원본 cys() 저장(시나리오 E 에서 복원 — 더미 CYS 로 rc127 강등)
 
 
 class _R:
@@ -61,14 +62,23 @@ def main():
     check("D 디스크 영속 확인 후 절단", truncated is True and not os.path.exists(ijp),
           "truncated=%s exists=%s" % (truncated, os.path.exists(ijp)))
 
-    # ── E. remove intent 도 대칭 동작(멱등) ──
+    # ── E. remove intent **풀사이클**(codex W2: in-memory discard만 보지 말 것) — 실 observe 경로.
+    #    prev desired: ghost 가 묘비+엔트리 보존 상태. remove intent(다운타임) 기록 → observe(데몬 down·RPC 재동기
+    #    실패) → intent 멱등 적용으로 ghost 묘비 해제 + 엔트리 보존(부활 가능). legacy topology 로 add-merge 후 remove.
     m.CYS = os.path.join(td, "nonexistent-cys")
-    m.cys = m.__dict__.get("cys")  # restore 안 함 — remove 는 저널 경로만 확인
-    # 직접 저널에 remove intent 기록 후 적용 검증(관대: 저널 append + apply)
-    m._append_tombstone_intent(sock, "ghost", True)
-    ts = set(["ghost", "keep"])
-    m._apply_intents_to_tombstones(m._read_tombstone_intents(sock), ts)
-    check("E remove intent 멱등 적용(ghost 제거·keep 보존)", "ghost" not in ts and "keep" in ts, str(sorted(ts)))
+    m.cys = _ORIG_CYS  # 원본 cys() 복원 — 더미 CYS 로 rc127(데몬 down·RPC 재동기 실패)
+    sd2 = os.path.join(td, "e"); ph2 = os.path.join(sd2, "phoenix"); os.makedirs(ph2, exist_ok=True)
+    sock2 = os.path.join(sd2, "cys.sock")
+    with open(os.path.join(ph2, "desired_roster.json"), "w") as f:
+        json.dump({"roster": {"ghost": {"role": "ghost", "session_id": "S9"}, "cso": {"role": "cso"}},
+                   "tombstones": ["ghost"], "tombstones_rev": 0, "daemon_epoch": "sa:E1"}, f)
+    m.read_topology = lambda socket: {"tombstones": ["ghost"], "entries": []}  # legacy(마커 부재)→add-merge
+    m._ACTIVE_EPOCH = "sa:E1"
+    m._append_tombstone_intent(sock2, "ghost", True)  # 다운타임 remove intent
+    roster, tombs = m.observe_and_persist_roster(sock2)
+    check("E remove intent observe 풀사이클: ghost 묘비 해제", "ghost" not in tombs, "tombs=%s" % sorted(tombs))
+    check("E remove intent: ghost 엔트리 보존(부활 가능)·cso 보존",
+          "ghost" in roster and "cso" in roster, "roster=%s" % sorted(roster.keys()))
 
     import shutil; shutil.rmtree(td, ignore_errors=True)
     npass = sum(1 for c in _results if c)

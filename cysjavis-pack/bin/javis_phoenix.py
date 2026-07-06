@@ -687,17 +687,26 @@ def _resync_intents_if_daemon_up(socket, intents):
     return True
 
 
-def _is_ephemeral_role(role, entry=None):
-    """★P2-1: fresh/ephemeral 역할 판정 — 부활 대상에서 제외한다(일회성 역할이 상설 부활로 축적되는 유령 부활 차단).
-    ① entry 의 source 플래그(source∈{fresh,ephemeral}) = 미래 유입 차단(데몬이 topology 엔트리에 기록).
-    ② 이름 패턴 '-fresh-'(schedule.rs 의 worker-fresh-<epoch> 등) = legacy 마이그레이션 heuristic — source 메타
-       없이 이미 desired 에 병합된 오염분을 quarantine. metadata 無 비-fresh 는 보존(오판 금지)."""
+def _ephemeral_verdict(role, entry=None):
+    """★P2-1 legacy migration 결정표(codex W2 minor): 세 판정 반환.
+    · 'ephemeral' = 명백한 일회성 → quarantine(부활 대상 제외·엔트리 제거). 근거: source 플래그
+      (source∈{fresh,ephemeral}·데몬 기록) 또는 이름의 '-fresh-' **부분문자열**(worker-fresh-<epoch> 등).
+    · 'ambiguous' = 비표준 변형('fresh' 포함하나 '-fresh-' 패턴 아님) → 부활 보류 + escalation(사람 판단).
+    · 'normal' = metadata 無 비-fresh → 보존·정상 부활(오판 금지)."""
     e = entry or {}
     if e.get("source") in ("fresh", "ephemeral"):
-        return True
-    if re.search(r"-fresh-\d", str(role or "")):
-        return True
-    return False
+        return "ephemeral"
+    r = str(role or "")
+    if "-fresh-" in r:
+        return "ephemeral"
+    if "fresh" in r.lower():
+        return "ambiguous"
+    return "normal"
+
+
+def _is_ephemeral_role(role, entry=None):
+    """★P2-1: 명백한 ephemeral(quarantine 대상)인가. ambiguous/normal 은 False(관측 병합 단계 제외 판정용)."""
+    return _ephemeral_verdict(role, entry) == "ephemeral"
 
 
 def observe_and_persist_roster(socket):
@@ -782,14 +791,19 @@ def observe_and_persist_roster(socket):
     for role, _surfs in live_role_surfaces(socket).items():
         if role and role != "-" and not _is_ephemeral_role(role):
             roster.setdefault(role, {"role": role})
-    # ★P2-1 legacy 마이그레이션: 이미 desired 에 병합된 ephemeral(*-fresh-*·source flag) 오염분을 quarantine
-    #   (부활 대상 제외). 결정표: source 메타 無 '*-fresh-*'=quarantine · 메타 無 비-fresh=보존(위 병합 유지).
+    # ★P2-1 legacy 마이그레이션 결정표(codex W2): ephemeral=quarantine(엔트리 제거·일회성) · ambiguous=부활 보류+
+    #   escalation(엔트리 보존·tombstones 로 target 제외해 사람 판단까지 부활 안 함·untomb 로 재편입 가능).
     for role in list(roster.keys()):
-        if _is_ephemeral_role(role, roster.get(role)):
+        v = _ephemeral_verdict(role, roster.get(role))
+        if v == "ephemeral":
             roster.pop(role, None)
-    # tombstone된 역할은 desired에서 제외(의도적 폐역)
-    for t in tombstones:
-        roster.pop(t, None)
+        elif v == "ambiguous":
+            tombstones.add(role)  # 부활 보류(엔트리 보존·target 제외)
+            log("★P2-1 escalation: 비표준 ephemeral 변형(%s) 판정 애매 — 부활 보류(사람 판단·untomb 로 재편입)." % role)
+    # ★codex W2 BLOCKING: 묘비 역할의 **roster 엔트리는 보존**한다(pop 금지). 배제는 부활 target 산정 시점에
+    #   tombstones 대조로 수행(run_restore·cmd_reconcile). 엔트리·메타(session/cwd/agent)가 남아 있어야 데몬이
+    #   묘비를 해제(untomb)하면 즉시 부활 가능하다 — 과거 pop 은 untomb 를 무의미하게 만드는 함정(false-green).
+    #   ※ 기존 desired 파일에 이미 pop 된 역할은 세대 스냅샷·live 병합이 자연 치유한다(신규 의미론은 전향 적용).
     # ★A-S2: 이물(state_dir_tag 불일치) 파일이면 write 거부 — 교차오염 차단. 정상 경로는 태그를 기록해 영속.
     if not _foreign:
         try:
@@ -867,8 +881,8 @@ def observe_and_persist_depts(socket):
         cur = roster.get(dept, {})
         cur.update(info)
         roster[dept] = cur
-    for t in tombstones:
-        roster.pop(t, None)
+    # ★codex W2 BLOCKING(dept 동형): 묘비 부서의 roster 엔트리 보존(pop 금지) — untomb 즉시 부활. 배제는
+    #   소비 시점(target 산정)에 tombstones 대조로 수행한다(role 경로와 대칭).
     try:
         _atomic_write_json(dept_roster_path(socket),
                            {"roster": roster, "tombstones": sorted(tombstones), "updated_at": _now()})
@@ -1255,7 +1269,9 @@ def run_restore(socket, ticket="default", stub=False, no_breaker=False, roles=No
                 return True
         return False
 
-    target_roles = roles or [r for r in entries if not _alive(r)]
+    # ★codex W2 BLOCKING: 묘비 제외는 target 산정 **시점**에 tombstones 대조로 수행(roster 엔트리는 보존됨).
+    #   entries 에 묘비 역할이 남아 있어도 부활 대상에서만 빠진다 — untomb 시 엔트리·메타가 있어 즉시 부활 가능.
+    target_roles = roles or [r for r in entries if not _alive(r) and r not in _tombstones]
     # ★M5/P1-3 회로차단기: '실제 부활 시도(죽은 역할 존재)'에만 기록한다. NOOP(대상 0)은 스폰 시도가
     #   아니므로 카운트하지 않고 오히려 창을 리셋한다 — NOOP 반복이 차단기를 OPEN 시켜 진짜 부활을 막는
     #   오검출(P1-3)을 차단. target 산출 이후로 이동해 "spawn 시도가 있을 때만 기록"(설계 축C4)을 만족.
@@ -1553,7 +1569,9 @@ def cmd_reconcile(args):
     live = live_role_surfaces(socket)
     todo = _read_worker_todo()
 
-    expected_roles = sorted(roster.keys())
+    # ★codex W2 BLOCKING: 묘비 역할은 roster 엔트리가 보존되므로 여기서 tombstones 대조로 제외 —
+    #   의도적 폐역을 'MISSING(부활 필요)'로 오판하지 않는다(엔트리는 untomb 시 부활용으로 보존).
+    expected_roles = sorted(r for r in roster.keys() if r not in tombstones)
     alive_roles = [role for role, ss in live.items() if role != "-" and any(not s["exited"] for s in ss)]
 
     missing = [r for r in expected_roles if r not in alive_roles]           # 대장엔 있는데 죽음
@@ -1592,10 +1610,12 @@ def cmd_tombstone(args):
         if args.remove:
             tombstones.discard(name); action = "폐역 해제(재편입 가능)"
         else:
-            tombstones.add(name); roster.pop(name, None); action = "폐역(보호집합에서 제외)"
+            # ★codex W2 BLOCKING(dept): 엔트리 보존(pop 금지) — 배제는 소비 시점 tombstones 대조. untomb 즉시 부활.
+            tombstones.add(name); action = "폐역(보호집합에서 제외 — 엔트리 보존·untomb 시 부활)"
         _atomic_write_json(path, {"roster": roster, "tombstones": sorted(tombstones), "updated_at": _now()})
         out = {"tombstone": name, "kind": "dept", "action": action, "via": "dept_roster",
-               "tombstones": sorted(tombstones), "remaining": sorted(roster.keys())}
+               "tombstones": sorted(tombstones),
+               "remaining": sorted(r for r in roster.keys() if r not in tombstones)}
         print(json.dumps(out, ensure_ascii=False, indent=2))
         return out
     # ★A-S3: role 폐역은 desired 직접 쓰기 대신 **데몬 RPC 경유**(옵션A 단일 작성자=데몬). RPC 성공=topology 묘비.
