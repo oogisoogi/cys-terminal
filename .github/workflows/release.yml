@@ -96,9 +96,11 @@ jobs:
           export PHOENIX_HARNESS_CYSD="$PWD/target/debug/cysd"
           export PATH="$PWD/target/debug:$PATH"
           export PHOENIX_CYS="$PWD/target/debug/cys"
-          for t in identity c2_sentinel w6_scenarios e2e_crosslayer e3_gc e2_schedule e2e_replacement; do
-            echo "== phoenix test: $t =="
-            python3 "cysjavis-pack/bin/tests/test_phoenix_${t}.py"
+          # ★커밋된 phoenix 테스트 전건 실행(glob) — 하드코딩 리스트는 신규 웨이브 테스트(w2/w3/c6/as3 …)를 조용히
+          #   누락시키는 위험이 있어 tests/ 디렉터리를 스캔한다(정직성: 게이트가 실제 커밋 테스트 전부를 돈다).
+          for t in cysjavis-pack/bin/tests/test_phoenix_*.py; do
+            echo "== phoenix test: $(basename "$t") =="
+            CYS_PACK_DIR="$(mktemp -d)" python3 "$t"
           done
           # Rust auto-restore 단위(재시도 seam·env 주입·B1·B3) + pack 소유권(B2).
           CYS_PACK_DIR="$(mktemp -d)" cargo test --bin cysd -- --test-threads=1

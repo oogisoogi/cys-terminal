@@ -1,0 +1,392 @@
+#!/usr/bin/env python3
+"""W3 손상 내성(C2 폴백 체인·C3 설명-가능-축소·C5 구조화 liveness) 테스트(리포 커밋).
+데몬 불요: CYS 를 더미로 두거나 m.cys/헬퍼를 몽키패치해 파일·순수 로직만 검증한다(라이브 무접촉).
+
+실행: python3 cysjavis-pack/bin/tests/test_phoenix_w3_corruption.py  (0=전건 PASS)
+"""
+import importlib.util, json, os, shutil, sys, tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+PH = os.path.normpath(os.path.join(HERE, "..", "javis_phoenix.py"))
+spec = importlib.util.spec_from_file_location("javis_phoenix", PH)
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+
+_results = []
+def check(name, cond, detail=""):
+    _results.append(bool(cond))
+    print(("PASS " if cond else "FAIL ") + name + (" | " + detail if detail else ""))
+
+
+def _write(path, obj):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        if isinstance(obj, str):
+            f.write(obj)
+        else:
+            json.dump(obj, f, ensure_ascii=False)
+
+
+def _ph_home(td, name):
+    sd = os.path.join(td, name)
+    home = os.path.join(sd, "phoenix")
+    os.makedirs(home, exist_ok=True)
+    return os.path.join(sd, "cys.sock"), home
+
+
+# ─────────────────────────── C2: 폴백 체인 ───────────────────────────
+
+def c2_bak_fallback(td):
+    """desired 손상 + 유효 .bak(죽은 역할 worker) → 격리 + .bak 복원 → DEGRADED(exit 3·부활 보류)."""
+    sock, home = _ph_home(td, "c2bak")
+    dp = os.path.join(home, "desired_roster.json")
+    _write(dp, "{ corrupt desired ]]]")
+    _write(dp + ".bak", {"roster": {"worker": {"role": "worker"}}, "tombstones": []})
+    m.CYS = os.path.join(td, "nonexistent-cys")  # cys 전부 rc127 강등 → live 없음
+    res = m.run_restore(sock, ticket="c2bak", stub=True, print_result=False)
+    check("C2.bak → DEGRADED", res.get("phoenix_restore") == "DEGRADED", "verdict=%s" % res.get("phoenix_restore"))
+    check("C2.bak → exit 3", m.restore_exit_code(res) == 3, "exit=%s" % m.restore_exit_code(res))
+    check("C2.bak → source=bak", any(d.get("source") == "bak" for d in (res.get("degraded") or [])),
+          "%s" % res.get("degraded"))
+    check("C2.bak → 부활 보류 held worker", "worker" in (res.get("held_roles") or []),
+          "held=%s" % res.get("held_roles"))
+    # 격리본(.corrupt-*) 이 생겼고, desired 는 .bak 내용으로 복원됨(이후 observe 가 정상 재기록)
+    corr = [f for f in os.listdir(home) if f.startswith("desired_roster.json.corrupt-")]
+    check("C2.bak → 손상 원본 .corrupt 격리", len(corr) >= 1, "corr=%s" % corr)
+    check("C2.bak → desired 유효 복원", m._roster_file_status(dp) == "valid", m._roster_file_status(dp))
+
+
+def c2_snapshot_fallback(td):
+    """desired 손상 + .bak 부재 + 세대 스냅샷 존재 → 스냅샷 복원 → DEGRADED(source=snapshot).
+    LIVE_STATE/HOME 를 격리 temp 로 몽키패치해 스냅샷 경로를 유효화한다."""
+    live = os.path.realpath(os.path.join(td, "live"))
+    home = os.path.join(live, "phoenix")
+    os.makedirs(home, exist_ok=True)
+    sock = os.path.join(live, "cys.sock")
+    dp = os.path.join(home, "desired_roster.json")
+    _write(dp, "]]] corrupt no bak")
+    gen = os.path.join(td, ".cys", "state-generations", "20260706T120000Z")
+    _write(os.path.join(gen, "topology.json"),
+           {"entries": [{"role": "worker"}], "tombstones": []})
+    _live0, _home0 = m.LIVE_STATE, m.HOME
+    try:
+        m.LIVE_STATE = live
+        m.HOME = td
+        m.CYS = os.path.join(td, "nonexistent-cys")
+        rec = m._recover_retention_file(sock, dp, "desired_roster")
+        check("C2.snap → degraded", rec.get("status") == "degraded", "%s" % rec)
+        check("C2.snap → source=snapshot", rec.get("source") == "snapshot", "%s" % rec)
+        # 복원된 desired 에 스냅샷 역할 worker 반영
+        rr, _t = m.load_desired_roster(sock)
+        check("C2.snap → worker 복원", "worker" in rr, "roster=%s" % list(rr))
+    finally:
+        m.LIVE_STATE, m.HOME = _live0, _home0
+
+
+def c2_unrecoverable(td):
+    """desired 손상 + .bak/스냅샷 전무(비 LIVE) → unrecoverable → CORRUPT(exit 6)."""
+    sock, home = _ph_home(td, "c2none")
+    _write(os.path.join(home, "desired_roster.json"), "{ corrupt nothing ]]]")
+    m.CYS = os.path.join(td, "nonexistent-cys")
+    res = m.run_restore(sock, ticket="c2none", stub=True, print_result=False)
+    check("C2.none → CORRUPT", res.get("phoenix_restore") == "CORRUPT", "verdict=%s" % res.get("phoenix_restore"))
+    check("C2.none → exit 6", m.restore_exit_code(res) == 6, "exit=%s" % m.restore_exit_code(res))
+    check("C2.none → isolated 명시", bool(res.get("isolated")), "%s" % res.get("isolated"))
+
+
+def c2_corrupt_prune(td):
+    """.corrupt-<ts> 격리본은 최근 3개만 유지(초과 prune·inode DoS 차단)."""
+    d = os.path.join(td, "prune")
+    os.makedirs(d, exist_ok=True)
+    target = os.path.join(d, "desired_roster.json")
+    made = []
+    for i in range(5):
+        _write(target, "corrupt %d" % i)
+        iso = m._isolate_corrupt(target)  # 매번 격리 → prune 이 최근 3개로 수렴
+        if iso:
+            made.append(iso)
+    remain = sorted(f for f in os.listdir(d) if f.startswith("desired_roster.json.corrupt-"))
+    check("C2.prune → 최근 3개만 유지", len(remain) == 3, "remain=%d(%s)" % (len(remain), remain))
+
+
+def c2_missing_vs_corrupt(td):
+    """corrupt 와 missing 은 다른 exit/event — missing=정상 빈 부팅(NOOP·exit0), corrupt=이벤트+degraded/corrupt."""
+    m.CYS = os.path.join(td, "nonexistent-cys")
+    sock_missing, _ = _ph_home(td, "missing")  # 상태파일 전무
+    res_missing = m.run_restore(sock_missing, ticket="miss", stub=True, print_result=False)
+    check("missing → NOOP exit0",
+          res_missing.get("phoenix_restore") == "NOOP" and m.restore_exit_code(res_missing) == 0,
+          "verdict=%s exit=%s" % (res_missing.get("phoenix_restore"), m.restore_exit_code(res_missing)))
+    sock_corrupt, home_c = _ph_home(td, "corruptvs")
+    _write(os.path.join(home_c, "desired_roster.json"), "]]] corrupt")
+    res_corrupt = m.run_restore(sock_corrupt, ticket="corr", stub=True, print_result=False)
+    check("corrupt → exit≠0(missing 과 상이)",
+          m.restore_exit_code(res_corrupt) != 0
+          and res_corrupt.get("phoenix_restore") in ("CORRUPT", "DEGRADED"),
+          "verdict=%s exit=%s" % (res_corrupt.get("phoenix_restore"), m.restore_exit_code(res_corrupt)))
+
+
+def c2_breaker_corrupt(td):
+    """보조상태 breaker.json 손상 → hard-fail 아님: 격리+경고 후 빈 카운트 재시작(크래시 없음)."""
+    sock, home = _ph_home(td, "breaker")
+    bp = os.path.join(home, "breaker.json")
+    _write(bp, "{ corrupt breaker ]]]")
+    m.CYS = os.path.join(td, "nonexistent-cys")
+    try:
+        opened, attempts = m.breaker_check_and_record(sock)
+        ok = (opened is False) and (len(attempts) == 1)
+    except Exception as e:
+        ok = False
+        attempts = "EXC:%s" % e
+    check("C2.breaker → 손상에도 크래시 없이 리셋", ok, "attempts=%s" % attempts)
+    corr = [f for f in os.listdir(home) if f.startswith("breaker.json.corrupt-")]
+    check("C2.breaker → 손상 격리(.corrupt·침묵 아님)", len(corr) >= 1, "corr=%s" % corr)
+
+
+# ─────────────────────────── C3: 설명-가능-축소 ───────────────────────────
+
+def _observe_isolated(td, name, prev_obj, load_ret, rebase=False):
+    """observe_and_persist_roster 를 격리 환경에서 호출하되 병합 소스를 전부 비활성화하고
+    load_desired_roster 를 주입해 '설명 여부'만 검증한다(순수 가드 로직)."""
+    sock, home = _ph_home(td, name)
+    dp = os.path.join(home, "desired_roster.json")
+    _write(dp, prev_obj)  # prev(직전 영속본)
+    m.CYS = os.path.join(td, "nonexistent-cys")
+    saved = {k: getattr(m, k) for k in
+             ("load_desired_roster", "_snapshot_roster_entries", "read_topology",
+              "live_role_surfaces", "_read_tombstone_intents", "_resync_intents_if_daemon_up",
+              "get_boot_epoch")}
+    m.load_desired_roster = lambda s: (dict(load_ret[0]), set(load_ret[1]))
+    m._snapshot_roster_entries = lambda s: {}
+    m.read_topology = lambda s: {"entries": [], "updated_at": 0}
+    m.live_role_surfaces = lambda s: {}
+    m._read_tombstone_intents = lambda s: []
+    m._resync_intents_if_daemon_up = lambda s, i: False
+    m.get_boot_epoch = lambda s: None
+    try:
+        roster, tombs = m.observe_and_persist_roster(sock, rebase=rebase)
+    finally:
+        for k, v in saved.items():
+            setattr(m, k, v)
+    on_disk = json.load(open(dp))
+    return roster, tombs, on_disk
+
+
+def c3_unexplained_refused(td):
+    """직전 {a,b} 대비 b 소실(묘비·ephemeral 아님) → write 1회 거부(직전 상태 보존·b 유지)."""
+    roster, tombs, disk = _observe_isolated(
+        td, "c3ref",
+        prev_obj={"roster": {"a": {"role": "a"}, "b": {"role": "b"}}, "tombstones": []},
+        load_ret=({"a": {"role": "a"}}, set()))  # load 가 b 를 잃음(부분/버그 시뮬)
+    check("C3.refuse → 반환 roster 에 b 보존", "b" in roster, "roster=%s" % list(roster))
+    check("C3.refuse → 디스크 미축소(b 유지)", "b" in (disk.get("roster") or {}),
+          "disk=%s" % list((disk.get("roster") or {})))
+
+
+def c3_explained_tombstone_ok(td):
+    """직전 {a,b} 대비 b 소실이 tombstone 으로 설명 → write 진행(정당 스케일다운)."""
+    roster, tombs, disk = _observe_isolated(
+        td, "c3tomb",
+        prev_obj={"roster": {"a": {"role": "a"}, "b": {"role": "b"}}, "tombstones": ["b"]},
+        load_ret=({"a": {"role": "a"}}, {"b"}))
+    check("C3.tomb → 설명된 축소 write 진행(디스크 roster=={a})",
+          set((disk.get("roster") or {}).keys()) == {"a"}, "disk=%s" % list((disk.get("roster") or {})))
+
+
+def c3_rebase_forces(td):
+    """설명불가 축소라도 rebase=True 면 강제 수용(운영자 명시 재기반)."""
+    roster, tombs, disk = _observe_isolated(
+        td, "c3rebase",
+        prev_obj={"roster": {"a": {"role": "a"}, "b": {"role": "b"}}, "tombstones": []},
+        load_ret=({"a": {"role": "a"}}, set()), rebase=True)
+    check("C3.rebase → 강제 수용(디스크 roster=={a})",
+          set((disk.get("roster") or {}).keys()) == {"a"}, "disk=%s" % list((disk.get("roster") or {})))
+
+
+def c3_write_failure_no_silent(td):
+    """원자쓰기 실패는 침묵(except:pass) 금지 — 예외를 삼켜 크래시하지 않고 roster 를 반환한다(log/EVT 는 부수)."""
+    sock, home = _ph_home(td, "c3wf")
+    dp = os.path.join(home, "desired_roster.json")
+    _write(dp, {"roster": {"a": {"role": "a"}}, "tombstones": []})
+    m.CYS = os.path.join(td, "nonexistent-cys")
+    saved_w = m._atomic_write_json
+    saved_snap = m._snapshot_roster_entries
+    saved_topo = m.read_topology
+    saved_live = m.live_role_surfaces
+    saved_intents = m._read_tombstone_intents
+    saved_resync = m._resync_intents_if_daemon_up
+    def _boom(*a, **k):
+        raise OSError("disk full (simulated)")
+    m._atomic_write_json = _boom
+    m._snapshot_roster_entries = lambda s: {}
+    m.read_topology = lambda s: {"entries": [], "updated_at": 0}
+    m.live_role_surfaces = lambda s: {}
+    m._read_tombstone_intents = lambda s: []
+    m._resync_intents_if_daemon_up = lambda s, i: False
+    try:
+        roster, tombs = m.observe_and_persist_roster(sock)
+        ok = "a" in roster  # 크래시 없이 반환
+    except Exception as e:
+        ok = False
+        roster = "EXC:%s" % e
+    finally:
+        m._atomic_write_json = saved_w
+        m._snapshot_roster_entries = saved_snap
+        m.read_topology = saved_topo
+        m.live_role_surfaces = saved_live
+        m._read_tombstone_intents = saved_intents
+        m._resync_intents_if_daemon_up = saved_resync
+    check("C3.writefail → 침묵 크래시 없이 roster 반환", ok, "%s" % roster)
+
+
+# ─────────────────────────── C5: 구조화 liveness ───────────────────────────
+
+class _FakeR:
+    def __init__(self, rc, out=""):
+        self.returncode = rc
+        self.stdout = out
+        self.stderr = ""
+
+
+def c5_liveness_from_status_json(td):
+    """live_role_surfaces 가 `cys status --json`.surfaces(구조화)에서 role/exited 를 읽는다."""
+    saved = m.cys
+    status = {"surfaces": [
+        {"surface_ref": "surface:10", "role": "worker", "exited": False, "agent_alive": True},
+        {"surface_ref": "surface:11", "role": "master", "exited": True, "agent_alive": False},
+        {"surface_ref": "surface:12", "role": None, "exited": True, "agent_alive": None},  # 미claim 잔재
+    ]}
+    def fake_cys(*args, **kw):
+        if args[:2] == ("status", "--json"):
+            return _FakeR(0, json.dumps(status))
+        return _FakeR(127, "")  # list 폴백은 오지 않아야(status 성공)
+    m.cys = fake_cys
+    try:
+        out = m.live_role_surfaces("sock")
+    finally:
+        m.cys = saved
+    check("C5.status → worker liveness 구조화 파싱",
+          out.get("worker") and out["worker"][0]["exited"] is False, "%s" % out.get("worker"))
+    check("C5.status → master exited 반영",
+          out.get("master") and out["master"][0]["exited"] is True, "%s" % out.get("master"))
+    check("C5.status → agent_alive 노출(readiness 신호)",
+          out["worker"][0].get("agent_alive") is True, "%s" % out.get("worker"))
+    check("C5.status → 미claim(role=null) 잔재는 '-'로 보존(P1-6 회귀 잠금·C6 회수용)",
+          out.get("-") and out["-"][0]["exited"] is True and out["-"][0]["surface"] == "surface:12",
+          "%s" % out.get("-"))
+
+
+def c5_liveness_fallback_to_list(td):
+    """status --json 미도달(rc≠0) 시 `cys list` 정규식 폴백(가용성 하한)."""
+    saved = m.cys
+    def fake_cys(*args, **kw):
+        if args[:2] == ("status", "--json"):
+            return _FakeR(1, "")  # 미지원/미도달
+        if args[:1] == ("list",):
+            return _FakeR(0, "surface:20\trole=worker\tpid=999\texited=false\t·\t·")
+        return _FakeR(127, "")
+    m.cys = fake_cys
+    try:
+        out = m.live_role_surfaces("sock")
+    finally:
+        m.cys = saved
+    check("C5.fallback → list 폴백 파싱",
+          out.get("worker") and out["worker"][0]["exited"] is False, "%s" % out.get("worker"))
+
+
+def c5_readiness_structured_ack(td):
+    """stage_ready(prod) 가 배너 이전에 구조화 ack(agent_alive)로 ready 판정."""
+    saved = m._status_json
+    m._status_json = lambda s: {"surfaces": [{"surface_ref": "surface:30", "role": "worker",
+                                              "exited": False, "agent_alive": True}]}
+    try:
+        alive = m._surface_agent_alive("sock", "surface:30")
+        ready, detail = m.stage_ready("sock", "worker", "surface:30", stub=False)
+    finally:
+        m._status_json = saved
+    check("C5.ack → _surface_agent_alive True", alive is True, "%s" % alive)
+    check("C5.ack → stage_ready 구조화 ready(배너 무의존)",
+          ready is True and "structured ack" in detail, "ready=%s detail=%s" % (ready, detail))
+
+
+def c5_harness_allow_live_gate():
+    """하네스 guard_isolation: LIVE 타깃은 CYS_PHOENIX_ALLOW_LIVE=1 없으면 거부, 있으면 통과."""
+    HPH = os.path.normpath(os.path.join(HERE, "..", "javis_phoenix_harness.py"))
+    hspec = importlib.util.spec_from_file_location("javis_phoenix_harness", HPH)
+    h = importlib.util.module_from_spec(hspec)
+    hspec.loader.exec_module(h)
+    saved_hd, saved_sock = h.HARN_DIR, h.HARN_SOCK
+    saved_env = os.environ.get("CYS_PHOENIX_ALLOW_LIVE")
+    try:
+        h.HARN_DIR = h.LIVE_STATE          # 강제 LIVE 타깃(사고/오설정 시뮬)
+        h.HARN_SOCK = h.LIVE_SOCK
+        os.environ.pop("CYS_PHOENIX_ALLOW_LIVE", None)
+        refused = False
+        try:
+            h.guard_isolation()
+        except SystemExit:
+            refused = True
+        check("C5.harness → opt-in 없으면 LIVE write 거부", refused)
+        os.environ["CYS_PHOENIX_ALLOW_LIVE"] = "1"
+        allowed = True
+        try:
+            h.guard_isolation()  # opt-in → 통과(die 없음)
+        except SystemExit:
+            allowed = False
+        check("C5.harness → opt-in(=1) 있으면 통과", allowed)
+    finally:
+        h.HARN_DIR, h.HARN_SOCK = saved_hd, saved_sock
+        if saved_env is None:
+            os.environ.pop("CYS_PHOENIX_ALLOW_LIVE", None)
+        else:
+            os.environ["CYS_PHOENIX_ALLOW_LIVE"] = saved_env
+
+
+# ─────────────────────────── deploy 중첩 lease(게이트 행) ───────────────────────────
+
+def deploy_nested_lease(td):
+    """restore lease 보유 중 재진입 restore 는 LEASE_HELD(멱등 skip·exit0) — deploy 내부 restore 가 콜드부트
+    auto 와 경합해도 FAILED 오판이 아니라 정직 skip. lease 해제 후 재진입은 정상 진행."""
+    sock, home = _ph_home(td, "lease")
+    _write(os.path.join(home, "desired_roster.json"), {"roster": {}, "tombstones": []})
+    m.CYS = os.path.join(td, "nonexistent-cys")
+    ok, handle = m._acquire_restore_lease(sock)
+    check("lease → 최초 획득", ok is True, "ok=%s" % ok)
+    res = m.run_restore(sock, ticket="held", stub=True, print_result=False)
+    check("lease → 보유 중 재진입 LEASE_HELD",
+          res.get("phoenix_restore") == "LEASE_HELD", "verdict=%s" % res.get("phoenix_restore"))
+    check("lease → LEASE_HELD exit 0(멱등·FAILED 아님)", m.restore_exit_code(res) == 0,
+          "exit=%s" % m.restore_exit_code(res))
+    m._release_lease(handle)
+    res2 = m.run_restore(sock, ticket="held2", stub=True, print_result=False)
+    check("lease → 해제 후 재진입 정상(NOOP)", res2.get("phoenix_restore") == "NOOP",
+          "verdict=%s" % res2.get("phoenix_restore"))
+
+
+def main():
+    td = tempfile.mkdtemp(prefix="phoenix-w3-")
+    try:
+        c2_bak_fallback(td)
+        c2_snapshot_fallback(td)
+        c2_unrecoverable(td)
+        c2_corrupt_prune(td)
+        c2_missing_vs_corrupt(td)
+        c2_breaker_corrupt(td)
+        c3_unexplained_refused(td)
+        c3_explained_tombstone_ok(td)
+        c3_rebase_forces(td)
+        c3_write_failure_no_silent(td)
+        c5_liveness_from_status_json(td)
+        c5_liveness_fallback_to_list(td)
+        c5_readiness_structured_ack(td)
+        c5_harness_allow_live_gate()
+        deploy_nested_lease(td)
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+    npass = sum(1 for c in _results if c)
+    print("\n=== %d/%d PASS ===" % (npass, len(_results)))
+    return 0 if npass == len(_results) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
