@@ -88,6 +88,23 @@ def main():
         check("③ 묘비 후 부활 target 제외(MISSING 아님)", tomb_present and "worker-fc" not in missing3,
               "tombstones=%s MISSING=%s" % (d3.get("tombstones"), missing3))
 
+        # ⑥ ★codex 재판정: 명시 --roles <tombstoned> 도 tombstone 필터 통과(우회 금지·의도삭제>강제부활).
+        #    worker-fc 가 폐역인 상태에서 restore --roles worker-fc → target 미진입·NOOP + 저널 skip 사유 기록.
+        res6, _ = _phoenix(["restore", "--stub", "--roles", "worker-fc", "--ticket", "fc6"])
+        excluded = "worker-fc" not in (res6.get("target_roles") or [])
+        noop = res6.get("phoenix_restore") == "NOOP"
+        jrec = os.path.join(h.HARN_DIR, "phoenix", "journal-fc6.json")
+        skip_logged = False
+        if os.path.exists(jrec):
+            try:
+                ev = json.load(open(jrec)).get("events", [])
+                skip_logged = any(e.get("status") == "skip_tombstoned" and e.get("role") == "worker-fc" for e in ev)
+            except Exception:
+                pass
+        check("⑥ 명시 --roles <tombstoned> 필터 통과(target 미진입·NOOP)", excluded and noop,
+              "target=%s verdict=%s" % (res6.get("target_roles"), res6.get("phoenix_restore")))
+        check("⑥ 저널에 skip_tombstoned 사유 기록", skip_logged, "journal-fc6 events")
+
         # ④ untomb: cys tombstone --remove → 데몬이 topology 묘비 해제(rev++).
         h.cys("tombstone", "worker-fc", "--remove")
         # ⑤ observe(reconcile): 묘비 해제 → worker-fc 가 부활 target(MISSING)으로 복귀 — 엔트리 보존 덕에 즉시 부활 가능.

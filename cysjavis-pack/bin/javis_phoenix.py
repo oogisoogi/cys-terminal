@@ -1271,7 +1271,18 @@ def run_restore(socket, ticket="default", stub=False, no_breaker=False, roles=No
 
     # ★codex W2 BLOCKING: 묘비 제외는 target 산정 **시점**에 tombstones 대조로 수행(roster 엔트리는 보존됨).
     #   entries 에 묘비 역할이 남아 있어도 부활 대상에서만 빠진다 — untomb 시 엔트리·메타가 있어 즉시 부활 가능.
-    target_roles = roles or [r for r in entries if not _alive(r) and r not in _tombstones]
+    # ★codex W2 재판정: 명시 --roles 경로도 tombstone 필터를 반드시 통과시킨다(과거 `roles or [...]` 는 명시
+    #   경로가 필터를 우회 — 의도삭제된 역할을 강제 부활시키는 구멍). '의도삭제>강제부활' 1급 원칙상 우회 스위치
+    #   (--ignore-tombstones 류)는 추가하지 않는다 — 정당한 재편입은 untomb RPC(cys tombstone --remove)가 정도(正道)다.
+    _requested = roles if roles is not None else [r for r in entries if not _alive(r)]
+    _tomb_skipped = [r for r in _requested if r in _tombstones]
+    target_roles = [r for r in _requested if not _alive(r) and r not in _tombstones]
+    if _tomb_skipped:
+        log("★묘비 필터: 요청 역할 중 폐역(tombstone) %s 은 부활 대상에서 제외(의도삭제>강제부활). untomb 로만 재편입." % _tomb_skipped)
+        for _r in _tomb_skipped:
+            jevent(j, _r, "target", "skip_tombstoned",
+                   "명시 요청됐으나 폐역(tombstone) — 부활 제외(의도삭제>강제부활). 재편입=untomb RPC.")
+        save_journal(socket, ticket, j)
     # ★M5/P1-3 회로차단기: '실제 부활 시도(죽은 역할 존재)'에만 기록한다. NOOP(대상 0)은 스폰 시도가
     #   아니므로 카운트하지 않고 오히려 창을 리셋한다 — NOOP 반복이 차단기를 OPEN 시켜 진짜 부활을 막는
     #   오검출(P1-3)을 차단. target 산출 이후로 이동해 "spawn 시도가 있을 때만 기록"(설계 축C4)을 만족.
