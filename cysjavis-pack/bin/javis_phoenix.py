@@ -585,17 +585,57 @@ def _snapshot_roster_entries(socket):
 
 
 def observe_and_persist_roster(socket):
-    """현재 관측(topology + 세대 스냅샷)을 desired 로스터에 단조 병합·영속하고 (roster, tombstones) 반환.
-    ★침식 전에 호출되면 전 역할이 박제된다 — 이후 topology가 줄어도 desired는 보존된다."""
+    """현재 관측(topology + 세대 스냅샷)을 desired 로스터에 영속하고 (roster, tombstones) 반환.
+    ★W2 옵션A(A-S1): 데몬 topology.json = 묘비 유일 진실. desired 묘비 = 미러(조건부 replace). 데몬의
+    claim/create 해제(topology 묘비 감소)가 자동으로 desired 에 흘러 제3겹(수동 tombstone --remove 불요)이 소멸한다.
+    replace 게이트: 파싱 성공 + schema_version 마커 실존 + tombstones_rev ≥ 마지막으로 본 rev. 역행은 gemini R3
+    rebase(epoch 변경/rev=0)로만 허용하고, 정당근거 없는 역행(부분절단·조작)은 replace 생략+desired 보존. legacy
+    (마커 부재)는 add-merge 유지+경고+부활 정상 진행. 손상(파싱 실패)은 replace 생략(전체 폴백은 W3/governance)."""
     roster, tombstones = load_desired_roster(socket)
+    # 이전에 본 rev/epoch(desired_roster.json) — A-S1 조건부 replace 판정 기준.
+    prev = {}
+    try:
+        _dp = desired_roster_path(socket)
+        if os.path.exists(_dp):
+            prev = json.load(open(_dp))
+    except Exception:
+        prev = {}
+    last_seen_rev = prev.get("tombstones_rev")
+    last_seen_epoch = prev.get("daemon_epoch")
+    cur_epoch = _ACTIVE_EPOCH if _ACTIVE_EPOCH is not None else get_boot_epoch(socket)
+
     topo = read_topology(socket)
-    # ★W2a 좀비 차단: 데몬 소유 topology.json의 tombstones(surface.close 경유 의도삭제)를 desired
-    #   tombstones로 병합한다. 데몬이 유일 작성자(이중 작성자 금지 — phoenix는 desired_roster.json에만,
-    #   데몬은 topology.json에만 쓴다). 병합된 역할은 아래 pop 루프로 roster에서 제외 → entries/need/
-    #   fresh-fallback 대상에서 자동 배제(기존 소비 로직 그대로 활용). 구 topology(필드 부재)=무병합.
-    for t in topo.get("tombstones", []):
-        if isinstance(t, str):
+    has_marker = "schema_version" in topo               # A-S1 마커(신 데몬)
+    topo_rev = topo.get("tombstones_rev")
+    topo_tombs = set(t for t in topo.get("tombstones", []) if isinstance(t, str))
+    new_rev = last_seen_rev
+
+    if "_error" in topo:
+        # 손상 topology → replace 금지(desired 보존). 전체 폴백 체인(.bak·스냅샷·degraded)은 W3/governance(P0-3).
+        log("★A-S1: topology 손상(%s) — 묘비 replace 생략, desired 보존." % topo.get("_error"))
+    elif has_marker and topo_rev is not None:
+        rebase = False
+        if last_seen_rev is not None and topo_rev < last_seen_rev:
+            # 역행 — gemini R3: epoch 변경 또는 rev=0(리셋/fresh install/.bak) 만 정당한 rebase.
+            if topo_rev == 0 or (cur_epoch is not None and cur_epoch != last_seen_epoch):
+                rebase = True
+        if last_seen_rev is None or topo_rev >= last_seen_rev or rebase:
+            # ★옵션A 조건부 replace: 데몬 topology 묘비를 desired 에 **그대로 대입**(add-merge 아님).
+            #   데몬 해제가 자동 반영 → 제3겹 소멸. rebase 시엔 정당한 역행을 손상으로 오판하지 않는다.
+            tombstones = set(topo_tombs)
+            new_rev = topo_rev
+            if rebase:
+                log("★A-S1 rebase: topology rev 정당 역행(%s<%s·epoch변경/rev0) — 강제 rebase 후 replace."
+                    % (topo_rev, last_seen_rev))
+        else:
+            log("★A-S1: topology rev 역행(%s<%s·정당근거 없음) — replace 생략, desired 보존(부분절단/조작 의심)."
+                % (topo_rev, last_seen_rev))
+    else:
+        # legacy topology(마커 부재)=손상 아님 → 조건부 replace 생략·add-merge 하위호환·경고·부활 정상 진행.
+        for t in topo_tombs:
             tombstones.add(t)
+        log("★A-S1: legacy topology(schema_version 부재) — 조건부 replace 생략, add-merge 유지·부활 정상 진행.")
+
     # 우선순위: 기존 desired < 세대 스냅샷 < 현재 topology (최신 관측이 메타를 갱신)
     for role, e in _snapshot_roster_entries(socket).items():
         roster[role] = e
@@ -603,7 +643,6 @@ def observe_and_persist_roster(socket):
         if e.get("role"):
             roster[e["role"]] = e
     # ★Phase 7: 라이브 role 직접 병합 — claim-role 즉시 자동 등재(topology 영속 지연/침식 무관).
-    #   '태어날 때부터 보호': 역할이 살아있는 순간 보호집합에 편입된다. 이미 있으면 갱신 안 함(topology 엔트리 우선).
     for role, _surfs in live_role_surfaces(socket).items():
         if role and role != "-":
             roster.setdefault(role, {"role": role})
@@ -612,7 +651,8 @@ def observe_and_persist_roster(socket):
         roster.pop(t, None)
     try:
         _atomic_write_json(desired_roster_path(socket),
-                           {"roster": roster, "tombstones": sorted(tombstones), "updated_at": _now()})
+                           {"roster": roster, "tombstones": sorted(tombstones),
+                            "tombstones_rev": new_rev, "daemon_epoch": cur_epoch, "updated_at": _now()})
     except Exception:
         pass
     return roster, tombstones

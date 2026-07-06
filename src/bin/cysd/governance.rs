@@ -726,10 +726,27 @@ pub fn persist_topology(daemon: &Arc<Daemon>) {
         v.sort();
         v
     };
+    // ★W2/A-S1: 묘비 집합이 직전 영속본과 달라졌을 때만 tombstones_rev 를 +1(단조 카운터). phoenix 의
+    // 조건부 replace(rev ≥ 마지막으로 본 rev) 게이트 근거 — 부분절단/조작으로 묘비만 빈 파일은 rev 부재/역행으로
+    // 걸러진다. rev 관리를 이 단일 지점에 집중(각 mutation 사이트 계장 대신)해 "묘비 변경=rev 증가"를 정확히 반영.
+    {
+        let mut last = daemon.last_persisted_tombstones.lock().unwrap();
+        if *last != tombstones {
+            daemon
+                .tombstones_rev
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            *last = tombstones.clone();
+        }
+    }
+    let rev = daemon.tombstones_rev.load(std::sync::atomic::Ordering::SeqCst);
     let dir = crate::state::state_dir(&daemon.socket_path);
-    let content = serde_json::to_string_pretty(
-        &json!({"updated_at": now_epoch(), "entries": entries, "tombstones": tombstones}),
-    )
+    let content = serde_json::to_string_pretty(&json!({
+        "schema_version": 1,          // ★A-S1 스키마 마커 — 이 키 부재=legacy topology(phoenix 는 경고+진행)
+        "tombstones_rev": rev,        // ★A-S1 단조 카운터
+        "updated_at": now_epoch(),
+        "entries": entries,
+        "tombstones": tombstones,
+    }))
     .unwrap_or_default();
     // ★원자 쓰기 — SIGTERM/크래시가 쓰기 도중 끼어도 topology.json은 옛 완본 또는 새 완본만
     // 남는다. 비원자 write면 torn write가 깨진 JSON을 남기고 load_topology가 빈 배열로 폴백해
@@ -788,6 +805,17 @@ pub fn load_tombstones_from_disk(socket_path: &std::path::Path) -> std::collecti
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// ★W2/A-S1: topology.json 의 tombstones_rev 를 읽어 기동 카운터를 시드(재시작 넘어 단조성 유지).
+/// 필드 부재(legacy·fresh install)·부재·손상은 0(phoenix 는 epoch 변경으로 rebase 처리 — gemini R3).
+pub fn load_tombstones_rev_from_disk(socket_path: &std::path::Path) -> u64 {
+    let dir = crate::state::state_dir(socket_path);
+    std::fs::read_to_string(dir.join("topology.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v["tombstones_rev"].as_u64())
+        .unwrap_or(0)
 }
 
 fn check_load(daemon: &Daemon, last_alert: &mut f64) {
@@ -2037,8 +2065,8 @@ mod tests {
     // ─────────── ★묘비 게이트: reap≠묘비, owner-close=묘비 (부활 불변식) ───────────
 
     use super::{
-        close_surface, load_tombstones_from_disk, now_epoch, persist_topology,
-        reap_exited_surfaces, CloseCause, Daemon,
+        close_surface, load_tombstones_from_disk, load_tombstones_rev_from_disk, now_epoch,
+        persist_topology, reap_exited_surfaces, CloseCause, Daemon,
     };
     use std::sync::atomic::Ordering as AtomicOrdering;
 
@@ -2130,6 +2158,37 @@ mod tests {
             !load_tombstones_from_disk(&daemon.socket_path).contains("worker"),
             "reap 묘비가 topology.json에 영속돼 재부팅 후 부활이 막힌다"
         );
+    }
+
+    /// ★W2/A-S1: tombstones_rev 는 묘비 집합이 실제 바뀔 때만 +1(단조), 무변경 persist 는 불변.
+    /// topology.json 에 schema_version:1 + tombstones_rev 영속, disk 시드 라운드트립.
+    #[test]
+    fn tombstones_rev_increments_only_on_change() {
+        use std::sync::atomic::Ordering;
+        let daemon = drill_daemon("rev");
+        let rev0 = daemon.tombstones_rev.load(Ordering::SeqCst);
+        // 묘비 무변경 persist 2회 → rev 불변
+        persist_topology(&daemon);
+        persist_topology(&daemon);
+        assert_eq!(daemon.tombstones_rev.load(Ordering::SeqCst), rev0, "무변경 persist 는 rev 불변");
+        // 오너 close(묘비 삽입) → persist side-effect → rev +1
+        let id = spawn_role_surface(&daemon, "worker");
+        close_surface(&daemon, id, CloseCause::OwnerClose).expect("close");
+        let rev1 = daemon.tombstones_rev.load(Ordering::SeqCst);
+        assert_eq!(rev1, rev0 + 1, "묘비 삽입 시 rev +1");
+        // 재persist(무변경) → rev 불변
+        persist_topology(&daemon);
+        assert_eq!(daemon.tombstones_rev.load(Ordering::SeqCst), rev1, "재persist 무변경 rev 불변");
+        // topology.json 에 schema_version + tombstones_rev 영속
+        let content = std::fs::read_to_string(
+            crate::state::state_dir(&daemon.socket_path).join("topology.json"),
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(v["schema_version"], 1);
+        assert_eq!(v["tombstones_rev"].as_u64(), Some(rev1));
+        // disk 시드 라운드트립
+        assert_eq!(load_tombstones_rev_from_disk(&daemon.socket_path), rev1);
     }
 
     /// 오너 의도적 닫기는 여전히 묘비를 남기고 영속한다(좀비 부활 차단 불변식 보존).

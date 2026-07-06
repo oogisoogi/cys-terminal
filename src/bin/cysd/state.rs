@@ -543,6 +543,13 @@ pub struct Daemon {
     /// 역할을 절대 재스폰하지 않는다(사고사만 부활, 의도삭제는 좀비 차단). 데몬 기동 시
     /// topology.json에서 로드한다(구 topology=필드 부재→빈 집합=기존 동작 하위호환).
     pub tombstones: Mutex<std::collections::HashSet<String>>,
+    /// ★W2/A-S1: 묘비 변경 단조 카운터(topology.json 의 tombstones_rev). persist_topology 가 묘비 집합이
+    /// 직전 영속본과 달라질 때만 +1 한다. phoenix 는 "rev ≥ 마지막으로 본 rev"일 때만 topology 묘비를 desired 에
+    /// 그대로 대입(조건부 replace)해, 부분절단·조작으로 묘비만 빈 파일(rev 부재/역행)을 걸러낸다. 기동 시
+    /// disk topology 의 tombstones_rev 를 시드해 재시작을 넘어 단조성을 유지한다.
+    pub tombstones_rev: std::sync::atomic::AtomicU64,
+    /// persist_topology 가 rev 증가 판정에 쓰는 '직전 영속 묘비 집합'(정렬본). 시드=기동 시 disk 묘비.
+    pub last_persisted_tombstones: Mutex<Vec<String>>,
     /// 적대검증 벡터-9 방어심화: master role이 현재 보유 surface로 (재)claim된 epoch초.
     /// master surface가 죽는 윈도우에 다른 노드가 claim_role("master")로 합법 승계 → 즉시
     /// approval.sign으로 위험명령을 정당 서명할 수 있다. 이 값으로 갓 승계한 master의 서명을
@@ -951,6 +958,16 @@ impl Daemon {
             roles: Mutex::new(HashMap::new()),
             // ★W2a 콜드부트 생존: topology.json에 영속된 묘비를 기동 시 로드(구 topology=빈 집합).
             tombstones: Mutex::new(crate::governance::load_tombstones_from_disk(&socket_path)),
+            // ★W2/A-S1: rev 를 disk topology 에서 시드(재시작 넘어 단조성 유지)·직전 영속본=시드 묘비.
+            tombstones_rev: std::sync::atomic::AtomicU64::new(
+                crate::governance::load_tombstones_rev_from_disk(&socket_path),
+            ),
+            last_persisted_tombstones: Mutex::new({
+                let mut v: Vec<String> =
+                    crate::governance::load_tombstones_from_disk(&socket_path).into_iter().collect();
+                v.sort();
+                v
+            }),
             // 벡터-9 방어심화: 기동 시 master 미승계 → None (첫 claim_role("master")에서 기록).
             master_claimed_at: Mutex::new(None),
             feed_items: Mutex::new(restored),
