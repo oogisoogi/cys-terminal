@@ -569,7 +569,11 @@ def _snapshot_roster_entries(socket):
         gens = sorted(g for g in os.listdir(gen_root) if re.match(r"\d{8}T\d{6}Z", g))
     except Exception:
         return {}
-    for g in reversed(gens):  # 최신 세대부터
+    # ★E3 주의(gemini W6): 여기는 단일 '최신 세대' 선택(heal 소스)이라 GC 처럼 union 보호가 불가능하다.
+    #   mtime max 를 쓰면 cp/touch 오염 세대가 '최신'으로 오선택돼 stale topology 로 heal 할 위험이 있어,
+    #   명목(이름) 기준을 유지한다(best-effort 소스 — 데이터 손실 아님). P2-5 의 실질 수리(오삭제 방어)는
+    #   compute_gc 의 명목∪실효 union 이 담당한다.
+    for g in reversed(gens):  # 이름(명목) 최신 세대부터
         tp = os.path.join(gen_root, g, "topology.json")
         if os.path.exists(tp):
             try:
