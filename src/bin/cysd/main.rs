@@ -247,7 +247,7 @@ async fn accept_loop(daemon: Arc<Daemon>, socket_path: &std::path::Path) {
     // raw `cys restore`가 아니라 phoenix를 태워 desired_roster·묘비·회로차단기·저널을 경유한다.
     // ★B1: 이전 실행의 잔여 추출 디렉터리를 먼저 정리(크래시 cleanup 누락분 — temp 누수 0).
     prune_stale_phoenix_embed(&state_dir);
-    spawn_auto_restore(&state_dir, &daemon);
+    spawn_auto_restore(&state_dir, socket_path, &daemon);
 
     loop {
         match listener.accept().await {
@@ -361,11 +361,15 @@ enum AutoRestore {
 }
 
 /// ★W1/B3: exe_dir·current_path 를 인자로 받는 순수 함수(부수효과 없음·env 주입까지 단위 테스트 가능).
+/// ★W6/E1: socket_path 를 phoenix 에 `--socket` 으로 명시 전달 — phoenix 의 상태 디렉터리(topology/desired/저널)가
+/// 데몬 자신의 소켓에서 파생되게 한다. 프로덕션 무변경(dirname(라이브 소켓)==phoenix LIVE_STATE 로 동일 해석)이면서,
+/// 격리 상태 디렉터리 E2E(데몬 교체 시뮬레이션)에서 phoenix 가 올바른 격리 소켓/상태를 타게 하는 enabler다.
 fn decide_auto_restore(
     pack_dir: &std::path::Path,
     opted_out: bool,
     exe_dir: &std::path::Path,
     current_path: &str,
+    socket: &str,
 ) -> AutoRestore {
     if opted_out {
         return AutoRestore::OptedOut;
@@ -391,10 +395,13 @@ fn decide_auto_restore(
     // mac Resources/runtime/python/bin/python3), 없으면 "python3" 리터럴(PATH 폴백). 순정 Windows(python3 부재)·
     // mac CLT 미설치 소비자에서 첫 스폰 단절(P0-7·P1-9)을 절대경로로 끊는다. PATH 선두주입과 이중 방어.
     let python = bundled_python3(exe_dir).unwrap_or_else(|| "python3".to_string());
+    // args[0]=디스크 phoenix(폴백 후보) · 이후 `--socket <s> restore --auto`. spawn 이 args[0]을 실 실행원으로 교체.
     AutoRestore::Ready {
         program: python,
         args: vec![
             phoenix.to_string_lossy().into_owned(),
+            "--socket".to_string(),
+            socket.to_string(),
             "restore".to_string(),
             "--auto".to_string(),
         ],
@@ -425,7 +432,11 @@ fn bundled_python3(exe_dir: &std::path::Path) -> Option<String> {
 /// 데몬을 autostart하는 재귀를 차단). 대기 스레드가 자식을 reap해 좀비 잔존을 막는다.
 /// ★W1: PHOENIX_CYS·PATH 주입(§5-1 침묵사 근원 수리) · stdout/stderr 를 null 대신 phoenix-restore.log 로
 /// 캡처(P0-5 사후 진단 불가 수리) · exit 계약 처리(5·6=재시도 금지, 그 외 비0=60s 후 1회 재시도).
-fn spawn_auto_restore(state_dir: &std::path::Path, daemon: &std::sync::Arc<Daemon>) {
+fn spawn_auto_restore(
+    state_dir: &std::path::Path,
+    socket_path: &std::path::Path,
+    daemon: &std::sync::Arc<Daemon>,
+) {
     let opted_out = cys::env_compat("CYS_NO_AUTORESTORE")
         .map(|v| v == "1")
         .unwrap_or(false);
@@ -435,7 +446,8 @@ fn spawn_auto_restore(state_dir: &std::path::Path, daemon: &std::sync::Arc<Daemo
         .and_then(|p| p.parent().map(|d| d.to_path_buf()));
     let current_path = std::env::var("PATH").unwrap_or_default();
     let exe_dir_ref = exe_dir.as_deref().unwrap_or_else(|| std::path::Path::new("."));
-    match decide_auto_restore(&cys::pack::pack_dir(), opted_out, exe_dir_ref, &current_path) {
+    let socket = socket_path.to_string_lossy();
+    match decide_auto_restore(&cys::pack::pack_dir(), opted_out, exe_dir_ref, &current_path, &socket) {
         AutoRestore::OptedOut => {
             eprintln!("[cysd] auto-restore skipped (CYS_NO_AUTORESTORE=1)");
         }
@@ -1803,7 +1815,7 @@ mod auto_restore_tests {
         std::fs::create_dir_all(&bin).unwrap();
         std::fs::write(bin.join("javis_phoenix.py"), "#!/usr/bin/env python3\n").unwrap();
         assert_eq!(
-            decide_auto_restore(&dir, true, &bin, "/usr/bin:/bin"),
+            decide_auto_restore(&dir, true, &bin, "/usr/bin:/bin", "sock:test"),
             AutoRestore::OptedOut
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -1815,10 +1827,12 @@ mod auto_restore_tests {
     fn missing_disk_phoenix_still_ready_embed_authoritative() {
         let dir = std::env::temp_dir().join(format!("cys-ar-missing-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        match decide_auto_restore(&dir, false, &dir, "/usr/bin:/bin") {
+        match decide_auto_restore(&dir, false, &dir, "/usr/bin:/bin", "sock:test") {
             AutoRestore::Ready { args, .. } => {
                 assert!(args[0].ends_with("bin/javis_phoenix.py"), "폴백 후보 경로: {}", args[0]);
-                assert_eq!(&args[1..], &["restore".to_string(), "--auto".to_string()]);
+                // args = [phoenix, "--socket", <sock>, "restore", "--auto"] — W6/E1 소켓 명시 전달.
+                assert_eq!(args[1], "--socket");
+                assert_eq!(&args[3..], &["restore".to_string(), "--auto".to_string()]);
             }
             other => panic!("expected Ready, got {other:?}"),
         }
@@ -1833,11 +1847,13 @@ mod auto_restore_tests {
         std::fs::create_dir_all(&bin).unwrap();
         let ph = bin.join("javis_phoenix.py");
         std::fs::write(&ph, "#!/usr/bin/env python3\n").unwrap();
-        match decide_auto_restore(&dir, false, &bin, "/usr/bin:/bin") {
+        match decide_auto_restore(&dir, false, &bin, "/usr/bin:/bin", "sock:test") {
             AutoRestore::Ready { program, args, .. } => {
                 assert_eq!(program, "python3");
                 assert_eq!(args[0], ph.to_string_lossy());
-                assert_eq!(&args[1..], &["restore".to_string(), "--auto".to_string()]);
+                // args = [phoenix, "--socket", <sock>, "restore", "--auto"] — W6/E1 소켓 명시 전달.
+                assert_eq!(args[1], "--socket");
+                assert_eq!(&args[3..], &["restore".to_string(), "--auto".to_string()]);
             }
             other => panic!("expected Ready, got {other:?}"),
         }
@@ -1857,7 +1873,7 @@ mod auto_restore_tests {
         let cys_path = bin.join(cys_name);
         std::fs::write(&cys_path, "#!/bin/sh\n").unwrap();
         // GUI/데몬 최소 PATH 모사 — exe_dir 미포함이라 선두주입이 일어나야 한다.
-        match decide_auto_restore(&dir, false, &bin, "/usr/bin:/bin:/usr/sbin:/sbin") {
+        match decide_auto_restore(&dir, false, &bin, "/usr/bin:/bin:/usr/sbin:/sbin", "sock:test") {
             AutoRestore::Ready { env, .. } => {
                 let cys_env = env
                     .iter()
@@ -1891,7 +1907,7 @@ mod auto_restore_tests {
         let bin = dir.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
         std::fs::write(bin.join("javis_phoenix.py"), "#!/usr/bin/env python3\n").unwrap();
-        match decide_auto_restore(&dir, false, &bin, "/usr/bin:/bin") {
+        match decide_auto_restore(&dir, false, &bin, "/usr/bin:/bin", "sock:test") {
             AutoRestore::Ready { env, .. } => {
                 assert!(
                     !env.iter().any(|(k, _)| k == "PHOENIX_CYS"),
@@ -2038,7 +2054,7 @@ mod auto_restore_tests {
         let py = pybin.join("python3");
         std::fs::write(&py, "#!/bin/sh\n").unwrap();
         assert_eq!(bundled_python3(&bin).as_deref(), Some(py.to_string_lossy().as_ref()));
-        match decide_auto_restore(&dir, false, &bin, "/usr/bin:/bin") {
+        match decide_auto_restore(&dir, false, &bin, "/usr/bin:/bin", "sock:test") {
             AutoRestore::Ready { program, .. } => {
                 assert_eq!(program, py.to_string_lossy(), "동봉 python3 절대경로여야 한다");
             }
@@ -2055,7 +2071,7 @@ mod auto_restore_tests {
         std::fs::create_dir_all(&bin).unwrap();
         std::fs::write(bin.join("javis_phoenix.py"), "#!/usr/bin/env python3\n").unwrap();
         assert_eq!(bundled_python3(&bin), None);
-        match decide_auto_restore(&dir, false, &bin, "/usr/bin:/bin") {
+        match decide_auto_restore(&dir, false, &bin, "/usr/bin:/bin", "sock:test") {
             AutoRestore::Ready { program, .. } => assert_eq!(program, "python3"),
             other => panic!("expected Ready, got {other:?}"),
         }
