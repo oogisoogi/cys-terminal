@@ -116,6 +116,9 @@ async fn main() {
     let daemon = Daemon::new(socket_path.clone());
 
     governance::spawn_watchdog(Arc::clone(&daemon));
+    // ★B2-1(W3): built-in phoenix 잡을 부트 시 idempotent ensure — schedule.json 이 user-owned 로 전환돼
+    //   팩 배달로는 built-in 잡을 갱신할 수 없으므로 코드가 upsert 한다(부재 생성·구버전 갱신·중복 0). 스케줄러 기동 전.
+    schedule::ensure_builtin_jobs();
     schedule::spawn_scheduler(Arc::clone(&daemon));
     usage::spawn_usage_collector(Arc::clone(&daemon));
     usage::spawn_agy_collector(Arc::clone(&daemon));

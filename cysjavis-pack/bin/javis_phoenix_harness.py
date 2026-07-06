@@ -118,13 +118,19 @@ def log(msg):
 
 
 def guard_isolation():
-    """격리 경로가 라이브 상태 디렉터리와 겹치지 않는지 하드 가드 — 겹치면 즉시 중단."""
+    """격리 경로가 라이브 상태 디렉터리와 겹치지 않는지 하드 가드 — 겹치면 즉시 중단.
+    ★C5/P1-10(W3): 라이브 상태/소켓을 타깃하는 것은 **CYS_PHOENIX_ALLOW_LIVE=1 명시 opt-in** 이 있을 때만
+    허용한다(없으면 LIVE write 거부). 하네스는 격리가 기본이며, 라이브 접촉은 사고가 아니라 의도된 예외여야 한다."""
     hd = os.path.realpath(HARN_DIR)
     ls = os.path.realpath(LIVE_STATE)
-    if hd == ls or hd.startswith(ls + os.sep) or ls.startswith(hd + os.sep):
-        die("격리 디렉터리(%s)가 라이브 상태(%s)와 겹친다 — 실행 거부." % (hd, ls))
-    if os.path.realpath(HARN_SOCK) == os.path.realpath(LIVE_SOCK):
-        die("격리 소켓이 라이브 소켓과 동일 — 실행 거부.")
+    allow_live = os.environ.get("CYS_PHOENIX_ALLOW_LIVE") == "1"
+    overlap = hd == ls or hd.startswith(ls + os.sep) or ls.startswith(hd + os.sep)
+    sock_same = os.path.realpath(HARN_SOCK) == os.path.realpath(LIVE_SOCK)
+    if overlap or sock_same:
+        if not allow_live:
+            die("★C5/P1-10: 하네스가 라이브 상태(%s)/소켓을 타깃 — CYS_PHOENIX_ALLOW_LIVE=1 명시 opt-in "
+                "없으면 LIVE write 거부(격리가 기본)." % ls)
+        log("★C5 경고: CYS_PHOENIX_ALLOW_LIVE=1 — 하네스의 라이브 상태 쓰기 허용(명시 opt-in·위험 작업).")
 
 
 def _daemon_env():

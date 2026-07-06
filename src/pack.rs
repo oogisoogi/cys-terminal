@@ -336,6 +336,10 @@ pub(crate) fn is_user_owned(rel: &str) -> bool {
         || rel.ends_with("/soul.md")
         || rel == "CLAUDE.md"
         || rel.ends_with("/CLAUDE.md")
+        // ★B2-1(W3): schedule.json 은 사용자가 `cys schedule add` 로 편집하는 혼합 파일 — 팩 강제갱신이 덮으면
+        // 사용자 잡이 소실(비가역 데이터 손실)된다. user 소유로 보존하고, built-in 잡(phoenix-*)은 데몬 부트 시
+        // 코드가 idempotent ensure 한다(cysd schedule::ensure_builtin_jobs). 기본 잡 드리프트(복구 가능) < 사용자 잡 소실.
+        || rel == "schedule.json"
 }
 
 /// semver(major.minor.patch) 파싱 — version_gt 내부 parts와 동일 규칙('v' 접두 제거,
@@ -1418,16 +1422,52 @@ mod tests {
         let _ = std::fs::remove_dir_all(&td);
     }
 
+    /// ★B2-1(W3): schedule.json 은 user-owned — 팩 **강제갱신(force)** 후에도 사용자 잡이 소실되지 않는다.
+    /// (built-in phoenix 잡은 데몬 부트 ensure_builtin_jobs 가 별도로 upsert — 이 테스트는 사용자 잡 보존만 검증.)
+    #[test]
+    fn install_force_preserves_user_schedule_jobs() {
+        let _g = PACK_ENV_LOCK.lock().unwrap();
+        let saved = std::env::var(ENV_PACK_DIR).ok();
+        let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
+        let td = std::env::temp_dir().join(format!("cys-sched-owner-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        std::env::set_var(ENV_PACK_DIR, &td);
+        std::env::set_var(ENV_CONFIG_DIR, td.join("cysclaude"));
+        std::fs::create_dir_all(&td).unwrap();
+
+        // 사용자가 `cys schedule add` 로 넣은 잡이 담긴 schedule.json(임베드와 상이).
+        let user_schedule = r#"{"jobs":[{"id":"my-daily-brief","every_minutes":1440,"action":"push","to":"master","text":"USER JOB"}]}"#;
+        std::fs::write(td.join("schedule.json"), user_schedule).unwrap();
+
+        // force=true 강제갱신 — user-owned schedule.json 은 보존돼야 한다.
+        install(true).expect("install(force) 실패");
+        let after = std::fs::read_to_string(td.join("schedule.json")).unwrap();
+
+        match saved {
+            Some(v) => std::env::set_var(ENV_PACK_DIR, v),
+            None => std::env::remove_var(ENV_PACK_DIR),
+        }
+        match saved_cfg {
+            Some(v) => std::env::set_var(ENV_CONFIG_DIR, v),
+            None => std::env::remove_var(ENV_CONFIG_DIR),
+        }
+        assert!(
+            after.contains("my-daily-brief") && after.contains("USER JOB"),
+            "강제갱신이 사용자 schedule.json 잡을 소실시켰다 — B2-1 위반. after={after}"
+        );
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
     /// ★B2 분류 순수 함수: user 화이트리스트(디렉티브·헌법·CLAUDE.md)만 preserve, 나머지=system.
     #[test]
     fn is_user_owned_classification() {
         for u in ["soul.md", "directives/MASTER_DIRECTIVE.md", "CLAUDE.md",
-                  "sub/dir/CSO_DIRECTIVE.md", "some/soul.md"] {
+                  "sub/dir/CSO_DIRECTIVE.md", "some/soul.md", "schedule.json"] {
             assert!(is_user_owned(u), "user 여야: {u}");
         }
         for s in ["bin/javis_phoenix.py", "hooks/session_start.sh", "README.md",
                   "acl.json", "CLAUDE.md.template", "skills/x/SKILL.md",
-                  "directives/CEO_TEMPLATE.md"] {
+                  "directives/CEO_TEMPLATE.md", "sub/schedule.json"] {
             assert!(!is_user_owned(s), "system 여야: {s}");
         }
     }
