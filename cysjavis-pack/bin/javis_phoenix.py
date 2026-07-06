@@ -832,7 +832,42 @@ def _is_ephemeral_role(role, entry=None):
     return _ephemeral_verdict(role, entry) == "ephemeral"
 
 
+def _acquire_roster_lock(socket, tag="roster", tries=40, sleep=0.05):
+    """★P1-7(W3): desired/dept read-modify-write 직렬화 lock(restore lease 와 동형 flock). reconcile·roster·
+    inherit·restore 가 동시에 desired/dept 를 RMW 하면 lost update(방금 병합한 역할이 다른 writer 에 덮임)가
+    난다 — `<phoenix_home>/<tag>.lock` 에 flock(LOCK_EX|NB) 을 tries×sleep 동안 재시도해 직렬화한다. 끝내 못
+    잡으면 fail-open(핸들 보유·경고) — 무한 블록/행 금지·가용성 우선(Windows msvcrt 는 W5). 반환 handle|None."""
+    try:
+        p = os.path.join(phoenix_home(socket), "%s.lock" % tag)
+        f = open(p, "w")
+    except Exception:
+        return None
+    if IS_WINDOWS:
+        return f  # msvcrt 직렬화는 W5 — 여기선 핸들 보유만(fail-open)
+    try:
+        import fcntl
+    except Exception:
+        return f  # fcntl 미가용 → fail-open
+    for _ in range(max(1, tries)):
+        try:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return f
+        except OSError:
+            time.sleep(sleep)
+    log("★P1-7: roster RMW lock(%s) 확보 실패(경합 지속) — fail-open 진행(가용성)." % tag)
+    return f  # 못 잡아도 핸들 보유(fail-open·무한 블록 금지)
+
+
 def observe_and_persist_roster(socket, rebase=False):
+    """desired 로스터 관측·영속의 공개 진입점. ★P1-7(W3): RMW 를 roster.lock flock 으로 직렬화(lost update 차단)."""
+    _lock = _acquire_roster_lock(socket, "roster")
+    try:
+        return _observe_and_persist_roster_locked(socket, rebase)
+    finally:
+        _release_lease(_lock)
+
+
+def _observe_and_persist_roster_locked(socket, rebase=False):
     """현재 관측(topology + 세대 스냅샷)을 desired 로스터에 영속하고 (roster, tombstones) 반환.
     ★C3(W3): rebase=True 면 '설명-가능-축소 불변식'을 1회 우회해 현재 관측을 강제 수용한다(운영자 `phoenix
     roster --rebase` 전용 — 정당한 축소로 판단한 사람이 교착을 푸는 경로).
@@ -1021,7 +1056,16 @@ def load_dept_roster(socket):
 
 def observe_and_persist_depts(socket):
     """발견된 부서를 dept_roster 에 단조 병합·영속(침식 면역). (roster, tombstones) 반환.
-    ★phoenix 소유 dept_roster.json 에만 쓴다 — 실 depts.json 무접촉. tombstone 된 부서는 제외(의도적 폐역)."""
+    ★phoenix 소유 dept_roster.json 에만 쓴다 — 실 depts.json 무접촉. tombstone 된 부서는 제외(의도적 폐역).
+    ★P1-7(W3): dept RMW 도 dept.lock flock 으로 직렬화(lost update 차단·role 경로와 대칭)."""
+    _lock = _acquire_roster_lock(socket, "dept")
+    try:
+        return _observe_and_persist_depts_locked(socket)
+    finally:
+        _release_lease(_lock)
+
+
+def _observe_and_persist_depts_locked(socket):
     roster, tombstones = load_dept_roster(socket)
     for dept, info in discover_depts().items():
         cur = roster.get(dept, {})
@@ -1101,8 +1145,15 @@ def load_journal(socket, ticket_id):
     if os.path.exists(p):
         try:
             return json.load(open(p))
-        except Exception:
-            pass
+        except Exception as _e:
+            # ★C2 2단계 보조상태(W3): 저널은 retention-critical 이 아니다(단계 진행 캐시 — 소실 시 재수행). 손상 시
+            #   hard-fail 하지 않고 격리(.corrupt-<ts>·최근3)+경고 후 fresh 로 시작한다. 단 '침묵 삼킴'(try:pass)은
+            #   금지 — 재개가 불가능해졌음을 log/EVT 로 가시화(gemini W1-gate3: resolve 저널 침묵 제거).
+            isolated = _isolate_corrupt(p)
+            log("★C2 보조상태: journal(%s) 손상 — 격리(%s) 후 fresh 시작(단계 재수행). 침묵 아님."
+                % (ticket_id, isolated))
+            _emit_evt("agent.error", agent="phoenix",
+                      summary="phoenix journal(%s) 손상 — fresh 재시작(단계 진행 소실)" % ticket_id)
     return {"ticket_id": ticket_id, "roles": {}, "events": [], "created": _now()}
 
 
@@ -2358,7 +2409,11 @@ def load_deploy_journal(socket, ticket):
         try:
             return json.load(open(p))
         except Exception:
-            pass
+            # ★C2 2단계 보조상태(W3): deploy 저널도 재개 캐시(비 retention) — 손상 시 격리+경고 후 fresh.
+            isolated = _isolate_corrupt(p)
+            log("★C2 보조상태: deploy journal(%s) 손상 — 격리(%s) 후 fresh 시작." % (ticket, isolated))
+            _emit_evt("agent.error", agent="phoenix",
+                      summary="phoenix deploy journal(%s) 손상 — fresh 재시작" % ticket)
     return {"ticket": ticket, "stages": {}, "events": [], "created": _now()}
 
 

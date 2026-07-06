@@ -363,6 +363,61 @@ def deploy_nested_lease(td):
           "verdict=%s" % res2.get("phoenix_restore"))
 
 
+# ─────────────────────────── P1-7 RMW flock · 보조상태 journal 손상 ───────────────────────────
+
+def p17_rmw_lock(td):
+    """desired/dept RMW 직렬화 lock(roster.lock) — 보유 중 외부 NB 실패·해제 후 성공·observe 후 자동 해제."""
+    if m.IS_WINDOWS:
+        check("P1-7 (Windows msvcrt=W5·skip)", True)
+        return
+    import fcntl
+    sock, home = _ph_home(td, "p17")
+    p = os.path.join(home, "roster.lock")
+    h = m._acquire_roster_lock(sock, "roster")
+    check("P1-7 lock 확보", h is not None)
+    f2 = open(p, "w"); held = False
+    try:
+        fcntl.flock(f2.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        held = True
+    f2.close()
+    check("P1-7 보유 중 외부 NB 실패(직렬화)", held)
+    m._release_lease(h)
+    f3 = open(p, "w"); reok = False
+    try:
+        fcntl.flock(f3.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB); reok = True
+    except OSError:
+        pass
+    f3.close()
+    check("P1-7 해제 후 재획득 성공", reok)
+    # observe_and_persist_roster 는 RMW 후 lock 을 해제한다
+    m.CYS = os.path.join(td, "nonexistent-cys")
+    _write(os.path.join(home, "desired_roster.json"), {"roster": {}, "tombstones": []})
+    m.observe_and_persist_roster(sock)
+    f4 = open(p, "w"); freed = False
+    try:
+        fcntl.flock(f4.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB); freed = True
+    except OSError:
+        pass
+    f4.close()
+    check("P1-7 observe 후 lock 자동 해제", freed)
+
+
+def aux_journal_corrupt(td):
+    """보조상태 journal 손상 → hard-fail 아님: fresh dict 반환(크래시 없음) + 격리(.corrupt·침묵 아님)."""
+    sock, home = _ph_home(td, "jrnl")
+    jp = m.journal_path(sock, "t1")
+    _write(jp, "{ corrupt journal ]]]")
+    try:
+        j = m.load_journal(sock, "t1")
+        ok = isinstance(j, dict) and j.get("roles") == {} and j.get("events") == []
+    except Exception as e:
+        ok = False; j = "EXC:%s" % e
+    check("aux.journal 손상 → fresh dict(크래시 없음)", ok, "%s" % j)
+    corr = [f for f in os.listdir(home) if f.startswith(os.path.basename(jp) + ".corrupt-")]
+    check("aux.journal 손상 격리(.corrupt·침묵 아님)", len(corr) >= 1, "%s" % corr)
+
+
 def main():
     td = tempfile.mkdtemp(prefix="phoenix-w3-")
     try:
@@ -380,6 +435,8 @@ def main():
         c5_liveness_fallback_to_list(td)
         c5_readiness_structured_ack(td)
         c5_harness_allow_live_gate()
+        p17_rmw_lock(td)
+        aux_journal_corrupt(td)
         deploy_nested_lease(td)
     finally:
         shutil.rmtree(td, ignore_errors=True)
