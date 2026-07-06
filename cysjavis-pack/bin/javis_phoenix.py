@@ -132,6 +132,9 @@ POISON_FRESH_FALLBACK = os.environ.get("PHOENIX_POISON_FRESH_FALLBACK", "1") != 
 
 CYS = None  # lazy resolve
 
+# ★phoenix protocol version — Rust cys::pack::PHOENIX_PROTOCOL_VERSION 과 동기(identity 3중 대조·B1 self-test 표기).
+PHOENIX_PROTOCOL_VERSION = "1"
+
 
 # ------------------------------------------------------------------ 기반 유틸
 
@@ -2297,6 +2300,13 @@ def cmd_deploy(args):
 
 def main():
     global CYS
+    # ★B1 self-test(임베드 추출 직후 cysd 가 호출): 추출된 phoenix 가 실행가능한지만 확인한다 — 데몬·cys 해석·
+    #   상태파일 무접촉. argparse(서브커맨드 required)·_resolve_cys 이전에 조기 종료해 순수 실행성만 검증.
+    #   설계 §2 B1③ 수용조건. --pack-version 은 별칭(설계 표기 정합).
+    if "--selftest" in sys.argv or "--pack-version" in sys.argv:
+        sys.stdout.write("phoenix selftest ok (proto=%s)\n" % PHOENIX_PROTOCOL_VERSION)
+        sys.stdout.flush()
+        sys.exit(0)
     # ★Windows 패리티(S1~S5): 재부팅 자동기동 토대는 mac=launchd·win=schtasks 로 플랫폼 디스패치하고, 경로/소켓은
     # named pipe→state_dir 매핑으로 해소한다. 과거 os.name=="nt" hard-gate 는 제거됐다 — 전 서브커맨드 Windows 동작.
     ap = argparse.ArgumentParser(description="불사조 부활 저널 상태머신 MVP (M1 게이트)")
