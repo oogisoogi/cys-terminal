@@ -1123,6 +1123,9 @@ async fn agy_quota_probe(port: u16) -> Option<Vec<RateWindow>> {
             "connect-protocol-version: 1",
             "--data",
             "{}",
+            // R-CLI-3(부차): URL이 고정 localhost(포트 숫자)라 실위험은 없으나 동형 패턴 방어심층 —
+            // `--` 옵션 종결자로 URL을 위치 인자로 강제한다.
+            "--",
             &url,
         ])
         .output();

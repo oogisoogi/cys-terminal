@@ -3241,14 +3241,26 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 _ => Vec::new(),
             };
             let prefix: Vec<String> = prefix.into_iter().filter(|t| !t.is_empty()).collect();
-            if prefix.is_empty() {
+            // R-GOV-1: 최소 2토큰 강제 — 단일 토큰(git·bash 등) 광역 prefix는 넓은 명령군을 자동
+            // 통과시키므로 거부(비어있음 폴백 차단 + 광역 단일토큰 차단). 서명 후 위조불가라 생성
+            // 게이트가 광역 승인 발급을 원천 봉인한다.
+            if prefix.len() < 2 {
                 return Reply::Single(err_response(
                     &id,
                     "invalid_params",
-                    "command_prefix must be a non-empty array (폴백 차단)",
+                    "command_prefix must have >= 2 tokens (광역 단일토큰 승인 차단; 폴백 차단)",
                 ));
             }
+            // R-GOV-3: cwd 필수 — cwd=None 레코드는 matches()에서 cwd 검사를 skip해 모든 디렉터리에
+            // 매칭(광역)되므로 승인 생성 자체를 거부한다(디렉터리 스코프 강제).
             let cwd = crate::approval::normalize_cwd(param_str(&params, "cwd").as_deref());
+            if cwd.is_none() {
+                return Reply::Single(err_response(
+                    &id,
+                    "invalid_params",
+                    "cwd is required (광역 전-디렉터리 매칭 차단)",
+                ));
+            }
             let env = params
                 .get("env")
                 .map(crate::approval::env_from_json)

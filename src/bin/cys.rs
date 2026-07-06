@@ -2706,7 +2706,11 @@ fn run_schedule(action: ScheduleAction) -> i32 {
                 let at: Option<i64> = match &in_dur {
                     Some(d) => {
                         let secs = parse_duration_secs(d)?;
-                        Some(chrono::Local::now().timestamp() + secs as i64)
+                        // R-CLI-2: secs>i64::MAX면 `as i64`가 음수 wrap → now+음수 = 과거 발화 시각.
+                        // 안전 캐스트(초과=Err) + saturating_add(i64 오버플로 clamp)로 봉인.
+                        let secs_i64 = i64::try_from(secs)
+                            .map_err(|_| format!("--in duration too large: {secs}s"))?;
+                        Some(chrono::Local::now().timestamp().saturating_add(secs_i64))
                     }
                     None => None,
                 };
@@ -6608,9 +6612,12 @@ fn fetch_remote_pack(manifest_url: &str, base: &std::path::Path) -> Result<std::
         (format!("{base_url}/pack.tar.gz"), "pack.tar.gz"),
     ] {
         let out = dl.join(name);
+        // R-CLI-3: URL 앞에 `--`(옵션 종결자)를 둔다. manifest_url이 원격/입력 유래라 `-`로 시작하면
+        // curl 플래그로 해석되던 인자 주입을 차단(옵션 파싱 종료 후 URL을 위치 인자로 강제).
         let status = std::process::Command::new("curl")
             .args(["-fsSL", "-o"])
             .arg(&out)
+            .arg("--")
             .arg(&url)
             .status()
             .map_err(|e| format!("curl 실행 실패: {e}"))?;

@@ -175,6 +175,27 @@ fn visible_for(status: &LicenseStatus) -> Vec<&'static str> {
     }
 }
 
+/// 라이선스 바이트에서 issued_at만 추출(R-SIG-3 롤백앵커용). 서명검증과 독립한 경량 파싱 —
+/// 호출부는 서명 검증을 통과한 신 열쇠 바이트, 또는 기설치된(과거 검증 통과) 열쇠에만 적용한다.
+fn parse_issued_at(bytes: &[u8]) -> Option<i64> {
+    serde_json::from_slice::<serde_json::Value>(bytes)
+        .ok()?
+        .get("issued_at")?
+        .as_i64()
+}
+
+/// 기설치 라이선스(license.json)의 issued_at 판독(R-SIG-3 롤백앵커). 부재·읽기실패·파싱불가 =
+/// None(앵커 없음 = 롤백 비교 skip).
+fn installed_issued_at(lic_dst: &Path) -> Option<i64> {
+    parse_issued_at(&std::fs::read(lic_dst).ok()?)
+}
+
+/// R-SIG-3 롤백 판정(순수 함수·단위테스트 대상): 신 열쇠 issued_at가 기설치보다 낮으면 true(=거부).
+/// 앵커 부재(기설치 None)·신 파싱불가(None)는 false(통과) — 첫 설치·손상 파일은 롤백 비교 skip.
+fn is_rollback(new_issued: Option<i64>, installed_issued: Option<i64>) -> bool {
+    matches!((new_issued, installed_issued), (Some(n), Some(o)) if n < o)
+}
+
 /// 열쇠 설치(§7) — src(디렉터리 또는 license.json 경로)의 번들을 §4 전건 검증 후에만
 /// 원자 반영. 실패 = 기존 라이선스 무손상 + 사유 Err.
 pub fn install(src: &Path, now_unix: i64) -> Result<String, String> {
@@ -189,6 +210,19 @@ pub fn install(src: &Path, now_unix: i64) -> Result<String, String> {
     match evaluate_bytes(&lic_bytes, &sig_bytes, now_unix, &keyring, &revoked) {
         LicenseStatus::Pro { client_id, license_id, expires, key_days_left } => {
             let (lic_dst, sig_dst) = license_paths();
+            // R-SIG-3 anti-rollback 앵커: 기설치 라이선스보다 낮은 issued_at 열쇠 설치를 거부한다
+            // (서명 유효한 구 라이선스로의 다운그레이드/롤백 차단 — packsig accepted-pack replay 게이트
+            // 동형). 신 issued_at ≥ 기설치 issued_at만 허용. 기설치 부재·파싱불가는 앵커 없음으로
+            // 보고 통과시킨다(손상 파일이 재설치를 브릭하지 않게 — 롤백은 유효한 구 열쇠가 있어야 성립).
+            let new_issued = parse_issued_at(&lic_bytes);
+            let installed_issued = installed_issued_at(&lic_dst);
+            if is_rollback(new_issued, installed_issued) {
+                return Err(format!(
+                    "설치 거부 — 롤백 방지: 신 열쇠 issued_at {:?} < 기설치 {:?} \
+                     (서명 유효한 구 라이선스 강등 차단)",
+                    new_issued, installed_issued
+                ));
+            }
             if let Some(parent) = lic_dst.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| format!("디렉터리 생성 실패: {e}"))?;
             }
@@ -490,5 +524,29 @@ mod tests {
 
         std::env::remove_var("CYS_PACK_DIR");
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // R-SIG-3: 롤백 앵커 — 기설치보다 낮은 issued_at은 거부, 동일·상위·앵커부재는 통과.
+    #[test]
+    fn rollback_anchor_rejects_older_issued_at() {
+        assert!(is_rollback(Some(100), Some(200)), "구 issued_at인데 통과");
+        assert!(!is_rollback(Some(200), Some(200)), "동일 issued_at인데 거부");
+        assert!(!is_rollback(Some(300), Some(200)), "신 issued_at인데 거부");
+        assert!(!is_rollback(Some(100), None), "앵커 부재(첫 설치)인데 거부");
+        assert!(!is_rollback(None, Some(200)), "신 파싱불가인데 거부");
+
+        // 파싱·판독 경로.
+        assert_eq!(
+            parse_issued_at(&license_json("L", "pro", "K", 12345, "never")),
+            Some(12345)
+        );
+        let dir = std::env::temp_dir().join(format!("cys-lic-rb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("license.json");
+        assert_eq!(installed_issued_at(&p), None, "부재인데 Some");
+        std::fs::write(&p, license_json("L", "pro", "K", 777, "never")).unwrap();
+        assert_eq!(installed_issued_at(&p), Some(777));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
