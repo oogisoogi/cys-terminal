@@ -1496,8 +1496,29 @@ def stage_observe_session(socket, surface, stub, role=None):
     return None, last_txt.strip()[-200:]  # grace 소진·미관측 → transient(verify가 unverified 처리)
 
 
+def _surface_agent_present(socket, surface):
+    """★WP-11 각성핑 agent-gate: 대상 surface에 배정된 에이전트가 있는지 조회.
+    True=agent 배정됨(재주입 대상)·False=agent=None 빈 셸(각성 핑 skip)·None=조회불가(보수적=진행).
+    빈 zsh 셸(role=master·agent=None)에 reinject --check 핑을 쏘면 셸이 glob/pipe로 오해석해
+    zsh 에러(감사 에러①)가 난다. 실 크래시 master(agent 있던)는 계속 복구하므로 agent=None만 skip한다."""
+    try:
+        r = cys("status", "--json", socket=socket, timeout=8)
+        if r.returncode != 0:
+            return None
+        surfaces = (json.loads(r.stdout or "{}") or {}).get("surfaces", [])
+    except Exception:
+        return None
+    for s in surfaces:
+        if s.get("surface_ref") == surface or ("surface:%s" % s.get("surface_id")) == surface:
+            return s.get("agent") is not None
+    return None
+
+
 def stage_reinject(socket, role, surface, stub):
-    """디렉티브 재주입 — reinject --check 재사용(각성 핑 후 필요 시 주입)."""
+    """디렉티브 재주입 — reinject --check 재사용(각성 핑 후 필요 시 주입).
+    ★WP-11 agent-gate: agent=None 빈 셸엔 각성 핑을 쏘지 않는다(zsh 오해석 에러 차단)."""
+    if _surface_agent_present(socket, surface) is False:
+        return True, "reinject skip: agent 없음(빈 셸) — 각성 핑 미발사(WP-11 agent-gate)"
     r = cys("reinject", "--check", "--role", role, "--surface", surface, "--timeout", "6",
             socket=socket, timeout=12)
     return r.returncode == 0, "reinject rc=%s %s" % (r.returncode, (r.stdout or r.stderr or "").strip()[:120])
@@ -1506,7 +1527,10 @@ def stage_reinject(socket, role, surface, stub):
 def stage_g2_ack(socket, role, surface, stub):
     """G2 핸드셰이크 ack — 부활 노드가 원장 대조 핑에 응답하는지(M7). 응답 없으면
     타임아웃 → unverified 격하 모드로 전진(무한 보류 금지). stub은 응답자가 없으므로
-    best-effort 로 시도만 하고 결과를 저널에 남긴다."""
+    best-effort 로 시도만 하고 결과를 저널에 남긴다.
+    ★WP-11 agent-gate: agent=None 빈 셸엔 각성 핑을 쏘지 않는다(빈 셸은 ack 주체 없음)."""
+    if _surface_agent_present(socket, surface) is False:
+        return False, "g2 skip: agent 없음(빈 셸) — 각성 핑 미발사(WP-11 agent-gate)"
     r = cys("reinject", "--check", "--role", role, "--surface", surface, "--timeout", "4",
             socket=socket, timeout=10)
     acked = (r.returncode == 0) and ("각성" in (r.stdout or "") or "awake" in (r.stdout or "").lower())

@@ -34,9 +34,11 @@ import unicodedata
 # ─────────────────────────────────────────────────────────────────────────────
 SEV_POINTS = {"CRITICAL": 50, "HIGH": 25, "MEDIUM": 10, "LOW": 5}
 SEV_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
-RISK_BANDS = [(81, "CRITICAL"), (51, "HIGH"), (21, "MEDIUM"), (0, "LOW")]
+RISK_BANDS = [(81, "CRITICAL"), (51, "HIGH"), (21, "MEDIUM"), (0, "LOW")]  # 정보용 점수밴드 — verdict 비의존(P-GATE-1)
 RECOMMENDATION = {"LOW": "SAFE", "MEDIUM": "CAUTION", "HIGH": "DO_NOT_INSTALL", "CRITICAL": "DO_NOT_INSTALL"}
-VERDICT = {"SAFE": "ACCEPT", "CAUTION": "REVISE", "DO_NOT_INSTALL": "BLOCK"}
+# severity-floor verdict — 점수밴드 대신 severity 존재로 판정(P-GATE-1/2/3).
+VERDICT_RANK = {"ACCEPT": 0, "REVISE": 1, "BLOCK": 2}
+VERDICT_MIN_CONFIDENCE = 0.5  # HIGH/MEDIUM 이 값 미만은 suppression 잔여 노이즈 → verdict 미반영(정보용 표시만)
 MAX_OCC_PER_RULE = 3
 DIMINISHING = (1.0, 0.5, 0.25)
 EXEC_MULTIPLIER = 1.3
@@ -731,6 +733,30 @@ def severity_band(score):
     return "LOW"
 
 
+def verdict_from_findings(findings):
+    """severity-floor 판정 — 점수밴드 대신 severity 존재로 verdict 결정(P-GATE-1/2/3).
+    CRITICAL 은 confidence 무관 BLOCK("CRITICAL 침묵드롭 금지" — 적대내용을 LLM 이 읽음).
+    HIGH→BLOCK · MEDIUM→REVISE 는 suppression 잔여 노이즈(<VERDICT_MIN_CONFIDENCE)를 verdict 에서
+    배제(정보용으로만 표시). UNSCANNED 등 audit finding 은 스캔불가 자체가 확정 사실이므로 confidence
+    게이트를 면제한다(실행확장자=HIGH→BLOCK, 오버사이즈 비실행=MEDIUM→REVISE·ACCEPT 금지)."""
+    worst = "ACCEPT"
+    for f in findings:
+        sev = f["severity"]
+        if sev == "CRITICAL":
+            v = "BLOCK"
+        elif f.get("category") != "audit" and f.get("confidence", 0) < VERDICT_MIN_CONFIDENCE:
+            v = "ACCEPT"
+        elif sev == "HIGH":
+            v = "BLOCK"
+        elif sev == "MEDIUM":
+            v = "REVISE"
+        else:
+            v = "ACCEPT"
+        if VERDICT_RANK[v] > VERDICT_RANK[worst]:
+            worst = v
+    return worst
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 9. 스캔 오케스트레이션
 # ─────────────────────────────────────────────────────────────────────────────
@@ -751,10 +777,16 @@ def scan_skill(root):
             skip_reason = "eval-dataset"
         if skip_reason:
             # fail-closed(defensive §3): 스킵된 파일을 조용히 통과시키지 않는다 — finding으로 가시화.
-            #   실행 확장자면 MEDIUM(스캔 안 된 코드는 ACCEPT 불가), 그 외 LOW. 적대검증 R-correctness.
-            sev = "HIGH" if is_executable_ext(ap) else "LOW"  # 스캔 안 된 실행파일=최소 REVISE 강제
+            #   실행확장자=HIGH(→BLOCK). 비실행이라도 오버사이즈·판독불가는 은닉 페이로드 위험 →
+            #   MEDIUM(→REVISE·ACCEPT 금지, item2·P-GATE-2). 그 외 비실행(binary·eval)은 LOW.
+            if is_executable_ext(ap):
+                sev, conf = "HIGH", 0.85
+            elif content is None:  # 오버사이즈·판독불가 — 스캔 우회로 페이로드 은닉 가능
+                sev, conf = "MEDIUM", 0.5
+            else:                  # binary·eval-dataset — 양성 가정 유지
+                sev, conf = "LOW", 0.4
             raw.append({"rule_id": "UNSCANNED", "message": "스캔 안 됨(%s)" % skip_reason,
-                        "severity": sev, "confidence": 0.85 if sev == "HIGH" else 0.4,
+                        "severity": sev, "confidence": conf,
                         "category": "audit", "file": rel, "start_line": 1,
                         "matched_text": skip_reason, "context": skip_reason})
             continue
@@ -771,25 +803,35 @@ def scan_skill(root):
         raw.extend(scan_ko(content, rel))
         # 행위·taint·능력 (.py)
         if ftype == "python":
-            raw.extend(scan_ast(content, rel))
-            raw.extend(scan_taint(content, rel))
+            try:
+                ast.parse(content)
+            except SyntaxError:
+                # item3: 조용한 스킵 금지 — 파싱불가 코드를 UNSCANNED audit 로 승격(.py=실행확장자=HIGH→BLOCK).
+                #   AST/taint 가 못 읽은 코드를 clean 으로 통과시키지 않는다(P-GATE-3).
+                raw.append({"rule_id": "UNSCANNED", "message": "스캔 안 됨(syntax-error)",
+                            "severity": "HIGH", "confidence": 0.85, "category": "audit",
+                            "file": rel, "start_line": 1,
+                            "matched_text": "syntax-error", "context": "syntax-error"})
+            else:
+                raw.extend(scan_ast(content, rel))
+                raw.extend(scan_taint(content, rel))
         if is_executable_ext(ap):
             file_caps[rel] = detect_capabilities(content)
     raw.extend(scan_mcp_least_privilege(manifest, file_caps, has_exec))
 
     for_score = deduplicate(raw)
-    score = compute_score(for_score, has_exec)
-    band = severity_band(score)
-    rec = RECOMMENDATION[band]
-    verdict = VERDICT[rec]
+    score = compute_score(for_score, has_exec)  # 정보용 점수(verdict 비의존)
+    band = severity_band(score)                 # 정보용 severity band
+    rec = RECOMMENDATION[band]                   # 정보용 recommendation
+    verdict = verdict_from_findings(for_score)   # item1: severity-floor 판정(점수밴드 제거·P-GATE-1)
     return {
         "skill": os.path.basename(os.path.abspath(root)),
         "source": root, "verdict": verdict, "severity": band, "recommendation": rec,
         "has_executable_scripts": has_exec,
         "findings": sorted(raw, key=lambda f: (SEV_ORDER.get(f["severity"], 3), f["file"], f["start_line"])),
     }
-    # ★score는 verdict 산출에만 쓰고 반환·영속하지 않는다(no-score 불변 — REVIEWER_VERDICT §1,
-    #   적대검증 R-fit: _internal_score 누출 차단). enum verdict만 외부 노출.
+    # ★score/band 는 정보용으로만 산출하고 반환·영속하지 않는다(no-score 불변 — REVIEWER_VERDICT §1).
+    #   verdict 는 severity-floor 로 결정하며 점수밴드에 의존하지 않는다(P-GATE-1 fail-open 봉인).
 
 
 def exit_for(verdict):

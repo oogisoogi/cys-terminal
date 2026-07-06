@@ -57,9 +57,18 @@ if [ "${1:-}" = "--self-test" ]; then
 else
   CAPGATE_INPUT="$(cat)" || { echo "role-capability-gate: cannot read stdin" >&2; exit 0; }
   export CAPGATE_INPUT
-  # 자기 surface 역할 조회(cysd 권위). 실패 시 빈 문자열 → '무역할'로 통과.
+  # 자기 surface 역할 조회(cysd 권위). 실패 시 빈 문자열 → '무역할'로 통과(사람/일반 셸 과차단 방지).
+  # 단, 과거 reviewer/planner로 *확인된* surface는 캐시 → 조회 실패 시 캐시로 fail-closed:
+  # 리뷰어가 신원조회를 실패시켜 gate를 우회(pass)하는 경로를 봉인한다(오탐 없이 known-reviewer만).
+  CAPGATE_CACHE="${TMPDIR:-/tmp}/cys-capgate-role-${CYS_SURFACE_ID:-none}"
   if [ -z "${CYS_SURFACE_ROLE:-}" ] && command -v cys >/dev/null 2>&1; then
     CYS_SURFACE_ROLE="$(cys surface-role 2>/dev/null | head -n1)"
+    if [ -n "${CYS_SURFACE_ID:-}" ]; then
+      case "$CYS_SURFACE_ROLE" in
+        reviewer*|planner|planner-*) printf '%s\n' "$CYS_SURFACE_ROLE" > "$CAPGATE_CACHE" 2>/dev/null ;;
+        "") [ -f "$CAPGATE_CACHE" ] && CYS_SURFACE_ROLE="$(head -n1 "$CAPGATE_CACHE" 2>/dev/null)" ;;
+      esac
+    fi
   fi
   export CYS_SURFACE_ROLE
 fi

@@ -613,3 +613,23 @@ body.cc-glance #cc-view-tasks .cc-task-meta { font-size: 13px; }
 body.cc-glance #cc-view-feed .fi-title { font-size: 18px; }
 body.cc-glance #cc-view-feed .fi-body { font-size: 15px; }
 body.cc-glance #cc-view-feed .feed-item button { font-size: 16px; padding: 10px 0; }
+
+/* ── WP-10: 부서 제작 중 진행 표시 ── (탭 스피너 글리프 + 빈 pane 중앙 스피너·안내)
+   '＋부서' 클릭 후 부서 데몬 준비(~12초) 동안 멈춘 줄 오해를 막는다. 기존 --accent/--border 팔레트와
+   cc-sweep(회전) 키프레임을 재사용. prefers-reduced-motion 에선 회전 정지·정적 링+문구로 진행 전달. */
+.ws-tab-spinner {
+  display: inline-block; width: 9px; height: 9px; margin-right: 5px; vertical-align: -1px;
+  border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%;
+  animation: cc-sweep 0.8s linear infinite;
+}
+.dept-pending { display: flex; align-items: center; justify-content: center; height: 100%; background: var(--bg); }
+.dept-pending-box { text-align: center; color: var(--canvas-text); padding: 24px; }
+.dept-spinner {
+  width: 30px; height: 30px; margin: 0 auto 14px;
+  border: 3px solid var(--border); border-top-color: var(--accent); border-radius: 50%;
+  animation: cc-sweep 0.9s linear infinite;
+}
+.dept-pending-msg { font-size: 13px; opacity: 0.8; }
+@media (prefers-reduced-motion: reduce) {
+  .ws-tab-spinner, .dept-spinner { animation: none; border-top-color: var(--accent); }
+}

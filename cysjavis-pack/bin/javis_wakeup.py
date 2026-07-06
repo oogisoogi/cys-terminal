@@ -112,7 +112,11 @@ def _target_alive(target):
         return "unknown"
     try:
         out = subprocess.run([cys, "list"], capture_output=True, text=True, timeout=10).stdout
-        return "alive" if target in out else "dead"
+        # ★WP-8(P-ORCH-4): 부분일치 금지 — target을 식별자 경계로 정확일치. 'worker'가
+        #   'worker-2'·'coworker' 안에 부분매칭돼 죽은/다른 노드를 alive로 오판하던 경로 차단.
+        #   경계 = 앞뒤로 식별자문자([A-Za-z0-9._-])가 아닌 곳(공백·줄·구분자).
+        pat = re.compile(r"(?<![A-Za-z0-9._-])%s(?![A-Za-z0-9._-])" % re.escape(target))
+        return "alive" if pat.search(out) else "dead"
     except (subprocess.SubprocessError, OSError):
         return "unknown"
 

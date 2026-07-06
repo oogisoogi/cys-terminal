@@ -47,12 +47,25 @@ def scrub(text):
     return (t if n else text), n
 
 
+# 민감 키 이름 — 값이 고신뢰 패턴에 안 걸려도(불투명 토큰) 키가 민감하면 값 전체를 마스킹한다.
+# 키워드 집합은 위 _SECRET_PATTERNS의 key=value 계층과 동일 — 'task_key'·'idempotency_key' 등
+# 정상 원장 키는 'api...key' 접두가 없어 미매칭(원장 오탐 0 원칙 유지).
+_SECRET_KEY_RE = re.compile(r"(?i)(api[_-]?key|secret|token|passwd|password|비밀번호|암호)")
+
+
 def scrub_obj(obj):
-    """dict/list/str 재귀 마스킹 — str 값만 교체, 키·구조·비문자열 보존."""
+    """dict/list/str 재귀 마스킹 — str 값만 교체, 키·구조·비문자열 보존.
+    ★WP-8(P-UTIL-1): 키 이름이 민감(_SECRET_KEY_RE)하면 값이 패턴에 안 걸려도 전체 마스킹."""
     if isinstance(obj, str):
         return scrub(obj)[0]
     if isinstance(obj, dict):
-        return {k: scrub_obj(v) for k, v in obj.items()}
+        out = {}
+        for k, v in obj.items():
+            if isinstance(v, str) and _SECRET_KEY_RE.search(str(k)):
+                out[k] = MASK.strip()  # 민감키의 문자열 값은 내용 무관 마스킹(불투명 토큰 차단)
+            else:
+                out[k] = scrub_obj(v)
+        return out
     if isinstance(obj, list):
         return [scrub_obj(v) for v in obj]
     return obj

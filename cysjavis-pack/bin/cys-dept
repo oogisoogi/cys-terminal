@@ -12,9 +12,9 @@
 set -euo pipefail
 
 # ★PATH 보강(GUI Finder/Dock 런칭 대응): cys.app은 launchd 기본 PATH(/usr/bin:/bin:/usr/sbin:/sbin)만
-# 상속해 cys(/opt/homebrew/bin)·claude(~/.local/bin)를 못 찾는다 → 부서장 각성 시 javis_boot_node 의
-# `cys status` 실패·dept cysd 의 claude spawn 실패 = 0 pane. 이 도구가 spawn 하는 모든 자식(cysd·
-# python3 javis_boot_node·그 아래 claude)이 상속하도록 단일 지점에서 로그인 셸 표준 경로를 prepend.
+# 상속해 cys(/opt/homebrew/bin)·claude(~/.local/bin)를 못 찾는다 → 빈 셸의 `cys status`·사용자의 claude
+# 수동 실행 실패·dept cysd 의 claude spawn 실패 = 0 pane. 이 도구가 spawn 하는 모든 자식(cysd·빈 셸·
+# 그 아래 사용자가 실행하는 claude)이 상속하도록 단일 지점에서 로그인 셸 표준 경로를 prepend.
 export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin${PATH:+:$PATH}"
 
 REG="${CYS_DEPTS_JSON:-$HOME/.cys/depts.json}"
@@ -303,6 +303,29 @@ print("IDLE")
 PY
 }
 
+# ★WP-12: 기본 데몬(cys 기본 소켓) role=master 원본 세션에 현재 MASTER_DIRECTIVE.md 를 라이브 재주입.
+#   파일 교체(MASTER↔CEO)만으로는 이미 실행 중인 원본 master 컨텍스트가 안 바뀐다(감사 에러②) →
+#   승격/강등 직후 원본 master 1개(부서 소켓 아님)에 재주입해 라이브 반영한다. env -u CYS_SOCKET 로
+#   상속된 부서 소켓을 지우고 cys 기본 소켓(원본 master)만 대상. agent 있는 실 master만 재주입하고
+#   빈 셸(agent=None)·조회불가는 skip(빈 zsh 오해석 각성핑 차단 — WP-11 정합). best-effort(부서 lifecycle 불파괴).
+ceo_reinject_master(){
+  local why="${1:-directive}" has_agent
+  has_agent=$(env -u CYS_SOCKET "$CYS" status --json 2>/dev/null | python3 -c '
+import json,sys
+try: d=json.load(sys.stdin)
+except Exception: sys.exit(2)
+for s in d.get("surfaces",[]):
+    if s.get("role")=="master" and not s.get("exited"):
+        print("yes" if s.get("agent") is not None else "no"); sys.exit(0)
+sys.exit(3)' 2>/dev/null) || true
+  if [ "$has_agent" = "yes" ]; then
+    env -u CYS_SOCKET "$CYS" reinject --role master >/dev/null 2>&1 \
+      && echo "[cys-dept] 원본 master 라이브 재주입($why) 완료" >&2 \
+      || echo "[cys-dept] WARN: 원본 master 라이브 재주입($why) 미확정 — read-screen 점검" >&2
+  else
+    echo "[cys-dept] 원본 master 재주입($why) skip: 실 agent 없음(빈 셸)·조회불가 — 각성핑 미발사(WP-11 정합)" >&2
+  fi
+}
 # CEO 승격: 부서가 1개 이상이면 기본 데몬을 CEO로(디렉티브 교체, 가역 백업). 부서 0이면 표준 master 보존(하위호환).
 ceo_promote(){
   local md="$PACK_DEFAULT/directives/MASTER_DIRECTIVE.md"
@@ -312,12 +335,14 @@ ceo_promote(){
   [ -f "$md.pre-ceo" ] || cp "$md" "$md.pre-ceo"
   cp "$ceo" "$md"
   echo "[cys-dept] 기본 데몬 CEO 승격(directives 교체·백업 .pre-ceo)"
+  ceo_reinject_master "CEO 승격"
 }
 ceo_demote(){
   local md="$PACK_DEFAULT/directives/MASTER_DIRECTIVE.md"
   [ -f "$md.pre-ceo" ] || return 0
   cp "$md.pre-ceo" "$md"; rm -f "$md.pre-ceo"
   echo "[cys-dept] CEO 강등(표준 master 원복)"
+  ceo_reinject_master "표준 master 복귀"
 }
 
 cmd="${1:?usage: cys-dept launch|allocate|create|down|down-sock|reap|list|sock <name> | <name> -- <cmd>}"
@@ -573,21 +598,18 @@ PY
       "$0" down "$name" >/dev/null 2>&1 || true
       exit 6
     fi
-    trap - EXIT   # 격리 확정 — 이후 각성/미션
-    # ★더블master guard(부트↔수동선언 경합 좀비 방지): 이미 live master surface가 있으면 재각성·미션주입 생략(멱등).
+    trap - EXIT   # 격리 확정 — 이후 빈 셸 생성
+    # ★WP-11(오너 2026-06-29 결정 일원화): create도 allocate와 동일하게 role=master '빈 셸'만 띄운다.
+    #   자동 각성(부트 노드)+미션 자동주입(send --to master)을 폐지 — 사용자가 그 셸에서 직접 claude 를
+    #   실행해 부서장으로 연결하고, 부서장이 미션 파일($MISS/$key.md)을 스스로 읽는다. 빈 셸(agent=None)엔
+    #   phoenix 각성핑도 미발사(stage_reinject agent-gate) → 빈 zsh 오해석 에러 0. 계정격리·미션파일은 보존.
+    # ★더블master guard(부트↔수동선언 경합 좀비 방지): 이미 live master surface가 있으면 셸 생성 생략(멱등).
     if dept_has_master "$sock"; then
-      echo "[cys-dept] $name 이미 live master surface 존재 — 재각성·미션주입 생략(멱등 더블master 방지)" >&2
-    # ★부서장 자동 각성(verdict B: 부서 소켓 컨텍스트) — 미션은 ★boot 성공 시에만(codex: boot 실패 후 주입 금지)
-    elif CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" CYS_ACCOUNT_DIR="$acctdir" \
-         python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_boot_node.py" \
-           --role master --agent claude --cwd "$cwd" 1>&2; then
-      if [ -f "$MISS/$key.md" ]; then
-        CYS_SOCKET="$sock" "$CYS" send --queued --to master "$(cat "$MISS/$key.md")" 1>&2 || true
-      else
-        echo "[cys-dept] WARN: 미션 파일 없음 $MISS/$key.md — 미션 미주입" >&2
-      fi
+      echo "[cys-dept] $name 이미 live master surface 존재 — 셸 생성 생략(멱등 더블master 방지)" >&2
+    elif CYS_SOCKET="$sock" "$CYS" new-surface --socket "$sock" --role master --cwd "$cwd" >/dev/null 2>&1; then
+      echo "[cys-dept] $name role=master 빈 셸 생성 완료 — 사용자가 직접 claude 연결 (미션 파일: $MISS/$key.md)" >&2
     else
-      echo "[cys-dept] WARN: $name 부서장 각성 미확정 — 미션 주입 보류·read-screen 점검" >&2
+      echo "[cys-dept] WARN: $name 셸 생성 실패 — read-screen 점검(데몬·격리는 정상)" >&2
     fi
     echo "[cys-dept] create '$disp'($name) 완료 (account=$acctkey sock=$sock)" >&2
     echo "$name"   # stdout 마지막 = 확정 name(Tauri 파싱)

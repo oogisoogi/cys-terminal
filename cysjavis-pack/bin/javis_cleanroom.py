@@ -79,14 +79,24 @@ def walk_vendored(src_dir):
     return sorted(out)
 
 
+class ManifestError(Exception):
+    """매니페스트가 존재하나 파싱 불가 — 부재(None)와 구분해 fail-closed 신호로 쓴다(P-GATE-4/5)."""
+
+
 def load_manifest(skills_dir):
     p = os.path.join(skills_dir, VENDOR_MANIFEST_NAME)
     if not os.path.isfile(p):
-        return None
+        return None  # 부재 = 미착수(정상 skip) — 이때만 None.
     try:
-        return json.load(open(p, encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
+        with open(p, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        # ★WP-8(P-GATE-4/5): 존재하나 파싱 실패 = 손상/변조. 부재로 위장(skip→pass)하면
+        #   매니페스트를 깨는 것만으로 벤더 드리프트·라이선스 게이트가 뚫린다 → fail-closed.
+        raise ManifestError("%s 파싱 실패: %s" % (p, e))
+    if not isinstance(data, dict):
+        raise ManifestError("%s 최상위가 객체(dict) 아님" % p)
+    return data
 
 
 def classify_vendor(manifest, skills_dir):
@@ -195,7 +205,13 @@ def license_verdict(cls):
 
 
 def cmd_vendor_check(skills_dir):
-    m = load_manifest(skills_dir)
+    try:
+        m = load_manifest(skills_dir)
+    except ManifestError as e:
+        # ★WP-8(P-GATE-4): 손상 매니페스트는 통과(skip) 금지 — BLOCK.
+        print(json.dumps({"ok": False, "verdict": "BLOCK", "error": "manifest-parse-fail",
+                          "note": str(e)}, ensure_ascii=False))
+        return 1
     if m is None:
         print(json.dumps({"ok": True, "skip": "no-manifest",
                           "note": "%s 부재 — vendor-snapshot 으로 baseline 생성 필요"
@@ -213,7 +229,12 @@ def cmd_vendor_snapshot(skills_dir):
         sys.stderr.write("[CLEANROOM] baseline 갱신 = 변조 정상승인 = 오너/owner 승인 필요"
                          "(denylist ②). CYS_VENDOR_SNAPSHOT_OWNER_APPROVED=1 후 재실행.\n")
         return 3
-    m = load_manifest(skills_dir)
+    try:
+        m = load_manifest(skills_dir)
+    except ManifestError as e:
+        # ★WP-8(P-GATE-4/5): 손상 매니페스트 위에 snapshot 하면 훼손을 baseline으로 굳힌다 → 거부.
+        print(json.dumps({"error": "manifest-parse-fail", "note": str(e)}, ensure_ascii=False))
+        return 1
     if m is None:
         print(json.dumps({"error": "no-manifest", "note":
                           "최초 manifest 골격을 먼저 만들어라(sources[].id/spdx/embed)"},
@@ -230,7 +251,13 @@ def cmd_vendor_snapshot(skills_dir):
 
 
 def cmd_license_check(skills_dir):
-    m = load_manifest(skills_dir)
+    try:
+        m = load_manifest(skills_dir)
+    except ManifestError as e:
+        # ★WP-8(P-GATE-5): 손상 매니페스트는 라이선스 게이트 통과 금지 — BLOCK.
+        print(json.dumps({"ok": False, "verdict": "BLOCK", "error": "manifest-parse-fail",
+                          "note": str(e)}, ensure_ascii=False))
+        return 1
     if m is None:
         print(json.dumps({"ok": True, "skip": "no-manifest"}, ensure_ascii=False))
         return 0

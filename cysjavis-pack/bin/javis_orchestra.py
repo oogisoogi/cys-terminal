@@ -966,10 +966,22 @@ def render_catalog():
     return "\n".join(lines)
 
 
+# ★WP-8(P-ORCH-5): 'block'을 부분문자열로 잡던 REJECT 게이트가 'unblocked'(정상어 — task
+#   done 시 unblocked 의존자 보고 문맥)를 만나 승인 verdict를 오반려했다. 정상어는 화이트리스트로
+#   먼저 지우고, 'block'은 단어 시작 경계(\bblock)로 검사해 'blocked'/'blockers'는 유지하되
+#   'unblocked'/'roadblock' 등 선행결합어는 제외한다. 나머지 마커는 기존 부분문자열 매칭 유지.
+_VERDICT_BENIGN = ("unblocked",)          # 'block' 포함하나 부정 신호 아님(정상어)
+_BLOCK_WORD_RE = re.compile(r"\bblock")   # 단어 시작 경계 — 'un'/'road' 선행 복합어는 미매칭
+_REJECT_MARKERS_SUBSTR = tuple(m for m in REJECT_MARKERS if m != "block")
+
+
 def verdict_approved(verdict):
     """verdict 문자열의 승인 판정 — 부정 토큰 우선 차단, 그 다음 승인 접두(순수 함수)."""
     v = verdict.strip().lower()
-    if any(m in v for m in REJECT_MARKERS):
+    scan = v
+    for w in _VERDICT_BENIGN:
+        scan = scan.replace(w, " ")  # 정상어 제거 후 부정토큰 검사(부분문자열 오매칭 방지)
+    if any(m in scan for m in _REJECT_MARKERS_SUBSTR) or _BLOCK_WORD_RE.search(scan):
         return False
     return any(v.startswith(p) for p in APPROVE_PREFIXES)
 

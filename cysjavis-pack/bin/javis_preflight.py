@@ -3273,6 +3273,62 @@ class Preflight:
             self.add(cid, PASS,
                      "cysjavis 워크스페이스 트러스트 OK(갭 없음 · %d config 점검)" % len(targets))
 
+    # ── C59 역할별 Bash denylist guard 배선 검증 (WP-2 · 감사 X-1·H-HOOK-3) ──
+    # 감사 2026-07-06: 워커(claude-cysinsight) 프로필에 Bash denylist guard 부재(X-1),
+    # master(claude-ysfuture)는 개인경로 guard 직접배선(H-HOOK-3). guard.sh를 팩 hooks/로
+    # 편입한 뒤, 두 역할 프로필의 PreToolUse에 팩경로 guard 배선 존재를 결정론 검증한다.
+    # 이전엔 guard 배선 검사 자체가 없어 배선 누락이 침묵 통과("skip정상")했다 → 부재 hard-fail.
+    # 검증만 수행(자동 배선 안 함): 잘못된 Bash guard는 전 Bash를 마비시키므로 배선은 의도적
+    # 수동 행위여야 한다(외과적 — settings enforcement 변경은 Tier C 정지경계).
+    GUARD_ROLE_PROFILES = (".claude-ysfuture", ".claude-cysinsight")  # master · worker (dotdir)
+
+    @staticmethod
+    def _guard_wired(settings_path):
+        """PreToolUse 에 팩경로 guard.sh(hooks/guard.sh) 배선이 있으면 True."""
+        try:
+            data = json.load(open(settings_path, encoding="utf-8"))
+        except (OSError, ValueError):
+            return False
+        for entry in data.get("hooks", {}).get("PreToolUse", []):
+            if not isinstance(entry, dict):
+                continue
+            for h in entry.get("hooks", []):
+                if isinstance(h, dict) and "hooks/guard.sh" in h.get("command", "").replace("\\", "/"):
+                    return True
+        return False
+
+    def c59_guard_wiring(self):
+        cid = "C59.guard-wiring"
+        if self.skipped(cid):
+            return
+        # 1) 팩에 guard.sh 실체 존재(+실행권한) — 배선 대상이 있어야 배선이 의미
+        gp = os.path.join(pack_dir(), "hooks", "guard.sh")
+        if not os.path.isfile(gp):
+            self.add(cid, FAIL, "hooks/guard.sh 없음 — 팩 편입 필요(WP-2)")
+            return
+        if os.name == "posix" and not (os.stat(gp).st_mode & stat.S_IXUSR):
+            if self.fix:
+                os.chmod(gp, os.stat(gp).st_mode | 0o755)
+            else:
+                self.add(cid, FAIL,
+                         "hooks/guard.sh 실행권한 없음 — 직접 실행(shebang) 배선이라 755 필수(--fix로 부여)")
+                return
+        # 2) 역할 프로필(master·워커)별 PreToolUse guard 배선 존재 검증
+        targets = [s for s in discover_claude_settings()
+                   if os.path.basename(os.path.dirname(s)) in self.GUARD_ROLE_PROFILES]
+        if not targets:
+            self.add(cid, PASS, "master·워커 역할 프로필 미설치 — guard 배선 대상 없음")
+            return
+        missing = [s for s in targets if not self._guard_wired(s)]
+        if missing:
+            names = ", ".join(os.path.basename(os.path.dirname(s)) for s in missing)
+            self.add(cid, FAIL,
+                     "역할 프로필 Bash guard 배선 부재: %s — PreToolUse에 hooks/guard.sh 배선 필요"
+                     " (감사 X-1·H-HOOK-3)" % names)
+            return
+        self.add(cid, PASS,
+                 "master·워커 guard 배선 OK (%d 프로필 검증 · %s)" % (len(targets), gp))
+
     # ── C60 결정론 게이트 '배선' 검증 (G4 · cokacdir 성찰 2026-07-04) ──
     # C41/C42는 게이트 도구의 존재·self-test만 본다 — "게이트를 짓고 문에 안 달았다"(G4)를
     # 여기서 닫는다: ①재주입 포이즌 게이트(G3) 배선 ②memory 스캐너 로드 가능(fail-closed는
@@ -3457,8 +3513,8 @@ class Preflight:
             self.c49_channel_health, self.c50_channel_watch,
             self.c51_cleanroom_vendor, self.c52_license_gate, self.c53_idempotency,
             self.c54_loc_cap, self.c55_grill_gate, self.c56_dept_hook_leak,
-            self.c57_temp_hook_leak, self.c58_trust_harden, self.c60_gate_wiring,
-            self.c61_doc_code_sot,
+            self.c57_temp_hook_leak, self.c58_trust_harden, self.c59_guard_wiring,
+            self.c60_gate_wiring, self.c61_doc_code_sot,
         ]
         # --fix/dry/safe 는 공유 상태(repair_via_init_pack 메모이즈·settings.json 원자적
         # 쓰기·planned 버퍼)를 갖는 변이 경로라 전면 직렬 유지. report 모드만 병렬화한다.

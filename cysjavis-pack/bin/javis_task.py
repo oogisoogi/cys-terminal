@@ -17,6 +17,7 @@
 exit codes: 0 ok · 2 usage · 3 not found · 4 blocked · 8 duplicate origin · 9 conflict(409)
 """
 import argparse
+import contextlib
 import getpass
 import json
 import os
@@ -52,6 +53,50 @@ def _task_path(task_id):
 
 def _lock_dir(task_id):
     return os.path.join(TASKS_DIR, f"{task_id}.lock")
+
+
+def _wlock_dir(task_id):
+    return os.path.join(TASKS_DIR, f"{task_id}.wlock")
+
+
+@contextlib.contextmanager
+def _wlock(task_id, timeout=5.0, stale=30.0):
+    """★WP-8(P-ORCH): 태스크 JSON read-modify-write 단일 직렬화 쓰기락(<id>.wlock).
+
+    소유권 락(<id>.lock)과 별개의 '쓰기 직렬화' 뮤텍스다 — set-status·checkout·release·create가
+    같은 <id>.json 을 동시에 read-modify-write 하며 갱신을 서로 덮어쓰던 경로(이중 락 비배제)를
+    닫는다. 임계구역은 JSON 갱신뿐(수 ms)이라 stale(30s) 회수가 산 소유자를 탈취하지 않는다 —
+    긴 완료-하한선 sleep 은 이 락 '밖'에 둔다. 과경합으로 획득 실패 시 하드 실패 대신 경고 후
+    무락 진행(기존 exit-code 계약 불변·최악의 경우 현행 무락 동작으로 degrade)."""
+    os.makedirs(TASKS_DIR, exist_ok=True)
+    path = _wlock_dir(task_id)
+    deadline = time.time() + timeout
+    acquired = False
+    while True:
+        try:
+            os.mkdir(path)  # ← 원자적: 경쟁 시 1명만 성공
+            acquired = True
+            break
+        except FileExistsError:
+            try:  # 죽은 소유자가 남긴 만료 락은 원자적으로 회수(rename→rmdir, 빈 디렉터리)
+                if time.time() - os.stat(path).st_mtime > stale:
+                    stale_name = f"{path}.stale.{time.time_ns()}"
+                    os.rename(path, stale_name)
+                    with contextlib.suppress(OSError):
+                        os.rmdir(stale_name)
+                    continue
+            except OSError:
+                pass
+            if time.time() > deadline:
+                print(f"warn: wlock 획득 실패(과경합) — 무락 진행: {task_id}", file=sys.stderr)
+                break
+            time.sleep(0.02)
+    try:
+        yield
+    finally:
+        if acquired:
+            with contextlib.suppress(OSError):
+                os.rmdir(path)
 
 
 def _write_json_atomic(path, obj):
@@ -108,7 +153,14 @@ def _read_owner(task_id):
         return None
 
 
-OWNER_WRITE_GRACE_SEC = 5.0  # 락 획득~owner.json 기록 사이의 정당한 창
+# ★WP-8(P-ORCH · lease-adopt 강화): '산 소유자 락 탈취' 창을 닫는다. _acquire_lock 의 adopt 는
+#   이미 run-liveness 기반이다 — 읽을 수 있는 owner.json + 살아있는 pid 는 아래 :159 에서 conflict
+#   로 보호되고, 죽은 pid 만 즉시 adopt 된다(그 경로는 이 grace 를 '건너뛴다'). 유일한 탈취 경로는
+#   owner.json 이 일시 부재/훼손(holder is None)인 상태에서 grace 경과 후 adopt 하는 경로뿐이다.
+#   pid 확인 불가(owner.json 없음)라 옵션 (a)'pid 사망 확인 한정'을 순수 적용하면 크래시-복구가
+#   영구 deadlock 이 되므로, 옵션 (b) 'LEASE 상향'을 택해 5s→30s 로 올린다 — dead-pid adopt 는
+#   무영향, ownerless 창만 길어져 산 소유자 탈취를 실질 0 에 수렴시키되 크래시 복구는 30s 내 보장.
+OWNER_WRITE_GRACE_SEC = 30.0  # 락 획득~owner.json 기록 사이의 정당한 lease(과거 5.0 → P-ORCH 강화)
 
 
 def _write_owner(lock, rec):
@@ -225,31 +277,32 @@ def _find_unblocked_dependents(done_task_id):
 
 def cmd_create(a):
     task_id = a.id or f"T{time.strftime('%m%d')}-{uuid.uuid4().hex[:6]}"
-    if _read_task(task_id):
-        print(f"error: task exists: {task_id}", file=sys.stderr)
-        return EXIT_DUP
-    if a.origin_fingerprint:
-        for t in _list_tasks():
-            if (t.get("status") in OPEN_STATUSES
-                    and t.get("origin_kind") == a.origin_kind
-                    and t.get("origin_fingerprint") == a.origin_fingerprint):
-                print(f"duplicate-origin: open task {t['id']} has same "
-                      f"({a.origin_kind},{a.origin_fingerprint}) — create 거부", file=sys.stderr)
-                return EXIT_DUP
-    task = {
-        "id": task_id,
-        "title": a.title,
-        "status": a.status,
-        "why": a.why or "",           # goal 체인: 이 일이 왜 존재하는가
-        "goal": a.goal or "",
-        "blocked_by": a.blocked_by or [],
-        "origin_kind": a.origin_kind,
-        "origin_fingerprint": a.origin_fingerprint or "default",
-        "owner": None,
-        "created_at": _now(),
-        "updated_at": _now(),
-    }
-    _write_json_atomic(_task_path(task_id), task)
+    with _wlock(task_id):  # ★WP-8(P-ORCH): dup 검사~쓰기 직렬화 — 동시 create 경합의 lost-write 차단
+        if _read_task(task_id):
+            print(f"error: task exists: {task_id}", file=sys.stderr)
+            return EXIT_DUP
+        if a.origin_fingerprint:
+            for t in _list_tasks():
+                if (t.get("status") in OPEN_STATUSES
+                        and t.get("origin_kind") == a.origin_kind
+                        and t.get("origin_fingerprint") == a.origin_fingerprint):
+                    print(f"duplicate-origin: open task {t['id']} has same "
+                          f"({a.origin_kind},{a.origin_fingerprint}) — create 거부", file=sys.stderr)
+                    return EXIT_DUP
+        task = {
+            "id": task_id,
+            "title": a.title,
+            "status": a.status,
+            "why": a.why or "",           # goal 체인: 이 일이 왜 존재하는가
+            "goal": a.goal or "",
+            "blocked_by": a.blocked_by or [],
+            "origin_kind": a.origin_kind,
+            "origin_fingerprint": a.origin_fingerprint or "default",
+            "owner": None,
+            "created_at": _now(),
+            "updated_at": _now(),
+        }
+        _write_json_atomic(_task_path(task_id), task)
     print(task_id)
     return EXIT_OK
 
@@ -271,10 +324,15 @@ def cmd_checkout(a):
         who = (holder or {}).get("owner_id", "unknown")
         print(f"conflict(409): 살아있는 소유자 {who} — 재시도 금지, 다른 태스크로 이동", file=sys.stderr)
         return EXIT_CONFLICT
-    task["status"] = "in_progress"
-    task["owner"] = a.owner
-    task["updated_at"] = _now()
-    _write_json_atomic(_task_path(a.id), task)
+    with _wlock(a.id):  # ★WP-8(P-ORCH): JSON 갱신 직렬화 — 동시 set-status 와의 lost-update 차단
+        task = _read_task(a.id)          # 락 안 재독 — 대기 중 갱신 반영
+        if not task:
+            print(f"not found: {a.id}", file=sys.stderr)
+            return EXIT_NOTFOUND
+        task["status"] = "in_progress"
+        task["owner"] = a.owner
+        task["updated_at"] = _now()
+        _write_json_atomic(_task_path(a.id), task)
     print(json.dumps({"checkout": verdict, "id": a.id, "owner": a.owner}, ensure_ascii=False))
     return EXIT_OK
 
@@ -287,23 +345,28 @@ def cmd_release(a):
     # ★G11(cokacdir 성찰 2026-07-04): --force 무검증 폐기 — 사유 필수 + 태스크 JSON에
     #   force_history 감사 기록. (암호학 verifier는 다중노드/원격 확장 시 — per-node secret
     #   없는 로컬 단일 시스템에서 해시는 검증이 아니라 장식이다. 성찰 G11 'P2 조건부' 준수.)
-    if a.force:
-        if not getattr(a, "force_reason", None):
-            print("error: --force는 --force-reason '<사유>' 필수 — 무검증 탈취 금지(G11)",
-                  file=sys.stderr)
-            return EXIT_USAGE
-        task.setdefault("force_history", []).append(
-            {"at": _now(), "by": a.owner, "reason": a.force_reason})
+    if a.force and not getattr(a, "force_reason", None):
+        print("error: --force는 --force-reason '<사유>' 필수 — 무검증 탈취 금지(G11)",
+              file=sys.stderr)
+        return EXIT_USAGE
     if not _release_lock(a.id, a.owner, force=a.force):
         holder = _read_owner(a.id)
         print(f"conflict(409): 락 소유자 불일치 (holder={(holder or {}).get('owner_id')})", file=sys.stderr)
         return EXIT_CONFLICT
-    if task.get("owner") == a.owner or a.force:
-        task["owner"] = None
-        if task["status"] == "in_progress":
-            task["status"] = "todo"
-        task["updated_at"] = _now()
-        _write_json_atomic(_task_path(a.id), task)
+    with _wlock(a.id):  # ★WP-8(P-ORCH): JSON 갱신 직렬화
+        task = _read_task(a.id)          # 락 안 재독
+        if not task:
+            print(f"not found: {a.id}", file=sys.stderr)
+            return EXIT_NOTFOUND
+        if a.force:
+            task.setdefault("force_history", []).append(
+                {"at": _now(), "by": a.owner, "reason": a.force_reason})
+        if task.get("owner") == a.owner or a.force:
+            task["owner"] = None
+            if task["status"] == "in_progress":
+                task["status"] = "todo"
+            task["updated_at"] = _now()
+            _write_json_atomic(_task_path(a.id), task)
     print(f"released: {a.id}")
     return EXIT_OK
 
@@ -371,10 +434,11 @@ def cmd_set_status(a):
         return EXIT_NOTFOUND
     # ★G6: done은 완료 하한선 통과 후에만 — 오종결이 의존자 unblock(:308)을 조기 발화하는
     #   경로를 닫는다. owner 없는(체크아웃 이력 없는) 태스크는 안착 대상이 없어 게이트 생략.
+    #   ★WP-8(P-ORCH): 최대 settle sleep 은 wlock '밖'에서 — 락 장기점유·타임아웃을 피한다.
+    settle_override_note = None
     if a.status == "done" and task.get("owner"):
         if getattr(a, "settled_override", None):
-            task.setdefault("settle_overrides", []).append(
-                {"at": _now(), "reason": a.settled_override})
+            settle_override_note = a.settled_override
         else:
             ok, why = _completion_settled(task["owner"])
             if not ok:
@@ -382,16 +446,24 @@ def cmd_set_status(a):
                                   "hint": "안착 후 재시도 또는 --settled-override '<사유>'"},
                                  ensure_ascii=False), file=sys.stderr)
                 return EXIT_BLOCKED
-    task["status"] = a.status
-    task["updated_at"] = _now()
-    _write_json_atomic(_task_path(a.id), task)
-    if a.status in TERMINAL_STATUSES:
-        _release_lock(a.id, task.get("owner") or "", force=True)
-        task["owner"] = None
+    with _wlock(a.id):  # ★WP-8(P-ORCH): JSON read-modify-write 직렬화 — 동시 mutator lost-update 차단
+        task = _read_task(a.id)          # 락 안 재독 — 대기 중 갱신 반영
+        if not task:
+            print(f"not found: {a.id}", file=sys.stderr)
+            return EXIT_NOTFOUND
+        if settle_override_note is not None:
+            task.setdefault("settle_overrides", []).append(
+                {"at": _now(), "reason": settle_override_note})
+        task["status"] = a.status
+        task["updated_at"] = _now()
         _write_json_atomic(_task_path(a.id), task)
-    result = {"id": a.id, "status": a.status}
-    if a.status == "done":
-        result["unblocked"] = _find_unblocked_dependents(a.id)  # → javis_wakeup enqueue 대상
+        if a.status in TERMINAL_STATUSES:
+            _release_lock(a.id, task.get("owner") or "", force=True)
+            task["owner"] = None
+            _write_json_atomic(_task_path(a.id), task)
+        result = {"id": a.id, "status": a.status}
+        if a.status == "done":
+            result["unblocked"] = _find_unblocked_dependents(a.id)  # → javis_wakeup enqueue 대상
     print(json.dumps(result, ensure_ascii=False))
     return EXIT_OK
 

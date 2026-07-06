@@ -8,6 +8,7 @@ import { imeStep, initialImeState, type ImeEvent } from "./ime";
 import { shellQuote, shellQuoteJoin } from "./shellquote";
 import { DEFAULT_BG, readableForeground } from "./theme";
 import { reorderWorkspace, reorderGroup } from "./reorder";
+import { deptPlaceholderLabel } from "./deptlabel";
 
 declare global {
   interface Window {
@@ -1825,8 +1826,10 @@ function paneAtPhysicalPoint(pos?: { x: number; y: number }): PaneRuntime | unde
 function render() {
   for (const rt of panes.values()) rt.el.remove();
   root.innerHTML = "";
-  const tree = current()?.tree;
+  const ws = current();
+  const tree = ws?.tree;
   if (tree) root.appendChild(renderNode(tree));
+  else if (ws?.pending) root.appendChild(renderDeptPending()); // WP-10: 부서 준비 중 빈 pane 스피너·안내
   renderWsTabs();
   requestAnimationFrame(() => {
     for (const sid of collectSids(current()?.tree ?? null)) {
@@ -1835,6 +1838,27 @@ function render() {
     }
   });
   saveLayout();
+}
+
+// WP-10: 부서 데몬 준비(~12초·tree:null) 동안 빈 pane 호스트에 중앙 스피너+안내 문구를 표시한다.
+// 성공 시 tree가 채워져 자연 교체되고, 실패 시 placeholder 탭이 롤백된다(addDeptWorkspace 3분기 로직 불변).
+// aria-busy/aria-live 로 스크린리더에 진행/해소를 통지. 스피너 회전·정지는 CSS(prefers-reduced-motion)가 담당.
+function renderDeptPending(): HTMLElement {
+  const host = document.createElement("div");
+  host.className = "pane dept-pending";
+  host.setAttribute("aria-busy", "true");
+  host.setAttribute("aria-live", "polite");
+  const box = document.createElement("div");
+  box.className = "dept-pending-box";
+  const spin = document.createElement("div");
+  spin.className = "dept-spinner";
+  spin.setAttribute("aria-hidden", "true");
+  const msg = document.createElement("div");
+  msg.className = "dept-pending-msg";
+  msg.textContent = "부서를 준비하고 있습니다 — 최대 십여 초 걸릴 수 있어요";
+  box.append(spin, msg);
+  host.appendChild(box);
+  return host;
 }
 
 function renderNode(node: Node): HTMLElement {
@@ -2168,12 +2192,20 @@ function buildTab(ws: Workspace): HTMLElement {
   titleRow.className = "ws-title-row";
   const label = document.createElement("span");
   label.className = "ws-name";
-  label.textContent = ws.name;
+  label.textContent = deptPlaceholderLabel(ws); // WP-10: pending이면 "부서 제작 중…" (멈춘 줄 오해 방지)
   const close = document.createElement("span");
   close.className = "ws-close";
   close.textContent = "×";
   close.title = "워크스페이스 닫기 (surface 전부 종료)";
   titleRow.append(label, close);
+  // WP-10: 부서 준비 중 탭엔 스피너 글리프를 라벨 앞에 붙이고 aria-busy 로 진행을 알린다(CSS가 회전·정지 담당).
+  if (ws.pending) {
+    const spin = document.createElement("span");
+    spin.className = "ws-tab-spinner";
+    spin.setAttribute("aria-hidden", "true");
+    titleRow.prepend(spin);
+    tab.setAttribute("aria-busy", "true");
+  }
   // 승인 대기 배지(B3): 중복 표시 방지 위해 활성 ws 행에만 1개 노출.
   if (pendingApprovals > 0 && workspaces.indexOf(ws) === activeWs) {
     const badge = document.createElement("span");
@@ -2646,9 +2678,9 @@ async function addDeptWorkspace(catalogKey?: string): Promise<Workspace> {
       if (firstSid != null) setFocus(firstSid);
       return dup;
     }
-    // 안 A(C4 더블 surface 해소): cys-dept(create=javis_boot_node·allocate=자동각성)가 부서장 role=master
-    // surface를 띄우므로 UI는 plain 셸을 직접 만들지 않는다. socket 확정 + pending 해제 → refreshPaneTitles
-    // 자동입양이 그 master를 '첫 pane'으로 채운다(rolePri master=0 → 좌측·focus). 빈 셸 0·더블 surface 0.
+    // 안 A(C4 더블 surface 해소): cys-dept(create·allocate 모두 role=master '빈 셸' — WP-11 일원화)가 부서장
+    // role=master surface를 띄우므로 UI는 plain 셸을 직접 만들지 않는다. socket 확정 + pending 해제 → refreshPaneTitles
+    // 자동입양이 그 master(빈 셸)를 '첫 pane'으로 채운다(rolePri master=0 → 좌측·focus). 별도 UI 셸 0·더블 surface 0.
     // 탭이 await 중 닫혀도(close 핸들러가 socket 기준 데몬 teardown) 좀비 없음 — 별도 plain-셸 회수 불필요.
     ws.socket = info.socket;
     ws.pending = false;

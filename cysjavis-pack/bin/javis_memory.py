@@ -149,6 +149,25 @@ def memory_files(mdir):
             if n.endswith(".md") and n != INDEX_FILE and not n.startswith(".")]
 
 
+def _write_text_atomic(path, text):
+    """텍스트 파일 원자쓰기 — 같은 디렉터리 temp에 쓴 뒤 os.replace(부분쓰기·색인 불일치 차단).
+    색인(MEMORY.md)이 append로 갈리던 P-MEM-3 비대칭을 본문 파일 O_EXCL 생성과 같은 원자성으로 통일."""
+    d = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".tmp-", suffix=".swap")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def cmd_add(mdir, args):
     if args.type not in VALID_TYPES:
         return fail(2, "type은 %s 중 하나" % "|".join(VALID_TYPES))
@@ -207,14 +226,24 @@ def cmd_add(mdir, args):
                 existing_index = open(index_path, encoding="utf-8", errors="replace").read()
                 if ("(%s)" % fname) in existing_index:
                     return fail(2, "색인에 %s 항목이 이미 있다 — verify로 정합부터 복구하라" % fname)
-            # 원자적 파일 생성(O_EXCL) 후 색인 append
+            # 원자적 파일 생성(O_EXCL) 후 색인도 원자쓰기(temp+os.replace)로 통일.
             fd = os.open(fpath, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(content)
-            with open(index_path, "a", encoding="utf-8") as f:
-                if existing_index and not existing_index.endswith("\n"):
-                    f.write("\n")
-                f.write(index_line)
+            # ★WP-8(P-MEM-3): 색인 append→원자쓰기. 갱신 실패 시 방금 만든 본문 파일을
+            #   unlink 롤백해 '본문만 있고 색인엔 없는' 고아·부분쓰기를 차단한다.
+            new_index = existing_index
+            if new_index and not new_index.endswith("\n"):
+                new_index += "\n"
+            new_index += index_line
+            try:
+                _write_text_atomic(index_path, new_index)
+            except OSError as e:
+                try:
+                    os.unlink(fpath)
+                except OSError:
+                    pass
+                return fail(3, "색인 갱신 실패(본문 롤백됨): %s" % e)
     except TimeoutError as e:
         return fail(3, str(e))
 

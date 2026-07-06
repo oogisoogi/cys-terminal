@@ -39,8 +39,11 @@ echo "$NOW	$EVENT	cwd=$CWD" >> "$RD/.state_log" 2>/dev/null
 # SESSION_STATE '최종 갱신' 타임스탬프 갱신 — 압축 직전(PreCompact)에만 (Stop은 로그만 = git noise 방지)
 SS="$RD/SESSION_STATE.md"
 if [ "$EVENT" = "PreCompact" ] && [ -f "$SS" ] && grep -q "최종 갱신:" "$SS" 2>/dev/null; then
-  sed -i '' "s#^\(> *최종 갱신:\).*#\1 ${NOW} (auto write-ahead: ${EVENT})#" "$SS" 2>/dev/null \
-    || sed -i "s#^\(> *최종 갱신:\).*#\1 ${NOW} (auto write-ahead: ${EVENT})#" "$SS" 2>/dev/null
+  # 치환문 삽입 전 delimiter(#)·백슬래시·& 이스케이프 — NOW·EVENT 값 오염이 sed 치환식을 깨지 않게(H-HOOK).
+  NOW_E=$(printf '%s' "$NOW" | sed 's/[#\\&]/\\&/g')
+  EVENT_E=$(printf '%s' "$EVENT" | sed 's/[#\\&]/\\&/g')
+  sed -i '' "s#^\(> *최종 갱신:\).*#\1 ${NOW_E} (auto write-ahead: ${EVENT_E})#" "$SS" 2>/dev/null \
+    || sed -i "s#^\(> *최종 갱신:\).*#\1 ${NOW_E} (auto write-ahead: ${EVENT_E})#" "$SS" 2>/dev/null
 fi
 
 # ---------- (A) SESSION_STATE 비대 워치 (스냅샷 규율을 기계가 감시 — 백서 §6) ----------

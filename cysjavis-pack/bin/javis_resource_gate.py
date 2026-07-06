@@ -50,12 +50,13 @@ NODE_PATTERNS = [r"claude(\s|$)", r"\bagy\b", r"\bcodex\b", r"\bgemini\b"]
 
 
 def _ps_lines():
+    # 측정 실패는 None으로 신호(빈 리스트로 위장하면 '0=건강'으로 조용히 통과 — P-ORCH-1).
     try:
         out = subprocess.run(["ps", "-axo", "pid,command"], capture_output=True,
                              text=True, timeout=10).stdout
         return out.splitlines()[1:]
     except (subprocess.SubprocessError, OSError):
-        return []
+        return None
 
 
 def _count_matching(lines, patterns, exclude_patterns=()):
@@ -72,29 +73,43 @@ def _count_matching(lines, patterns, exclude_patterns=()):
 
 
 def measure(a):
-    lines = None
+    # 측정 실패는 0으로 조용히 넘기지 않고 measure_errors로 신호(P-ORCH-1) — 소비자(evaluate)가
+    # 최소 soft로 격상해 '측정 실패=조용한 allow'를 차단한다.
+    errors = []
+    need_ps = a.servers_override is None or a.nodes_override is None
+    lines = _ps_lines() if need_ps else None
+    ps_failed = need_ps and lines is None
+
     if a.servers_override is not None:
         servers = a.servers_override
+    elif ps_failed:
+        errors.append("servers(ps)")
+        servers = None
     else:
-        lines = _ps_lines()
         servers = _count_matching(lines, SERVER_PATTERNS, SERVER_EXCLUDE_PATTERNS)
+
     if a.nodes_override is not None:
         nodes = a.nodes_override
+    elif ps_failed:
+        errors.append("nodes(ps)")
+        nodes = None
     else:
-        if lines is None:
-            lines = _ps_lines()
         nodes = _count_matching(lines, NODE_PATTERNS)
+
     if a.load_override is not None:
         load1 = a.load_override
     else:
         try:
             load1 = os.getloadavg()[0]
-        except OSError:
-            load1 = 0.0
+        except (OSError, AttributeError):
+            errors.append("load(getloadavg)")
+            load1 = None
     ncpu = os.cpu_count() or 1
-    return {"servers": servers, "nodes": nodes, "load1": round(load1, 2),
-            "ncpu": ncpu, "load_ratio": round(load1 / ncpu, 3),
-            "context_pct": a.context}
+    return {"servers": servers, "nodes": nodes,
+            "load1": round(load1, 2) if load1 is not None else None,
+            "ncpu": ncpu,
+            "load_ratio": round(load1 / ncpu, 3) if load1 is not None else None,
+            "context_pct": a.context, "measure_errors": errors}
 
 
 def evaluate(m, a):
@@ -112,7 +127,8 @@ def evaluate(m, a):
     add("load_ratio", m["load_ratio"], a.load_soft_ratio, a.load_hard_ratio)
     add("context_pct", m["context_pct"], a.context_soft, a.context_hard)
 
-    worst = "ok"
+    # 측정 실패는 최소 soft로 격상(조용한 allow 금지 · P-ORCH-1) — 실제 hard 트립이 있으면 hard가 우선.
+    worst = "soft" if m.get("measure_errors") else "ok"
     for c in checks:
         if c["level"] == "hard":
             worst = "hard"
@@ -127,14 +143,28 @@ def cmd_check(a):
     worst, checks = evaluate(m, a)
     verdict = {"ok": "allow", "soft": "soft_warn", "hard": "hard_block"}[worst]
     trips = [c for c in checks if c["level"] != "ok"]
-    result = {"verdict": verdict, "measured": m, "trips": trips, "checks": checks}
+    warnings = []
+    if m["measure_errors"]:
+        warnings.append("measure_error:" + ",".join(m["measure_errors"]))
+    if m["context_pct"] is None:
+        warnings.append("context_unmeasured")
+    result = {"verdict": verdict, "measured": m, "trips": trips,
+              "checks": checks, "warnings": warnings}
     if a.json:
         print(json.dumps(result, ensure_ascii=False, indent=1))
     else:
         print(f"verdict: {verdict}")
+        for w in warnings:
+            print(f"  ⚠ {w}")
         for c in checks:
             mark = {"ok": "·", "soft": "⚠", "hard": "✗"}[c["level"]]
             print(f"  {mark} {c['metric']}={c['value']} (soft {c['soft']} / hard {c['hard']})")
+        if m["measure_errors"]:
+            print("measure_error: 자원 측정 실패(ps/load) — 조용한 allow 금지, 최소 soft로 격상. "
+                  "측정 환경 확인 후 재시도.")
+        if m["context_pct"] is None:
+            print("context_unmeasured: --context 미제공 — 컨텍스트 60%/clear 규칙을 검사하지 못함. "
+                  "check 시 --context <pct> 전달 권장.")
         if worst == "hard":
             print("hard_block: 착수 거부 — 자원 정리(서버 kill·/clear·노드 회수) 후 재시도하거나 "
                   "master 승인으로 임계 상향. (사후 watchdog와 별개의 사전 게이트)")
@@ -157,7 +187,7 @@ def cmd_classify(a):
 # ── ★G12(cokacdir 성찰 2026-07-04): hard_block '판정'과 분리돼 있던 '집행' ──
 def _server_procs(lines=None):
     """SERVER_PATTERNS 매칭 (pid, cmd) 목록 — _count_matching과 동일 분류(제외 패턴 포함)."""
-    lines = lines if lines is not None else _ps_lines()
+    lines = lines if lines is not None else (_ps_lines() or [])
     regs = [re.compile(p) for p in SERVER_PATTERNS]
     excl = [re.compile(p, re.IGNORECASE) for p in SERVER_EXCLUDE_PATTERNS]
     out = []
