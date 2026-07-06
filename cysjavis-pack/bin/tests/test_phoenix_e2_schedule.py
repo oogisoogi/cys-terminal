@@ -1,13 +1,21 @@
 #!/usr/bin/env python3
-"""W6/E2 정기화 배선 검증(리포 커밋) — 임베드 schedule.json 에 phoenix 세대 스냅샷 6h + 주간 격리 드릴
-잡이 정석 배선(데몬 핫리로드 스키마)돼 있는지 결정론 확인. cysd schedule.rs Job 스키마(serde default)와 정합.
+"""W6/E2 정기화 배선 검증(리포 커밋). ★B2-1(W3) 진화: phoenix 세대 스냅샷 6h + 주간 격리 드릴 잡은
+이제 팩 schedule.json 배달이 아니라 **cysd 코드(schedule.rs builtin_jobs)** 가 소유하고 데몬 부트 시
+idempotent ensure 한다 — schedule.json 이 user-owned 로 전환돼(사용자 `cys schedule add` 잡 보존) 팩
+강제갱신이 사용자 잡을 소실시키지 않게 하기 위함. 따라서 이 테스트는 ①팩 schedule.json 에는 phoenix
+잡이 **부재**(코드로 이전) ②schedule.rs 에 두 built-in 잡이 올바른 주기·명령으로 정의 ③main.rs 부트가
+ensure_builtin_jobs 를 호출하는지 확인한다. Job 스키마 내용 정합(주기·명령·중복0)은 Rust 테스트
+schedule::tests::builtin_jobs_ensure_idempotent_and_versioned 가 담당(typed 검증).
 
 실행: python3 cysjavis-pack/bin/tests/test_phoenix_e2_schedule.py  (0=전건 PASS)
 """
-import json, os, sys
+import json, os, re, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCHED = os.path.normpath(os.path.join(HERE, "..", "..", "schedule.json"))
+ROOT = os.path.normpath(os.path.join(HERE, "..", "..", ".."))
+SCHED_RS = os.path.join(ROOT, "src", "bin", "cysd", "schedule.rs")
+MAIN_RS = os.path.join(ROOT, "src", "bin", "cysd", "main.rs")
 
 _results = []
 def check(n, c, d=""):
@@ -15,31 +23,32 @@ def check(n, c, d=""):
 
 
 def main():
+    # ① 팩 schedule.json 에는 phoenix built-in 잡이 부재해야 한다(코드로 이전 — B2-1). 사용자/하트비트 잡은 잔존.
     d = json.load(open(SCHED))
-    jobs = {j["id"]: j for j in d.get("jobs", [])}
+    pack_ids = {j["id"] for j in d.get("jobs", [])}
+    check("① 팩 schedule.json 에 phoenix-snapshot-6h 부재(코드 이전)", "phoenix-snapshot-6h" not in pack_ids)
+    check("① 팩 schedule.json 에 phoenix-drill-weekly 부재(코드 이전)", "phoenix-drill-weekly" not in pack_ids)
+    check("① 하트비트 잡은 잔존(팩 배달 유지)", "owner-progress-report-5min" in pack_ids, str(sorted(pack_ids)))
 
-    # ① 6h 세대 스냅샷 정기화(P2-4) — snapshot 명령·6시간 주기.
-    snap = jobs.get("phoenix-snapshot-6h")
-    check("① phoenix-snapshot-6h 잡 존재", snap is not None)
-    if snap:
-        check("① 주기 6h(360분)", snap.get("every_minutes") == 360, str(snap.get("every_minutes")))
-        check("① javis_state_snapshot snapshot 호출", "javis_state_snapshot.py" in (snap.get("text_command") or "")
-              and "snapshot" in (snap.get("text_command") or ""))
+    # ② schedule.rs builtin_jobs 가 두 잡을 올바른 주기·명령으로 정의.
+    rs = open(SCHED_RS, encoding="utf-8").read()
+    check("② schedule.rs builtin_jobs 정의 존재", "fn builtin_jobs()" in rs and "fn ensure_builtin_jobs()" in rs)
+    check("② phoenix-snapshot-6h 정의(6h·snapshot)",
+          bool(re.search(r'"id":\s*"phoenix-snapshot-6h"', rs))
+          and bool(re.search(r'"every_minutes":\s*360', rs))
+          and "javis_state_snapshot.py" in rs
+          and "snapshot 2>&1" in rs)
+    check("② phoenix-drill-weekly 정의(7일·self-test)",
+          bool(re.search(r'"id":\s*"phoenix-drill-weekly"', rs))
+          and bool(re.search(r'"every_minutes":\s*10080', rs))
+          and "self-test" in rs)
+    check("② built-in 버전 마커(idempotent ensure 기준)", "_builtin_version" in rs and "BUILTIN_JOBS_VERSION" in rs)
 
-    # ② 주간 격리 드릴 — self-test(라이브 무접촉)·7일 주기.
-    drill = jobs.get("phoenix-drill-weekly")
-    check("② phoenix-drill-weekly 잡 존재", drill is not None)
-    if drill:
-        check("② 주기 7일(10080분)", drill.get("every_minutes") == 10080, str(drill.get("every_minutes")))
-        check("② self-test(격리·라이브 무접촉) 호출", "self-test" in (drill.get("text_command") or ""))
-
-    # ③ 스키마 정합 — cysd Job(serde default): action·to·if_absent·every_minutes·text_command 만 사용(미지 키 없음).
-    allowed = {"id", "time", "days", "in", "every_minutes", "action", "to", "text", "text_command",
-               "if_absent", "launch"}
-    for jid in ("phoenix-snapshot-6h", "phoenix-drill-weekly"):
-        j = jobs.get(jid) or {}
-        unknown = set(j.keys()) - allowed
-        check("③ %s 키 스키마 정합(미지 키 0)" % jid, not unknown, "unknown=%s" % unknown)
+    # ③ 데몬 부트가 ensure_builtin_jobs 를 스케줄러 기동 전에 호출.
+    mn = open(MAIN_RS, encoding="utf-8").read()
+    check("③ main.rs 부트가 ensure_builtin_jobs 호출", "schedule::ensure_builtin_jobs()" in mn)
+    check("③ ensure 가 spawn_scheduler 보다 먼저",
+          mn.find("ensure_builtin_jobs") < mn.find("spawn_scheduler") if "ensure_builtin_jobs" in mn else False)
 
     npass = sum(1 for c in _results if c)
     print("\n=== %d/%d PASS ===" % (npass, len(_results)))
