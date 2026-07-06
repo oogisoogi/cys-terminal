@@ -420,6 +420,52 @@ def case7_keepalive_respawn():
         subprocess.run(["taskkill", "/IM", "cysd.exe", "/F"], capture_output=True, timeout=15)
 
 
+def case8_real_autorestore():
+    """★D4(W5) 실경로 auto-restore(주입 우회 금지): 설치된 cysd.exe 를 콜드부트해 cysd **자체**
+    decide_auto_restore(동봉 python3.exe 절대경로 + PATH 선두주입 + exe옆 cys.exe)로 phoenix 를 스폰하는지
+    관측한다. env 에서 PHOENIX_CYS 를 명시 제거해 '주입 없이' 실경로가 살아있음을 증명(P0-7·P1-9 첫 스폰 단절
+    회귀 차단). 관측: state_dir/phoenix-restore.log 에 헤더 + [phoenix] 출력이 남으면 실경로 성공(FileNotFoundError/
+    빈 로그면 실패). ★기존 케이스⑤는 phoenix 를 PHOENIX_CYS 주입해 직접 실행 → cysd auto-restore 실경로 미검증이었다."""
+    _cp("⑧ real auto-restore setup")
+    import shutil
+    pipe = r"\\.\pipe\cys-phxsmoke-realauto"
+    sd = _state_dir(pipe)
+    tracked = None
+    try:
+        shutil.rmtree(sd, ignore_errors=True)
+        # desired 로스터에 죽은 역할 seed(auto-restore 대상 존재) — phoenix_home = state_dir/phoenix.
+        ph_home = os.path.join(sd, "phoenix")
+        os.makedirs(ph_home, exist_ok=True)
+        with open(os.path.join(ph_home, "desired_roster.json"), "w", encoding="utf-8") as f:
+            json.dump({"roster": {"worker": {"role": "worker"}}, "tombstones": []}, f)
+        # ★주입 금지: cysd env 에서 PHOENIX_CYS 제거 — cysd 자체 해석만으로 phoenix 를 스폰해야 한다.
+        env = _phoenix_env({"CYS_SOCKET": pipe})
+        env.pop("PHOENIX_CYS", None)
+        CREATE_NO_WINDOW = 0x08000000 if IS_WIN else 0
+        tracked = subprocess.Popen([CYSD_BIN], env=env, stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                   creationflags=CREATE_NO_WINDOW)
+        _cp("⑧ waiting cold-boot auto-restore log")
+        log_path = os.path.join(sd, "phoenix-restore.log")
+        content = ""
+        for _ in range(80):  # ~40s(콜드부트 스폰 + phoenix 관측·정착 여유)
+            _cp("⑧ waiting cold-boot auto-restore log")
+            if os.path.exists(log_path):
+                content = open(log_path, encoding="utf-8", errors="replace").read()
+                if "phoenix auto-restore @ epoch=" in content and "[phoenix]" in content:
+                    break
+            time.sleep(0.5)
+        check("⑧ 실경로 auto-restore 로그 생성(cysd 자체 스폰)",
+              "phoenix auto-restore @ epoch=" in content, "head=%r" % content[:160])
+        check("⑧ phoenix 실제 실행(주입 없이 python+cys 해석 성공·[phoenix] 출력)",
+              "[phoenix]" in content, "tail=%r" % content[-300:])
+        check("⑧ 첫 스폰 단절 흔적 없음(FileNotFoundError/실행 불가 아님)",
+              ("FileNotFoundError" not in content) and ("실행 불가" not in content), "tail=%r" % content[-300:])
+    finally:
+        _cp("⑧ teardown")
+        teardown_daemon(pipe, state_dir=sd, tracked=tracked)
+
+
 def resolve_bins():
     import shutil
     cys = os.environ.get("PHOENIX_CYS") or shutil.which("cys") or shutil.which("cys.exe")
@@ -453,7 +499,7 @@ def run():
 
     for fn in (case1_path_mapping, case2_schtasks, case3_restart_primitive,
                case4_snapshot_runbook, case5_stub_restore, case6_deploy_plan,
-               case7_keepalive_respawn):
+               case7_keepalive_respawn, case8_real_autorestore):
         try:
             fn()
         except Exception as e:
