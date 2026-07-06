@@ -271,6 +271,7 @@ jobs:
       # T4 무중단 재설치 스모크 (P1 rename-swap + P1b 잔해청소 — nsis-hooks.nsh의 실기기 검증).
       # 핵심 assert: 라이브 데몬+세션 위로 setup.exe /S 재설치 → 데몬 PID 불변·세션 생존·
       # cysd.prev.exe 존재(kill이 아니라 rename이었다는 증거) → 새 cysd 기동 시 prev 청소(P1b).
+      # + T4-9/10 rotate_daemon 프리미티브(P3 지연 핸드오프): lame-duck 데몬의 drain 봉사·PID 세대교체.
       # 이 기능은 "업데이트=전 세션 사망" 불안을 없애는 축이라 실기기 검증 없이 출하 금지.
       # ─────────────────────────────────────────────────────────────────────────
       - name: T4 무중단 재설치 스모크 (rename-swap 데몬 생존)
@@ -333,6 +334,14 @@ jobs:
           Write-Host ("T4-8 RESULT: {0}  msys-2.0.dll 신본 추출(잠금 스윕 검증)" -f ($(if($msysOk){'PASS'}else{'FAIL'})))
           if (-not ($alive -and $sessOk -and $prevOk -and $newOk -and $bashAlive -and $msysOk)) { Write-Host "== after list =="; Write-Host $after.Out; throw "T4: 무중단 재설치 assert 실패" }
 
+          # ③' T4-9 rotate_daemon 1단계 스모크: 스큐(lame-duck) 상태의 구 데몬이 drain RPC를 봉사하는지.
+          # rotate_daemon(src-tauri/main.rs)은 drain을 best-effort(let _ =)로 취급하므로 exit 코드는
+          # 로그만 남기고(비0 허용 = 프로덕션 의미론 동일), 워치독 내 완주(hang 아님)만 게이트한다.
+          $dr = Bx $cys @('drain') 30000
+          $drOk = ($dr.Code -ne -1)
+          Write-Host ("T4-9 RESULT: {0}  drain 완주(lame-duck 데몬 RPC, exit={1})" -f ($(if($drOk){'PASS'}else{'FAIL'})), $dr.Code)
+          if (-not $drOk) { throw "T4-9: drain이 워치독(30s) 내 미완주 — lame-duck 데몬 hang" }
+
           # ④ P1b: 잠금 해제(bash 종료) → 구 데몬 종료 → 새 cysd 기동 → prev 잔해 재귀 자가청소 assert
           try { $bp.Kill($true) } catch {}
           Stop-Process -Id $pidBefore -Force; Start-Sleep 2
@@ -340,12 +349,17 @@ jobs:
           $r2 = $null; foreach($i in 1..20){ Start-Sleep 1; $r2 = Bx $cys @('list') 15000; if($r2.Code -eq 0){ break } }
           if ($r2.Code -ne 0) { throw "T4: 새 데몬 기동 실패" }
           Start-Sleep 2
+          # T4-10 rotate 세대교체 증거: 새 데몬 PID ≠ 구 PID (교대가 재사용이 아니라 신 바이너리 프로세스).
+          $pidAfter = (Get-Process cysd | Select-Object -First 1).Id
+          $swapOk = ($pidAfter -ne $pidBefore)
+          Write-Host ("T4-10 RESULT: {0}  데몬 세대교체(신 pid={1} ≠ 구 pid={2})" -f ($(if($swapOk){'PASS'}else{'FAIL'})), $pidAfter, $pidBefore)
           $rootPrev = Test-Path (Join-Path $dir 'cysd.prev.exe')
           $rtPrev = @(Get-ChildItem (Join-Path $dir 'runtime') -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -like '*.prev*' }).Count
           $cleaned = (-not $rootPrev) -and ($rtPrev -eq 0)
           Write-Host ("T4-6 RESULT: {0}  새 cysd 기동 후 prev 잔해 재귀 청소(P1b — root+runtime, 잔존 {1}개)" -f ($(if($cleaned){'PASS'}else{'FAIL'})), $rtPrev)
           Get-Process cys,cysd -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
           if (-not $cleaned) { throw "T4-6: prev 잔해 미청소" }
+          if (-not $swapOk) { throw "T4-10: 데몬 세대교체 실패(PID 불변 — 구 데몬 잔존)" }
           Write-Host "OK: T4 무중단 재설치 스모크 전행 통과 — 업데이트 중 데몬·세션 무사망 실증"
 
       # ─────────────────────────────────────────────────────────────────────────
