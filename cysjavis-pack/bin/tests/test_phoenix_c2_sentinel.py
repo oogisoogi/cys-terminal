@@ -67,8 +67,15 @@ def main():
         f.write("]]] corrupt dept")
     sock_d = os.path.join(sd_d, "cys.sock")
     res = m.run_restore(sock_d, ticket="dept", stub=True, print_result=False)
-    check("D corrupt dept_roster → exit 6", m.restore_exit_code(res) == 6 and res.get("corrupt_file") == "dept_roster",
-          "verdict=%s file=%s" % (res.get("phoenix_restore"), res.get("corrupt_file")))
+    # ★W3 진화: dept_roster 는 glob(cys-dept-*)∪registry 로 재발견 가능하므로 corrupt 를 hard-fail(exit 6)이 아니라
+    #   격리+discovery 복원→degraded(exit 3)로 다룬다(폴백 체인). silent-empty 통과는 여전히 차단(fresh 로 진행 안 함)
+    #   — 다른 exit/event(DEGRADED·escalation)로 구분됨. 상세 시나리오는 test_phoenix_w3_corruption.py.
+    check("D corrupt dept_roster → DEGRADED(exit 3·W3 폴백 복원)",
+          m.restore_exit_code(res) == 3 and res.get("phoenix_restore") == "DEGRADED",
+          "verdict=%s exit=%s" % (res.get("phoenix_restore"), m.restore_exit_code(res)))
+    check("D corrupt dept_roster → degraded 에 dept_roster 명시(silent-empty 아님)",
+          any(d.get("file") == "dept_roster" for d in (res.get("degraded") or [])),
+          "degraded=%s" % res.get("degraded"))
 
     import shutil
     shutil.rmtree(td, ignore_errors=True)
