@@ -189,6 +189,42 @@ def main():
     check("D PATH(which) 후보 match → 채택+verified", got == FAKE_CYS and m._CYS_IDENTITY == "verified",
           "got=%r identity=%s" % (got, m._CYS_IDENTITY))
 
+    # ── E. W4 STRICT 하위케이스(codex W4 fix3): PHOENIX_STRICT_CYS=1 positive(주입 정상=성공)·
+    #    negative(주입 부재=표준경로 폴백 차단 exit 6). B1 임베드 실행이 의존하는 cys 해석을 STRICT 로 봉인 —
+    #    B1 폴백이 Rust PHOENIX_CYS/PATH 주입 누락을 가리는 false-green 차단.
+    os.environ["PHOENIX_STRICT_CYS"] = "1"
+    # positive: STRICT + PHOENIX_CYS(X_OK·주입 정상) → 채택(폴백 불필요·성공, exit 없음).
+    m._CYS_IDENTITY = None; m._IDENTITY_RETRY_SLEEP = 0.0
+    os.environ["PHOENIX_CYS"] = FAKE_CYS
+    oi, oa = m.os.path.isfile, m.os.access
+    m.os.path.isfile = lambda p: True if p == FAKE_CYS else oi(p)
+    m.os.access = lambda p, mode: True if p == FAKE_CYS else oa(p, mode)
+    got = None
+    try:
+        with _mock_subprocess(SELF, dict(SELF)):  # identity match → verified
+            got = m._resolve_cys(socket)
+    except SystemExit as e:
+        got = "EXIT:%s" % e.code
+    finally:
+        m.os.path.isfile, m.os.access = oi, oa
+        os.environ.pop("PHOENIX_CYS", None)
+    check("E STRICT + PHOENIX_CYS 주입 정상 → 성공(채택·exit 없음)", got == FAKE_CYS,
+          "got=%r identity=%s" % (got, m._CYS_IDENTITY))
+    # negative: STRICT + PHOENIX_CYS 부재 + which=None → 표준경로 폴백 강제 차단 exit 6.
+    ow = m._which
+    m._which = lambda name: None
+    code = None
+    err = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(err):
+            m._resolve_cys(socket)
+    except SystemExit as e:
+        code = e.code
+    finally:
+        m._which = ow
+        os.environ.pop("PHOENIX_STRICT_CYS", None)
+    check("E STRICT + 주입 부재 → exit 6(표준경로 폴백 차단)", code == 6, "code=%s" % code)
+
     npass = sum(1 for _, c, _ in _results if c)
     print("\n=== %d/%d PASS ===" % (npass, len(_results)))
     return 0 if npass == len(_results) else 1

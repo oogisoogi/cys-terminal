@@ -494,16 +494,10 @@ fn phoenix_embed_files() -> Vec<(&'static str, &'static str)> {
         .collect()
 }
 
-/// 임베드된 bin/javis_phoenix.py 내용 해시(디스크 폴백 stale 판정 기준).
-fn embedded_phoenix_hash() -> Option<String> {
-    cys::pack::PACK_ALL
-        .iter()
-        .find(|(rel, _)| *rel == "bin/javis_phoenix.py")
-        .map(|(_, c)| cys::pack::content_hash_pub(c))
-}
-
 /// ★B1①: 임베드 phoenix 트리를 <state>/phoenix-embed/<version>-<uuid>/ 에 추출한다(버전+고유 ID 격리).
 /// 추출 실패(공간·권한·noexec)는 Err — 호출측이 디스크 폴백으로 강등한다. 반환=(추출 루트, phoenix 스크립트 경로).
+/// ★codex W4 major: 중간 실패(create_dir_all/write) 시 이미 만든 partial root 를 즉시 remove_dir_all(정리 후 Err)
+///   — temp 누수 0(다음 부팅 prune 에 의존하지 않는다).
 fn extract_phoenix_embed(
     state_dir: &std::path::Path,
 ) -> std::io::Result<(std::path::PathBuf, std::path::PathBuf)> {
@@ -516,15 +510,36 @@ fn extract_phoenix_embed(
         format!("{version}-{}-{nanos}", std::process::id())
     };
     let root = state_dir.join("phoenix-embed").join(uniq);
-    for (rel, content) in phoenix_embed_files() {
-        let path = root.join(rel);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+    let write_all = || -> std::io::Result<()> {
+        let mut written = 0u32;
+        for (rel, content) in phoenix_embed_files() {
+            let path = root.join(rel);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&path, content)?;
+            written += 1;
+            // 테스트 seam: root+일부 파일 생성 후 강제 실패 주입(중간 실패 정리 결정론 검증).
+            if written == 1 && std::env::var("CYS_PHOENIX_EXTRACT_FAIL").is_ok() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "injected mid-extraction failure",
+                ));
+            }
         }
-        std::fs::write(&path, content)?;
+        Ok(())
+    };
+    match write_all() {
+        Ok(()) => {
+            let script = root.join("bin").join("javis_phoenix.py");
+            Ok((root, script))
+        }
+        Err(e) => {
+            // partial root 즉시 정리(temp 누수 0). best-effort — 정리 실패해도 원 에러를 반환.
+            let _ = std::fs::remove_dir_all(&root);
+            Err(e)
+        }
     }
-    let script = root.join("bin").join("javis_phoenix.py");
-    Ok((root, script))
 }
 
 /// ★B1③: 추출된 phoenix self-test — `<python> <script> --selftest` 가 exit 0 + "selftest ok" 응답이면 통과.
@@ -575,42 +590,56 @@ fn resolve_phoenix_source(
             );
         }
     }
-    // 2) 디스크 폴백 — 임베드 해시와 일치할 때만(stale 거부).
-    let embed_hash = match embedded_phoenix_hash() {
-        Some(h) => h,
-        None => return PhoenixResolve::Failed("임베드 phoenix 부재(빌드 이상)".to_string()),
-    };
-    let disk_content = match std::fs::read_to_string(disk_phoenix) {
-        Ok(c) => c,
-        Err(e) => {
-            return PhoenixResolve::Failed(format!(
-                "디스크 폴백 phoenix 읽기 실패({}: {e})",
+    // 2) 디스크 폴백 — ★codex W4 major: script-only 해시가 아니라 phoenix 실행 closure **전체**(phoenix_embed_files
+    //    단일 소스 — 추출과 동일 목록)를 대조한다. javis_phoenix.py 만 일치하고 형제 의존(javis_state_snapshot.py)이
+    //    부재/stale 인 디스크 팩이 통과하던 구멍을 막는다. 하나라도 불일치/부재=거부+어느 rel 인지 보고.
+    match disk_fallback_verify(disk_phoenix) {
+        Ok(()) => {
+            eprintln!(
+                "[cysd] phoenix 디스크 폴백 채택(전 closure 해시 일치·verified): {}",
                 disk_phoenix.display()
-            ))
+            );
+            PhoenixResolve::Ready {
+                script: disk_phoenix.to_path_buf(),
+                cleanup: None,
+            }
         }
-    };
-    if cys::pack::content_hash_pub(&disk_content) == embed_hash {
-        eprintln!(
-            "[cysd] phoenix 디스크 폴백 채택(해시 일치·verified): {}",
-            disk_phoenix.display()
-        );
-        PhoenixResolve::Ready {
-            script: disk_phoenix.to_path_buf(),
-            cleanup: None,
+        Err(reason) => {
+            daemon.push_feed_notification(
+                "error",
+                "phoenix 디스크 폴백 거부(stale/불완전)",
+                &format!("디스크 팩 phoenix closure 검증 실패 — 실행 거부(구/불완전 phoenix 부활 금지): {reason}"),
+                None,
+            );
+            PhoenixResolve::Failed(format!("디스크 폴백 closure 검증 실패 — {reason}"))
         }
-    } else {
-        daemon.push_feed_notification(
-            "error",
-            "phoenix 디스크 폴백 거부(stale)",
-            "디스크 팩 phoenix 가 임베드와 해시 불일치(구버전/스큐) — 실행 거부(구 phoenix 부활 금지).",
-            None,
-        );
-        PhoenixResolve::Failed(format!(
-            "디스크 폴백 stale(해시 불일치) — disk={} embed={}",
-            &cys::pack::content_hash_pub(&disk_content)[..12.min(embed_hash.len())],
-            &embed_hash[..12.min(embed_hash.len())]
-        ))
     }
+}
+
+/// ★B1②(codex W4): 디스크 팩 phoenix closure 전체 검증 — phoenix_embed_files(추출과 동일 단일 소스)의
+/// 각 rel 이 <pack>/<rel> 로 존재하고 임베드 내용과 해시 일치해야 Ok. 부재/불일치=Err(어느 rel 인지 명시).
+/// disk_phoenix = <pack>/bin/javis_phoenix.py → pack_dir = 그 조부모(bin 의 부모).
+fn disk_fallback_verify(disk_phoenix: &std::path::Path) -> Result<(), String> {
+    let pack_dir = disk_phoenix
+        .parent()
+        .and_then(|bin| bin.parent())
+        .ok_or_else(|| "디스크 phoenix 경로에서 pack_dir 파생 실패".to_string())?;
+    let files = phoenix_embed_files();
+    if files.is_empty() {
+        return Err("임베드 phoenix closure 비었음(빌드 이상)".to_string());
+    }
+    for (rel, content) in files {
+        let path = pack_dir.join(rel);
+        match std::fs::read_to_string(&path) {
+            Ok(disk) => {
+                if cys::pack::content_hash_pub(&disk) != cys::pack::content_hash_pub(content) {
+                    return Err(format!("stale(해시 불일치): {rel}"));
+                }
+            }
+            Err(_) => return Err(format!("부재/읽기실패: {rel}")),
+        }
+    }
+    Ok(())
 }
 
 /// ★B1: 이전 실행의 잔여 phoenix-embed 디렉터리를 정리한다(크래시로 cleanup 못한 잔재 — temp 누수 방지).
@@ -1875,11 +1904,53 @@ mod auto_restore_tests {
     }
 
     use super::{
-        bundled_python3, embedded_phoenix_hash, extract_phoenix_embed, phoenix_embed_files,
+        bundled_python3, disk_fallback_verify, extract_phoenix_embed, phoenix_embed_files,
         phoenix_self_test,
     };
     use std::cell::RefCell;
     use std::time::Duration;
+
+    /// ★codex W4 fix1: 추출 중간 실패(seam CYS_PHOENIX_EXTRACT_FAIL) 시 partial root 즉시 정리 — phoenix-embed 잔여 0.
+    #[test]
+    fn b1_extract_mid_failure_leaves_no_partial_root() {
+        let sd = std::env::temp_dir().join(format!("cys-b1mf-{}", std::process::id()));
+        std::fs::create_dir_all(&sd).unwrap();
+        std::env::set_var("CYS_PHOENIX_EXTRACT_FAIL", "1");
+        let res = extract_phoenix_embed(&sd);
+        std::env::remove_var("CYS_PHOENIX_EXTRACT_FAIL");
+        assert!(res.is_err(), "주입된 중간 실패가 Err 여야 한다");
+        // phoenix-embed 하위 child dir 0(즉시 정리 — 다음 부팅 prune 의존 금지).
+        let root = sd.join("phoenix-embed");
+        let children = std::fs::read_dir(&root).map(|r| r.count()).unwrap_or(0);
+        assert_eq!(children, 0, "중간 실패 후 partial root 잔존");
+        let _ = std::fs::remove_dir_all(&sd);
+    }
+
+    /// ★codex W4 fix2: 디스크 폴백은 script-only 가 아니라 phoenix closure 전체 대조.
+    /// phoenix.py 는 일치해도 형제(javis_state_snapshot.py) 부재/stale 이면 거부(어느 rel 인지 보고).
+    #[test]
+    fn b1_disk_fallback_full_tree_verify() {
+        let pack = std::env::temp_dir().join(format!("cys-b1ft-{}", std::process::id()));
+        let bin = pack.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        // 전 closure 를 임베드 내용 그대로 디스크에 배치 → verified(Ok).
+        for (rel, content) in phoenix_embed_files() {
+            let p = pack.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, content).unwrap();
+        }
+        let disk_phoenix = bin.join("javis_phoenix.py");
+        assert!(disk_fallback_verify(&disk_phoenix).is_ok(), "전 closure 일치 → verified");
+        // 형제 stale: snapshot.py 를 변조 → 거부(rel 명시).
+        std::fs::write(bin.join("javis_state_snapshot.py"), "STALE-SNAPSHOT-DRIFT").unwrap();
+        let e = disk_fallback_verify(&disk_phoenix).unwrap_err();
+        assert!(e.contains("javis_state_snapshot.py"), "stale 형제 rel 미보고: {e}");
+        // 형제 부재: snapshot.py 삭제 → 거부(부재 명시).
+        std::fs::remove_file(bin.join("javis_state_snapshot.py")).unwrap();
+        let e2 = disk_fallback_verify(&disk_phoenix).unwrap_err();
+        assert!(e2.contains("javis_state_snapshot.py") && e2.contains("부재"), "부재 형제 미보고: {e2}");
+        let _ = std::fs::remove_dir_all(&pack);
+    }
 
     /// ★B1①: 임베드 추출이 phoenix.py + 형제 의존(javis_state_snapshot.py)을 버전+uuid 격리 디렉터리에
     /// 임베드 내용 그대로 쓴다. temp 누수 0: 정리 후 디렉터리 소멸.
@@ -1951,20 +2022,6 @@ mod auto_restore_tests {
         let _ = std::fs::remove_dir_all(&empty);
     }
 
-    /// ★B1②④: 디스크 폴백 stale 판정 = 임베드 phoenix 해시 대조. 일치=verified·불일치=stale 거부의 핵심 로직.
-    #[test]
-    fn b1_disk_fallback_hash_gate() {
-        let embed_hash = embedded_phoenix_hash().expect("임베드 phoenix 해시");
-        let embed_phoenix = phoenix_embed_files()
-            .into_iter()
-            .find(|(rel, _)| *rel == "bin/javis_phoenix.py")
-            .map(|(_, c)| c)
-            .unwrap();
-        // 동일 내용 → 해시 일치(verified 채택 경로)
-        assert_eq!(cys::pack::content_hash_pub(embed_phoenix), embed_hash);
-        // 상이 내용(구버전/스큐) → 불일치(stale 거부 경로)
-        assert_ne!(cys::pack::content_hash_pub("STALE-PHOENIX-DRIFT"), embed_hash);
-    }
 
     /// ★B3: 동봉 runtime python3 가 있으면 program 은 그 절대경로(리터럴 "python3" 아님). mac 레이아웃
     /// (runtime/python/bin/python3)으로 검증 — 순정 Windows/mac CLT 미설치 첫 스폰 단절 수리의 핵심.
