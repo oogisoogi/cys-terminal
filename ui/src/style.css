@@ -25,11 +25,12 @@ html, body {
 }
 #brand { font-weight: 700; color: var(--accent); }
 #daemon-info { color: #8b949e; font-size: 11px; }
-/* P2 버전 스큐 배지 — lame-duck 데몬(세션 보존) 안내. 경고색이되 위협적이지 않게(불안 방지가 목적). */
+/* P2 버전 스큐 배지 — lame-duck 데몬(세션 보존) 안내. 경고색이되 위협적이지 않게(불안 방지가 목적).
+   클릭 = 데몬 교대(promptRotateDaemon). */
 .ver-skew-badge {
   margin-left: 8px; padding: 1px 8px; border-radius: 8px;
   background: rgba(210,153,34,.15); border: 1px solid rgba(210,153,34,.4);
-  color: var(--warn); font-size: 10px; cursor: help;
+  color: var(--warn); font-size: 10px; cursor: pointer;
 }
 .spacer { flex: 1; }
 #topbar button {

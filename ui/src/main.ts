@@ -3055,6 +3055,44 @@ async function promptInstall() {
   }
 }
 
+/// 스큐 교대 — rotate_daemon 호출(세션 없으면 자동·있으면 확인, promptInstall 정책 동형).
+/// app.restart가 없는 경로라 완료·실패 토스트까지 이 함수가 책임진다. 성공 시 배지 제거(스큐 해소).
+let rotatingDaemon = false;
+async function promptRotateDaemon(badge: HTMLElement, appVer: string) {
+  if (rotatingDaemon) return; // 유휴 자동 교대와 수동 클릭의 중복 발동 방지
+  const sessions = (await invoke("live_session_count").catch(() => 0)) as number;
+  let force = false;
+  if (sessions > 0) {
+    const ok = await confirmModal(
+      `데몬 교대 (새 버전 v${appVer})`,
+      `작업 세션 ${sessions}개가 구 데몬에 물려 있습니다. 저장(drain) 신호 후 데몬을 새 버전으로 ` +
+        `교대하고 세션을 복원합니다. 마지막 미저장분은 손실될 수 있습니다.\n\n지금 교대하시겠습니까?`,
+    );
+    if (!ok) return;
+    force = true;
+  }
+  rotatingDaemon = true;
+  stickyToast("rotate-daemon", "feed", "↻ 데몬 교대", `새 버전 v${appVer}로 교대 중… 저장 후 세션을 복원합니다.`);
+  try {
+    await invoke("rotate_daemon", { force });
+    dismissToast("rotate-daemon");
+    badge.remove(); // 스큐 해소 — 배지 내림(유휴 타이머도 isConnected 가드로 멈춘다)
+    toast("watchdog", "✅ 데몬 교대 완료", `데몬이 v${appVer}로 교대됐습니다. 노드 복원이 진행됩니다.`);
+  } catch (e) {
+    dismissToast("rotate-daemon");
+    const msg = String(e);
+    if (msg.includes("live_sessions:")) {
+      // 가드에 막힘(force 미적용 경로 — 확인 사이 세션 증가 등) — 다시 확인 흐름으로
+      rotatingDaemon = false;
+      await promptRotateDaemon(badge, appVer);
+      return;
+    }
+    toast("health", "데몬 교대 실패", msg);
+  } finally {
+    rotatingDaemon = false;
+  }
+}
+
 /// 무중단 팩 설치 — install_pack_update(세션·데몬 생존, app.restart 없음) 호출.
 /// 진행/완료/경고는 pack-progress·pack-updated·update-warning 리스너가 표시한다(아래 startup).
 /// ★"재시작" 확인 다이얼로그를 띄우지 않는다 — 세션이 죽지 않는 게 바이너리 경로와의 핵심 차이.
@@ -3567,8 +3605,21 @@ async function start() {
       badge.className = "ver-skew-badge";
       badge.textContent = `데몬 v${daemonVer} · 앱 v${appVer} — 세션 보존 중`;
       badge.title =
-        "업데이트가 적용됐지만 실행 중인 세션(마스터·워커·부서)을 보존하기 위해 기존 데몬이 계속 봉사합니다.\n모든 작업이 유휴일 때 데몬을 재시작하면 새 버전으로 교대됩니다. 세션은 죽지 않습니다.";
+        "업데이트가 적용됐지만 실행 중인 세션(마스터·워커·부서)을 보존하기 위해 기존 데몬이 계속 봉사합니다.\n클릭하면 저장(drain) 후 새 버전으로 교대하고 세션을 복원합니다.";
+      badge.addEventListener("click", () => void promptRotateDaemon(badge, appVer));
       info.appendChild(badge);
+      // 유휴 자동 교대: 잃을 세션이 0이면 무손실 — 시작 시 1회 + 5분 주기로 확인해 자동 교대.
+      // 카운트 실패(-1)는 자동 발동 금지(보수적) — 수동 클릭 경로만 남긴다.
+      const tryIdleRotate = async () => {
+        if (!badge.isConnected) {
+          clearInterval(idleTimer); // 이미 교대됨(수동 클릭 성공) — 재교대 방지
+          return;
+        }
+        const n = (await invoke("live_session_count").catch(() => -1)) as number;
+        if (n === 0) await promptRotateDaemon(badge, appVer);
+      };
+      const idleTimer = setInterval(() => void tryIdleRotate(), 5 * 60_000);
+      void tryIdleRotate();
     }
   } catch {
     /* 배지는 부가 기능 — 실패해도 시작을 막지 않는다 */
