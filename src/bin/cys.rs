@@ -248,7 +248,13 @@ enum Command {
         cols: u16,
     },
     /// Close a surface and force-kill its entire descendant process tree
-    CloseSurface { surface: String },
+    CloseSurface {
+        surface: String,
+        /// ★W2/C6: Reap 사유로 닫는다(묘비 미생성·부활 대상 유지) — 죽은 surface 잔재 회수용.
+        /// 기본(플래그 없음)=OwnerClose(묘비 생성·의도적 폐역).
+        #[arg(long)]
+        reap: bool,
+    },
     /// Subscribe to the daemon event stream (push; no polling)
     Events {
         #[arg(long)]
@@ -1807,11 +1813,18 @@ fn run(command: Command) -> i32 {
                 .map(|_| println!("OK"))
         }),
 
-        Command::CloseSurface { surface } => parse_surface_ref(&surface)
+        Command::CloseSurface { surface, reap } => parse_surface_ref(&surface)
             .ok_or_else(|| format!("invalid surface ref: {surface}"))
             .and_then(|sid| {
-                request("surface.close", json!({"surface_id": sid})).map(|r| {
-                    println!("closed {} (descendants killed)", surface);
+                // ★W2/C6: --reap → cause="reap"(묘비 미생성). 기본=OwnerClose(묘비).
+                let params = if reap {
+                    json!({"surface_id": sid, "cause": "reap"})
+                } else {
+                    json!({"surface_id": sid})
+                };
+                request("surface.close", params).map(|r| {
+                    println!("closed {} (descendants killed{})", surface,
+                             if reap { ", reap" } else { "" });
                     let _ = r;
                 })
             }),

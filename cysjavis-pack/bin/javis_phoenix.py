@@ -1019,18 +1019,32 @@ def _release_lease(handle):
 
 
 def c6_detect_stale_surfaces(socket):
-    """★C6 S0(죽은 surface 잔재 탐지) — restore 파이프라인 맨 앞. exited=true surface 를 열거·보고한다.
-    ★W1 범위 = 탐지·보고 전용(회수 미실행). 근거: phoenix 가 부를 수 있는 회수 CLI 는 surface.close(고정
-    OwnerClose)뿐이라 이를 쓰면 P0-6(역할 오묘비화) 함정을 그대로 밟는다 — 설계 절대 금지 경로. 안전한 Reap
-    (묘비 미생성)은 데몬 governance 주기 루프(reap_exited_surfaces·CloseCause::Reap)가 이미 담당한다.
-    TODO(W2): 데몬에 cause 파라미터 회수 RPC(Reap)가 노출되면 그때 실제 회수를 활성화한다(surface.close 금지).
-    라이브(exited=false)는 어떤 경우에도 비대상. 반환 = 탐지된 잔재 리스트(저널·결과에 정직 기록)."""
+    """★C6 S0: exited=true surface 잔재를 열거한다. 라이브(exited=false)는 어떤 경우에도 비대상."""
     stale = []
     for role, surfs in live_role_surfaces(socket).items():
         for s in surfs:
             if s.get("exited"):
                 stale.append({"surface": s.get("surface"), "role": role, "pid": s.get("pid")})
     return stale
+
+
+def c6_reap_stale_surfaces(socket):
+    """★C6 S0 실 회수(W2 — P0-6 cause 활용): exited=true 잔재를 **Reap 사유로만** 회수한다
+    (`cys close-surface <ref> --reap` → CloseCause::Reap → 묘비 미생성·부활 대상 유지). 고정 OwnerClose 경로
+    (--reap 없는 close)는 절대 쓰지 않는다(P0-6 오묘비 함정). 라이브(exited=false)는 비대상. 반환:
+    {"detected":[...], "reaped":[refs], "reap_failed":[...]}. 회수 후에도 묘비 0이어야 함(호출측 게이트 검증)."""
+    detected = c6_detect_stale_surfaces(socket)
+    reaped, failed = [], []
+    for item in detected:
+        ref = item.get("surface")
+        if not ref:
+            continue
+        r = cys("close-surface", ref, "--reap", socket=socket, timeout=12)
+        if getattr(r, "returncode", 1) == 0:
+            reaped.append(ref)
+        else:
+            failed.append({"surface": ref, "err": (getattr(r, "stderr", "") or getattr(r, "stdout", ""))[:120]})
+    return {"detected": detected, "reaped": reaped, "reap_failed": failed}
 
 
 def run_restore(socket, ticket="default", stub=False, no_breaker=False, roles=None,
@@ -1074,13 +1088,16 @@ def run_restore(socket, ticket="default", stub=False, no_breaker=False, roles=No
             return out
 
     j = load_journal(socket, ticket)
-    # ★C6 S0: 죽은 surface 잔재 탐지·보고(회수는 W1 미실행 — surface.close=OwnerClose 함정 회피). 저널 기록.
-    c6_stale = c6_detect_stale_surfaces(socket)
+    # ★C6 S0 실 회수(W2 — P0-6 cause): exited=true 잔재를 Reap 사유로만 회수(cys close-surface --reap →
+    #   CloseCause::Reap → 묘비 미생성). 라이브(exited=false)는 비대상. OwnerClose 경로는 절대 미사용(오묘비 함정).
+    c6 = c6_reap_stale_surfaces(socket)
+    c6_stale = c6.get("detected", [])
     if c6_stale:
-        jevent(j, "*", "s0_c6", "detected",
-               "exited 잔재 %d개 탐지(회수 미실행·데몬 governance Reap 담당): %s"
-               % (len(c6_stale), [x.get("surface") for x in c6_stale]))
-        log("★C6 S0: 죽은 surface 잔재 %d개 탐지(탐지·보고 전용·묘비 0 — 회수는 데몬 Reap/W2)." % len(c6_stale))
+        jevent(j, "*", "s0_c6", "reaped",
+               "exited 잔재 %d개 탐지·%d개 Reap 회수(묘비 미생성): %s"
+               % (len(c6_stale), len(c6.get("reaped", [])), c6.get("reaped", [])))
+        log("★C6 S0: 죽은 surface 잔재 %d개 탐지 → %d개 Reap 회수(묘비 0·라이브 무접촉)."
+            % (len(c6_stale), len(c6.get("reaped", []))))
         save_journal(socket, ticket, j)
     # ★Phase 4: 대상 판정 근거 = actual-state(topology)가 아니라 desired 로스터.
     # 관측을 조기·단조 영속해 topology 침식(부분 부활 후 미부활 역할 삭제)에 면역시킨다(§12).
@@ -1351,7 +1368,9 @@ def run_restore(socket, ticket="default", stub=False, no_breaker=False, roles=No
         "backend": "surrogate(stub)" if stub else "production(cys restore)",
         "target_roles": target_roles,
         "per_role_outcome": outcomes,
-        "c6_stale_surfaces": c6_stale,     # ★C6 S0: 탐지된 죽은 surface 잔재(회수 미실행·묘비 0 — W2에서 Reap 활성화)
+        "c6_stale_surfaces": c6_stale,     # ★C6 S0: 탐지된 죽은 surface 잔재
+        "c6_reaped": c6.get("reaped", []), # ★C6 S0(W2): Reap 사유로 실제 회수한 잔재(묘비 미생성·라이브 무접촉)
+        "c6_reap_failed": c6.get("reap_failed", []),
         "cys_identity": _CYS_IDENTITY,     # ★gate2: 해석된 cys 의 3중 identity 검증 상태(verified|degraded-unverified|None)
         "journal": journal_path(socket, ticket),
         "honesty_note": honesty,
