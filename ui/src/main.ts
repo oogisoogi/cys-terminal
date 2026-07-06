@@ -2804,6 +2804,18 @@ function openFeed() {
   setCcTab("feed");
 }
 
+// 승인 자동 화면전환 유예: master가 이 시간 안에 자동 승인(reply)하면 전환하지 않는다.
+// 유예 후에도 pending인 항목 = 사람 수동 승인 필요 → 그때만 승인 Feed 탭으로 전환.
+const FEED_SWITCH_GRACE_MS = 30_000;
+function scheduleFeedSwitchIfStillPending(requestId: string) {
+  if (!requestId) return;
+  setTimeout(async () => {
+    const r = (await invoke("feed_list", { status: null }).catch(() => null)) as { items: FeedItem[] } | null;
+    const item = r?.items.find((i) => i.request_id === requestId);
+    if (item?.status === "pending") openFeed();
+  }, FEED_SWITCH_GRACE_MS);
+}
+
 // ---------- file tree (오른쪽 섹션 — 선택한 surface의 폴더 탐색) ----------
 
 let ftOpen = false;
@@ -3507,7 +3519,8 @@ function onDaemonEvent(event: Record<string, unknown>) {
   if (name === "approval.request") {
     toast("approval", "⚠ 승인 대기", `${payload.role ?? ""} ${payload.surface_ref ?? ""} — ${String(payload.excerpt ?? "").slice(0, 100)}`);
     osBanner("⚠ 승인 대기", `${payload.role ?? ""} ${payload.surface_ref ?? ""} — ${String(payload.excerpt ?? "").slice(0, 100)}`); // B4 OS 배너(고우선)
-    openFeed(); // 승인은 즉시 승인 Feed 탭 오픈 (feed.item.created의 wait 경로와 정합)
+    // 자동 화면전환 없음 — 페인 승인 프롬프트는 master 즉각 자동승인 관할.
+    // 토스트·OS 배너·사이드바 배지로만 알린다(feed.item.created의 유예 경로와 정합).
     refreshFeed();
     refreshSidebarStatus(); // 사이드바 ⚠ 배지 갱신 (B3)
     return;
@@ -3559,7 +3572,9 @@ function onDaemonEvent(event: Record<string, unknown>) {
   } else if (category === "feed") {
     if (name === "feed.item.created") {
       toast("feed", "📥 승인 요청", String(payload.title ?? ""));
-      if (payload.wait === true) openFeed();
+      // 즉시 전환하지 않는다 — master 자동 승인 유예 후에도 pending인 항목만
+      // 사람 개입 필요로 보고 전환한다(자동 승인분은 무전환).
+      if (payload.wait === true) scheduleFeedSwitchIfStillPending(String(payload.request_id ?? ""));
     }
     refreshFeed();
     refreshSidebarStatus(); // 피드 이벤트 시 집계 배지 갱신(멀티부서 정합)
