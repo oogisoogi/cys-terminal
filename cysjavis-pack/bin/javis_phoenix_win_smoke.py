@@ -528,10 +528,13 @@ def case8_real_autorestore():
         # ★주입 금지: cysd env 에서 PHOENIX_CYS 제거 — cysd 자체 해석만으로 phoenix 를 스폰해야 한다.
         env = _phoenix_env({"CYS_SOCKET": pipe})
         env.pop("PHOENIX_CYS", None)
+        # ★진단(CI 28780215417: auto-restore 스레드 std/time.rs panic — 라인:컬럼·메시지·프레임 필요): RUST_BACKTRACE
+        #   로 panic 백트레이스를 켠다 — '<unnamed>' 스레드가 auto-restore 인지 다른 부트 스레드(scheduler/watchdog/
+        #   usage)인지 프레임으로 교차확정하고, 근본 time 연산(파일:라인)을 특정한다.
+        env["RUST_BACKTRACE"] = "1"
         CREATE_NO_WINDOW = 0x08000000 if IS_WIN else 0
         # ★진단(CI 28778120380 head=''): cysd stderr 를 파일로 포착한다 — resolve_phoenix_source ABORT·자동복원
-        #   skip·디스크폴백 거부 등은 cysd stderr 로만 드러나는데 과거 DEVNULL 이라 원인 불가시였다(auto-restore
-        #   triggered/finished/ABORTED 라인 추적).
+        #   skip·디스크폴백 거부·스레드 panic 백트레이스는 cysd stderr 로만 드러나는데 과거 DEVNULL 이라 불가시였다.
         cysd_err_path = os.path.join(sd, "cysd.stderr.log")
         cysd_err = open(cysd_err_path, "w", encoding="utf-8", errors="replace")
         tracked = subprocess.Popen([CYSD_BIN], env=env, stdin=subprocess.DEVNULL,
@@ -555,22 +558,30 @@ def case8_real_autorestore():
             cysd_err.flush()
         except Exception:
             pass
-        err_tail = ""
+        err_full = ""
         if os.path.exists(cysd_err_path):
-            err_tail = open(cysd_err_path, encoding="utf-8", errors="replace").read()[-500:]
+            err_full = open(cysd_err_path, encoding="utf-8", errors="replace").read()
         tmp_tail = ""
         if os.path.exists(temp_fallback):
-            tmp_tail = open(temp_fallback, encoding="utf-8", errors="replace").read()[-300:]
-        diag = "head=%r | cysd.stderr(tail)=%r | temp_fallback=%r" % (content[:120], err_tail, tmp_tail)
+            tmp_tail = open(temp_fallback, encoding="utf-8", errors="replace").read()[-800:]
+        # ★cysd stderr **전문** 을 stdout(=CI 로그)으로 dump — tail 슬라이스가 panic 라인:컬럼·메시지·백트레이스를
+        #   자르던 문제 해소(팀리드 지시: 최소 panic 라인+메시지+백트레이스 수십 줄). 판정 detail 은 tail 4000 유지.
+        log("⑧ cysd.stderr 전문 dump ↓↓↓ (%d bytes)" % len(err_full))
+        for _ln in err_full.splitlines():
+            log("  [cysd.stderr] %s" % _ln)
+        log("⑧ cysd.stderr 전문 dump ↑↑↑")
+        err_tail = err_full[-4000:]
+        diag = "head=%r | temp_fallback=%r | cysd.stderr(tail4000)=%r" % (content[:120], tmp_tail, err_tail)
         check("⑧ 실경로 auto-restore 로그 생성(cysd 자체 스폰)",
               "phoenix auto-restore @ epoch=" in content, diag)
         check("⑧ phoenix 실제 실행(주입 없이 python+cys 해석 성공·[phoenix] 출력)",
               "[phoenix]" in content, "tail=%r" % content[-300:])
-        # ★첫 스폰 단절 흔적 없음: content 뿐 아니라 cysd stderr 도 본다(ABORTED/FileNotFoundError/실행 불가).
+        # ★첫 스폰 단절/스레드 즉사 흔적 없음: content + cysd stderr 전문(ABORTED/FileNotFoundError/panic).
         _spawn_ok = (("FileNotFoundError" not in content) and ("실행 불가" not in content)
-                     and ("ABORTED" not in err_tail) and ("FileNotFoundError" not in err_tail))
-        check("⑧ 첫 스폰 단절 흔적 없음(FileNotFoundError/실행 불가/ABORTED 아님)", _spawn_ok,
-              "err=%r" % err_tail)
+                     and ("ABORTED" not in err_full) and ("FileNotFoundError" not in err_full)
+                     and ("panicked" not in err_full))
+        check("⑧ 첫 스폰 단절/스레드 즉사 흔적 없음(FileNotFoundError/실행 불가/ABORTED/panic 아님)", _spawn_ok,
+              "err_tail=%r" % err_tail)
         try:
             cysd_err.close()
         except Exception:
