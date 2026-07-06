@@ -32,6 +32,22 @@
       "to": "master",
       "text_command": "python3 \"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_channel_watch.py\" --no-push",
       "if_absent": "skip"
+    },
+    {
+      "id": "phoenix-snapshot-6h",
+      "every_minutes": 360,
+      "action": "push",
+      "to": "master",
+      "if_absent": "skip",
+      "text_command": "printf '[heartbeat] phoenix 세대 스냅샷 정기화(6h·P2-4) — 손상 치유 소스 최신화.\\n'; python3 \"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_state_snapshot.py\" snapshot 2>&1 | tail -3"
+    },
+    {
+      "id": "phoenix-drill-weekly",
+      "every_minutes": 10080,
+      "action": "push",
+      "to": "master",
+      "if_absent": "skip",
+      "text_command": "printf '[heartbeat] phoenix 주간 격리 드릴(원자성·중단내성 self-test·라이브 무접촉) — 실전이 첫 테스트인 상태 종료(축E E2).\\n'; python3 \"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_state_snapshot.py\" self-test 2>&1 | tail -5"
     }
   ]
 }
