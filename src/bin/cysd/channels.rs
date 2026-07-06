@@ -544,7 +544,16 @@ fn on_bridge_exit(daemon: &Arc<Daemon>, channel: &str, pid: u32) {
 // ── RPC 위임 ─────────────────────────────────────────────────────────────────
 
 /// dispatch에서 `channel.<sub>` 전량을 여기로 위임한다(match 비대화 방지·모듈 자기완결).
-pub fn handle(daemon: &Arc<Daemon>, sub: &str, params: &Value, id: &Value, caller_pid: Option<u32>) -> Reply {
+pub fn handle(
+    daemon: &Arc<Daemon>,
+    sub: &str,
+    params: &Value,
+    id: &Value,
+    caller: crate::state::Caller,
+) -> Reply {
+    // WP-3 3-state: register/inbound은 pgid-pin으로 이미 fail-CLOSED다(None=deny). Peer만 pid를
+    // 가지므로 pgid 검사에 도달하고 Anonymous·Internal(테스트전용)은 pid None → 기존대로 deny된다.
+    let caller_pid = caller.pid();
     let mut guard = daemon.channels.lock().unwrap();
     let Some(conn) = guard.as_mut() else {
         return Reply::Single(err_response(
@@ -2175,7 +2184,13 @@ mod tests {
     }
 
     fn call(daemon: &Arc<Daemon>, sub: &str, params: Value, caller_pid: Option<u32>) -> Value {
-        match handle(daemon, sub, &params, &json!(1), caller_pid) {
+        // WP-3: caller_pid → Caller. Some=Peer(경계와 동일 해석·pgid 핀 도달), None=Anonymous
+        // (피어 미식별 = 기존 pgid None fail-closed와 동치).
+        let caller = match caller_pid {
+            Some(pid) => crate::handlers::caller_from_socket(daemon, Some(pid)),
+            None => crate::state::Caller::Anonymous,
+        };
+        match handle(daemon, sub, &params, &json!(1), caller) {
             Reply::Single(v) => v,
             _ => panic!("expected Single reply"),
         }

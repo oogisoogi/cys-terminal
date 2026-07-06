@@ -863,6 +863,14 @@ fn run_auto_restore_once(
     }
 }
 
+// WP-3 PLATFORM-INVARIANT(R3 Q5): Peer 인증(peer_pid)은 파괴계 게이트의 하드 전제다. 미지원
+// 플랫폼(mac/linux/win 외)에선 peer_pid가 상시 None → 전 Caller가 Anonymous → 파괴계 전건 deny로
+// 벽돌화한다. 조용한 런타임 벽돌 대신 시끄러운 빌드 실패로 불변식을 박제한다.
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+compile_error!(
+    "peer authentication (peer_pid) unavailable on this platform — WP-3 destructive-op gates would deny-all; supported: macOS/Linux/Windows"
+);
+
 /// T1-3: UDS peer pid 조회 — macOS LOCAL_PEERPID, Linux SO_PEERCRED.
 #[cfg(unix)]
 fn peer_pid(stream: &tokio::net::UnixStream) -> Option<u32> {
@@ -1129,7 +1137,8 @@ async fn handle_connection(daemon: Arc<Daemon>, stream: Stream, caller_pid: Opti
             }
         };
 
-        match handlers::dispatch(&daemon, req, caller_pid) {
+        // WP-3 소켓 경계(단일 변환 지점): 커널 peer pid를 Caller 3상태로 승격해 dispatch에 넘긴다.
+        match handlers::dispatch(&daemon, req, handlers::caller_from_socket(&daemon, caller_pid)) {
             Reply::Single(resp) => {
                 if write_line(&mut write_half, &resp).await.is_err() {
                     return;
