@@ -245,7 +245,9 @@ async fn accept_loop(daemon: Arc<Daemon>, socket_path: &std::path::Path) {
     // ★W2 콜드부트 자동 복원: 소켓 바인드·수신 준비가 끝난 '이후'에만 1회 발화한다(자식
     // phoenix가 이 데몬 소켓으로 즉시 RPC할 수 있어야 하므로 바인드 성공이 선행 조건).
     // raw `cys restore`가 아니라 phoenix를 태워 desired_roster·묘비·회로차단기·저널을 경유한다.
-    spawn_auto_restore(&state_dir);
+    // ★B1: 이전 실행의 잔여 추출 디렉터리를 먼저 정리(크래시 cleanup 누락분 — temp 누수 0).
+    prune_stale_phoenix_embed(&state_dir);
+    spawn_auto_restore(&state_dir, &daemon);
 
     loop {
         match listener.accept().await {
@@ -341,14 +343,13 @@ fn log_lock_loss(state_dir: &std::path::Path, lock_path: &std::path::Path, reaso
 }
 
 /// ★W2 콜드부트 자동 복원 판정(순수 함수 — 부수효과 없음, 단위 테스트 가능).
-/// opt-out(CYS_NO_AUTORESTORE) 또는 phoenix 미설치면 스폰하지 않는다.
+/// opt-out(CYS_NO_AUTORESTORE)이 아니면 항상 Ready — ★B1: phoenix 는 바이너리 임베드본이 권위이므로
+/// 디스크 팩 phoenix 부재가 "미설치 skip"이 아니다(임베드 추출로 실행). args[0]=디스크 phoenix(폴백 후보).
 #[derive(Debug, PartialEq)]
 enum AutoRestore {
     /// CYS_NO_AUTORESTORE=1 — 사용자가 콜드부트 복원을 껐다.
     OptedOut,
-    /// phoenix 스크립트 부재(구 배포·미설치) — 조용히 skip(로그 1줄).
-    PhoenixMissing(std::path::PathBuf),
-    /// 스폰 대상: `python3 <phoenix> restore --auto`.
+    /// 스폰 대상: `python3 <phoenix> restore --auto`. args[0]=디스크 phoenix(B1 폴백 후보).
     /// ★W1/B3(§5-1): env 에 PHOENIX_CYS(exe 옆 cys 절대경로)·PATH(runtime 선두주입)를 주입한다 —
     /// GUI/데몬 최소 PATH(/usr/bin:/bin:…)에서 phoenix 가 `cys` 를 못 찾아 FileNotFoundError→exit 1
     /// 침묵사하던 라이브 결함(2026-07-06 실증)의 근원 수리. 순수 판정이라 단위 테스트로 env 를 검증한다.
@@ -369,10 +370,8 @@ fn decide_auto_restore(
     if opted_out {
         return AutoRestore::OptedOut;
     }
+    // ★B1: 디스크 존재 게이트 제거 — 임베드본이 권위(디스크 부재여도 추출 실행). 이 경로는 폴백 후보다.
     let phoenix = pack_dir.join("bin").join("javis_phoenix.py");
-    if !phoenix.exists() {
-        return AutoRestore::PhoenixMissing(phoenix);
-    }
     let mut env: Vec<(String, String)> = Vec::new();
     // PHOENIX_CYS: 데몬 exe 옆 동봉 cys 절대경로. 실존할 때만 주입한다(없으면 phoenix 의 which→표준경로
     // 폴백에 맡긴다 — 존재하지 않는 경로를 강제 주입해 재차 FileNotFoundError 를 만들지 않는다).
@@ -388,8 +387,12 @@ fn decide_auto_restore(
     if let Some(newp) = cys::runtime_prefixed_path(exe_dir, current_path) {
         env.push(("PATH".to_string(), newp));
     }
+    // ★B3(§2 축B): 인터프리터 절대경로 해석 — 동봉 runtime python3 우선(win runtime\python\python3.exe /
+    // mac Resources/runtime/python/bin/python3), 없으면 "python3" 리터럴(PATH 폴백). 순정 Windows(python3 부재)·
+    // mac CLT 미설치 소비자에서 첫 스폰 단절(P0-7·P1-9)을 절대경로로 끊는다. PATH 선두주입과 이중 방어.
+    let python = bundled_python3(exe_dir).unwrap_or_else(|| "python3".to_string());
     AutoRestore::Ready {
-        program: "python3".to_string(),
+        program: python,
         args: vec![
             phoenix.to_string_lossy().into_owned(),
             "restore".to_string(),
@@ -399,11 +402,30 @@ fn decide_auto_restore(
     }
 }
 
+/// ★B3: 동봉 runtime python3 절대경로(exe 옆 번들). runtime_bin_dirs(pane 자식과 동일 SOT)에서 python3 실행파일을
+/// 찾는다. 없으면 None(호출측이 "python3" 리터럴로 폴백 — PATH 선두주입이 동봉본을 잡거나 시스템 python3).
+fn bundled_python3(exe_dir: &std::path::Path) -> Option<String> {
+    let names: &[&str] = if cfg!(windows) {
+        &["python3.exe", "python.exe"]
+    } else {
+        &["python3"]
+    };
+    for d in cys::runtime_bin_dirs(exe_dir) {
+        for n in names {
+            let p = d.join(n);
+            if p.is_file() {
+                return Some(p.to_string_lossy().into_owned());
+            }
+        }
+    }
+    None
+}
+
 /// 콜드부트 auto-restore를 detached 스폰한다(env에 CYS_NO_AUTOSTART=1 — 자식 CLI가 라이벌
 /// 데몬을 autostart하는 재귀를 차단). 대기 스레드가 자식을 reap해 좀비 잔존을 막는다.
 /// ★W1: PHOENIX_CYS·PATH 주입(§5-1 침묵사 근원 수리) · stdout/stderr 를 null 대신 phoenix-restore.log 로
 /// 캡처(P0-5 사후 진단 불가 수리) · exit 계약 처리(5·6=재시도 금지, 그 외 비0=60s 후 1회 재시도).
-fn spawn_auto_restore(state_dir: &std::path::Path) {
+fn spawn_auto_restore(state_dir: &std::path::Path, daemon: &std::sync::Arc<Daemon>) {
     let opted_out = cys::env_compat("CYS_NO_AUTORESTORE")
         .map(|v| v == "1")
         .unwrap_or(false);
@@ -417,18 +439,215 @@ fn spawn_auto_restore(state_dir: &std::path::Path) {
         AutoRestore::OptedOut => {
             eprintln!("[cysd] auto-restore skipped (CYS_NO_AUTORESTORE=1)");
         }
-        AutoRestore::PhoenixMissing(p) => {
-            eprintln!(
-                "[cysd] auto-restore skipped (phoenix not installed: {})",
-                p.display()
+        AutoRestore::Ready { program, mut args, env } => {
+            // args = [disk_phoenix, "restore", "--auto"]. disk_phoenix 는 B1 폴백 후보.
+            let disk_phoenix = std::path::PathBuf::from(args.remove(0));
+            let tail = args; // ["restore","--auto"]
+            let log_path = state_dir.join("phoenix-restore.log");
+            let state_dir = state_dir.to_path_buf();
+            let daemon = daemon.clone();
+            std::thread::spawn(move || {
+                // ★B1: 임베드 추출 실행 우선(바이너리=스크립트 동일 커밋 하드보장) → 실패 시 manifest-검증 디스크 폴백.
+                match resolve_phoenix_source(&state_dir, &disk_phoenix, &program, &daemon) {
+                    PhoenixResolve::Ready { script, cleanup } => {
+                        let mut run_args = vec![script.to_string_lossy().into_owned()];
+                        run_args.extend(tail);
+                        loop_auto_restore(&program, &run_args, &env, &log_path);
+                        // temp 누수 0: 추출본은 실행 후 정리(디스크 폴백은 cleanup=None).
+                        if let Some(dir) = cleanup {
+                            let _ = std::fs::remove_dir_all(&dir);
+                        }
+                    }
+                    PhoenixResolve::Failed(reason) => {
+                        eprintln!("[cysd] auto-restore ABORTED — 안전한 phoenix 없음: {reason}");
+                        daemon.push_feed_notification(
+                            "error",
+                            "auto-restore 중단",
+                            &format!("안전한 phoenix 실행원 없음(임베드 추출·디스크 폴백 모두 실패): {reason}"),
+                            None,
+                        );
+                    }
+                }
+            });
+            eprintln!("[cysd] auto-restore triggered (phoenix restore --auto · 임베드 추출 우선)");
+        }
+    }
+}
+
+/// ★B1 phoenix 실행원 해석 결과.
+enum PhoenixResolve {
+    /// 실행 가능한 phoenix 스크립트. cleanup=Some(dir)면 실행 후 그 임시 디렉터리를 정리한다(추출본).
+    Ready {
+        script: std::path::PathBuf,
+        cleanup: Option<std::path::PathBuf>,
+    },
+    /// 임베드 추출·디스크 폴백 모두 실패 — auto-restore 중단(사유 보고).
+    Failed(String),
+}
+
+/// PACK_ALL 에서 phoenix 실행에 필요한 bin/ 트리(javis_phoenix.py + 형제 의존 javis_state_snapshot.py 등)를 추린다.
+fn phoenix_embed_files() -> Vec<(&'static str, &'static str)> {
+    cys::pack::PACK_ALL
+        .iter()
+        .copied()
+        .filter(|(rel, _)| rel.starts_with("bin/"))
+        .collect()
+}
+
+/// ★B1①: 임베드 phoenix 트리를 <state>/phoenix-embed/<version>-<uuid>/ 에 추출한다(버전+고유 ID 격리).
+/// 추출 실패(공간·권한·noexec)는 Err — 호출측이 디스크 폴백으로 강등한다. 반환=(추출 루트, phoenix 스크립트 경로).
+/// ★codex W4 major: 중간 실패(create_dir_all/write) 시 이미 만든 partial root 를 즉시 remove_dir_all(정리 후 Err)
+///   — temp 누수 0(다음 부팅 prune 에 의존하지 않는다).
+fn extract_phoenix_embed(
+    state_dir: &std::path::Path,
+) -> std::io::Result<(std::path::PathBuf, std::path::PathBuf)> {
+    let version = env!("CARGO_PKG_VERSION");
+    let uniq = {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        format!("{version}-{}-{nanos}", std::process::id())
+    };
+    let root = state_dir.join("phoenix-embed").join(uniq);
+    let write_all = || -> std::io::Result<()> {
+        let mut written = 0u32;
+        for (rel, content) in phoenix_embed_files() {
+            let path = root.join(rel);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&path, content)?;
+            written += 1;
+            // 테스트 seam: root+일부 파일 생성 후 강제 실패 주입(중간 실패 정리 결정론 검증).
+            if written == 1 && std::env::var("CYS_PHOENIX_EXTRACT_FAIL").is_ok() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "injected mid-extraction failure",
+                ));
+            }
+        }
+        Ok(())
+    };
+    match write_all() {
+        Ok(()) => {
+            let script = root.join("bin").join("javis_phoenix.py");
+            Ok((root, script))
+        }
+        Err(e) => {
+            // partial root 즉시 정리(temp 누수 0). best-effort — 정리 실패해도 원 에러를 반환.
+            let _ = std::fs::remove_dir_all(&root);
+            Err(e)
+        }
+    }
+}
+
+/// ★B1③: 추출된 phoenix self-test — `<python> <script> --selftest` 가 exit 0 + "selftest ok" 응답이면 통과.
+/// 실행성만 확인(데몬·상태 무접촉). 실패=false(호출측이 정리 후 디스크 폴백).
+fn phoenix_self_test(python: &str, script: &std::path::Path) -> bool {
+    let out = std::process::Command::new(python)
+        .arg(script)
+        .arg("--selftest")
+        .env("CYS_NO_AUTOSTART", "1")
+        .stdin(std::process::Stdio::null())
+        .output();
+    match out {
+        Ok(o) => o.status.success() && String::from_utf8_lossy(&o.stdout).contains("selftest ok"),
+        Err(_) => false,
+    }
+}
+
+/// ★B1②④: phoenix 실행원 해석 — 임베드 추출+self-test 우선, 실패 시 manifest-해시 검증 디스크 폴백.
+/// stale 디스크(임베드와 해시 불일치)는 거부+보고(구버전 phoenix 실행 금지). 전 폴백 실패=Failed.
+fn resolve_phoenix_source(
+    state_dir: &std::path::Path,
+    disk_phoenix: &std::path::Path,
+    python: &str,
+    daemon: &std::sync::Arc<Daemon>,
+) -> PhoenixResolve {
+    // 1) 임베드 추출 우선.
+    match extract_phoenix_embed(state_dir) {
+        Ok((root, script)) => {
+            if phoenix_self_test(python, &script) {
+                return PhoenixResolve::Ready { script, cleanup: Some(root) };
+            }
+            let _ = std::fs::remove_dir_all(&root); // temp 누수 0(self-test 실패분 즉시 정리)
+            eprintln!("[cysd] phoenix 임베드 self-test 실패 — 디스크 폴백 시도");
+            daemon.push_feed_notification(
+                "warn",
+                "phoenix 임베드 self-test 실패",
+                "임베드 추출본이 --selftest 를 통과하지 못함 — 디스크 폴백으로 강등(침묵 금지).",
+                None,
             );
         }
-        AutoRestore::Ready { program, args, env } => {
-            let log_path = state_dir.join("phoenix-restore.log");
-            std::thread::spawn(move || {
-                loop_auto_restore(&program, &args, &env, &log_path);
-            });
-            eprintln!("[cysd] auto-restore triggered (phoenix restore --auto)");
+        Err(e) => {
+            eprintln!("[cysd] phoenix 임베드 추출 실패({e}) — 디스크 폴백 시도");
+            daemon.push_feed_notification(
+                "warn",
+                "phoenix 임베드 추출 실패",
+                &format!("추출 실패({e}) — manifest-검증 디스크 폴백으로 강등(침묵 금지)."),
+                None,
+            );
+        }
+    }
+    // 2) 디스크 폴백 — ★codex W4 major: script-only 해시가 아니라 phoenix 실행 closure **전체**(phoenix_embed_files
+    //    단일 소스 — 추출과 동일 목록)를 대조한다. javis_phoenix.py 만 일치하고 형제 의존(javis_state_snapshot.py)이
+    //    부재/stale 인 디스크 팩이 통과하던 구멍을 막는다. 하나라도 불일치/부재=거부+어느 rel 인지 보고.
+    match disk_fallback_verify(disk_phoenix) {
+        Ok(()) => {
+            eprintln!(
+                "[cysd] phoenix 디스크 폴백 채택(전 closure 해시 일치·verified): {}",
+                disk_phoenix.display()
+            );
+            PhoenixResolve::Ready {
+                script: disk_phoenix.to_path_buf(),
+                cleanup: None,
+            }
+        }
+        Err(reason) => {
+            daemon.push_feed_notification(
+                "error",
+                "phoenix 디스크 폴백 거부(stale/불완전)",
+                &format!("디스크 팩 phoenix closure 검증 실패 — 실행 거부(구/불완전 phoenix 부활 금지): {reason}"),
+                None,
+            );
+            PhoenixResolve::Failed(format!("디스크 폴백 closure 검증 실패 — {reason}"))
+        }
+    }
+}
+
+/// ★B1②(codex W4): 디스크 팩 phoenix closure 전체 검증 — phoenix_embed_files(추출과 동일 단일 소스)의
+/// 각 rel 이 <pack>/<rel> 로 존재하고 임베드 내용과 해시 일치해야 Ok. 부재/불일치=Err(어느 rel 인지 명시).
+/// disk_phoenix = <pack>/bin/javis_phoenix.py → pack_dir = 그 조부모(bin 의 부모).
+fn disk_fallback_verify(disk_phoenix: &std::path::Path) -> Result<(), String> {
+    let pack_dir = disk_phoenix
+        .parent()
+        .and_then(|bin| bin.parent())
+        .ok_or_else(|| "디스크 phoenix 경로에서 pack_dir 파생 실패".to_string())?;
+    let files = phoenix_embed_files();
+    if files.is_empty() {
+        return Err("임베드 phoenix closure 비었음(빌드 이상)".to_string());
+    }
+    for (rel, content) in files {
+        let path = pack_dir.join(rel);
+        match std::fs::read_to_string(&path) {
+            Ok(disk) => {
+                if cys::pack::content_hash_pub(&disk) != cys::pack::content_hash_pub(content) {
+                    return Err(format!("stale(해시 불일치): {rel}"));
+                }
+            }
+            Err(_) => return Err(format!("부재/읽기실패: {rel}")),
+        }
+    }
+    Ok(())
+}
+
+/// ★B1: 이전 실행의 잔여 phoenix-embed 디렉터리를 정리한다(크래시로 cleanup 못한 잔재 — temp 누수 방지).
+fn prune_stale_phoenix_embed(state_dir: &std::path::Path) {
+    let root = state_dir.join("phoenix-embed");
+    if let Ok(rd) = std::fs::read_dir(&root) {
+        for ent in rd.flatten() {
+            let _ = std::fs::remove_dir_all(ent.path());
         }
     }
 }
@@ -1590,16 +1809,18 @@ mod auto_restore_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// phoenix 미설치(구 배포)면 조용히 skip — 데몬은 정상 기동한다.
+    /// ★B1: 디스크 phoenix 부재여도 Ready(임베드 추출이 권위) — 과거 PhoenixMissing skip 은 폐기.
+    /// args[0]=디스크 phoenix 경로(폴백 후보)로 유지된다.
     #[test]
-    fn missing_phoenix_skips() {
+    fn missing_disk_phoenix_still_ready_embed_authoritative() {
         let dir = std::env::temp_dir().join(format!("cys-ar-missing-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         match decide_auto_restore(&dir, false, &dir, "/usr/bin:/bin") {
-            AutoRestore::PhoenixMissing(p) => {
-                assert!(p.ends_with("bin/javis_phoenix.py"), "부재 경로: {}", p.display())
+            AutoRestore::Ready { args, .. } => {
+                assert!(args[0].ends_with("bin/javis_phoenix.py"), "폴백 후보 경로: {}", args[0]);
+                assert_eq!(&args[1..], &["restore".to_string(), "--auto".to_string()]);
             }
-            other => panic!("expected PhoenixMissing, got {other:?}"),
+            other => panic!("expected Ready, got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1682,8 +1903,164 @@ mod auto_restore_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    use super::{
+        bundled_python3, disk_fallback_verify, extract_phoenix_embed, phoenix_embed_files,
+        phoenix_self_test,
+    };
     use std::cell::RefCell;
     use std::time::Duration;
+
+    /// ★codex W4 fix1: 추출 중간 실패(seam CYS_PHOENIX_EXTRACT_FAIL) 시 partial root 즉시 정리 — phoenix-embed 잔여 0.
+    #[test]
+    fn b1_extract_mid_failure_leaves_no_partial_root() {
+        let sd = std::env::temp_dir().join(format!("cys-b1mf-{}", std::process::id()));
+        std::fs::create_dir_all(&sd).unwrap();
+        std::env::set_var("CYS_PHOENIX_EXTRACT_FAIL", "1");
+        let res = extract_phoenix_embed(&sd);
+        std::env::remove_var("CYS_PHOENIX_EXTRACT_FAIL");
+        assert!(res.is_err(), "주입된 중간 실패가 Err 여야 한다");
+        // phoenix-embed 하위 child dir 0(즉시 정리 — 다음 부팅 prune 의존 금지).
+        let root = sd.join("phoenix-embed");
+        let children = std::fs::read_dir(&root).map(|r| r.count()).unwrap_or(0);
+        assert_eq!(children, 0, "중간 실패 후 partial root 잔존");
+        let _ = std::fs::remove_dir_all(&sd);
+    }
+
+    /// ★codex W4 fix2: 디스크 폴백은 script-only 가 아니라 phoenix closure 전체 대조.
+    /// phoenix.py 는 일치해도 형제(javis_state_snapshot.py) 부재/stale 이면 거부(어느 rel 인지 보고).
+    #[test]
+    fn b1_disk_fallback_full_tree_verify() {
+        let pack = std::env::temp_dir().join(format!("cys-b1ft-{}", std::process::id()));
+        let bin = pack.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        // 전 closure 를 임베드 내용 그대로 디스크에 배치 → verified(Ok).
+        for (rel, content) in phoenix_embed_files() {
+            let p = pack.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, content).unwrap();
+        }
+        let disk_phoenix = bin.join("javis_phoenix.py");
+        assert!(disk_fallback_verify(&disk_phoenix).is_ok(), "전 closure 일치 → verified");
+        // 형제 stale: snapshot.py 를 변조 → 거부(rel 명시).
+        std::fs::write(bin.join("javis_state_snapshot.py"), "STALE-SNAPSHOT-DRIFT").unwrap();
+        let e = disk_fallback_verify(&disk_phoenix).unwrap_err();
+        assert!(e.contains("javis_state_snapshot.py"), "stale 형제 rel 미보고: {e}");
+        // 형제 부재: snapshot.py 삭제 → 거부(부재 명시).
+        std::fs::remove_file(bin.join("javis_state_snapshot.py")).unwrap();
+        let e2 = disk_fallback_verify(&disk_phoenix).unwrap_err();
+        assert!(e2.contains("javis_state_snapshot.py") && e2.contains("부재"), "부재 형제 미보고: {e2}");
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// ★B1①: 임베드 추출이 phoenix.py + 형제 의존(javis_state_snapshot.py)을 버전+uuid 격리 디렉터리에
+    /// 임베드 내용 그대로 쓴다. temp 누수 0: 정리 후 디렉터리 소멸.
+    #[test]
+    fn b1_extract_writes_phoenix_and_deps() {
+        let sd = std::env::temp_dir().join(format!("cys-b1x-{}", std::process::id()));
+        std::fs::create_dir_all(&sd).unwrap();
+        let (root, script) = extract_phoenix_embed(&sd).expect("추출 성공");
+        assert!(script.ends_with("bin/javis_phoenix.py"));
+        assert!(script.is_file(), "phoenix.py 추출 안됨");
+        let snap = root.join("bin").join("javis_state_snapshot.py");
+        assert!(snap.is_file(), "형제 의존 javis_state_snapshot.py 미추출");
+        // 내용 == 임베드
+        let embed_phoenix = phoenix_embed_files()
+            .into_iter()
+            .find(|(rel, _)| *rel == "bin/javis_phoenix.py")
+            .map(|(_, c)| c)
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&script).unwrap(), embed_phoenix);
+        // 버전+uuid 격리 경로
+        assert!(root.parent().unwrap().ends_with("phoenix-embed"));
+        // temp 누수 0
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists());
+        let _ = std::fs::remove_dir_all(&sd);
+    }
+
+    /// ★B1③: 추출된 실 phoenix 가 --selftest 를 통과한다(python3 가용 시). self-test 게이트 실증.
+    #[test]
+    fn b1_self_test_passes_on_real_embed() {
+        let py = match std::process::Command::new("python3").arg("--version").output() {
+            Ok(o) if o.status.success() => "python3".to_string(),
+            _ => {
+                eprintln!("python3 미가용 — self-test 게이트 skip");
+                return;
+            }
+        };
+        let sd = std::env::temp_dir().join(format!("cys-b1st-{}", std::process::id()));
+        std::fs::create_dir_all(&sd).unwrap();
+        let (root, script) = extract_phoenix_embed(&sd).expect("추출 성공");
+        assert!(phoenix_self_test(&py, &script), "실 임베드 self-test 실패");
+        // 존재하지 않는 스크립트는 self-test 실패(정직 강등 경로)
+        assert!(!phoenix_self_test(&py, &root.join("bin").join("nope.py")));
+        std::fs::remove_dir_all(&root).unwrap();
+        let _ = std::fs::remove_dir_all(&sd);
+    }
+
+    /// ★B1 temp 누수 0: 크래시로 남은 이전 추출 디렉터리를 부트 시 prune 한다(정리 후 phoenix-embed 비움).
+    #[test]
+    fn b1_prune_stale_embed_dirs() {
+        use super::prune_stale_phoenix_embed;
+        let sd = std::env::temp_dir().join(format!("cys-b1p-{}", std::process::id()));
+        let root = sd.join("phoenix-embed");
+        // 이전 실행 잔재 2개 모사(크래시로 cleanup 못한 것).
+        for u in ["0.12.20-111-222", "0.12.20-333-444"] {
+            std::fs::create_dir_all(root.join(u).join("bin")).unwrap();
+            std::fs::write(root.join(u).join("bin").join("x.py"), "stale").unwrap();
+        }
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 2);
+        prune_stale_phoenix_embed(&sd);
+        // prune 후 잔재 0(디렉터리 자체는 남아도 하위 비움).
+        let remaining = std::fs::read_dir(&root).map(|r| r.count()).unwrap_or(0);
+        assert_eq!(remaining, 0, "prune 후 잔여 추출 디렉터리 존재");
+        // phoenix-embed 부재(부트 첫 회)에서도 panic 없이 무해.
+        let empty = std::env::temp_dir().join(format!("cys-b1p-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&empty).unwrap();
+        prune_stale_phoenix_embed(&empty); // no-op·무패닉
+        let _ = std::fs::remove_dir_all(&sd);
+        let _ = std::fs::remove_dir_all(&empty);
+    }
+
+
+    /// ★B3: 동봉 runtime python3 가 있으면 program 은 그 절대경로(리터럴 "python3" 아님). mac 레이아웃
+    /// (runtime/python/bin/python3)으로 검증 — 순정 Windows/mac CLT 미설치 첫 스폰 단절 수리의 핵심.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn b3_bundled_python_absolute_path_preferred() {
+        let dir = std::env::temp_dir().join(format!("cys-b3-{}", std::process::id()));
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("javis_phoenix.py"), "#!/usr/bin/env python3\n").unwrap();
+        // exe_dir=bin. 동봉 python: bin/runtime/python/bin/python3.
+        let pybin = bin.join("runtime").join("python").join("bin");
+        std::fs::create_dir_all(&pybin).unwrap();
+        let py = pybin.join("python3");
+        std::fs::write(&py, "#!/bin/sh\n").unwrap();
+        assert_eq!(bundled_python3(&bin).as_deref(), Some(py.to_string_lossy().as_ref()));
+        match decide_auto_restore(&dir, false, &bin, "/usr/bin:/bin") {
+            AutoRestore::Ready { program, .. } => {
+                assert_eq!(program, py.to_string_lossy(), "동봉 python3 절대경로여야 한다");
+            }
+            other => panic!("expected Ready, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★B3: 동봉 runtime 이 없으면 program 은 "python3" 리터럴(PATH 폴백).
+    #[test]
+    fn b3_no_bundled_python_falls_back_to_literal() {
+        let dir = std::env::temp_dir().join(format!("cys-b3-nolit-{}", std::process::id()));
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("javis_phoenix.py"), "#!/usr/bin/env python3\n").unwrap();
+        assert_eq!(bundled_python3(&bin), None);
+        match decide_auto_restore(&dir, false, &bin, "/usr/bin:/bin") {
+            AutoRestore::Ready { program, .. } => assert_eq!(program, "python3"),
+            other => panic!("expected Ready, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// ★W1(codex major): 1차 비0 → (수동 복원으로 대상 라이브) → 2차 NOOP(=0)·정확히 2회 실행·중복 스폰 0.
     /// run_auto_restore_once 대신 스크립트 러너를 주입해 sleep 0 으로 결정론 검증(60s 실 sleep 회귀 회피).

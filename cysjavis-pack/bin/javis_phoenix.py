@@ -132,6 +132,9 @@ POISON_FRESH_FALLBACK = os.environ.get("PHOENIX_POISON_FRESH_FALLBACK", "1") != 
 
 CYS = None  # lazy resolve
 
+# ★phoenix protocol version — Rust cys::pack::PHOENIX_PROTOCOL_VERSION 과 동기(identity 3중 대조·B1 self-test 표기).
+PHOENIX_PROTOCOL_VERSION = "1"
+
 
 # ------------------------------------------------------------------ 기반 유틸
 
@@ -525,6 +528,20 @@ def read_topology(socket):
 #   desired는 관측으로만 늘고, ★tombstone(의도적 폐역)으로만 준다 — transient 사망으로 줄지 않는다.
 #   죽은 역할 판정 = desired − 현재 생존. topology 침식과 무관해진다.
 
+def _roster_file_status(path):
+    """★C2 sentinel(W4 게이트): 상태파일 3분류 — 부재='missing'(fresh install 정상)·파싱성공='valid'·
+    파싱실패='corrupt'. corrupt 를 missing 과 **구분**해, 손상 desired 가 빈 상태(fresh)로 위장해 통과하는
+    silent-empty 를 차단하는 근거를 제공한다(현행 load_* 는 corrupt 를 missing 과 동일 빈집합 처리 — 그 구멍)."""
+    if not os.path.exists(path):
+        return "missing"
+    try:
+        with open(path) as f:
+            json.load(f)
+        return "valid"
+    except Exception:
+        return "corrupt"
+
+
 def desired_roster_path(socket):
     return os.path.join(phoenix_home(socket), "desired_roster.json")
 
@@ -536,7 +553,8 @@ def load_desired_roster(socket):
             d = json.load(open(p))
             return d.get("roster", {}), set(d.get("tombstones", []))
         except Exception:
-            pass
+            # ★C2: 손상은 침묵 빈집합이 아니라 로그(sentinel 이 run_restore 진입에서 부활 차단). 전체 복원 체인=W3.
+            log("★C2 경고: desired_roster 파싱 실패(손상) — %s (빈 상태 반환은 run_restore sentinel 이 차단)" % p)
     return {}, set()
 
 
@@ -994,6 +1012,22 @@ def run_restore(socket, ticket="default", stub=False, no_breaker=False, roles=No
         atexit.register(lambda h=_lease_handle: _release_lease(h))
     # ★Phase 6: 이 부팅 세대(재시작마다 변경)를 취득 — 저널 완료 마킹의 유효성 기준.
     _ACTIVE_EPOCH = get_boot_epoch(socket)
+
+    # ★C2 sentinel(W4 게이트): retention-critical desired/dept 가 **손상(corrupt)**이면 부활 중단(exit 6).
+    #   missing(부재)=fresh install 정상 진행(빈 상태 부팅) · corrupt(파싱 실패)=손상이므로 빈 상태(fresh)로
+    #   위장 통과 금지 — 손상 desired 를 무시하고 빈 로스터로 진행하면 폐역/생존 역할 판정이 오염된다.
+    #   전체 복원 체인(.bak·세대 스냅샷·degraded 부활 보류)은 W3. W4 는 '침묵 빈-empty 통과 차단'까지.
+    for _p, _kind in ((desired_roster_path(socket), "desired_roster"),
+                      (dept_roster_path(socket), "dept_roster")):
+        if _roster_file_status(_p) == "corrupt":
+            log("★C2 손상 감지: %s 파싱 실패 — fresh-install(빈 상태) 위장 통과 차단. 부활 중단(exit 6)." % _kind)
+            out = {"phoenix_restore": "CORRUPT", "corruption": True, "corrupt_file": _kind,
+                   "corrupt_path": _p,
+                   "note": ("손상된 %s — 빈 상태(fresh)로 진행하지 않는다(W4 sentinel: missing≠corrupt). "
+                            "복원 체인(.bak·스냅샷·degraded)은 W3." % _kind)}
+            if print_result:
+                print(json.dumps(out, ensure_ascii=False, indent=2))
+            return out
 
     j = load_journal(socket, ticket)
     # ★C6 S0: 죽은 surface 잔재 탐지·보고(회수는 W1 미실행 — surface.close=OwnerClose 함정 회피). 저널 기록.
@@ -2297,6 +2331,13 @@ def cmd_deploy(args):
 
 def main():
     global CYS
+    # ★B1 self-test(임베드 추출 직후 cysd 가 호출): 추출된 phoenix 가 실행가능한지만 확인한다 — 데몬·cys 해석·
+    #   상태파일 무접촉. argparse(서브커맨드 required)·_resolve_cys 이전에 조기 종료해 순수 실행성만 검증.
+    #   설계 §2 B1③ 수용조건. --pack-version 은 별칭(설계 표기 정합).
+    if "--selftest" in sys.argv or "--pack-version" in sys.argv:
+        sys.stdout.write("phoenix selftest ok (proto=%s)\n" % PHOENIX_PROTOCOL_VERSION)
+        sys.stdout.flush()
+        sys.exit(0)
     # ★Windows 패리티(S1~S5): 재부팅 자동기동 토대는 mac=launchd·win=schtasks 로 플랫폼 디스패치하고, 경로/소켓은
     # named pipe→state_dir 매핑으로 해소한다. 과거 os.name=="nt" hard-gate 는 제거됐다 — 전 서브커맨드 Windows 동작.
     ap = argparse.ArgumentParser(description="불사조 부활 저널 상태머신 MVP (M1 게이트)")

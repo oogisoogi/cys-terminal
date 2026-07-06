@@ -318,6 +318,26 @@ fn content_hash(content: &str) -> String {
     format!("{:x}", Sha256::digest(content.as_bytes()))
 }
 
+/// ★B1: 외부(cysd)가 디스크 폴백 phoenix 의 stale 여부(임베드 해시 대조)를 판정할 때 쓰는 공개 래퍼.
+pub fn content_hash_pub(content: &str) -> String {
+    content_hash(content)
+}
+
+/// ★B2(§2 축B 소유권 매니페스트): 팩 파일의 system|user 소유권 축. **기본값=system**(임베드 진실 —
+/// 해시 불일치 시 강제 갱신), **user 는 화이트리스트만**(사용자 수정 보존). 화이트리스트를 좁게 유지해
+/// '조용한 탈락'(system 인데 user 로 오분류돼 스큐가 동결)을 방지한다.
+///   user(preserve)  = 디렉티브(*_DIRECTIVE.md)·헌법(soul.md)·CLAUDE.md — CEO/사용자 커스텀 대상.
+///   system(update)  = bin/*.py·hooks/*·skills·schemas·templates 등 그 외 전부(cysd 소유·스큐 금지).
+/// P0-4 수리: 과거 `_ =>` catch-all 이 매니페스트 부재·읽기 실패까지 'user 수정'으로 오판해 phoenix(system)를
+/// 영구 동결시켜 배포 스큐를 냈다 — 이 분류가 그 근원을 대체한다(CLAUDE.md.template 은 .template 이라 system).
+pub(crate) fn is_user_owned(rel: &str) -> bool {
+    rel.ends_with("_DIRECTIVE.md")
+        || rel == "soul.md"
+        || rel.ends_with("/soul.md")
+        || rel == "CLAUDE.md"
+        || rel.ends_with("/CLAUDE.md")
+}
+
 /// semver(major.minor.patch) 파싱 — version_gt 내부 parts와 동일 규칙('v' 접두 제거,
 /// prerelease/build suffix('-rc','+build') 분리, major 결측·비숫자는 None). ★version_gt와 달리
 /// 파싱 실패를 안전측 bool로 흡수하지 않고 Option으로 노출한다 — remote 비교(§7-④)는 실패=거부
@@ -459,11 +479,11 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
     let mut kept = 0;
     for (rel, content) in items.iter().copied() {
         let path = dir.join(rel);
-        // 디렉티브 영구 보존(멀티마스터 정식화 F1): *_DIRECTIVE.md가 디스크에 임베드와 다른
-        // 내용으로 존재하면(CEO 디렉티브·사용자 헌법 커스텀) force여도 절대 덮지 않는다.
-        // CEO 승격이 pack-ceo/directives/MASTER_DIRECTIVE.md를 CEO 내용으로 둔 것을, 데몬 매
-        // 기동 install(false)·init-pack --force가 임베드 표준본으로 파괴하는 것을 결정론 차단.
-        if path.exists() && rel.ends_with("_DIRECTIVE.md") {
+        // ★B2 user 소유 영구 보존(멀티마스터 정식화 F1 + 소유권 매니페스트): 디렉티브·헌법(soul.md)·CLAUDE.md가
+        // 디스크에 임베드와 다른 내용으로 존재하면(CEO 디렉티브·사용자 헌법 커스텀) force여도 절대 덮지 않는다.
+        // CEO 승격이 directives/MASTER_DIRECTIVE.md를 CEO 내용으로 둔 것을, 데몬 매 기동 install(false)·
+        // init-pack --force가 임베드 표준본으로 파괴하는 것을 결정론 차단. system 파일은 이 보존에서 제외(force-update).
+        if path.exists() && is_user_owned(rel) {
             if let Ok(existing) = std::fs::read_to_string(&path) {
                 if existing != content {
                     kept += 1;
@@ -489,9 +509,15 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                     // 설치-당시 해시 그대로(사용자 비수정) + 임베드가 더 새 버전 → 갱신.
                 }
                 _ => {
-                    // 사용자 수정본·매니페스트 부재·읽기 실패 — 전부 보존(안전측).
-                    kept += 1;
-                    continue;
+                    // ★B2 소유권 분기(P0-4 catch-all 대체): 여기 도달 = 사용자 수정본·매니페스트 부재·읽기 실패.
+                    //   user 소유(디렉티브·헌법·CLAUDE) → 보존(안전측·사용자 편집 존중).
+                    //   system 소유(bin/*.py·hooks/*·skills 등) → 강제 갱신(임베드 진실 — 스큐/손상 오판 동결 금지).
+                    //     매니페스트 부재·해시 불일치를 'user 수정'으로 오판해 phoenix 를 영구 동결시키던 P0-4 근원 제거.
+                    if is_user_owned(rel) {
+                        kept += 1;
+                        continue;
+                    }
+                    // system: 아래 write 로 fall through(임베드 내용으로 갱신).
                 }
             }
         }
@@ -518,8 +544,8 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                 .collect();
             let mut pruned = 0;
             for rel in stale {
-                if rel.ends_with("_DIRECTIVE.md") {
-                    continue; // 디렉티브는 영구 보존(멀티마스터 정식화)
+                if is_user_owned(&rel) {
+                    continue; // ★B2: user 소유(디렉티브·헌법·CLAUDE)는 영구 보존 — prune 대상 제외
                 }
                 let path = dir.join(&rel);
                 match std::fs::read_to_string(&path) {
@@ -1326,65 +1352,58 @@ mod tests {
         assert_eq!(disk_forced.trim(), embed, "force는 다운그레이드 우회해 embed로 갱신");
     }
 
-    /// ★불변식 박제: force=false 업그레이드 의미론 (전수조사 발견 B 보완).
-    /// ① 사용자 비수정 파일(설치-당시 해시 일치) → 임베드 신버전으로 자동 갱신
-    /// ② 사용자 수정 파일 → 불가침 보존
-    /// ③ 매니페스트 부재(구설치본) + 내용 상이 → 보존(안전측)
-    /// ④ 디스크=임베드인 구설치본 → 매니페스트 채택 기록(다음 버전부터 자동 갱신)
+    /// ★불변식 박제 + B2 소유권 매니페스트: force=false 업그레이드 의미론.
+    /// ① system 비수정 파일(설치-당시 해시 일치) → 임베드 신버전으로 자동 갱신
+    /// ② user 파일(soul.md) 수정 → 불가침 보존
+    /// ③ ★B2/P0-4: system 파일 매니페스트 부재 + 내용 상이 → **강제 갱신**(과거 보존 동결이 배포 스큐 근원)
+    /// ④ user 파일 매니페스트 부재 + 내용 상이 → 보존(안전측)
+    /// ⑤ 디스크=임베드인 구설치본 → 매니페스트 채택 기록 + 멱등
     #[test]
-    fn install_upgrades_unmodified_keeps_user_modified() {
+    fn install_ownership_system_forced_user_preserved() {
         let _g = PACK_ENV_LOCK.lock().unwrap();
         let saved = std::env::var(ENV_PACK_DIR).ok();
         let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
-        let td = std::env::temp_dir().join(format!("cys-pack-upgrade-test-{}", std::process::id()));
+        let td = std::env::temp_dir().join(format!("cys-pack-ownership-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&td);
         std::env::set_var(ENV_PACK_DIR, &td);
         std::env::set_var(ENV_CONFIG_DIR, td.join("cysclaude")); // 격리(밀폐)
 
-        let (rel_a, content_a) = PACK[0]; // 비수정·구버전 → 갱신 대상
-        let (rel_b, content_b) = PACK[1]; // 사용자 수정 → 보존 대상
-        let (rel_c, content_c) = PACK[2]; // 구설치본(매니페스트 없음)·내용 상이 → 보존
+        let get = |rel: &str| PACK_ALL.iter().find(|(r, _)| *r == rel).map(|(_, c)| *c)
+            .unwrap_or_else(|| panic!("팩에 {rel} 부재"));
+        let sys_a = "README.md";       // system·비수정(manifest 일치) → 갱신
+        let user_b = "soul.md";        // user·수정 → 보존
+        let sys_c = "acl.json";        // system·manifest 부재·상이 → 강제 갱신(B2/P0-4)
+        let user_d = "directives/MASTER_DIRECTIVE.md"; // user·manifest 부재·상이 → 보존
+        let (sys_a_c, user_b_c, sys_c_c, user_d_c) =
+            (get(sys_a), get(user_b), get(sys_c), get(user_d));
+        // 임베드 4파일과 상이한 값이어야 함(내용 상이 조건).
+        for c in [sys_a_c, user_b_c, sys_c_c, user_d_c] {
+            assert_ne!(c, "OLD-INSTALLED"); assert_ne!(c, "USER-MODIFIED");
+            assert_ne!(c, "SYS-DRIFT"); assert_ne!(c, "USER-CUSTOM");
+        }
         std::fs::create_dir_all(&td).unwrap();
-        for (rel, stale) in [(rel_a, "OLD-INSTALLED"), (rel_b, "USER-MODIFIED"), (rel_c, "LEGACY-STALE")] {
+        for (rel, stale) in [(sys_a, "OLD-INSTALLED"), (user_b, "USER-MODIFIED"),
+                             (sys_c, "SYS-DRIFT"), (user_d, "USER-CUSTOM")] {
             let p = td.join(rel);
             std::fs::create_dir_all(p.parent().unwrap()).unwrap();
             std::fs::write(&p, stale).unwrap();
         }
-        // 매니페스트: a는 설치-당시 해시 = 현재 디스크 해시(비수정 증명),
-        // b는 설치-당시 해시 ≠ 현재 디스크 해시(수정 증명), c는 항목 자체가 없음.
-        let manifest = serde_json::json!({
-            rel_a: content_hash("OLD-INSTALLED"),
-            rel_b: content_hash("(다른 내용으로 설치됐었음)"),
-        });
+        // 매니페스트: sys_a 는 설치-당시 해시=현재 디스크 해시(비수정 증명). 나머지는 항목 없음(부재).
+        let manifest = serde_json::json!({ sys_a: content_hash("OLD-INSTALLED") });
         std::fs::write(td.join(INSTALL_MANIFEST), manifest.to_string()).unwrap();
 
         install(false).expect("install 실패");
+        let read = |rel: &str| std::fs::read_to_string(td.join(rel)).unwrap();
 
-        assert_eq!(
-            std::fs::read_to_string(td.join(rel_a)).unwrap(),
-            content_a,
-            "①비수정 구버전이 임베드 신버전으로 갱신되지 않음"
-        );
-        assert_eq!(
-            std::fs::read_to_string(td.join(rel_b)).unwrap(),
-            "USER-MODIFIED",
-            "②사용자 수정본 불가침 위반"
-        );
-        assert_eq!(
-            std::fs::read_to_string(td.join(rel_c)).unwrap(),
-            "LEGACY-STALE",
-            "③매니페스트 부재 파일은 보존(안전측)이어야 함"
-        );
-        // ④ 채택 기록: 디스크=임베드(이번에 신규 설치된 나머지 파일들)는 매니페스트에 등재
+        assert_eq!(read(sys_a), sys_a_c, "①system 비수정 → 임베드로 갱신");
+        assert_eq!(read(user_b), "USER-MODIFIED", "②user 수정본 불가침");
+        assert_eq!(read(sys_c), sys_c_c, "③★B2/P0-4: system 매니페스트부재·상이 → 강제 갱신(동결 금지)");
+        assert_eq!(read(user_d), "USER-CUSTOM", "④user 매니페스트부재·상이 → 보존");
+
+        // ⑤ 채택 기록 + 멱등: 재실행이 아무것도 다시 쓰지 않고 user 보존 유지.
         let m: std::collections::BTreeMap<String, String> =
-            serde_json::from_str(&std::fs::read_to_string(td.join(INSTALL_MANIFEST)).unwrap())
-                .unwrap();
-        assert_eq!(m.get(rel_a), Some(&content_hash(content_a)), "갱신 후 매니페스트 미반영");
-        assert!(
-            m.get(rel_b) != Some(&content_hash(content_b)),
-            "수정본을 임베드 해시로 기록하면 다음 기동에서 덮어써진다"
-        );
-        // 재실행 멱등: 두 번째 install은 아무것도 다시 쓰지 않아야 한다 (b·c 보존 유지)
+            serde_json::from_str(&read(INSTALL_MANIFEST)).unwrap();
+        assert_eq!(m.get(sys_a), Some(&content_hash(sys_a_c)), "갱신 후 매니페스트 미반영");
         let (w2, _) = install(false).unwrap();
         match saved {
             Some(v) => std::env::set_var(ENV_PACK_DIR, v),
@@ -1395,8 +1414,22 @@ mod tests {
             None => std::env::remove_var(ENV_CONFIG_DIR),
         }
         assert_eq!(w2, 0, "멱등 위반: 재실행이 {w2}개를 다시 씀");
-        assert_eq!(std::fs::read_to_string(td.join(rel_b)).unwrap(), "USER-MODIFIED");
+        assert_eq!(std::fs::read_to_string(td.join(user_b)).unwrap(), "USER-MODIFIED");
         let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// ★B2 분류 순수 함수: user 화이트리스트(디렉티브·헌법·CLAUDE.md)만 preserve, 나머지=system.
+    #[test]
+    fn is_user_owned_classification() {
+        for u in ["soul.md", "directives/MASTER_DIRECTIVE.md", "CLAUDE.md",
+                  "sub/dir/CSO_DIRECTIVE.md", "some/soul.md"] {
+            assert!(is_user_owned(u), "user 여야: {u}");
+        }
+        for s in ["bin/javis_phoenix.py", "hooks/session_start.sh", "README.md",
+                  "acl.json", "CLAUDE.md.template", "skills/x/SKILL.md",
+                  "directives/CEO_TEMPLATE.md"] {
+            assert!(!is_user_owned(s), "system 여야: {s}");
+        }
     }
 
     #[test]
@@ -1597,7 +1630,7 @@ mod tests {
     // 모든 트랜잭션 테스트는 PACK_ENV_LOCK으로 직렬화한다(ENV_PACK_DIR 프로세스 전역 + 저널은
     // pack_dir 형제라 격리 base/pack 구조로 저널을 base 안에 가둔다).
 
-    /// pre-state(.pack-version·soul.md·.install-manifest)를 base/pack에 깔고 env를 세팅한다.
+    /// pre-state(.pack-version·README.md·.install-manifest)를 base/pack에 깔고 env를 세팅한다.
     /// 반환: (base, pd). 정리는 호출처가 remove_dir_all(base).
     /// 트랜잭션 테스트 공용 free 상태(v6 §3 — 시그니처 확장에 따른 헬퍼).
     fn test_free_state(base: &str) -> PackState {
@@ -1651,12 +1684,12 @@ mod tests {
         let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
         let (base, pd) = txn_prestate(
             "commit",
-            &[("soul.md", "OLD-SOUL"), ("stale.txt", "STALE")],
+            &[("README.md", "OLD-SOUL"), ("stale.txt", "STALE")],
             "1.0.0",
         );
 
-        // soul.md 갱신 + new.txt 추가, stale.txt는 items 부재 → prune.
-        let items: Vec<(&str, &str)> = vec![("soul.md", "NEW-SOUL"), ("new.txt", "NEW")];
+        // README.md 갱신 + new.txt 추가, stale.txt는 items 부재 → prune.
+        let items: Vec<(&str, &str)> = vec![("README.md", "NEW-SOUL"), ("new.txt", "NEW")];
         let committed = std::cell::Cell::new(false);
         let res = apply_pack_transactional(&items, "2.0.0", &test_free_state("2.0.0"), || {
             committed.set(true);
@@ -1664,7 +1697,7 @@ mod tests {
         });
 
         let pv = std::fs::read_to_string(pd.join(PACK_VERSION_FILE)).unwrap();
-        let soul = std::fs::read_to_string(pd.join("soul.md")).unwrap();
+        let soul = std::fs::read_to_string(pd.join("README.md")).unwrap();
         let newf = std::fs::read_to_string(pd.join("new.txt")).unwrap();
         let stale_exists = pd.join("stale.txt").exists();
         let journal_exists = pack_journal_dir().exists();
@@ -1675,7 +1708,7 @@ mod tests {
         assert!(committed.get(), "post_commit(record_accepted) 미호출");
         assert!(post_ok, "post_commit 성공인데 false 보고");
         assert_eq!(pv.trim(), "2.0.0", ".pack-version commit marker 미기록");
-        assert_eq!(soul, "NEW-SOUL", "soul.md 갱신 안됨");
+        assert_eq!(soul, "NEW-SOUL", "README.md 갱신 안됨");
         assert_eq!(newf, "NEW", "new.txt 추가 안됨");
         assert!(!stale_exists, "stale.txt prune 안됨");
         assert!(!journal_exists, "commit 성공 후 저널 미삭제");
@@ -1690,13 +1723,13 @@ mod tests {
         let _g = PACK_ENV_LOCK.lock().unwrap();
         let saved = std::env::var(ENV_PACK_DIR).ok();
         let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
-        let (base, pd) = txn_prestate("fault", &[("soul.md", "OLD-SOUL")], "1.0.0");
+        let (base, pd) = txn_prestate("fault", &[("README.md", "OLD-SOUL")], "1.0.0");
         let pre_fp = fingerprint_dir(&pd);
 
-        // soul.md 갱신(1번째 성공) → collide 파일(2번째 성공) → collide/child(3번째: 부모가
+        // README.md 갱신(1번째 성공) → collide 파일(2번째 성공) → collide/child(3번째: 부모가
         // 파일이라 create_dir_all 실패) = mid-apply fault.
         let items: Vec<(&str, &str)> =
-            vec![("soul.md", "NEW"), ("collide", "X"), ("collide/child", "Y")];
+            vec![("README.md", "NEW"), ("collide", "X"), ("collide/child", "Y")];
         let res = apply_pack_transactional(&items, "2.0.0", &test_free_state("2.0.0"), || Ok(()));
 
         let post_fp = fingerprint_dir(&pd);
@@ -1722,18 +1755,18 @@ mod tests {
         let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
         let (base, pd) = txn_prestate(
             "recordfail",
-            &[("soul.md", "OLD-SOUL"), ("stale.txt", "STALE")],
+            &[("README.md", "OLD-SOUL"), ("stale.txt", "STALE")],
             "1.0.0",
         );
 
         // 파일 반영·prune·커밋은 성공, post-commit record_accepted만 실패.
-        let items: Vec<(&str, &str)> = vec![("soul.md", "NEW-SOUL"), ("new.txt", "NEW")];
+        let items: Vec<(&str, &str)> = vec![("README.md", "NEW-SOUL"), ("new.txt", "NEW")];
         let res = apply_pack_transactional(&items, "2.0.0", &test_free_state("2.0.0"), || {
             Err("record_accepted boom".into())
         });
 
         let pv = std::fs::read_to_string(pd.join(PACK_VERSION_FILE)).unwrap();
-        let soul = std::fs::read_to_string(pd.join("soul.md")).unwrap();
+        let soul = std::fs::read_to_string(pd.join("README.md")).unwrap();
         let stale_exists = pd.join("stale.txt").exists();
         let journal_exists = pack_journal_dir().exists();
         restore_env(saved, saved_cfg);
@@ -1748,24 +1781,24 @@ mod tests {
     }
 
     /// orphan 저널 recovery: 디스크 .pack-version != 저널 target(미커밋)이면 rollback으로
-    /// pre-state 자가치유. crash로 남은 부분적용(soul.md=PARTIAL·new.txt 생성)을 되돌린다.
+    /// pre-state 자가치유. crash로 남은 부분적용(README.md=PARTIAL·new.txt 생성)을 되돌린다.
     #[test]
     fn orphan_journal_recovery_rolls_back() {
         let _g = PACK_ENV_LOCK.lock().unwrap();
         let saved = std::env::var(ENV_PACK_DIR).ok();
         let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
-        // crash 후 디스크: .pack-version 옛 1.0.0(미커밋) + soul.md 부분반영 + new.txt 신규생성.
-        let (base, pd) = txn_prestate("orphan-rb", &[("soul.md", "PARTIAL-NEW")], "1.0.0");
+        // crash 후 디스크: .pack-version 옛 1.0.0(미커밋) + README.md 부분반영 + new.txt 신규생성.
+        let (base, pd) = txn_prestate("orphan-rb", &[("README.md", "PARTIAL-NEW")], "1.0.0");
         std::fs::write(pd.join("new.txt"), "ORPHAN-NEW").unwrap();
-        // 저널 수작업 조립: target 2.0.0, soul.md(existed) backup=OLD-SOUL, new.txt(신규) existed=false.
+        // 저널 수작업 조립: target 2.0.0, README.md(existed) backup=OLD-SOUL, new.txt(신규) existed=false.
         let jdir = pack_journal_dir();
         let files_dir = jdir.join("files");
         std::fs::create_dir_all(&files_dir).unwrap();
-        std::fs::write(files_dir.join("soul.md"), "OLD-SOUL").unwrap();
+        std::fs::write(files_dir.join("README.md"), "OLD-SOUL").unwrap();
         let index = serde_json::json!({
             "target_version": "2.0.0",
             "entries": [
-                {"rel": "soul.md", "existed": true},
+                {"rel": "README.md", "existed": true},
                 {"rel": "new.txt", "existed": false}
             ]
         });
@@ -1773,7 +1806,7 @@ mod tests {
 
         let recovered = recover_pack_journal();
 
-        let soul = std::fs::read_to_string(pd.join("soul.md")).unwrap();
+        let soul = std::fs::read_to_string(pd.join("README.md")).unwrap();
         let new_exists = pd.join("new.txt").exists();
         let pv = std::fs::read_to_string(pd.join(PACK_VERSION_FILE)).unwrap();
         let journal_exists = pack_journal_dir().exists();
@@ -1781,7 +1814,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
 
         assert_eq!(recovered.expect("recover 실패"), true, "orphan 미발견");
-        assert_eq!(soul, "OLD-SOUL", "soul.md rollback 안됨");
+        assert_eq!(soul, "OLD-SOUL", "README.md rollback 안됨");
         assert!(!new_exists, "신규생성 new.txt 삭제 안됨");
         assert_eq!(pv.trim(), "1.0.0", ".pack-version 변경됨(미커밋인데)");
         assert!(!journal_exists, "recovery 후 저널 잔존");
@@ -1794,21 +1827,21 @@ mod tests {
         let _g = PACK_ENV_LOCK.lock().unwrap();
         let saved = std::env::var(ENV_PACK_DIR).ok();
         let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
-        // 커밋 성공: .pack-version=2.0.0, soul.md=NEW-SOUL(새 내용).
-        let (base, pd) = txn_prestate("orphan-commit", &[("soul.md", "NEW-SOUL")], "2.0.0");
+        // 커밋 성공: .pack-version=2.0.0, README.md=NEW-SOUL(새 내용).
+        let (base, pd) = txn_prestate("orphan-commit", &[("README.md", "NEW-SOUL")], "2.0.0");
         let jdir = pack_journal_dir();
         let files_dir = jdir.join("files");
         std::fs::create_dir_all(&files_dir).unwrap();
-        std::fs::write(files_dir.join("soul.md"), "OLD-SOUL").unwrap(); // 커밋 전 백업본
+        std::fs::write(files_dir.join("README.md"), "OLD-SOUL").unwrap(); // 커밋 전 백업본
         let index = serde_json::json!({
             "target_version": "2.0.0",
-            "entries": [{"rel": "soul.md", "existed": true}]
+            "entries": [{"rel": "README.md", "existed": true}]
         });
         std::fs::write(jdir.join("index.json"), index.to_string()).unwrap();
 
         let recovered = recover_pack_journal();
 
-        let soul = std::fs::read_to_string(pd.join("soul.md")).unwrap();
+        let soul = std::fs::read_to_string(pd.join("README.md")).unwrap();
         let journal_exists = pack_journal_dir().exists();
         restore_env(saved, saved_cfg);
         let _ = std::fs::remove_dir_all(&base);
@@ -1820,27 +1853,27 @@ mod tests {
 
     /// ★핵심(R2CODE2 HIGH #1): pack-update 트랜잭션에서 .install-manifest.json write_atomic 실패
     /// (경로를 디렉터리로 만들어 rename 실패 유발)는 fail-closed로 Err가 되어 apply_pack_transactional이
-    /// rollback을 타야 한다. 트리 pre-state 복원(soul.md=OLD·new.txt 제거)·.pack-version 불변(미커밋)을
+    /// rollback을 타야 한다. 트리 pre-state 복원(README.md=OLD·new.txt 제거)·.pack-version 불변(미커밋)을
     /// assert해 부분커밋 0을 증명한다.
     #[test]
     fn manifest_write_failure_transactional_rolls_back() {
         let _g = PACK_ENV_LOCK.lock().unwrap();
         let saved = std::env::var(ENV_PACK_DIR).ok();
         let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
-        let (base, pd) = txn_prestate("manifest-fail", &[("soul.md", "OLD-SOUL")], "1.0.0");
+        let (base, pd) = txn_prestate("manifest-fail", &[("README.md", "OLD-SOUL")], "1.0.0");
         // .install-manifest.json을 디렉터리로 치환 → write_atomic(rename) 실패 유발(IO fault 주입).
         let mp = pd.join(INSTALL_MANIFEST);
         std::fs::remove_file(&mp).unwrap();
         std::fs::create_dir_all(mp.join("child")).unwrap();
 
-        let items: Vec<(&str, &str)> = vec![("soul.md", "NEW-SOUL"), ("new.txt", "NEW")];
+        let items: Vec<(&str, &str)> = vec![("README.md", "NEW-SOUL"), ("new.txt", "NEW")];
         let committed = std::cell::Cell::new(false);
         let res = apply_pack_transactional(&items, "2.0.0", &test_free_state("2.0.0"), || {
             committed.set(true);
             Ok(())
         });
 
-        let soul = std::fs::read_to_string(pd.join("soul.md")).unwrap();
+        let soul = std::fs::read_to_string(pd.join("README.md")).unwrap();
         let new_exists = pd.join("new.txt").exists();
         let pv = std::fs::read_to_string(pd.join(PACK_VERSION_FILE)).unwrap();
         let journal_exists = pack_journal_dir().exists();
@@ -1849,7 +1882,7 @@ mod tests {
 
         assert!(res.is_err(), "매니페스트 write 실패인데 성공 반환(best-effort 흡수)");
         assert!(!committed.get(), "파일 반영 실패 전에 commit_extra가 호출되면 안됨");
-        assert_eq!(soul, "OLD-SOUL", "rollback이 soul.md를 pre-state로 복원 못함");
+        assert_eq!(soul, "OLD-SOUL", "rollback이 README.md를 pre-state로 복원 못함");
         assert!(!new_exists, "rollback이 신규 new.txt를 제거 못함(부분적용 잔존)");
         assert_eq!(pv.trim(), "1.0.0", ".pack-version 불변이어야(미커밋)");
         assert!(!journal_exists, "rollback 후 저널 잔존");
@@ -1863,15 +1896,15 @@ mod tests {
         let _g = PACK_ENV_LOCK.lock().unwrap();
         let saved = std::env::var(ENV_PACK_DIR).ok();
         let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
-        let (base, pd) = txn_prestate("manifest-embed", &[("soul.md", "OLD-SOUL")], "1.0.0");
+        let (base, pd) = txn_prestate("manifest-embed", &[("README.md", "OLD-SOUL")], "1.0.0");
         let mp = pd.join(INSTALL_MANIFEST);
         std::fs::remove_file(&mp).unwrap();
         std::fs::create_dir_all(mp.join("child")).unwrap();
 
-        // new.txt는 신규(preserve-gate 충돌 없음)라 반영된다. soul.md는 매니페스트 불가독으로
+        // new.txt는 신규(preserve-gate 충돌 없음)라 반영된다. README.md는 매니페스트 불가독으로
         // preserve-gate가 안전측 보존(OLD 유지) — 이는 manifest 손상의 정상 부작용이며 embed
         // best-effort 분기와 무관하다. 핵심: 매니페스트 write 실패에도 Err 없이 진행 + 버전 마커 기록.
-        let items: Vec<(&str, &str)> = vec![("soul.md", "NEW-SOUL"), ("new.txt", "NEW")];
+        let items: Vec<(&str, &str)> = vec![("README.md", "NEW-SOUL"), ("new.txt", "NEW")];
         let res = install_from_iter(items.iter().copied(), false, "2.0.0", false);
 
         let new_exists = pd.join("new.txt").exists();
@@ -1932,7 +1965,7 @@ mod tests {
         let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
         let (base, pd) = txn_prestate(
             "proguard",
-            &[("soul.md", "OLD-SOUL"), ("pro-only/skill.md", "PRO-SKILL")],
+            &[("README.md", "OLD-SOUL"), ("pro-only/skill.md", "PRO-SKILL")],
             "1.0.0",
         );
         write_pack_state(
@@ -1942,11 +1975,11 @@ mod tests {
         .unwrap();
 
         // 내장 install 시뮬레이션: 신버전 2.0.0, items에 pro-only 파일 부재(=구현 전이라면 prune 대상).
-        let items: Vec<(&str, &str)> = vec![("soul.md", "NEW-SOUL")];
+        let items: Vec<(&str, &str)> = vec![("README.md", "NEW-SOUL")];
         let res = install_from_iter(items.iter().copied(), false, "2.0.0", false);
 
         let pro_file = std::fs::read_to_string(pd.join("pro-only/skill.md")).unwrap_or_default();
-        let soul = std::fs::read_to_string(pd.join("soul.md")).unwrap();
+        let soul = std::fs::read_to_string(pd.join("README.md")).unwrap();
         let pv = std::fs::read_to_string(pd.join(PACK_VERSION_FILE)).unwrap();
         let st_after = read_pack_state(&pd);
         restore_env(saved, saved_cfg);
@@ -1969,13 +2002,13 @@ mod tests {
         let _g = PACK_ENV_LOCK.lock().unwrap();
         let saved = std::env::var(ENV_PACK_DIR).ok();
         let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
-        let (base, pd) = txn_prestate("corruptguard", &[("soul.md", "OLD")], "1.0.0");
+        let (base, pd) = txn_prestate("corruptguard", &[("README.md", "OLD")], "1.0.0");
         std::fs::write(pd.join(PACK_STATE_FILE), b"{not json").unwrap();
 
-        let items: Vec<(&str, &str)> = vec![("soul.md", "NEW")];
+        let items: Vec<(&str, &str)> = vec![("README.md", "NEW")];
         let res = install_from_iter(items.iter().copied(), false, "2.0.0", false);
 
-        let soul = std::fs::read_to_string(pd.join("soul.md")).unwrap();
+        let soul = std::fs::read_to_string(pd.join("README.md")).unwrap();
         restore_env(saved, saved_cfg);
         let _ = std::fs::remove_dir_all(&base);
 
@@ -1989,14 +2022,14 @@ mod tests {
         let _g = PACK_ENV_LOCK.lock().unwrap();
         let saved = std::env::var(ENV_PACK_DIR).ok();
         let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
-        // install-manifest 키는 임베드 트리에 실재하는 rel만(soul.md) — pro 파일 증거 없음.
-        let (base, pd) = txn_prestate("healok", &[("soul.md", "OLD")], "1.0.0");
+        // install-manifest 키는 임베드 트리에 실재하는 rel만(README.md) — pro 파일 증거 없음.
+        let (base, pd) = txn_prestate("healok", &[("README.md", "OLD")], "1.0.0");
         write_pack_state(&pd, &test_free_state("0.9.0")).unwrap(); // base 불일치(0.9.0 ≠ 1.0.0)
 
-        let items: Vec<(&str, &str)> = vec![("soul.md", "NEW")];
+        let items: Vec<(&str, &str)> = vec![("README.md", "NEW")];
         let res = install_from_iter(items.iter().copied(), false, "2.0.0", false);
 
-        let soul = std::fs::read_to_string(pd.join("soul.md")).unwrap();
+        let soul = std::fs::read_to_string(pd.join("README.md")).unwrap();
         let st_after = read_pack_state(&pd);
         restore_env(saved, saved_cfg);
         let _ = std::fs::remove_dir_all(&base);
@@ -2020,7 +2053,7 @@ mod tests {
         let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
         let (base, pd) = txn_prestate(
             "falsefree",
-            &[("soul.md", "OLD"), ("pro-only/skill.md", "PRO")],
+            &[("README.md", "OLD"), ("pro-only/skill.md", "PRO")],
             "1.0.0",
         );
         write_pack_state(&pd, &test_free_state("0.9.0")).unwrap(); // 거짓 free + 불일치
@@ -2031,11 +2064,11 @@ mod tests {
         )
         .unwrap();
 
-        let items: Vec<(&str, &str)> = vec![("soul.md", "NEW")];
+        let items: Vec<(&str, &str)> = vec![("README.md", "NEW")];
         let res = install_from_iter(items.iter().copied(), false, "2.0.0", false);
 
         let pro_file = std::fs::read_to_string(pd.join("pro-only/skill.md")).unwrap_or_default();
-        let soul = std::fs::read_to_string(pd.join("soul.md")).unwrap();
+        let soul = std::fs::read_to_string(pd.join("README.md")).unwrap();
         restore_env(saved, saved_cfg);
         let _ = std::fs::remove_dir_all(&base);
 
@@ -2053,12 +2086,12 @@ mod tests {
         // install-manifest에 임베드 트리 밖 rel(pro-only/skill.md) = pro 파일 증거.
         let (base, pd) = txn_prestate(
             "proevidence",
-            &[("soul.md", "OLD"), ("pro-only/skill.md", "PRO")],
+            &[("README.md", "OLD"), ("pro-only/skill.md", "PRO")],
             "1.0.0",
         );
         write_pack_state(&pd, &test_free_state("0.9.0")).unwrap();
 
-        let items: Vec<(&str, &str)> = vec![("soul.md", "NEW")];
+        let items: Vec<(&str, &str)> = vec![("README.md", "NEW")];
         let res = install_from_iter(items.iter().copied(), false, "2.0.0", false);
 
         let pro_file = std::fs::read_to_string(pd.join("pro-only/skill.md")).unwrap_or_default();
@@ -2085,11 +2118,11 @@ mod tests {
         // .pack-version 경로를 디렉터리로 만들어 write_atomic(rename) 실패 주입.
         std::fs::create_dir_all(pd.join(PACK_VERSION_FILE).join("child")).unwrap();
 
-        let items: Vec<(&str, &str)> = vec![("soul.md", "NEW")];
+        let items: Vec<(&str, &str)> = vec![("README.md", "NEW")];
         let res = install_from_iter(items.iter().copied(), false, "2.0.0", false);
 
         let state_exists = pd.join(PACK_STATE_FILE).exists();
-        let soul_exists = pd.join("soul.md").exists();
+        let soul_exists = pd.join("README.md").exists();
         restore_env(saved, saved_cfg);
         let _ = std::fs::remove_dir_all(&base);
 
@@ -2217,19 +2250,30 @@ mod tests {
         std::env::set_var(ENV_CONFIG_DIR, base.join("claude"));
 
         install_staged(false).unwrap();
-        // 비-디렉티브·비-shebang 임베드 파일 하나를 사용자 편집으로 오염.
-        let target = PACK_ALL
+        // ★B2: user 소유 파일(soul.md 등 — 디렉티브 제외)의 편집은 보존, system 파일 편집은 강제 갱신.
+        let user_target = PACK_ALL
             .iter()
-            .find(|(rel, content)| !rel.ends_with("_DIRECTIVE.md") && !content.starts_with("#!"))
+            .find(|(rel, content)| is_user_owned(rel) && !rel.ends_with("_DIRECTIVE.md") && !content.starts_with("#!"))
             .map(|(rel, _)| *rel)
-            .expect("비-디렉티브 임베드 파일 존재");
-        std::fs::write(pd.join(target), "USER-EDIT-XYZ").unwrap();
+            .expect("user 소유 비-디렉티브 임베드 파일(soul.md 등) 존재");
+        let (sys_target, sys_embed) = PACK_ALL
+            .iter()
+            .find(|(rel, content)| !is_user_owned(rel) && !content.starts_with("#!"))
+            .map(|(rel, c)| (*rel, *c))
+            .expect("system 비-shebang 임베드 파일 존재");
+        std::fs::write(pd.join(user_target), "USER-EDIT-XYZ").unwrap();
+        std::fs::write(pd.join(sys_target), "SYS-EDIT-XYZ").unwrap();
 
         install_staged(false).unwrap();
         assert_eq!(
-            std::fs::read_to_string(pd.join(target)).unwrap(),
+            std::fs::read_to_string(pd.join(user_target)).unwrap(),
             "USER-EDIT-XYZ",
-            "user-edit 보존(force=false)"
+            "★B2: user 소유 파일 편집 보존(force=false)"
+        );
+        assert_eq!(
+            std::fs::read_to_string(pd.join(sys_target)).unwrap(),
+            sys_embed,
+            "★B2: system 파일 편집은 임베드로 강제 갱신(스큐 동결 금지)"
         );
 
         restore_env(saved, saved_cfg);
