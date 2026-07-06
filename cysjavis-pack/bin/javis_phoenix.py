@@ -566,10 +566,24 @@ def _snapshot_roster_entries(socket):
     snap = os.path.join(os.path.dirname(os.path.abspath(__file__)), "javis_state_snapshot.py")
     gen_root = os.path.join(HOME, ".cys", "state-generations")
     try:
-        gens = sorted(g for g in os.listdir(gen_root) if re.match(r"\d{8}T\d{6}Z", g))
+        names = [g for g in os.listdir(gen_root) if re.match(r"\d{8}T\d{6}Z", g)]
     except Exception:
         return {}
-    for g in reversed(gens):  # 최신 세대부터
+    # ★E3(P2-5): 이름(명목 타임스탬프)과 mtime 중 더 나중을 실효 시각으로 — 시계 역행 시 lexical 오선택 방어.
+    def _eff(g):
+        try:
+            mt = os.path.getmtime(os.path.join(gen_root, g))
+        except OSError:
+            mt = 0.0
+        # 이름 타임스탬프를 epoch 초로(파싱 실패=0), mtime 과 max.
+        try:
+            import calendar
+            nominal = calendar.timegm(time.strptime(g, "%Y%m%dT%H%M%SZ"))
+        except Exception:
+            nominal = 0
+        return max(nominal, mt)
+    gens = sorted(names, key=_eff)
+    for g in reversed(gens):  # 실효 시각 최신 세대부터
         tp = os.path.join(gen_root, g, "topology.json")
         if os.path.exists(tp):
             try:

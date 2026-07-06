@@ -314,21 +314,40 @@ def _parse_stamp(name):
     return datetime.strptime(m.group(1), "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
 
 
-def compute_gc(generations, now=None):
-    """보관/삭제 결정. (keep_set, delete_list) 반환. 순수함수(테스트 가능)."""
+def _gen_effective_dt(gen_root, name):
+    """★E3(P2-5) 세대 실효 시각 — 이름의 명목 타임스탬프와 디렉터리 mtime 중 **더 나중**을 취한다.
+    시계 역행 시 실제로 더 최근에 만든 세대가 이름은 lexically 작아지는데, mtime 이 이를 바로잡아 '최근'으로
+    인식되게 한다(lexical 오선택·GC 오삭제 방어). 둘 다 없으면 None."""
+    nominal = _parse_stamp(name)
+    mt = None
+    try:
+        mt = datetime.fromtimestamp(os.path.getmtime(os.path.join(gen_root, name)), tz=timezone.utc)
+    except OSError:
+        pass
+    cands = [d for d in (nominal, mt) if d is not None]
+    return max(cands) if cands else None
+
+
+def compute_gc(generations, now=None, dt_of=None):
+    """보관/삭제 결정. (keep_set, delete_list) 반환. 순수함수(테스트 가능).
+    ★E3(P2-5): dt_of(name)→실효 시각으로 정렬·판정한다(기본=이름 파싱·하위호환). do_gc 는 mtime 병행
+    dt_of 를 주입해 시계 역행 시 lexical 오선택·오삭제를 막는다(monotonic GC)."""
     now = now or _now_utc()
-    gens_desc = sorted(generations, reverse=True)  # 최신 먼저
+    _EPOCH0 = datetime.min.replace(tzinfo=timezone.utc)
+    dt_of = dt_of or _parse_stamp
+    _key = lambda n: (dt_of(n) or _EPOCH0)
+    gens_desc = sorted(generations, key=_key, reverse=True)  # 실효 시각 최신 먼저(clock 역행 방어)
     keep = set()
 
-    # 규칙 A: 최근 48세대
+    # 규칙 A: 실효 시각 기준 최근 48세대
     for name in gens_desc[:KEEP_RECENT]:
         keep.add(name)
 
-    # 규칙 B: 최근 14일, 하루당 대표(그 날의 최신 세대) 1건
+    # 규칙 B: 최근 14일, 하루당 대표(그 날의 최신 세대) 1건 — 실효 시각 기준
     cutoff = now - timedelta(days=KEEP_DAILY_DAYS)
     day_rep = {}
-    for name in gens_desc:  # 최신부터 → 각 날짜 첫 등장이 그 날 최신
-        dt = _parse_stamp(name)
+    for name in gens_desc:  # 실효 시각 최신부터 → 각 날짜 첫 등장이 그 날 최신
+        dt = dt_of(name)
         if dt is None or dt < cutoff:
             continue
         day = dt.strftime("%Y%m%d")
@@ -342,7 +361,7 @@ def compute_gc(generations, now=None):
 
 def do_gc(gen_root=GEN_ROOT, dry_run=False):
     gens = list_generations(gen_root)
-    keep, delete = compute_gc(gens)
+    keep, delete = compute_gc(gens, dt_of=lambda n: _gen_effective_dt(gen_root, n))
     if dry_run:
         print(f"[gc dry-run] 총 {len(gens)}세대 → 보관 {len(keep)} / 삭제 {len(delete)}")
         for n in delete:
