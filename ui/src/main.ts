@@ -1604,9 +1604,11 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
   // WKWebView는 표준 composition 없이 음절 첫 자모를 insertText로 커밋하거나(자모 유출), 혼성 프로필에선
   // 첫 자모를 insertText로 커밋한 뒤 나머지 조합을 표준 composition 이벤트로 진행한다.
   // 자모 pending, 병합 커밋, 음절 확정 flush, 조합 흡수 자모 폐기(drop) 판단은 ime.ts 리듀서가 하고,
-  // 여기서는 DOM 이벤트를 리듀서에 배선만 한다. 계측: localStorage.cysImeDebug="1" 시 이벤트 시퀀스를
-  // log_ime로 기록(유실 경로를 결정론으로 확정하는 채널). 평시 비용 0.
-  const imeDbg = localStorage.getItem("cysImeDebug") === "1";
+  // 여기서는 DOM 이벤트를 리듀서에 배선만 한다. 계측: localStorage.cysImeDebug="1" 또는 파일
+  // 게이트(~/.cys/ime-debug)/CYS_IME_DEBUG=1 시 이벤트 시퀀스를 log_ime로 기록(유실 경로를
+  // 결정론으로 확정하는 채널 — 릴리스 빌드엔 devtools가 없어 파일 게이트가 최종 사용자 진단 경로). 평시 비용 0.
+  let imeDbg = localStorage.getItem("cysImeDebug") === "1";
+  if (!imeDbg) invoke("ime_debug_enabled").then((v) => { imeDbg = v === true; }).catch(() => {});
   const dbg = (line: string) => {
     if (imeDbg) invoke("log_ime", { line: `[s${sid}] ${line}` }).catch(() => {});
   };

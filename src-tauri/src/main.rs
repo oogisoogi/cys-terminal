@@ -392,6 +392,14 @@ fn log_ime(line: String) {
     }
 }
 
+/// IME 디버그 게이트(파일/환경변수): 릴리스 빌드엔 devtools가 없어 localStorage.cysImeDebug를
+/// 최종 사용자가 켤 수 없다 → ~/.cys/ime-debug 파일 존재 또는 CYS_IME_DEBUG=1이면 계측 활성.
+#[tauri::command]
+fn ime_debug_enabled() -> bool {
+    std::env::var("CYS_IME_DEBUG").map(|v| v == "1").unwrap_or(false)
+        || cys::home_dir().join(".cys/ime-debug").exists()
+}
+
 #[tauri::command]
 async fn send_input(socket: Option<String>, surface_id: u64, data: String) -> Result<(), String> {
     // human=true: T3-13 타이핑 가드의 신호 — UI 키 입력을 '사람'으로 표시해
@@ -1754,6 +1762,7 @@ fn main() {
             send_input,
             save_pasted_image,
             log_ime,
+            ime_debug_enabled,
             rename_surface,
             resize_surface,
             close_surface,

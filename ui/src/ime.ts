@@ -38,6 +38,15 @@ export const initialImeState = (): ImeState => ({ pending: "" });
 const HANGUL_TEXT = /^[ㄱ-ㆎᄀ-ᇿ가-힣]+$/;
 export const isHangulText = (t: string) => HANGUL_TEXT.test(t);
 
+// keydown flush 허용목록: 조합 확정이 필요한 제어·공백 키만. 글자 키는 flush 금지 —
+// 일부 WebKit 프로필이 조합 참여 글쇠를 keyCode≠229로 발화해 자모 pending이 유출되던 구멍 봉인.
+// 글자 키의 pending은 후속 input/composition/onData 이벤트가 해소한다(바이트·순서 불변).
+const KEYDOWN_FLUSH_KEYS = new Set([
+  "Enter", " ", "Tab", "Backspace", "Delete", "Escape",
+  "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown",
+  "Home", "End", "PageUp", "PageDown",
+]);
+
 export function imeStep(state: ImeState, event: ImeEvent): ImeResult {
   const actions: ImeAction[] = [];
   let pending = state.pending;
@@ -91,9 +100,10 @@ export function imeStep(state: ImeState, event: ImeEvent): ImeResult {
       break;
     }
     case "keydown": {
-      // 일반 키(Enter·Space·화살표 등, IME 처리중 229 제외) 직전에 조합 확정
-      if (event.keyCode !== 229) {
-        actions.push({ debug: `keydown ${event.key}` });
+      // 계측은 전 keydown(229 포함) — 제5 프로필 이벤트 시퀀스 진단 채널.
+      actions.push({ debug: `keydown key="${event.key}" code=${event.keyCode}` });
+      // 제어·공백 키(IME 처리중 229 제외) 직전에만 조합 확정 — 글자 키 flush는 자모 유출 구멍.
+      if (event.keyCode !== 229 && KEYDOWN_FLUSH_KEYS.has(event.key)) {
         flush("keydown");
       }
       break;

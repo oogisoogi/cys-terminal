@@ -140,6 +140,41 @@ describe("keydown/blur flush · 229 무전송 · onData 순서 보존", () => {
   });
 });
 
+describe("구멍① — keydown keyCode≠229 프로필(자모 유출 방어)", () => {
+  it("insertText 'ㄴ' → keydown(74,'ㅓ')(비229 글자 키) → compositionstart → onData '너' ⇒ '너'(유출 없음)", () => {
+    const r = run([
+      input("insertText", "ㄴ"), // pending "ㄴ"
+      keydown(74, "ㅓ"), // 비229 글자 키 — 허용목록 前엔 여기서 "ㄴ" flush(유출)
+      { kind: "compositionstart" }, // 조합이 pending 자모 흡수 → drop
+      onData("너"),
+    ]);
+    expect(r.bytes).toBe("너"); // 허용목록 前엔 "ㄴ너"
+    expect(r.state.pending).toBe("");
+  });
+
+  it("229 인터리빙: insertText 'ㄴ' → keydown(229,'Process') → compositionstart → onData '너' ⇒ '너'", () => {
+    const r = run([
+      input("insertText", "ㄴ"),
+      keydown(229, "Process"),
+      { kind: "compositionstart" },
+      onData("너"),
+    ]);
+    expect(r.bytes).toBe("너");
+    expect(r.state.pending).toBe("");
+  });
+
+  it("허용목록 flush 유지: pending 'ㅋ' + keydown(32,' ') ⇒ 'ㅋ' flush(단독 자모+Space 무손상)", () => {
+    const r = run([keydown(32, " ")], { pending: "ㅋ" });
+    expect(r.bytes).toBe("ㅋ");
+    expect(r.state.pending).toBe("");
+  });
+
+  it("keydown 계측: keydown(229,'Process')가 debug 라인을 남긴다", () => {
+    const r = run([keydown(229, "Process")]);
+    expect(r.debugs).toContain('keydown key="Process" code=229');
+  });
+});
+
 describe("isHangulText — 자모·완성형만 참", () => {
   it("자모/완성형 참, 그 외 거짓", () => {
     expect(isHangulText("ㄴ")).toBe(true);
