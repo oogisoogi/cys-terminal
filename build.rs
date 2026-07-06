@@ -30,6 +30,21 @@ fn main() {
         panic!("pack 소스 비었음 — git 인덱스 부재? 빌드 중단");
     }
 
+    // ★W1 identity(3중 대조 field 1): 빌드 식별자 = git HEAD 짧은 SHA. 같은 빌드의 cys·cysd 는 동일 SHA →
+    // 폴백 cys 가 데몬과 같은 빌드인지 교차대조하는 anti-shadowing 근거(embedded pack hash·protocol version 과 함께).
+    // build.rs 는 이미 git 에 하드 의존(위 ls-files)하므로 추가 의존 없음. 실패 시 "unknown"(대조에서 불일치로 안전측).
+    println!("cargo:rerun-if-changed=.git/HEAD");
+    let build_id = Command::new("git")
+        .args(["rev-parse", "--short=12", "HEAD"])
+        .current_dir(&manifest_dir)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+    println!("cargo:rustc-env=CYS_BUILD_ID={build_id}");
+
     // 추적 파일 → cysjavis-pack/ 접두 제거한 rel. 제외규칙(기존 walk와 동형): 경로 컴포넌트가
     // '.'로 시작(.gitignore 등 dotfile/dotdir)·tests·__pycache__ 이면 배포 대상이 아니다.
     let mut rels: Vec<String> = Vec::new();

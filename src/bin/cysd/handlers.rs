@@ -2473,6 +2473,10 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     "daemon": {"version": env!("CARGO_PKG_VERSION"),
                                "started_at": daemon.started_at,
                                "latest_seq": daemon.bus.latest_seq(),
+                               // ★W1 identity(3중 대조): 폴백 cys 가 이 데몬과 같은 빌드인지 python 이 교차대조.
+                               "build_id": cys::pack::build_id(),
+                               "embedded_pack_hash": cys::pack::embedded_pack_hash(),
+                               "protocol_version": cys::pack::PHOENIX_PROTOCOL_VERSION,
                                // (W4) 데몬 전체 파서 패닉 격리 누적 — health 신호.
                                "parser_panics": daemon.parser_panics_total.load(Ordering::Relaxed)},
                     "surfaces": list,

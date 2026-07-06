@@ -27,6 +27,30 @@ include!(concat!(env!("OUT_DIR"), "/pack_all.rs"));
 pub const PACK: &[(&str, &str)] = PACK_ALL;
 pub const PACK_SKILLS: &[(&str, &str)] = &[];
 
+/// ★W1 identity(3중 대조): phoenix ↔ cysd/cys 실행 신뢰원이 같은 빌드인지 교차대조하는 3필드 단일 SOT.
+/// 폴백 cys 채택 시 python 이 이 3필드를 self-report(cys) vs daemon(cysd status) 로 대조한다(§5-1②).
+/// ① build_id = git HEAD SHA(build.rs 임베드) ② embedded_pack_hash = 임베드 팩 트리 해시 ③ protocol version.
+pub const PHOENIX_PROTOCOL_VERSION: &str = "1";
+
+/// 빌드 식별자(git HEAD 짧은 SHA · build.rs 가 CYS_BUILD_ID 로 주입). 같은 빌드의 cys·cysd 동일.
+pub fn build_id() -> &'static str {
+    option_env!("CYS_BUILD_ID").unwrap_or("unknown")
+}
+
+/// 임베드 팩 매니페스트 해시 — PACK_ALL(rel+content, build.rs 가 이미 정렬)을 sha256 스트리밍 해시.
+/// 같은 소스로 빌드된 cys·cysd 는 동일 값(둘 다 동일 PACK_ALL 임베드). 팩 내용이 다르면 값이 갈린다.
+pub fn embedded_pack_hash() -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    for (rel, content) in PACK_ALL.iter() {
+        h.update(rel.as_bytes());
+        h.update(b"\0");
+        h.update(content.as_bytes());
+        h.update(b"\0");
+    }
+    format!("{:x}", h.finalize())
+}
+
 /// 설치 위치: $CYS_PACK_DIR (구 JAVIS_PACK_DIR·AITERM_JARVIS_DIR 폴백) 또는 ~/.cys/pack
 pub fn pack_dir() -> PathBuf {
     if let Some(d) = crate::env_compat(ENV_PACK_DIR) {

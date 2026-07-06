@@ -147,70 +147,137 @@ _CYS_STD_PATHS = ["/opt/homebrew/bin/cys", "/usr/local/bin/cys"]
 
 
 def _extract_version(text):
-    """`cys --version`('cys 0.12.20') / daemon.version('0.12.20') 에서 x.y.z 를 추출(비교용 정규화)."""
+    """`cys --version`('cys 0.12.20') / daemon.version('0.12.20') 에서 x.y.z 를 추출(진단 로깅용)."""
     m = re.search(r"\d+\.\d+\.\d+", text or "")
     return m.group(0) if m else ""
 
 
-def _cys_identity_ok(candidate, socket):
-    """폴백 후보 cys 의 정체 검증: 후보 `--version` ↔ 대상 데몬 `status --json`.daemon.version 대조.
-    일치해야 True. 다중 설치·구버전 스큐(후보가 이 데몬과 다른 빌드)를 차단한다. 서브프로세스 실패/미응답/
-    버전 미상은 보수적으로 False(불일치 취급 → 호출측이 exit 6 로 안전 정지)."""
+# ★W1 identity 3중 대조 필드(§5-1② · codex R3 blocking): 버전 문자열 단일 대조는 shadowing 구멍
+#   (같은 version 문자열의 다른 빌드·다른 embedded pack·다른 protocol 이 통과). 3필드 전건 일치를 요구한다.
+_IDENTITY_FIELDS = ("build_id", "embedded_pack_hash", "protocol_version")
+
+
+def _cys_self_identity(candidate):
+    """후보 cys 자신의 3필드 self-report(`cys phoenix-identity` — 데몬 불요·컴파일타임 상수). 실패=None."""
     try:
-        vr = subprocess.run([candidate, "--version"], capture_output=True, text=True, timeout=10)
+        r = subprocess.run([candidate, "phoenix-identity"], capture_output=True, text=True, timeout=10)
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        return False
-    cli_ver = _extract_version((vr.stdout or "") + (vr.stderr or ""))
+        return None
+    try:
+        return json.loads(r.stdout or "{}")
+    except Exception:
+        return None
+
+
+def _daemon_identity(candidate, socket):
+    """대상 데몬의 3필드(`cys status --json`.daemon). 서브프로세스 실패/미도달/파싱실패=None."""
     cmd = [candidate]
     if socket:
         cmd += ["--socket", socket]
     cmd += ["status", "--json"]
     try:
-        sr = subprocess.run(cmd, capture_output=True, text=True, timeout=12)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=12)
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        return False
+        return None
     try:
-        st = json.loads(sr.stdout or "{}")
+        return (json.loads(r.stdout or "{}").get("daemon") or {})
     except Exception:
-        return False
-    daemon_ver = _extract_version((st.get("daemon") or {}).get("version") or "")
-    return bool(cli_ver) and bool(daemon_ver) and cli_ver == daemon_ver
+        return None
+
+
+def _cys_identity_check(candidate, socket):
+    """★3중 대조(§5-1②): 후보 self-report(phoenix-identity) ↔ 대상 데몬 status.daemon 의
+    build_id·embedded_pack_hash·protocol_version 전건 일치 검증. 반환 (status, field, detail):
+      · ('match', None, detail)        전 3필드 일치(같은 빌드·팩·프로토콜 확증)
+      · ('mismatch', <field>, detail)  특정 필드 불일치/부재(다른 빌드/팩/프로토콜 — shadowing 차단, 어느 필드인지 명시)
+      · ('inconclusive', reason, '')   self-report 또는 데몬 status 미도달로 대조 불가."""
+    self_id = _cys_self_identity(candidate)
+    if not self_id:
+        return ("inconclusive", "self-report(phoenix-identity) 실패 — 구버전 cys(커맨드 부재) 의심", "")
+    dmn = _daemon_identity(candidate, socket)
+    if not dmn:
+        return ("inconclusive", "데몬 status 미도달(대조 불가)", "")
+    for f in _IDENTITY_FIELDS:
+        sv, dv = self_id.get(f), dmn.get(f)
+        if not sv or not dv:
+            return ("mismatch", f, "self=%r daemon=%r(필드 부재 — 구버전/legacy 의심)" % (sv, dv))
+        if sv != dv:
+            return ("mismatch", f, "self=%r daemon=%r" % (sv, dv))
+    return ("match", None, "build_id=%s proto=%s" % (self_id.get("build_id"), self_id.get("protocol_version")))
+
+
+def _resolve_journal_start(socket):
+    """★gemini major: _resolve_cys die 전에 저널 뼈대(ticket=resolve·타임스탬프·stage=resolve_cys)를 먼저
+    생성한다 — die 로 무단 종료해도 저널에 시도 이력이 남게 하는 관측 사각 제거. best-effort."""
+    try:
+        j = load_journal(socket, "resolve")
+        jevent(j, "*", "resolve_cys", "start", "cys 실행 경로 해석 시작")
+        save_journal(socket, "resolve", j)
+    except Exception:
+        pass
+
+
+def _resolve_die(socket, msg, code):
+    """★gemini major: resolve 실패를 저널에 기록한 뒤 die — 침묵사(저널 무이력 종료) 차단."""
+    try:
+        j = load_journal(socket, "resolve")
+        jevent(j, "*", "resolve_cys", "fail", msg[:280])
+        j.setdefault("resolve", {})["failed_at"] = _now()
+        save_journal(socket, "resolve", j)
+    except Exception:
+        pass
+    die(msg, code=code)
 
 
 def _resolve_cys(socket):
     """cys 실행 경로 해석(§5-1 W1). 우선순위: PHOENIX_CYS > which('cys') > 표준경로 폴백(조건부).
     ★리터럴 'cys' 최종 폴백은 제거됨 — PATH 미해석을 침묵 통과시켜 첫 subprocess 에서 FileNotFoundError→
     이유 없는 exit 1 침묵사를 유발한 근원(라이브 실증 2026-07-06). 미해석은 즉시 exit 6(정직 정지).
-    폴백(표준경로) 채택 규칙:
-      · PHOENIX_STRICT_CYS=1        → 폴백 금지(미해석=즉시 exit 6). E2E 게이트가 Rust env 주입 자체를 검증.
-      · 하네스(--socket 또는 PHOENIX_FORBID_LIVE=1) → 폴백 금지(테스트 독립성 — 실 표준경로 오염 차단).
-      · 그 외(라이브) → 후보 존재+실행가능 + identity-check(후보↔데몬 버전 일치) 통과 시에만 채택, 불일치=exit 6.
-    폴백 채택 사실은 stderr(→cysd phoenix-restore.log)에 기록한다."""
+    ★codex major: PHOENIX_CYS 도 무검증 수용 금지 — 실행가능(X_OK)+3중 identity 계약 적용. 불일치=exit 6.
+    채택 규칙:
+      · PHOENIX_CYS(명시)  → X_OK 필수. identity mismatch=exit 6. match/inconclusive(데몬 미도달)=채택(X_OK 통과).
+      · PHOENIX_STRICT_CYS=1 → 표준경로 폴백 금지(미해석=즉시 exit 6). E2E 게이트가 Rust env 주입 자체를 검증.
+      · 하네스(--socket 또는 PHOENIX_FORBID_LIVE=1) → 표준경로 폴백 금지(테스트 독립성).
+      · 표준경로 폴백(라이브·PATH 미해석) → positive proof 요구: X_OK + identity **match**만 채택(mismatch·inconclusive=exit 6).
+    실패·채택 모두 저널·stderr(→cysd phoenix-restore.log)에 기록한다."""
+    _resolve_journal_start(socket)
     explicit = os.environ.get("PHOENIX_CYS")
     if explicit:
+        if not (os.path.isfile(explicit) and os.access(explicit, os.X_OK)):
+            _resolve_die(socket, "PHOENIX_CYS(%s) 실행 불가(파일 부재/실행권한 없음) — 무검증 수용 금지·exit 6." % explicit, 6)
+        status, field, detail = _cys_identity_check(explicit, socket)
+        if status == "mismatch":
+            _resolve_die(socket, "PHOENIX_CYS(%s) identity 3중 대조 불일치 — 불일치 필드=%s (%s). "
+                         "다른 빌드/팩/프로토콜 스큐 차단·exit 6." % (explicit, field, detail), 6)
+        if status == "inconclusive":
+            sys.stderr.write("[phoenix] PHOENIX_CYS(%s) identity inconclusive(%s) — X_OK 통과로 채택"
+                             "(데몬 미도달 시 3중 대조 불가).\n" % (explicit, field))
+            sys.stderr.flush()
         return explicit
     found = _which("cys")
     if found:
         return found
-    # 여기부터 폴백 경로 — PATH·PHOENIX_CYS 모두 cys 미해석.
+    # 여기부터 표준경로 폴백 — PATH·PHOENIX_CYS 모두 cys 미해석.
     strict = os.environ.get("PHOENIX_STRICT_CYS") == "1"
     harness = bool(socket) or os.environ.get("PHOENIX_FORBID_LIVE") == "1"
     if strict:
-        die("PHOENIX_STRICT_CYS=1 이나 cys 를 PHOENIX_CYS/PATH 로 해석하지 못했다 — 표준경로 폴백 금지(exit 6). "
-            "Rust auto-restore 의 PHOENIX_CYS 주입이 누락됐을 수 있다(B3).", code=6)
+        _resolve_die(socket, "PHOENIX_STRICT_CYS=1 이나 cys 를 PHOENIX_CYS/PATH 로 해석하지 못했다 — 표준경로 폴백 "
+                     "금지(exit 6). Rust auto-restore 의 PHOENIX_CYS 주입이 누락됐을 수 있다(B3).", 6)
     if harness:
-        die("하네스 모드(--socket/PHOENIX_FORBID_LIVE)에서 cys 미해석 — 표준경로 폴백 금지(테스트 독립성·exit 6). "
-            "격리 실행은 PHOENIX_CYS 로 대상 cys 를 명시하라.", code=6)
+        _resolve_die(socket, "하네스 모드(--socket/PHOENIX_FORBID_LIVE)에서 cys 미해석 — 표준경로 폴백 금지"
+                     "(테스트 독립성·exit 6). 격리 실행은 PHOENIX_CYS 로 대상 cys 를 명시하라.", 6)
     for c in _CYS_STD_PATHS:
         if os.path.isfile(c) and os.access(c, os.X_OK):
-            if _cys_identity_ok(c, socket):
-                sys.stderr.write("[phoenix] cys 표준경로 폴백 채택: %s (PATH 미해석 — identity 검증 통과)\n" % c)
+            status, field, detail = _cys_identity_check(c, socket)
+            if status == "match":
+                sys.stderr.write("[phoenix] cys 표준경로 폴백 채택: %s (PATH 미해석 — 3중 identity match·%s)\n" % (c, detail))
                 sys.stderr.flush()
                 return c
-            die("cys 표준경로 폴백 후보(%s) identity 불일치(--version↔daemon.version) — 다중설치/구버전 스큐 "
-                "의심(exit 6). PHOENIX_CYS 로 이 데몬과 동일 빌드의 cys 를 명시하라." % c, code=6)
-    die("cys 실행 경로 미해석(PHOENIX_CYS·PATH·표준경로 %s 모두 실패) — 리터럴 폴백 제거됨(침묵사 방지·exit 6)."
-        % _CYS_STD_PATHS, code=6)
+            # 폴백 후보는 positive proof 요구 — mismatch·inconclusive 모두 거부(불일치 필드 명시).
+            _resolve_die(socket, "cys 표준경로 폴백 후보(%s) identity %s(field=%s · %s) — 채택 거부·exit 6. "
+                         "PHOENIX_CYS 로 이 데몬과 동일 빌드의 cys 를 명시하라." % (c, status, field, detail), 6)
+    _resolve_die(socket, "cys 실행 경로 미해석(PHOENIX_CYS·PATH·표준경로 %s 모두 실패) — 리터럴 폴백 제거됨"
+                 "(침묵사 방지·exit 6)." % _CYS_STD_PATHS, 6)
 
 
 def die(msg, code=2):
@@ -291,7 +358,13 @@ def _run_capture(cmd, env, timeout):
     ef = tempfile.TemporaryFile()
     r = _CapR()
     try:
-        p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=of, stderr=ef, env=env)
+        try:
+            p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=of, stderr=ef, env=env)
+        except (FileNotFoundError, OSError) as e:
+            # ★codex major(Windows 대칭): cys.exe 미해석/실행불가 → 비구조화 crash 대신 구조화 실패(rc=127).
+            r.returncode = 127
+            r.stderr = "cys 실행 불가(%s: %s) cmd=%r" % (type(e).__name__, e, cmd)
+            return r
         try:
             p.wait(timeout=timeout)
             r.returncode = p.returncode
@@ -333,6 +406,14 @@ def cys(*args, socket=None, timeout=25):
             returncode = 124
             stdout = (e.stdout.decode() if isinstance(e.stdout, bytes) else (e.stdout or "")) if e.stdout else ""
             stderr = "TIMEOUT %ss" % timeout
+        return _R()
+    except (FileNotFoundError, OSError) as e:
+        # ★codex major: CYS 해석 후에도 파일이 사라지거나 실행 불가면 여기서 비구조화 exit 1 crash 가 났다.
+        #   구조화 실패(rc=127)로 강등해 상위 판정(스폰 실패→INCOMPLETE 등)이 정직히 흐르게 한다.
+        class _R:
+            returncode = 127
+            stdout = ""
+            stderr = "cys 실행 불가(%s: %s) cmd=%r" % (type(e).__name__, e, cmd)
         return _R()
 
 
@@ -2115,6 +2196,11 @@ def cmd_deploy(args):
     _lease_retry = 0
     while restore_res.get("phoenix_restore") == "LEASE_HELD" and _lease_retry < 2:
         _lease_retry += 1
+        # ★gemini minor: 재시도 대기를 deploy 저널에 이벤트로 기록(대기 이력 관측 · 반복 run_restore 로 인한 이력 꼬임 방지).
+        _dmark(j, "restore", "lease_retry",
+               "다른 restore lease 보유 — %d/2회차 재시도 대기(backoff %.1fs)" % (_lease_retry, SPAWN_BACKOFF * _lease_retry),
+               epoch=get_boot_epoch(socket), lease_retry=_lease_retry)
+        save_deploy_journal(socket, ticket, j)
         time.sleep(SPAWN_BACKOFF * _lease_retry)
         restore_res = run_restore(socket, ticket="deploy-" + ticket, stub=stub, no_breaker=True,
                                   roles=None, include_master=include_master, stub_sids=None, print_result=False)

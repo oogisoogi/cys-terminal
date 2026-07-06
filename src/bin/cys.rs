@@ -26,6 +26,10 @@ enum Command {
     Ping,
     /// Identify daemon + caller (uses AITERM_SURFACE_ID env when inside a surface)
     Identify,
+    /// ★W1: 이 cys 바이너리 자신의 identity 3필드(build_id·embedded_pack_hash·protocol_version) JSON 출력.
+    /// 데몬 불요(컴파일타임 상수 self-report) — phoenix 폴백이 데몬 status 의 동일 3필드와 교차대조한다.
+    #[command(name = "phoenix-identity", hide = true)]
+    PhoenixIdentity,
     /// Emit the data-derived command catalog (self-describing index — agents/LLM read this
     /// instead of re-parsing prose tables; the clap definition IS the single source of truth)
     Actions {
@@ -1279,6 +1283,19 @@ fn request(method: &str, params: Value) -> Result<Value, String> {
 fn run(command: Command) -> i32 {
     let result = match command {
         Command::Ping => request("system.ping", json!({})).map(|r| println!("{}", r.as_str().unwrap_or("pong"))),
+        Command::PhoenixIdentity => {
+            // 데몬 접속 없이 이 바이너리 자신의 3필드를 출력(phoenix 폴백 identity 대조의 self-report 측).
+            println!(
+                "{}",
+                json!({
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "build_id": cys::pack::build_id(),
+                    "embedded_pack_hash": cys::pack::embedded_pack_hash(),
+                    "protocol_version": cys::pack::PHOENIX_PROTOCOL_VERSION,
+                })
+            );
+            return 0;
+        }
 
         Command::Identify => {
             let caller = cys::env_compat(ENV_SURFACE_ID).ok_or(std::env::VarError::NotPresent)
