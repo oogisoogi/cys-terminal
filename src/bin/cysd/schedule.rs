@@ -118,10 +118,14 @@ fn builtin_jobs() -> Vec<serde_json::Value> {
     ]
 }
 
-/// built-in 잡을 jobs 배열에 idempotent upsert(순수 — 회귀 핀). id 로 대조: 부재=append(생성)·존재+동버전=
-/// 무접촉·존재+구버전(또는 마커부재)=교체(갱신). 사용자 잡·타 built-in 은 건드리지 않는다. 반환=변경 여부.
-fn apply_builtin_jobs(jobs: &mut Vec<serde_json::Value>) -> bool {
+/// built-in 잡을 jobs 배열에 idempotent upsert(순수 — 회귀 핀). id 로 대조:
+///   · 부재 → append(생성)
+///   · 존재 + built-in 마커(`_builtin=="phoenix"`) → 버전 상이 시 교체(갱신)·동버전 무접촉
+///   · 존재 + **마커 없음(사용자가 그 id 선점)** → ★codex W3: 교체 금지(사용자 잡 보존)·경고(conflicts 반환)
+/// 반환 (changed, conflicts) — conflicts=사용자가 reserved id 를 쓴 잡 id 목록(호출측 loud 경고).
+fn apply_builtin_jobs(jobs: &mut Vec<serde_json::Value>) -> (bool, Vec<String>) {
     let mut changed = false;
+    let mut conflicts = Vec::new();
     for bj in builtin_jobs() {
         let id = match bj.get("id").and_then(|v| v.as_str()) {
             Some(s) => s.to_string(),
@@ -133,9 +137,17 @@ fn apply_builtin_jobs(jobs: &mut Vec<serde_json::Value>) -> bool {
             .position(|j| j.get("id").and_then(|v| v.as_str()) == Some(id.as_str()))
         {
             Some(pos) => {
+                // ★codex W3 major: built-in 마커(_builtin=="phoenix")가 있는 항목만 우리 소유 → 버전 갱신.
+                //   마커 없는 동명 항목은 사용자가 그 id 를 선점한 것 → 교체 금지+conflict 경고(user 잡 보존).
+                let is_ours =
+                    jobs[pos].get("_builtin").and_then(|v| v.as_str()) == Some("phoenix");
+                if !is_ours {
+                    conflicts.push(id);
+                    continue;
+                }
                 let cur_ver = jobs[pos].get("_builtin_version").and_then(|v| v.as_u64());
                 if cur_ver != Some(want_ver) {
-                    jobs[pos] = bj; // 구버전/마커부재 → 갱신
+                    jobs[pos] = bj; // built-in 구버전 → 갱신
                     changed = true;
                 }
                 // 존재+동버전 = 무접촉(중복 생성 0)
@@ -146,7 +158,7 @@ fn apply_builtin_jobs(jobs: &mut Vec<serde_json::Value>) -> bool {
             }
         }
     }
-    changed
+    (changed, conflicts)
 }
 
 /// ★B2-1(W3): 데몬 부트 시 built-in phoenix 잡을 schedule.json 에 idempotent 하게 보장한다. schedule.json 은
@@ -181,7 +193,13 @@ pub fn ensure_builtin_jobs() {
             .insert("jobs".to_string(), json!([]));
     }
     let arr = root.get_mut("jobs").and_then(|j| j.as_array_mut()).unwrap();
-    let changed = apply_builtin_jobs(arr);
+    let (changed, conflicts) = apply_builtin_jobs(arr);
+    for id in &conflicts {
+        eprintln!(
+            "[cysd] ensure_builtin_jobs: 사용자 잡이 예약 id '{id}' 를 선점 — built-in 갱신 skip(사용자 잡 보존). \
+             built-in 기능을 원하면 사용자 잡을 다른 id 로 옮기라."
+        );
+    }
     if changed {
         match serde_json::to_string_pretty(&root) {
             Ok(s) => {
@@ -772,8 +790,9 @@ mod tests {
         })];
 
         // 1차: built-in 2개 생성 → changed=true.
-        let c1 = apply_builtin_jobs(&mut jobs);
+        let (c1, conf1) = apply_builtin_jobs(&mut jobs);
         assert!(c1, "1차 ensure 는 built-in 잡을 생성해야 한다");
+        assert!(conf1.is_empty(), "conflict 없음(예약 id 미선점)");
         let ids: Vec<&str> = jobs.iter().filter_map(|j| j["id"].as_str()).collect();
         assert!(ids.contains(&"phoenix-snapshot-6h") && ids.contains(&"phoenix-drill-weekly"));
         assert!(ids.contains(&"user-custom-job"), "사용자 잡은 보존돼야 한다");
@@ -788,7 +807,7 @@ mod tests {
         assert_eq!(period("phoenix-drill-weekly"), Some(10080), "drill 7일");
 
         // 2차: 동버전 재실행 → 무접촉(changed=false·중복 0).
-        let c2 = apply_builtin_jobs(&mut jobs);
+        let (c2, _) = apply_builtin_jobs(&mut jobs);
         assert!(!c2, "동버전 재실행은 무접촉(변경 없음)이어야 한다");
         let snap_count = jobs
             .iter()
@@ -804,7 +823,7 @@ mod tests {
                 j["every_minutes"] = json!(99999); // 사용자가 못 고치는 드리프트 시뮬
             }
         }
-        let c3 = apply_builtin_jobs(&mut jobs);
+        let (c3, _) = apply_builtin_jobs(&mut jobs);
         assert!(c3, "구버전 항목은 갱신돼야 한다");
         let refreshed = jobs
             .iter()
@@ -827,6 +846,34 @@ mod tests {
             1,
             "갱신 후에도 중복 0"
         );
+    }
+
+    // ★codex W3 major: 사용자가 예약 id(phoenix-snapshot-6h)를 마커 없이 선점하면 built-in ensure 가
+    //   교체하지 않고 보존+conflict 경고해야 한다(B2-1 사용자 잡 보존 계약).
+    #[test]
+    fn builtin_ensure_preserves_user_job_on_reserved_id() {
+        let mut jobs: Vec<serde_json::Value> = vec![json!({
+            "id": "phoenix-snapshot-6h",           // 사용자가 예약 id 선점(_builtin 마커 없음)
+            "every_minutes": 5, "action": "push", "to": "master", "text": "USER OWN SNAPSHOT"
+        })];
+        let (changed, conflicts) = apply_builtin_jobs(&mut jobs);
+        // snapshot id 는 conflict 로 보존, drill 은 신규 생성.
+        assert!(conflicts.contains(&"phoenix-snapshot-6h".to_string()), "예약 id 충돌 보고");
+        let snap = jobs
+            .iter()
+            .find(|j| j["id"].as_str() == Some("phoenix-snapshot-6h"))
+            .unwrap();
+        assert_eq!(snap["text"].as_str(), Some("USER OWN SNAPSHOT"), "사용자 잡 내용 보존(교체 금지)");
+        assert_eq!(snap["every_minutes"].as_u64(), Some(5), "사용자 주기 보존");
+        assert!(snap.get("_builtin").is_none(), "사용자 잡에 built-in 마커 미주입");
+        assert_eq!(
+            jobs.iter().filter(|j| j["id"].as_str() == Some("phoenix-snapshot-6h")).count(),
+            1,
+            "충돌 id 중복 생성 0"
+        );
+        // drill 은 마커 없는 선점이 없으므로 정상 생성(changed=true).
+        assert!(changed, "drill 신규 생성으로 changed");
+        assert!(jobs.iter().any(|j| j["id"].as_str() == Some("phoenix-drill-weekly")));
     }
 
     #[test]

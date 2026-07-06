@@ -418,6 +418,142 @@ def aux_journal_corrupt(td):
     check("aux.journal 손상 격리(.corrupt·침묵 아님)", len(corr) >= 1, "%s" % corr)
 
 
+# ─────────── codex W3 BLOCKING 수정 게이트: provenance 영속·해제·unknown-liveness·dept 매트릭스 ───────────
+
+def c2_degraded_persists_across_retry(td):
+    """★codex BLOCKING(1): 손상 복구→DEGRADED 후, cysd auto-retry 상당 2차 실행에서도 보류 유지(휘발 금지).
+    lease 는 별도 프로세스 재시도를 모사하려 fail-open 으로 우회(동일 프로세스 재호출 LEASE_HELD 회피)."""
+    sock, home = _ph_home(td, "persist")
+    dp = os.path.join(home, "desired_roster.json")
+    _write(dp, "{ corrupt ]]]")
+    _write(dp + ".bak", {"roster": {"worker": {"role": "worker"}}, "tombstones": []})
+    m.CYS = os.path.join(td, "nonexistent-cys")
+    saved_lease = m._acquire_restore_lease
+    m._acquire_restore_lease = lambda s: (True, None)  # 재시도=별도 프로세스 모사(lease 자유)
+    try:
+        r1 = m.run_restore(sock, ticket="p1", stub=True, print_result=False)
+        # 복구본에 provenance 영속 확인
+        prov = m._recovered_provenance(dp)
+        r2 = m.run_restore(sock, ticket="p1", stub=True, print_result=False)  # auto-retry 2차
+    finally:
+        m._acquire_restore_lease = saved_lease
+    check("persist ① attempt1 DEGRADED", r1.get("phoenix_restore") == "DEGRADED", "%s" % r1.get("phoenix_restore"))
+    check("persist ② 복구본에 recovered_from 영속", isinstance(prov, dict) and prov.get("source") == "bak", "%s" % prov)
+    check("persist ③ attempt2(재시도)도 DEGRADED 유지(휘발 아님)",
+          r2.get("phoenix_restore") == "DEGRADED", "%s" % r2.get("phoenix_restore"))
+    check("persist ④ attempt2 held worker(부활 보류 지속)", "worker" in (r2.get("held_roles") or []),
+          "held=%s" % r2.get("held_roles"))
+
+
+def c2_provenance_release(td):
+    """★codex BLOCKING(1) 해제: ①검증된-건강 topology replace(rev 마커) ②운영자 --rebase 시 provenance 제거."""
+    # ① healthy topology replace → provenance 자동 해제
+    sock, home = _ph_home(td, "release_healthy")
+    dp = os.path.join(home, "desired_roster.json")
+    _write(dp, {"roster": {"worker": {"role": "worker"}}, "tombstones": [],
+                "recovered_from": {"source": "bak", "ts": 1}})
+    # state_dir(=dirname(sock))에 건강 topology(schema_version+rev) 배치
+    _write(os.path.join(os.path.dirname(sock), "topology.json"),
+           {"schema_version": 1, "tombstones_rev": 7, "tombstones": [], "entries": [{"role": "worker"}]})
+    m.CYS = os.path.join(td, "nonexistent-cys")
+    m.observe_and_persist_roster(sock)
+    check("release ① 건강 replace → provenance 제거", m._recovered_provenance(dp) is None,
+          "%s" % m._recovered_provenance(dp))
+    # ② --rebase → provenance 제거(topology 없어도)
+    sock2, home2 = _ph_home(td, "release_rebase")
+    dp2 = os.path.join(home2, "desired_roster.json")
+    _write(dp2, {"roster": {"worker": {"role": "worker"}}, "tombstones": [],
+                 "recovered_from": {"source": "snapshot", "ts": 1}})
+    m.observe_and_persist_roster(sock2, rebase=True)
+    check("release ② --rebase → provenance 제거", m._recovered_provenance(dp2) is None,
+          "%s" % m._recovered_provenance(dp2))
+    # ③ 건강 replace 아니고 rebase 아니면 provenance 유지(보류 지속)
+    sock3, home3 = _ph_home(td, "release_hold")
+    dp3 = os.path.join(home3, "desired_roster.json")
+    _write(dp3, {"roster": {"worker": {"role": "worker"}}, "tombstones": [],
+                 "recovered_from": {"source": "bak", "ts": 1}})
+    m.observe_and_persist_roster(sock3)  # topology 없음(불건강) → 유지
+    check("release ③ 불건강·비rebase → provenance 유지(보류 지속)",
+          m._recovered_provenance(dp3) is not None, "%s" % m._recovered_provenance(dp3))
+
+
+def c5_malformed_list_holds(td):
+    """★codex BLOCKING(3): status --json 실패 + list 형식 드리프트(비어있지 않은데 0건/부분 미매칭) →
+    liveness=unknown → 전원 사망 추정 금지·부활 보류(대량 오스폰 0)."""
+    saved = m.cys
+    def fake_cys(*args, **kw):
+        if args[:2] == ("status", "--json"):
+            return _FakeR(1, "")                       # status 미도달
+        if args[:1] == ("list",):
+            return _FakeR(0, "surface:5 BROKEN FORMAT no fields here\nsurface:6 also drifted")
+        return _FakeR(1, "")
+    m.cys = fake_cys
+    try:
+        out, known = m._live_role_surfaces_checked("sock")
+        # run_restore 로 대량 스폰 차단 확인(desired 에 죽은 역할 존재)
+        sock, home = _ph_home(td, "c5malformed")
+        _write(os.path.join(home, "desired_roster.json"),
+               {"roster": {"worker": {"role": "worker"}}, "tombstones": []})
+        saved_lease = m._acquire_restore_lease
+        m._acquire_restore_lease = lambda s: (True, None)
+        try:
+            res = m.run_restore(sock, ticket="c5m", stub=True, print_result=False)
+        finally:
+            m._acquire_restore_lease = saved_lease
+    finally:
+        m.cys = saved
+    check("C5.malformed → known=False(구조 드리프트)", known is False, "known=%s" % known)
+    check("C5.malformed → run_restore DEGRADED(unknown_liveness)",
+          res.get("phoenix_restore") == "DEGRADED" and res.get("degraded_reason") == "unknown_liveness",
+          "%s/%s" % (res.get("phoenix_restore"), res.get("degraded_reason")))
+    check("C5.malformed → 대량 스폰 0(target 미진입)", not res.get("held_roles") and "spawned" not in res,
+          "%s" % res)
+
+
+def c5_empty_list_is_known(td):
+    """대조군: rc≠0·빈 출력(데몬 미도달/콜드부트)은 known=True(살아있는 surface 0 = 정당 관측·부활 정상)."""
+    saved = m.cys
+    def fake_cys(*args, **kw):
+        return _FakeR(127, "")  # status·list 모두 실패·빈 출력
+    m.cys = fake_cys
+    try:
+        out, known = m._live_role_surfaces_checked("sock")
+    finally:
+        m.cys = saved
+    check("C5.empty → known=True(빈=surface 0·부활 정상)", known is True and out == {}, "known=%s out=%s" % (known, out))
+
+
+def dept_corruption_matrix(td):
+    """★codex minor(4): dept_roster × 손상유형 매트릭스 — .bak 복원·missing·repeated retry 지속(desired 대칭)."""
+    # ── dept corrupt + .bak(유효) → degraded(source=bak)·provenance 영속 ──
+    sock, home = _ph_home(td, "deptbak")
+    depp = os.path.join(home, "dept_roster.json")
+    _write(depp, "]]] corrupt dept")
+    _write(depp + ".bak", {"roster": {"dept-1": {}}, "tombstones": ["dept-9"]})
+    m.CYS = os.path.join(td, "nonexistent-cys")
+    rec = m._recover_retention_file(sock, depp, "dept_roster")
+    check("dept.bak → degraded source=bak", rec.get("status") == "degraded" and rec.get("source") == "bak", "%s" % rec)
+    check("dept.bak → provenance 영속", isinstance(m._recovered_provenance(depp), dict))
+    # ── dept missing → status missing(부활 정상·degrade 아님) ──
+    sock_m, home_m = _ph_home(td, "deptmissing")
+    rec_m = m._recover_retention_file(sock_m, os.path.join(home_m, "dept_roster.json"), "dept_roster")
+    check("dept.missing → status missing(정상)", rec_m.get("status") == "missing", "%s" % rec_m)
+    # ── dept corrupt + no bak → discovery degraded(재발견 경로·unrecoverable 아님) ──
+    sock_d, home_d = _ph_home(td, "deptdisc")
+    ddp = os.path.join(home_d, "dept_roster.json")
+    _write(ddp, "{ corrupt no bak ]]]")
+    rec_d = m._recover_retention_file(sock_d, ddp, "dept_roster")
+    check("dept.corrupt+nobak → discovery degraded(재발견)", rec_d.get("status") == "degraded" and rec_d.get("source") == "discovery", "%s" % rec_d)
+    # ── dept degraded 반복 retry 지속(observe_and_persist_depts 가 provenance 이월) ──
+    m.observe_and_persist_depts(sock)  # topology 무관(dept=glob) → provenance 유지
+    check("dept.retry → provenance 지속(보류 유지)", isinstance(m._recovered_provenance(depp), dict),
+          "%s" % m._recovered_provenance(depp))
+    # ── dept --rebase → provenance 해제 ──
+    m.observe_and_persist_depts(sock, rebase=True)
+    check("dept.rebase → provenance 해제", m._recovered_provenance(depp) is None,
+          "%s" % m._recovered_provenance(depp))
+
+
 def main():
     td = tempfile.mkdtemp(prefix="phoenix-w3-")
     try:
@@ -438,6 +574,11 @@ def main():
         p17_rmw_lock(td)
         aux_journal_corrupt(td)
         deploy_nested_lease(td)
+        c2_degraded_persists_across_retry(td)
+        c2_provenance_release(td)
+        c5_malformed_list_holds(td)
+        c5_empty_list_is_known(td)
+        dept_corruption_matrix(td)
     finally:
         shutil.rmtree(td, ignore_errors=True)
     npass = sum(1 for c in _results if c)

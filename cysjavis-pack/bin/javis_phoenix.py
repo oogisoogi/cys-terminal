@@ -666,22 +666,52 @@ def _prune_corrupt(path, keep=3):
             pass
 
 
+def _recovered_provenance(path):
+    """복구본에 영속된 degraded provenance(`recovered_from`)를 읽는다 — 있으면 dict{source,ts}, 없으면 None.
+    ★codex W3 BLOCKING: 이 필드가 존재하는 한(파일이 유효 JSON 이어도) 부활 보류가 유지된다 — degraded 가
+    복구 1회로 휘발하지 않고 auto-retry 전반에 걸쳐 영속(fail-safe). 해제=검증된-건강 topology replace 또는 --rebase."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            d = json.load(f)
+        rf = d.get("recovered_from")
+        return rf if isinstance(rf, dict) else None
+    except Exception:
+        return None
+
+
+def _write_recovered(path, obj, source):
+    """복구본을 provenance(`recovered_from`)와 함께 원자적으로 쓴다 — degraded 영속의 단일 지점."""
+    obj = dict(obj)
+    obj["recovered_from"] = {"source": source, "ts": _now()}
+    obj.setdefault("updated_at", _now())
+    _atomic_write_json(path, obj, keep_bak=False)
+
+
 def _recover_retention_file(socket, path, kind):
     """retention-critical 파일 상태를 판정하고, 손상이면 폴백 체인으로 복원한다(복원분을 path 에 되써 후속
-    load_* 가 정상 읽게 한다). 반환 dict:
-      · {'status':'valid'}              정상
+    load_* 가 정상 읽게 한다). ★codex W3 BLOCKING: 복구본에 `recovered_from` provenance 를 영속해 degraded
+    부활 보류가 1회로 휘발하지 않게 한다(다음 auto-retry 도 동일 hold). 반환 dict:
+      · {'status':'valid'}              정상(provenance 없음)
       · {'status':'missing'}            부재(fresh install 정상 — hard-fail 아님)
-      · {'status':'degraded','source':..,'isolated':..}   손상→폴백 복원(묘비 불확실·부활 보류 대상)
+      · {'status':'degraded','source':..,'isolated':..,'pending':bool}  손상→폴백 복원 또는 valid+provenance(보류 유지)
       · {'status':'unrecoverable','isolated':..}          손상→전 폴백 실패(exit 6)"""
     st = _roster_file_status(path)
-    if st in ("valid", "missing"):
-        return {"status": st}
+    if st == "missing":
+        return {"status": "missing"}
+    if st == "valid":
+        # ★영속된 degraded: 유효 JSON 이어도 provenance 가 있으면 아직 보류 상태(전 auto-retry 지속).
+        prov = _recovered_provenance(path)
+        if prov:
+            return {"status": "degraded", "source": prov.get("source"), "pending": True, "isolated": None}
+        return {"status": "valid"}
     # corrupt — 격리 후 폴백 체인
     isolated = _isolate_corrupt(path)
     bak = path + ".bak"
     if _roster_file_status(bak) == "valid":
         try:
-            shutil.copy2(bak, path)
+            with open(bak, encoding="utf-8") as f:
+                bak_obj = json.load(f)
+            _write_recovered(path, bak_obj, "bak")
             return {"status": "degraded", "source": "bak", "isolated": isolated}
         except Exception:
             pass
@@ -690,9 +720,7 @@ def _recover_retention_file(socket, path, kind):
         snap_t = _snapshot_tombstones(socket)
         if snap_r or snap_t:
             try:
-                _atomic_write_json(path, {"roster": snap_r,
-                                          "tombstones": sorted(snap_t or []),
-                                          "updated_at": _now()}, keep_bak=False)
+                _write_recovered(path, {"roster": snap_r, "tombstones": sorted(snap_t or [])}, "snapshot")
                 return {"status": "degraded", "source": "snapshot", "isolated": isolated}
             except Exception:
                 pass
@@ -700,7 +728,7 @@ def _recover_retention_file(socket, path, kind):
         # 부서는 glob(cys-dept-*)∪registry 로 재발견 가능(discover_depts) — 빈 상태로 복원하면 observe 가 roster 를
         #   재구성한다. 단 묘비는 스냅샷 소스가 없어 소실 → degraded(부활 보류). '전부 불가' 아님(재발견 경로 존재).
         try:
-            _atomic_write_json(path, {"roster": {}, "tombstones": [], "updated_at": _now()}, keep_bak=False)
+            _write_recovered(path, {"roster": {}, "tombstones": []}, "discovery")
             return {"status": "degraded", "source": "discovery", "isolated": isolated}
         except Exception:
             pass
@@ -909,21 +937,27 @@ def _observe_and_persist_roster_locked(socket, rebase=False):
     topo_tombs = set(t for t in topo.get("tombstones", []) if isinstance(t, str))
     new_rev = last_seen_rev
 
+    # ★codex W3 BLOCKING(2): degraded provenance 해제 판정 — 검증된-건강 topology replace(rev 마커 확정)가
+    #   묘비 집합을 확정하는 시점에만 True. 그때 복구본의 recovered_from 을 제거(부활 보류 자동 해제).
+    _healthy_replace = False
+    # ★버그 수정: A-S1 rev-rollback rebase 는 함수 파라미터 rebase(운영자 --rebase)와 **별개 개념**이다 —
+    #   지역명을 _rev_rebase 로 분리한다(과거 동명 재대입이 has_marker 경로에서 운영자 rebase 를 무력화했음).
     if "_error" in topo:
         # 손상 topology → replace 금지(desired 보존). 전체 폴백 체인(.bak·스냅샷·degraded)은 W3/governance(P0-3).
         log("★A-S1: topology 손상(%s) — 묘비 replace 생략, desired 보존." % topo.get("_error"))
     elif has_marker and topo_rev is not None:
-        rebase = False
+        _rev_rebase = False
         if last_seen_rev is not None and topo_rev < last_seen_rev:
             # 역행 — gemini R3: epoch 변경 또는 rev=0(리셋/fresh install/.bak) 만 정당한 rebase.
             if topo_rev == 0 or (cur_epoch is not None and cur_epoch != last_seen_epoch):
-                rebase = True
-        if last_seen_rev is None or topo_rev >= last_seen_rev or rebase:
+                _rev_rebase = True
+        if last_seen_rev is None or topo_rev >= last_seen_rev or _rev_rebase:
             # ★옵션A 조건부 replace: 데몬 topology 묘비를 desired 에 **그대로 대입**(add-merge 아님).
             #   데몬 해제가 자동 반영 → 제3겹 소멸. rebase 시엔 정당한 역행을 손상으로 오판하지 않는다.
             tombstones = set(topo_tombs)
             new_rev = topo_rev
-            if rebase:
+            _healthy_replace = True  # 건강 데몬이 묘비 집합 확정 → degraded provenance 해제 근거
+            if _rev_rebase:
                 log("★A-S1 rebase: topology rev 정당 역행(%s<%s·epoch변경/rev0) — 강제 rebase 후 replace."
                     % (topo_rev, last_seen_rev))
         else:
@@ -985,11 +1019,17 @@ def _observe_and_persist_roster_locked(socket, rebase=False):
     #   ★C2(W3): keep_bak=True 로 직전 유효본을 .bak 에 보존(손상 폴백 소스). 쓰기 실패는 침묵(except:pass) 금지 →
     #   log+EVT(P2-8: 영속 실패 무보고 차단).
     if not _foreign:
+        _out = {"roster": roster, "tombstones": sorted(tombstones),
+                "tombstones_rev": new_rev, "daemon_epoch": cur_epoch,
+                "state_dir_tag": cur_tag, "updated_at": _now()}
+        # ★codex W3 BLOCKING(1): degraded provenance 영속 — 복구본의 recovered_from 을 다음 write 로 이월해
+        #   부활 보류가 auto-retry 전반에 지속되게 한다. 해제 조건: 검증된-건강 topology replace(_healthy_replace)
+        #   또는 운영자 --rebase(rebase) — 그때만 provenance 를 떨궈 정상 복귀. 그 외에는 계속 보류(fail-safe).
+        _prev_prov = prev.get("recovered_from")
+        if isinstance(_prev_prov, dict) and not _healthy_replace and not rebase:
+            _out["recovered_from"] = _prev_prov
         try:
-            _atomic_write_json(desired_roster_path(socket),
-                               {"roster": roster, "tombstones": sorted(tombstones),
-                                "tombstones_rev": new_rev, "daemon_epoch": cur_epoch,
-                                "state_dir_tag": cur_tag, "updated_at": _now()}, keep_bak=True)
+            _atomic_write_json(desired_roster_path(socket), _out, keep_bak=True)
         except Exception as _e:
             log("★C3/P2-8: desired_roster 원자쓰기 실패(%s: %s) — 침묵 삼킴 금지, escalation." % (type(_e).__name__, _e))
             _emit_evt("agent.error", agent="phoenix",
@@ -1054,29 +1094,40 @@ def load_dept_roster(socket):
     return {}, set()
 
 
-def observe_and_persist_depts(socket):
+def observe_and_persist_depts(socket, rebase=False):
     """발견된 부서를 dept_roster 에 단조 병합·영속(침식 면역). (roster, tombstones) 반환.
     ★phoenix 소유 dept_roster.json 에만 쓴다 — 실 depts.json 무접촉. tombstone 된 부서는 제외(의도적 폐역).
-    ★P1-7(W3): dept RMW 도 dept.lock flock 으로 직렬화(lost update 차단·role 경로와 대칭)."""
+    ★P1-7(W3): dept RMW 도 dept.lock flock 으로 직렬화(lost update 차단·role 경로와 대칭).
+    ★C2(W3): rebase=True 면 degraded provenance(recovered_from) 를 제거해 부활 보류를 해제(운영자 --rebase)."""
     _lock = _acquire_roster_lock(socket, "dept")
     try:
-        return _observe_and_persist_depts_locked(socket)
+        return _observe_and_persist_depts_locked(socket, rebase)
     finally:
         _release_lease(_lock)
 
 
-def _observe_and_persist_depts_locked(socket):
+def _observe_and_persist_depts_locked(socket, rebase=False):
     roster, tombstones = load_dept_roster(socket)
+    # ★codex W3 BLOCKING(1): dept degraded provenance 이월 — 손상 복구 후 부활 보류가 auto-retry 전반 지속.
+    #   dept 는 topology 건강-replace 경로가 없으므로(glob 재발견) 해제=운영자 --rebase 만(fail-safe 기본).
+    _prev_prov = None
+    try:
+        _dp = dept_roster_path(socket)
+        if os.path.exists(_dp):
+            _prev_prov = json.load(open(_dp)).get("recovered_from")
+    except Exception:
+        _prev_prov = None
     for dept, info in discover_depts().items():
         cur = roster.get(dept, {})
         cur.update(info)
         roster[dept] = cur
     # ★codex W2 BLOCKING(dept 동형): 묘비 부서의 roster 엔트리 보존(pop 금지) — untomb 즉시 부활. 배제는
     #   소비 시점(target 산정)에 tombstones 대조로 수행한다(role 경로와 대칭).
+    _out = {"roster": roster, "tombstones": sorted(tombstones), "updated_at": _now()}
+    if isinstance(_prev_prov, dict) and not rebase:
+        _out["recovered_from"] = _prev_prov  # 보류 지속(해제=--rebase)
     try:
-        _atomic_write_json(dept_roster_path(socket),
-                           {"roster": roster, "tombstones": sorted(tombstones), "updated_at": _now()},
-                           keep_bak=True)  # ★C2(W3): .bak 유지(손상 폴백 소스)
+        _atomic_write_json(dept_roster_path(socket), _out, keep_bak=True)  # ★C2(W3): .bak 유지(손상 폴백 소스)
     except Exception as _e:
         log("★P2-8: dept_roster 원자쓰기 실패(%s: %s) — 침묵 삼킴 금지, escalation." % (type(_e).__name__, _e))
         _emit_evt("agent.error", agent="phoenix",
@@ -1096,26 +1147,48 @@ def _status_json(socket):
 
 
 def _live_role_surfaces_from_list(socket):
-    """폴백: `cys list` 화면 정규식 파싱(status --json 미도달 시). P1-6 근원은 status --json 이지만 데몬이
-    구버전/status 미지원일 때를 위한 하한 경로로 보존한다(가용성)."""
+    """폴백: `cys list` 화면 정규식 파싱(status --json 미도달 시). 반환 (dict, known:bool).
+    ★codex W3 BLOCKING(3): 이 폴백이 P1-6(정규식 취약)을 되살리지 않도록 **구조 유효성**을 판정한다 — list 가
+    rc≠0 이거나, stdout 이 비어있지 않은데 파싱 0건이거나, `surface:` 로 시작하는 행 중 4필드 정규식 미매칭이
+    하나라도 있으면 known=False(구조 드리프트). known=False 는 '전원 사망' 추정 금지 신호로, 호출측이 부활을
+    보류한다(대량 오스폰 방지 fail-safe). 구조 유효(빈 출력=surface 0, 또는 surface 행 전부 매칭)일 때만 known=True."""
     r = cys("list", socket=socket, timeout=12)
+    txt = r.stdout or ""
     out = {}
-    for line in (r.stdout or "").splitlines():
+    lines = [ln for ln in txt.splitlines() if ln.strip()]
+    surface_lines = [ln for ln in lines if ln.strip().startswith("surface:")]
+    matched = 0
+    for line in lines:
         m = re.match(r"(surface:\d+)\s+role=(\S+)\s+pid=(\d+)\s+exited=(\S+)", line)
         if m:
+            matched += 1
             ref, role, pid, exited = m.group(1), m.group(2), int(m.group(3)), m.group(4)
             out.setdefault(role, []).append({"surface": ref, "pid": pid, "exited": exited == "true"})
-    return out
+    # ★codex W3(3) 정밀: known=False 는 **구조 드리프트**(데몬이 살아 데이터를 주는데 형식이 바뀐 오파싱)로 한정한다
+    #   — 즉 stdout 이 비어있지 않은데 파싱 0건, 또는 `surface:` 행 일부 미매칭. rc≠0·빈 출력(데몬 미도달/콜드부트)은
+    #   '살아있는 surface 0'이 정당한 관측이므로 known=True(그 경우 부활은 정상 진행 = phoenix 본연). 형식 드리프트만
+    #   전원 사망 오판 → 대량 스폰 위험이라 보류시킨다.
+    known = True
+    if lines and matched == 0:
+        known = False                                   # 비어있지 않은데 0건 = 구조 드리프트
+    if surface_lines and matched < len(surface_lines):
+        known = False                                   # surface: 행 일부 미매칭 = 부분 드리프트
+    return out, known
 
 
-def live_role_surfaces(socket):
-    """현재 살아있는 surface들의 role→[{surface, pid, exited, agent_alive}] 실측.
-    ★C5/P1-6(W3): liveness 근원을 화면 정규식(`cys list`)에서 **구조화 소스**(`cys status --json`.surfaces)로
-    전환한다 — 포맷 변경에 취약한 정규식이 전 역할을 죽음 오판(→대량 재스폰)하던 P1-6 을 제거. status 미도달 시엔
-    `cys list` 폴백(가용성 하한)."""
+# ★codex W3(3): 직전 liveness 관측의 신뢰도(구조 유효성). live_role_surfaces 가 실제 소스를 파싱할 때 갱신되고,
+#   테스트가 live_role_surfaces 를 통째로 몽키패치하면(=실 소스 우회) 직전값(기본 True=신뢰)을 유지한다.
+_LAST_LIVENESS_KNOWN = True
+
+
+def _live_surfaces_raw(socket):
+    """실 liveness 파싱 — status --json(구조화) 우선·실패 시 list 폴백. _LAST_LIVENESS_KNOWN 을 갱신하고 dict 반환."""
+    global _LAST_LIVENESS_KNOWN
     st = _status_json(socket)
     if st is None:
-        return _live_role_surfaces_from_list(socket)
+        out, known = _live_role_surfaces_from_list(socket)
+        _LAST_LIVENESS_KNOWN = known
+        return out
     out = {}
     for s in st.get("surfaces", []):
         # 미claim surface 는 status --json 에서 role=null — 구 `cys list` 규약(미claim="-")과 일치시켜 보존한다.
@@ -1127,7 +1200,22 @@ def live_role_surfaces(socket):
             "exited": bool(s.get("exited")),
             "agent_alive": s.get("agent_alive"),  # ★C5 구조화 readiness ack 신호(P1-10)
         })
+    _LAST_LIVENESS_KNOWN = True
     return out
+
+
+def live_role_surfaces(socket):
+    """현재 살아있는 surface들의 role→[{surface, pid, exited, agent_alive}] 실측(dict만).
+    ★C5/P1-6(W3): liveness 근원을 화면 정규식(`cys list`)에서 **구조화 소스**(`cys status --json`.surfaces)로
+    전환. 보고/관측·부활 target 산정 공통 진입점(몽키패치 지점)."""
+    return _live_surfaces_raw(socket)
+
+
+def _live_role_surfaces_checked(socket):
+    """부활 target 산정용 liveness (dict, known:bool). live_role_surfaces 를 경유해(몽키패치 존중) dict 를 얻고,
+    직전 파싱의 구조 신뢰도(_LAST_LIVENESS_KNOWN)를 함께 반환한다 — known=False 면 호출측이 부활 보류(fail-safe)."""
+    d = live_role_surfaces(socket)
+    return d, _LAST_LIVENESS_KNOWN
 
 
 # ------------------------------------------------------------------ 저널
@@ -1493,7 +1581,8 @@ def run_restore(socket, ticket="default", stub=False, no_breaker=False, roles=No
     #     · 폴백 복원 성공 = degraded(묘비 불확실 → 부활 보류+escalation, fail-safe · exit 3)
     #     · 전 폴백 실패 = unrecoverable(부활 중단+escalation · exit 6)
     #   빈 상태(fresh) 위장 통과는 어느 경우도 없다(silent-empty 차단).
-    _c2_degraded = []
+    #     · 폴백 복원(신규 손상)=recovered_from provenance 를 파일에 영속 → degraded(부활 보류·전 auto-retry 지속).
+    #   ★codex W3 BLOCKING: degraded 최종 판정은 observe **후** 파일의 recovered_from 으로 한다(휘발 방지 — 아래).
     for _p, _kind in ((desired_roster_path(socket), "desired_roster"),
                       (dept_roster_path(socket), "dept_roster")):
         _rec = _recover_retention_file(socket, _p, _kind)
@@ -1509,13 +1598,12 @@ def run_restore(socket, ticket="default", stub=False, no_breaker=False, roles=No
             if print_result:
                 print(json.dumps(out, ensure_ascii=False, indent=2))
             return out
-        if _rec["status"] == "degraded":
-            _c2_degraded.append({"file": _kind, "source": _rec.get("source"),
-                                 "isolated": _rec.get("isolated")})
-            log("★C2 폴백 복원: %s 손상 → %s 로 복원(degraded). 묘비 불확실 → 부활 보류+escalation(fail-safe)."
+        if _rec["status"] == "degraded" and not _rec.get("pending"):
+            # 이번 실행에서 새로 손상→복구(fresh) — escalation EVT 1회. pending(전 auto-retry 이월)은 재방출 안 함.
+            log("★C2 폴백 복원: %s 손상 → %s 로 복원(degraded·provenance 영속). 묘비 불확실 → 부활 보류(fail-safe)."
                 % (_kind, _rec.get("source")))
             _emit_evt("agent.error", agent="phoenix",
-                      summary="C2 손상→폴백 복원(%s src=%s) — degraded, 부활 보류"
+                      summary="C2 손상→폴백 복원(%s src=%s) — degraded, 부활 보류(영속)"
                               % (_kind, _rec.get("source")))
 
     j = load_journal(socket, ticket)
@@ -1533,7 +1621,16 @@ def run_restore(socket, ticket="default", stub=False, no_breaker=False, roles=No
     # ★Phase 4: 대상 판정 근거 = actual-state(topology)가 아니라 desired 로스터.
     # 관측을 조기·단조 영속해 topology 침식(부분 부활 후 미부활 역할 삭제)에 면역시킨다(§12).
     entries, _tombstones = observe_and_persist_roster(socket)
-    live = live_role_surfaces(socket)
+    # ★codex W3 BLOCKING(1): degraded 최종 판정 = observe **후** 영속된 recovered_from(진실은 파일 상태).
+    #   observe 의 검증된-건강 topology replace 가 provenance 를 떨궜으면 해제(부활 진행), 남아있으면 hold —
+    #   따라서 복구본이 유효 JSON 이 된 뒤 도는 cysd auto-retry 2차 실행도 동일하게 보류가 유지된다(휘발 방지).
+    _c2_degraded = []
+    for _p, _kind in ((desired_roster_path(socket), "desired_roster"),
+                      (dept_roster_path(socket), "dept_roster")):
+        _prov = _recovered_provenance(_p)
+        if _prov:
+            _c2_degraded.append({"file": _kind, "source": _prov.get("source"), "ts": _prov.get("ts")})
+    live, _live_known = _live_role_surfaces_checked(socket)
 
     # 대상 = desired 로스터에 있으나 살아있지 않은(또는 exited) 역할
     def _alive(role):
@@ -1556,20 +1653,35 @@ def run_restore(socket, ticket="default", stub=False, no_breaker=False, roles=No
             jevent(j, _r, "target", "skip_tombstoned",
                    "명시 요청됐으나 폐역(tombstone) — 부활 제외(의도삭제>강제부활). 재편입=untomb RPC.")
         save_journal(socket, ticket, j)
-    # ★C2 degraded 부활 보류(fail-safe): retention 파일이 폴백(.bak/스냅샷)으로만 복원됐다면 묘비 상태가
-    #   불확실(백업은 과거 시점 — 최근 폐역 누락 가능)하다. 불확실 시 부활하지 않는 쪽이 안전(묘비 일원화 원칙과
-    #   모순 없음) — 이번 restore 는 전 대상 부활을 보류하고 escalation 후 DEGRADED(exit 3)로 종료한다.
-    #   복귀 = 다음 정상 관측 사이클(topology 건강 시 replace 로 묘비 재확립) 또는 운영자 `phoenix roster --rebase`.
+    # ★C5 unknown-liveness 부활 보류(codex W3 BLOCKING(3)·fail-safe): status --json 실패 + list 폴백 구조
+    #   드리프트로 liveness 를 신뢰할 수 없으면(_live_known=False) 전 역할을 '죽음'으로 오판해 대량 스폰하지 않고
+    #   보류+escalation 한다(P1-6 재도입 차단). 복귀 = liveness 소스 회복(status --json 정상 또는 list 형식 복구).
+    if not _live_known:
+        log("★C5 unknown-liveness: status --json 실패 + list 폴백 구조 무효 — 전원 사망 추정 금지, 부활 보류(fail-safe).")
+        _emit_evt("agent.error", agent="phoenix",
+                  summary="liveness 소스 불신(status --json 실패+list 드리프트) — 부활 보류, 대량 스폰 차단")
+        jevent(j, "*", "c5_unknown_liveness", "hold", "liveness 불신 — 부활 보류(대량 오스폰 방지)")
+        save_journal(socket, ticket, j)
+        out = {"phoenix_restore": "DEGRADED", "degraded_reason": "unknown_liveness",
+               "note": ("liveness 소스(status --json/list) 불신 — 전원 사망 추정 금지, 부활 보류(fail-safe). "
+                        "복귀: liveness 소스 회복.")}
+        if print_result:
+            print(json.dumps(out, ensure_ascii=False, indent=2))
+        return out
+    # ★C2 degraded 부활 보류(fail-safe): retention 파일에 recovered_from provenance 가 영속돼 있으면(손상 폴백
+    #   복원으로 묘비 불확실) 전 대상 부활을 보류하고 DEGRADED(exit 3)로 종료한다. ★codex W3 BLOCKING(1): 이
+    #   판정은 observe 후 파일 상태(recovered_from)로 하므로, 복구본이 유효 JSON 이 된 뒤 도는 auto-retry 2차
+    #   실행도 동일하게 보류가 유지된다. 복귀 = 검증된-건강 topology replace(provenance 자동 제거) 또는 `--rebase`.
     if _c2_degraded:
         for _d in _c2_degraded:
             jevent(j, "*", "c2_degraded", "hold",
-                   "손상 폴백 복원(%s src=%s) — 묘비 불확실, 부활 보류(fail-safe)" % (_d["file"], _d["source"]))
+                   "손상 폴백 복원(%s src=%s·provenance 영속) — 묘비 불확실, 부활 보류(fail-safe)" % (_d["file"], _d["source"]))
         jevent(j, "*", "c2_degraded", "held_roles", "부활 보류 역할: %s" % target_roles)
         save_journal(socket, ticket, j)
         out = {"phoenix_restore": "DEGRADED", "degraded_reason": "c2_corrupt_fallback",
                "degraded": _c2_degraded, "held_roles": target_roles,
-               "note": ("retention 파일 손상→폴백 복원으로 묘비 불확실 — 부활 보류(fail-safe). "
-                        "복귀: 다음 정상 관측 사이클 또는 `phoenix roster --rebase`.")}
+               "note": ("retention 파일 손상→폴백 복원(recovered_from 영속)으로 묘비 불확실 — 부활 보류(fail-safe). "
+                        "복귀: 검증된-건강 topology replace 또는 `phoenix roster --rebase`.")}
         if print_result:
             print(json.dumps(out, ensure_ascii=False, indent=2))
         return out
@@ -1940,11 +2052,13 @@ def cmd_roster(args):
     """desired 로스터(대장) 현황 — actual topology와 분리된 선언 상태를 노출(§12).
     ★C3: --rebase 면 설명-가능-축소 불변식을 1회 우회해 현재 관측을 강제 수용한다(운영자 명시 재기반)."""
     socket = args.socket
-    roster, tombstones = observe_and_persist_roster(socket, rebase=getattr(args, "rebase", False))
+    _rebase = getattr(args, "rebase", False)
+    roster, tombstones = observe_and_persist_roster(socket, rebase=_rebase)
     live = live_role_surfaces(socket)
     alive = {r for r, ss in live.items() if r != "-" and any(not s["exited"] for s in ss)}
     topo_roles = sorted(e.get("role") for e in read_topology(socket).get("entries", []) if e.get("role"))
-    dept_roster, dept_tomb = observe_and_persist_depts(socket)  # ★Phase7: 부서도 보호집합에 노출
+    # ★C2(W3): --rebase 는 dept degraded provenance 도 해제(운영자 명시 재기반).
+    dept_roster, dept_tomb = observe_and_persist_depts(socket, rebase=_rebase)  # ★Phase7: 부서도 보호집합에 노출
     out = {
         "desired_roster(선언·침식 면역)": sorted(roster.keys()),
         "tombstones(의도적 폐역)": sorted(tombstones),
