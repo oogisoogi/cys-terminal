@@ -388,8 +388,12 @@ fn decide_auto_restore(
     if let Some(newp) = cys::runtime_prefixed_path(exe_dir, current_path) {
         env.push(("PATH".to_string(), newp));
     }
+    // ★B3(§2 축B): 인터프리터 절대경로 해석 — 동봉 runtime python3 우선(win runtime\python\python3.exe /
+    // mac Resources/runtime/python/bin/python3), 없으면 "python3" 리터럴(PATH 폴백). 순정 Windows(python3 부재)·
+    // mac CLT 미설치 소비자에서 첫 스폰 단절(P0-7·P1-9)을 절대경로로 끊는다. PATH 선두주입과 이중 방어.
+    let python = bundled_python3(exe_dir).unwrap_or_else(|| "python3".to_string());
     AutoRestore::Ready {
-        program: "python3".to_string(),
+        program: python,
         args: vec![
             phoenix.to_string_lossy().into_owned(),
             "restore".to_string(),
@@ -397,6 +401,25 @@ fn decide_auto_restore(
         ],
         env,
     }
+}
+
+/// ★B3: 동봉 runtime python3 절대경로(exe 옆 번들). runtime_bin_dirs(pane 자식과 동일 SOT)에서 python3 실행파일을
+/// 찾는다. 없으면 None(호출측이 "python3" 리터럴로 폴백 — PATH 선두주입이 동봉본을 잡거나 시스템 python3).
+fn bundled_python3(exe_dir: &std::path::Path) -> Option<String> {
+    let names: &[&str] = if cfg!(windows) {
+        &["python3.exe", "python.exe"]
+    } else {
+        &["python3"]
+    };
+    for d in cys::runtime_bin_dirs(exe_dir) {
+        for n in names {
+            let p = d.join(n);
+            if p.is_file() {
+                return Some(p.to_string_lossy().into_owned());
+            }
+        }
+    }
+    None
 }
 
 /// 콜드부트 auto-restore를 detached 스폰한다(env에 CYS_NO_AUTOSTART=1 — 자식 CLI가 라이벌
@@ -1682,8 +1705,48 @@ mod auto_restore_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    use super::bundled_python3;
     use std::cell::RefCell;
     use std::time::Duration;
+
+    /// ★B3: 동봉 runtime python3 가 있으면 program 은 그 절대경로(리터럴 "python3" 아님). mac 레이아웃
+    /// (runtime/python/bin/python3)으로 검증 — 순정 Windows/mac CLT 미설치 첫 스폰 단절 수리의 핵심.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn b3_bundled_python_absolute_path_preferred() {
+        let dir = std::env::temp_dir().join(format!("cys-b3-{}", std::process::id()));
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("javis_phoenix.py"), "#!/usr/bin/env python3\n").unwrap();
+        // exe_dir=bin. 동봉 python: bin/runtime/python/bin/python3.
+        let pybin = bin.join("runtime").join("python").join("bin");
+        std::fs::create_dir_all(&pybin).unwrap();
+        let py = pybin.join("python3");
+        std::fs::write(&py, "#!/bin/sh\n").unwrap();
+        assert_eq!(bundled_python3(&bin).as_deref(), Some(py.to_string_lossy().as_ref()));
+        match decide_auto_restore(&dir, false, &bin, "/usr/bin:/bin") {
+            AutoRestore::Ready { program, .. } => {
+                assert_eq!(program, py.to_string_lossy(), "동봉 python3 절대경로여야 한다");
+            }
+            other => panic!("expected Ready, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★B3: 동봉 runtime 이 없으면 program 은 "python3" 리터럴(PATH 폴백).
+    #[test]
+    fn b3_no_bundled_python_falls_back_to_literal() {
+        let dir = std::env::temp_dir().join(format!("cys-b3-nolit-{}", std::process::id()));
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("javis_phoenix.py"), "#!/usr/bin/env python3\n").unwrap();
+        assert_eq!(bundled_python3(&bin), None);
+        match decide_auto_restore(&dir, false, &bin, "/usr/bin:/bin") {
+            AutoRestore::Ready { program, .. } => assert_eq!(program, "python3"),
+            other => panic!("expected Ready, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// ★W1(codex major): 1차 비0 → (수동 복원으로 대상 라이브) → 2차 NOOP(=0)·정확히 2회 실행·중복 스폰 0.
     /// run_auto_restore_once 대신 스크립트 러너를 주입해 sleep 0 으로 결정론 검증(60s 실 sleep 회귀 회피).
