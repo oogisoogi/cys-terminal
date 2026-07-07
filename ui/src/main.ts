@@ -3525,6 +3525,16 @@ function onDaemonEvent(event: Record<string, unknown>) {
     refreshSidebarStatus(); // 사이드바 ⚠ 배지 갱신 (B3)
     return;
   }
+  if (name === "approval.stalled") {
+    // master가 stall 임계(기본 5분) 내 처리하지 못한 승인 = 사람 개입 필요 신호 —
+    // 이때만 화면을 전환한다(승인 UX 원칙: 알림과 포커스 강탈의 분리, escalation 짝).
+    toast("approval", "⚠ 승인 방치", `${payload.surface_ref ?? ""} ${String(payload.title ?? "").slice(0, 80)} — ${payload.age_secs}s 경과`);
+    osBanner("⚠ 승인 방치 — 사람 확인 필요", `${payload.surface_ref ?? ""} ${String(payload.title ?? "").slice(0, 80)}`);
+    openFeed();
+    refreshFeed();
+    refreshSidebarStatus();
+    return;
+  }
   if (name === "context.threshold") {
     toast("threshold", `🔋 컨텍스트 ${payload.context_pct}%`, `${payload.role ?? ""} ${payload.surface_ref ?? ""} ≥ ${payload.threshold}% — ${payload.action ?? ""}`);
     if (Number(payload.context_pct ?? 0) >= 80)

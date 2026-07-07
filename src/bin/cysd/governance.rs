@@ -30,6 +30,8 @@ pub fn spawn_watchdog(daemon: Arc<Daemon>) {
         let mut launch_flag_warned: std::collections::HashSet<u64> =
             std::collections::HashSet::new();
         let mut feed_backlog_alerted: bool = false;
+        let mut approval_stall_fired: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         let mut tick_no: u64 = 0;
         loop {
             tokio::time::sleep(Duration::from_secs(WATCHDOG_INTERVAL_SECS)).await;
@@ -49,6 +51,7 @@ pub fn spawn_watchdog(daemon: Arc<Daemon>) {
                 check_surface_crash(&daemon);
                 check_feed_aging(&daemon, &mut feed_reminded);
                 check_feed_backlog(&daemon, &mut feed_backlog_alerted);
+                check_approval_stall(&daemon, &mut approval_stall_fired);
                 check_master_deadman(&daemon, &mut deadman_last_alert);
                 // 저빈도 검사(15초): 파일 stat·화면 렌더 — 5초마다 돌릴 필요 없음
                 if tick_no.is_multiple_of(3) {
@@ -707,6 +710,17 @@ fn check_approvals(daemon: &Arc<Daemon>, debounce: &mut HashMap<(u64, String), f
                 &excerpt,
                 Some(s.id),
             );
+            // L2 방치 차단(2026-07-07 재발방지): 새 에피소드 1건당 master를 큐로 1회 각성 —
+            // '즉각 승인' 산문 계약의 기계 배선(재발행 억제는 위 L3 코얼레싱이 보장).
+            // 배달은 deliver_queued의 조용시점·typing-guard 규약을 그대로 탄다.
+            enqueue_master_wakeup(
+                daemon,
+                s.id,
+                &format!(
+                    "[승인감지] {agent} {}에 승인 프롬프트 대기 — read-screen으로 확인 후 즉시 처리하라: {excerpt}",
+                    cys::surface_ref(s.id)
+                ),
+            );
         }
         // L3 stale-clear: 화면에서 승인 패턴이 전부 사라졌으면 이 surface의 pending 감지
         // 항목은 알림 수명 종료 — 자동 종결한다. 프롬프트가 (사람·master의 pane 응답으로)
@@ -717,6 +731,92 @@ fn check_approvals(daemon: &Arc<Daemon>, debounce: &mut HashMap<(u64, String), f
                 daemon.resolve_feed_item(&rid, "stale-cleared");
             }
         }
+    }
+}
+
+/// L2 방치 차단(2026-07-07 feed 폭주 재발방지): master role surface의 pending_queue에
+/// 텍스트 1건을 직접 적재한다 — 승인 감지가 이벤트 bus에만 실려 master stdin에 닿지 않던
+/// 갭의 봉인. cap(100)·배달 규약(deliver_queued 조용시점·typing-guard)은 큐 기존 계약을
+/// 그대로 따른다. master 부재·종료·큐 포화면 조용히 무시하고, 감지 대상이 master 자신이면
+/// 적재하지 않는다(자기 프롬프트에 큐 배달 시 다이얼로그 오입력 위험 — stalled escalation이 커버).
+fn enqueue_master_wakeup(daemon: &Arc<Daemon>, detected_sid: u64, text: &str) {
+    let Some(master_sid) = daemon.roles.lock().unwrap().get("master").copied() else {
+        return;
+    };
+    if master_sid == detected_sid {
+        return;
+    }
+    let Some(s) = daemon.get_surface(master_sid) else {
+        return;
+    };
+    if s.exited.load(Ordering::Relaxed) {
+        return;
+    }
+    let depth = {
+        let mut q = s.pending_queue.lock().unwrap();
+        if q.len() >= 100 {
+            return;
+        }
+        q.push_back(text.to_string());
+        q.len()
+    };
+    daemon.bus.publish(
+        "queue.enqueued",
+        "queue",
+        Some(master_sid),
+        json!({"bytes": text.len(), "depth": depth, "from": "governance-approval"}),
+    );
+    daemon.persist_queue_state();
+}
+
+/// L2 escalation(2026-07-07 재발방지): 데몬 감지(approval) 항목이 stall 임계
+/// (CYS_APPROVAL_STALL_SECS, 기본 300s)를 넘겨 pending이면 사람 개입 필요 신호
+/// approval.stalled를 항목당 1회 발행한다 — 'master가 처리 못한 승인만 사람에게'
+/// (v0.12.27 화면전환 원칙)의 데몬측 짝. resolved는 종결 상태라 재발화 없음. 0=비활성.
+fn check_approval_stall(daemon: &Arc<Daemon>, fired: &mut std::collections::HashSet<String>) {
+    let stall = env_u64("CYS_APPROVAL_STALL_SECS", 300);
+    if stall == 0 {
+        return;
+    }
+    let now = now_epoch();
+    let (pending_ids, stalled): (
+        std::collections::HashSet<String>,
+        Vec<(String, String, f64, Option<u64>)>,
+    ) = {
+        let items = daemon.feed_items.lock().unwrap();
+        let pend: std::collections::HashSet<String> = items
+            .iter()
+            .filter(|i| {
+                i.status == "pending"
+                    && i.kind == "approval"
+                    && i.request_id.starts_with("daemon-")
+            })
+            .map(|i| i.request_id.clone())
+            .collect();
+        let st = items
+            .iter()
+            .filter(|i| {
+                i.status == "pending"
+                    && i.kind == "approval"
+                    && i.request_id.starts_with("daemon-")
+                    && now - i.created_at >= stall as f64
+            })
+            .map(|i| (i.request_id.clone(), i.title.clone(), now - i.created_at, i.surface_id))
+            .collect();
+        (pend, st)
+    };
+    fired.retain(|id| pending_ids.contains(id)); // 해소된 항목 키 회수(맵 누수 차단)
+    for (rid, title, age, sid) in stalled {
+        if !fired.insert(rid.clone()) {
+            continue; // 항목당 1회
+        }
+        daemon.bus.publish(
+            "approval.stalled",
+            "watchdog",
+            sid,
+            json!({"request_id": rid, "title": title, "age_secs": age as u64,
+                   "surface_ref": sid.map(cys::surface_ref)}),
+        );
     }
 }
 
@@ -1702,6 +1802,39 @@ mod tests {
             "중복 해소=None(멱등)"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// L2 escalation 핀: stall 임계 초과 pending 감지 항목은 approval.stalled를 항목당
+    /// 정확히 1회 발행하고, 해소된 항목은 fired 집합에서 회수된다.
+    #[test]
+    fn approval_stall_fires_once_per_item() {
+        let dir = std::env::temp_dir().join(format!("cys_stall_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let daemon = crate::state::Daemon::new(dir.join("cysd.sock"));
+        let mut rx = daemon.bus.subscribe();
+        daemon.push_feed_notification("approval", "claude 승인 대기 감지 (surface:7)", "b", Some(7));
+        // 인위 노화: created_at을 임계(기본 300s) 밖으로 이동
+        {
+            let mut items = daemon.feed_items.lock().unwrap();
+            items.last_mut().unwrap().created_at -= 400.0;
+        }
+        let mut fired = std::collections::HashSet::new();
+        super::check_approval_stall(&daemon, &mut fired);
+        super::check_approval_stall(&daemon, &mut fired); // 2회 호출해도
+        let mut stalled_events = 0;
+        while let Ok(ev) = rx.try_recv() {
+            if ev["name"].as_str() == Some("approval.stalled") {
+                stalled_events += 1;
+                assert_eq!(ev["payload"]["surface_ref"].as_str(), Some("surface:7"));
+            }
+        }
+        assert_eq!(stalled_events, 1, "항목당 1회만 발화");
+        // 해소 후 fired 집합 회수
+        let rid = daemon.pending_daemon_approvals(7).pop().unwrap();
+        daemon.resolve_feed_item(&rid, "allow");
+        super::check_approval_stall(&daemon, &mut fired);
+        assert!(fired.is_empty(), "해소 항목 키 회수");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
