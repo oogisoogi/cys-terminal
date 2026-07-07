@@ -14,4 +14,15 @@ IN=$(cat)
 if [ -n "$IN" ] && command -v cys >/dev/null 2>&1; then
   printf '%s' "$IN" | cys usage-event-stdin >/dev/null 2>&1
 fi
+# ── 사용자 로컬 훅 오버레이(~/.cys/local/hooks/<이벤트>.d/*.sh) — 업데이트 불가침 확장점 ──
+# 팩 파일을 직접 고치지 않고 훅을 확장하는 공식 채널. OBSERVABILITY 클래스를 상속한다:
+# 후행 실행·stdout 미노출·모든 실패 무해 흘림(사용자 훅이 에이전트를 차단할 수 없다 — 안전핵).
+EV=$(printf '%s' "$IN" | sed -n 's/.*"hook_event_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+LHD="${CYS_LOCAL_DIR:-$HOME/.cys/local}/hooks/${EV}.d"
+if [ -n "$EV" ] && [ -d "$LHD" ]; then
+  for f in "$LHD"/*.sh; do
+    [ -f "$f" ] || continue
+    printf '%s' "$IN" | sh "$f" >/dev/null 2>&1 || true
+  done
+fi
 exit 0

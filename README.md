@@ -188,6 +188,12 @@ cys feed reply <request_id> allow                            # CLI 또는 UI All
 남으면 배지 클릭 교대 또는 유휴 자동 교대(라이브 세션 0일 때 — 무손실)로 해소됩니다.
 진단·수리는 `cys doctor [--fix]`.
 
+**커스터마이즈와 공존**: 사용자 수정본은 업데이트가 파괴하지 않습니다 — user-owned 파일은
+보존+신버전 `.new` 병치, system 파일은 치유 전 `.user` 보존, `~/.cys/local/` 오버레이
+(디렉티브 append·스킬 shadowing·훅 후행)는 업데이트가 존재 자체를 모릅니다.
+`cys pack-plan`(사전 미리보기) · `cys pack-merge`(3-way/AI 병합) — 상세는
+[User Manual §12.7](USER-MANUAL.md#127-커스터마이징--업데이트와-공존하는-방법).
+
 ## 채널 브리지 (Slack·Discord)
 
 함대의 승인 요청·보고를 외부 메신저로 내보내고, 허가된 발신자의 원격 승인을 받습니다 —

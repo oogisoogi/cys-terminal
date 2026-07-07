@@ -136,7 +136,7 @@ fn setup_isolated_config_dir() {
 
 /// 설치 매니페스트: rel → 설치 당시 내용의 sha256. "지금 디스크에 있는 파일이 우리가
 /// 설치한 그대로인가(=사용자 비수정)"를 판정하는 유일한 근거다.
-const INSTALL_MANIFEST: &str = ".install-manifest.json";
+pub const INSTALL_MANIFEST: &str = ".install-manifest.json";
 const PACK_VERSION_FILE: &str = ".pack-version";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -342,6 +342,203 @@ pub(crate) fn is_user_owned(rel: &str) -> bool {
         || rel == "schedule.json"
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// ★사용자 커스터마이즈 절충 계층 (2026-07-07 오너 승인 6층 로드맵의 ②③④ 코어)
+//   문제: system 파일은 매 install 강제 치유(P0-4)로 사용자 수정이 소실, user-owned 는
+//   보존되지만 영구 동결(병합 경로 없음) — 업데이트가 커스텀을 무효화한다는 사용자 항의의 실체.
+//   절충(dpkg conffile/rpmnew·rpmsave 패턴):
+//     - user-owned 수정본 + 임베드 신버전 변경 → 보존 유지 + `<rel>.new` 병치(병합 대기)
+//     - system 수정본 치유 → 덮어쓰기 **전에** `<rel>.user` 로 사용자본 보존(파괴 0)
+//     - `.pristine/<rel>` = 마지막으로 디스크에 적용된 vendor 원본(3-way 병합의 공통 조상)
+//     - `.merge-pending.json` = 병합 대기 원장 — `cys pack-merge` 가 소비
+//   판정은 decide_file_action(순수)로 추출해 install_into(쓰기)와 plan_install(드라이런)이
+//   같은 논리를 공유한다(플랜≠실제 드리프트 차단).
+
+/// 병합 대기 원장 파일명 (pack_dir 루트 · install-manifest 형제 · 매니페스트 비등재라 prune 불가침).
+pub const MERGE_PENDING_FILE: &str = ".merge-pending.json";
+/// pristine 미러 디렉터리 — 마지막 적용 vendor 원본(3-way base). 매니페스트 비등재.
+pub const PRISTINE_DIR: &str = ".pristine";
+
+/// 사용자 로컬 오버레이 루트(⑤①) — 업데이터·치유·prune 이 **존재 자체를 모르는** 사용자 전용 영역.
+/// directives/*_DIRECTIVE.local.md(디렉티브 append)·skills/(동명 shadowing)·hooks/<event>.d/(후행 실행)·notes/.
+/// 테스트 오버라이드: CYS_LOCAL_DIR. 기본 = pack_dir 형제 `local`(~/.cys/local).
+pub fn local_dir() -> PathBuf {
+    if let Some(d) = crate::env_compat("CYS_LOCAL_DIR") {
+        return PathBuf::from(d);
+    }
+    let pd = pack_dir();
+    match pd.parent() {
+        Some(parent) => parent.join("local"),
+        None => PathBuf::from("local"),
+    }
+}
+
+/// 파일 1건의 설치 판정(순수·부수효과 0) — install_into 와 plan_install 공용.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FileAction {
+    /// 임베드 내용을 디스크에 기록. heal_user_copy=true 면 사용자 수정본을 `<rel>.user` 로 먼저 보존.
+    Write { heal_user_copy: bool },
+    /// 디스크 유지. adopt_hash=true 면 매니페스트에 현재 임베드 해시 채택(구설치본 승계).
+    /// new_pending=true 면 임베드 신버전을 `<rel>.new` 로 병치(병합 대기 — user-owned 동결 해소 경로).
+    Keep { adopt_hash: bool, new_pending: bool },
+}
+
+/// 현행 install_into 분기(★B2 user-owned 영구 보존 · P0-4 system 강제 치유 · 비수정 자동 갱신)를
+/// 글자 그대로 보존한 순수 판정 + 신규 부수효과 플래그(heal_user_copy·new_pending)만 추가한다.
+pub(crate) fn decide_file_action(
+    rel: &str,
+    embed: &str,
+    exists: bool,
+    disk: Option<&str>, // None = 부재 또는 읽기 실패(비UTF-8 등)
+    manifest_hash: Option<&str>,
+    force: bool,
+) -> FileAction {
+    // ★B2 user-owned 영구 보존 (force 여도) — 읽기 성공 + 내용 상이일 때.
+    if exists && is_user_owned(rel) {
+        if let Some(d) = disk {
+            if d != embed {
+                // 임베드가 마지막 적용본(매니페스트 해시)에서 전진했으면 신버전 병치(병합 대기).
+                // 매니페스트 부재(구설치본)도 안전측으로 병치해 가시화한다(base 없는 2-way 병합).
+                let new_pending = manifest_hash != Some(content_hash(embed).as_str());
+                return FileAction::Keep { adopt_hash: false, new_pending };
+            }
+        }
+    }
+    if exists && !force {
+        match disk {
+            Some(d) if d == embed => {
+                return FileAction::Keep { adopt_hash: true, new_pending: false };
+            }
+            Some(d) if manifest_hash == Some(content_hash(d).as_str()) => {
+                // 설치-당시 해시 그대로(사용자 비수정) + 임베드가 더 새 버전 → 갱신.
+                return FileAction::Write { heal_user_copy: false };
+            }
+            _ => {
+                // 사용자 수정본·매니페스트 부재·읽기 실패.
+                if is_user_owned(rel) {
+                    // (여기 도달 = 읽기 실패 케이스 — 내용 상이는 위 첫 블록이 잡는다) 보존.
+                    return FileAction::Keep { adopt_hash: false, new_pending: false };
+                }
+                // system: 강제 치유(P0-4 — 임베드 진실). 진짜 사용자 수정본이면 먼저 .user 보존.
+                let heal = matches!(disk, Some(d) if d != embed
+                    && manifest_hash != Some(content_hash(d).as_str()));
+                return FileAction::Write { heal_user_copy: heal };
+            }
+        }
+    }
+    // 신규 생성 또는 force 갱신 — force 로 수정본을 덮을 때도 사용자본은 보존한다(파괴 0).
+    let heal = exists
+        && matches!(disk, Some(d) if d != embed
+            && manifest_hash != Some(content_hash(d).as_str()));
+    FileAction::Write { heal_user_copy: heal }
+}
+
+/// 병합 대기 원장 로드(부재·손상 = 빈 원장, 기동 차단 0).
+pub fn load_merge_pending(dir: &Path) -> serde_json::Map<String, serde_json::Value> {
+    std::fs::read_to_string(dir.join(MERGE_PENDING_FILE))
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default()
+}
+
+/// 병합 대기 원장 저장(best-effort — 자문 메타데이터라 실패가 설치를 막지 않는다).
+pub fn save_merge_pending(dir: &Path, pending: &serde_json::Map<String, serde_json::Value>) {
+    if let Ok(json) = serde_json::to_string_pretty(&serde_json::Value::Object(pending.clone())) {
+        let _ = write_atomic(&dir.join(MERGE_PENDING_FILE), json.as_bytes());
+    }
+}
+
+/// install 드라이런 리포트(④ 투명성) — `cys pack-plan` 이 설치 **전에** 사용자에게 보여준다.
+#[derive(Debug, Default)]
+pub struct InstallPlan {
+    pub create: Vec<String>,              // 신규 생성
+    pub update: Vec<String>,              // 자동 갱신(비수정 system)
+    pub heal: Vec<String>,                // 수정본 강제 치유(사용자본 `<rel>.user` 보존 후 덮어씀)
+    pub merge_new: Vec<String>,           // user-owned 보존 + 신버전 `<rel>.new` 병치(병합 대기)
+    pub keep_user: Vec<String>,           // user-owned 보존(신버전 병치 불요)
+    pub unchanged: usize,                 // 최신(변화 없음)
+    pub prune_delete: Vec<String>,        // 폐기 파일 제거(비수정)
+    pub prune_keep_modified: Vec<String>, // 폐기됐지만 수정본이라 보존
+    pub blocked: Option<String>,          // 다운그레이드 등 설치 차단 사유(파일 판정 무의미)
+}
+
+/// install_into 와 **같은 판정 함수**로 드라이런 리포트를 만든다(쓰기 0·드리프트 0).
+pub fn plan_install(
+    dir: &Path,
+    items: &[(&str, &str)],
+    force: bool,
+    target_version: &str,
+) -> InstallPlan {
+    let mut plan = InstallPlan::default();
+    // 다운그레이드 차단 미러(install_into 와 동일 판정).
+    if !force {
+        if let Some(dv) = std::fs::read_to_string(dir.join(PACK_VERSION_FILE))
+            .ok()
+            .map(|s| s.trim().to_string())
+        {
+            if version_gt(&dv, target_version) {
+                plan.blocked = Some(format!(
+                    "다운그레이드 차단 — 디스크 {dv} > 대상 {target_version}"
+                ));
+                return plan;
+            }
+        }
+    }
+    let manifest: std::collections::BTreeMap<String, String> =
+        std::fs::read_to_string(dir.join(INSTALL_MANIFEST))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+    for (rel, content) in items.iter().copied() {
+        let path = dir.join(rel);
+        let exists = path.exists();
+        let disk = if exists { std::fs::read_to_string(&path).ok() } else { None };
+        match decide_file_action(
+            rel,
+            content,
+            exists,
+            disk.as_deref(),
+            manifest.get(rel).map(String::as_str),
+            force,
+        ) {
+            FileAction::Write { heal_user_copy: true } => plan.heal.push(rel.to_string()),
+            FileAction::Write { heal_user_copy: false } => {
+                if exists {
+                    plan.update.push(rel.to_string());
+                } else {
+                    plan.create.push(rel.to_string());
+                }
+            }
+            FileAction::Keep { new_pending: true, .. } => plan.merge_new.push(rel.to_string()),
+            FileAction::Keep { .. } => {
+                if is_user_owned(rel) && disk.as_deref() != Some(content) {
+                    plan.keep_user.push(rel.to_string());
+                } else {
+                    plan.unchanged += 1;
+                }
+            }
+        }
+    }
+    // prune 프리뷰(install_into prune 블록과 동일 판정).
+    let embedded: std::collections::HashSet<&str> = items.iter().map(|(rel, _)| *rel).collect();
+    if !embedded.is_empty() {
+        for (rel, mh) in manifest.iter() {
+            if embedded.contains(rel.as_str()) || is_user_owned(rel) {
+                continue;
+            }
+            match std::fs::read_to_string(dir.join(rel)) {
+                Ok(existing) if mh.as_str() == content_hash(&existing).as_str() => {
+                    plan.prune_delete.push(rel.clone());
+                }
+                Ok(_) => plan.prune_keep_modified.push(rel.clone()),
+                Err(_) => {} // 파일 이미 없음 — 매니페스트 정리만(사용자 표시 불요)
+            }
+        }
+    }
+    plan
+}
+
 /// semver(major.minor.patch) 파싱 — version_gt 내부 parts와 동일 규칙('v' 접두 제거,
 /// prerelease/build suffix('-rc','+build') 분리, major 결측·비숫자는 None). ★version_gt와 달리
 /// 파싱 실패를 안전측 bool로 흡수하지 않고 Option으로 노출한다 — remote 비교(§7-④)는 실패=거부
@@ -406,6 +603,20 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
             Err(e)
         }
     }
+}
+
+/// pristine 미러 갱신(best-effort — 3-way 병합의 공통 조상 확보용 자문 데이터).
+/// **디스크에 실제 적용된** vendor 내용일 때만 호출된다 — user-owned 동결 파일에는 호출하지
+/// 않아 조상이 사용자가 fork 한 시점의 vendor 본으로 남는다(3-way 정확성의 핵심).
+fn ensure_pristine(dir: &Path, rel: &str, content: &str) {
+    let p = dir.join(PRISTINE_DIR).join(rel);
+    if std::fs::read_to_string(&p).ok().as_deref() == Some(content) {
+        return;
+    }
+    if let Some(parent) = p.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = write_atomic(&p, content.as_bytes());
 }
 
 /// PACK 템플릿 설치 (CLI init-pack과 데몬 첫 기동 자동 설치의 공용 코어).
@@ -481,47 +692,80 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
     }
     let mut written = 0;
     let mut kept = 0;
+    // ★커스터마이즈 절충 원장(②): .new/.user 병치·pristine 미러·병합 대기 기록.
+    // 판정 자체는 decide_file_action(순수 — ★B2 user-owned 영구 보존 · P0-4 system 강제 치유 ·
+    // 비수정 자동 갱신을 글자 그대로 보존)에 위임하고, 여기는 부수효과만 수행한다.
+    let mut pending = load_merge_pending(&dir);
+    let mut pending_dirty = false;
+    let now_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // 병합 대기 항목 upsert — kind·side·version 이 이미 같으면 no-op(매 기동 install 의 원장 rewrite 방지).
+    let mut upsert_pending = |pending: &mut serde_json::Map<String, serde_json::Value>,
+                              dirty: &mut bool,
+                              rel: &str,
+                              kind: &str,
+                              side: String| {
+        let same = pending.get(rel).is_some_and(|e| {
+            e.get("kind").and_then(|v| v.as_str()) == Some(kind)
+                && e.get("side").and_then(|v| v.as_str()) == Some(side.as_str())
+                && e.get("version").and_then(|v| v.as_str()) == Some(target_version)
+        });
+        if !same {
+            pending.insert(
+                rel.to_string(),
+                serde_json::json!({"kind": kind, "side": side, "version": target_version, "ts": now_ts}),
+            );
+            *dirty = true;
+        }
+    };
     for (rel, content) in items.iter().copied() {
         let path = dir.join(rel);
-        // ★B2 user 소유 영구 보존(멀티마스터 정식화 F1 + 소유권 매니페스트): 디렉티브·헌법(soul.md)·CLAUDE.md가
-        // 디스크에 임베드와 다른 내용으로 존재하면(CEO 디렉티브·사용자 헌법 커스텀) force여도 절대 덮지 않는다.
-        // CEO 승격이 directives/MASTER_DIRECTIVE.md를 CEO 내용으로 둔 것을, 데몬 매 기동 install(false)·
-        // init-pack --force가 임베드 표준본으로 파괴하는 것을 결정론 차단. system 파일은 이 보존에서 제외(force-update).
-        if path.exists() && is_user_owned(rel) {
-            if let Ok(existing) = std::fs::read_to_string(&path) {
-                if existing != content {
-                    kept += 1;
-                    continue;
-                }
-            }
-        }
-        if path.exists() && !force {
-            match std::fs::read_to_string(&path) {
-                Ok(existing) if existing == content => {
+        let exists = path.exists();
+        let disk = if exists { std::fs::read_to_string(&path).ok() } else { None };
+        let mhash: Option<String> = manifest.get(rel).cloned();
+        match decide_file_action(rel, content, exists, disk.as_deref(), mhash.as_deref(), force) {
+            FileAction::Keep { adopt_hash, new_pending } => {
+                if adopt_hash {
                     // 디스크 = 임베드: 최신. 매니페스트 공백(구설치본)이면 채택 기록해
-                    // 다음 버전부터 자동 갱신 대상이 되게 한다.
+                    // 다음 버전부터 자동 갱신 대상이 되게 한다. pristine 승계도 보장.
                     manifest
                         .entry(rel.to_string())
                         .or_insert_with(|| content_hash(content));
-                    kept += 1;
-                    continue;
+                    ensure_pristine(&dir, rel, content);
                 }
-                Ok(existing)
-                    if manifest.get(rel).map(String::as_str)
-                        == Some(content_hash(&existing).as_str()) =>
-                {
-                    // 설치-당시 해시 그대로(사용자 비수정) + 임베드가 더 새 버전 → 갱신.
-                }
-                _ => {
-                    // ★B2 소유권 분기(P0-4 catch-all 대체): 여기 도달 = 사용자 수정본·매니페스트 부재·읽기 실패.
-                    //   user 소유(디렉티브·헌법·CLAUDE) → 보존(안전측·사용자 편집 존중).
-                    //   system 소유(bin/*.py·hooks/*·skills 등) → 강제 갱신(임베드 진실 — 스큐/손상 오판 동결 금지).
-                    //     매니페스트 부재·해시 불일치를 'user 수정'으로 오판해 phoenix 를 영구 동결시키던 P0-4 근원 제거.
-                    if is_user_owned(rel) {
-                        kept += 1;
-                        continue;
+                if new_pending {
+                    // user-owned 보존 + 임베드 신버전 병치(idempotent) — '영구 동결'을 '보이는 병합 대기'로.
+                    let new_path = dir.join(format!("{rel}.new"));
+                    if std::fs::read_to_string(&new_path).ok().as_deref() != Some(content) {
+                        let _ = write_atomic(&new_path, content.as_bytes());
                     }
-                    // system: 아래 write 로 fall through(임베드 내용으로 갱신).
+                    upsert_pending(&mut pending, &mut pending_dirty, rel, "new-pending", format!("{rel}.new"));
+                } else if pending
+                    .get(rel)
+                    .and_then(|e| e.get("kind"))
+                    .and_then(|k| k.as_str())
+                    == Some("new-pending")
+                {
+                    // 병합 대기 해소(사용자가 vendor 본 채택 등) — 원장·.new 잔재 청소.
+                    pending.remove(rel);
+                    pending_dirty = true;
+                    let _ = std::fs::remove_file(dir.join(format!("{rel}.new")));
+                }
+                kept += 1;
+                continue;
+            }
+            FileAction::Write { heal_user_copy } => {
+                if heal_user_copy {
+                    // system 강제 치유(P0-4)·force 갱신이 사용자 수정본을 덮기 **전에** 보존(파괴 0).
+                    if let Some(d) = disk.as_deref() {
+                        let user_path = dir.join(format!("{rel}.user"));
+                        if std::fs::read_to_string(&user_path).ok().as_deref() != Some(d) {
+                            let _ = write_atomic(&user_path, d.as_bytes());
+                        }
+                        upsert_pending(&mut pending, &mut pending_dirty, rel, "healed", format!("{rel}.user"));
+                    }
                 }
             }
         }
@@ -532,7 +776,28 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
         write_atomic(&path, content.as_bytes())
             .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
         manifest.insert(rel.to_string(), content_hash(content));
+        ensure_pristine(&dir, rel, content);
+        // 정상 갱신으로 합류(비수정 update·신규 생성) — 남은 new-pending 잔재는 무의미하므로 청소.
+        if pending
+            .get(rel)
+            .and_then(|e| e.get("kind"))
+            .and_then(|k| k.as_str())
+            == Some("new-pending")
+        {
+            pending.remove(rel);
+            pending_dirty = true;
+            let _ = std::fs::remove_file(dir.join(format!("{rel}.new")));
+        }
         written += 1;
+    }
+    if pending_dirty {
+        save_merge_pending(&dir, &pending);
+    }
+    if !pending.is_empty() {
+        println!(
+            "[init-pack] 커스터마이즈 병합 대기 {}건 — `cys pack-merge` 로 검토 (신버전 .new 병치 / 치유 전 사용자본 .user 보존)",
+            pending.len()
+        );
     }
     // prune: 임베드에서 사라진 옛 파일(폐기 스킬·디렉티브)을 제거해 '기능 제거 배포'를 가능케 한다.
     // 비수정(설치-당시 해시 == 현재 디스크 해시)만 삭제하고, 사용자 수정본·*_DIRECTIVE.md는 보존(안전측).
@@ -1003,6 +1268,22 @@ where
     }
     backup_set.insert(INSTALL_MANIFEST.to_string());
     backup_set.insert(PACK_STATE_FILE.to_string());
+    // ★커스터마이즈 절충 부수효과(.pristine/·.new·.user·병합 원장)도 저널 편입 — rollback이
+    // pre-state 를 **글자 단위로** 복원한다는 기존 계약(mid_apply_fault 테스트)을 부수효과까지 확장.
+    // 대부분 부재 경로라 저널 증가는 미미하다(write_journal 은 존재/부재를 그대로 스냅샷).
+    let side_paths: Vec<String> = backup_set
+        .iter()
+        .filter(|rel| !rel.starts_with('.')) // 마커·매니페스트·state 파일 자신은 제외
+        .flat_map(|rel| {
+            [
+                format!("{}/{rel}", PRISTINE_DIR),
+                format!("{rel}.new"),
+                format!("{rel}.user"),
+            ]
+        })
+        .collect();
+    backup_set.extend(side_paths);
+    backup_set.insert(MERGE_PENDING_FILE.to_string());
     write_journal(target_version, &backup_set)?;
     // ② 파일 반영(transactional=true) — .pack-version은 여기서 쓰지 않고(④에서 commit marker로),
     //    .install-manifest.json write 실패는 fail-closed로 Err가 되어 아래 rollback을 탄다.
@@ -1362,6 +1643,140 @@ mod tests {
     /// ③ ★B2/P0-4: system 파일 매니페스트 부재 + 내용 상이 → **강제 갱신**(과거 보존 동결이 배포 스큐 근원)
     /// ④ user 파일 매니페스트 부재 + 내용 상이 → 보존(안전측)
     /// ⑤ 디스크=임베드인 구설치본 → 매니페스트 채택 기록 + 멱등
+    /// ★커스터마이즈 절충(②) 순수 판정: decide_file_action 이 기존 B2/P0-4 분기를 보존하면서
+    /// heal_user_copy(치유 전 사용자본 보존)·new_pending(user-owned 신버전 병치)만 추가하는지 박제.
+    #[test]
+    fn decide_file_action_threeway_matrix() {
+        use super::FileAction::*;
+        let embed = "EMBED-V2";
+        let eh = content_hash(embed);
+        // 부재 → 신규 생성(보존 대상 없음).
+        assert_eq!(decide_file_action("bin/x.py", embed, false, None, None, false),
+                   Write { heal_user_copy: false });
+        // 디스크=임베드 → 최신 채택.
+        assert_eq!(decide_file_action("bin/x.py", embed, true, Some(embed), None, false),
+                   Keep { adopt_hash: true, new_pending: false });
+        // system 비수정(매니페스트 해시=디스크) → 자동 갱신(사용자본 보존 불요).
+        assert_eq!(decide_file_action("bin/x.py", embed, true, Some("OLD"),
+                       Some(content_hash("OLD").as_str()), false),
+                   Write { heal_user_copy: false });
+        // system 수정본(매니페스트 부재·상이) → 강제 치유(P0-4)하되 사용자본 .user 보존.
+        assert_eq!(decide_file_action("bin/x.py", embed, true, Some("HACKED"), None, false),
+                   Write { heal_user_copy: true });
+        // force 로 system 수정본을 덮을 때도 사용자본 보존.
+        assert_eq!(decide_file_action("bin/x.py", embed, true, Some("HACKED"), None, true),
+                   Write { heal_user_copy: true });
+        // user-owned 수정 + 임베드가 마지막 적용본에서 전진 → 보존 + 신버전 병치(병합 대기).
+        assert_eq!(decide_file_action("soul.md", embed, true, Some("MY-SOUL"),
+                       Some(content_hash("EMBED-V1").as_str()), false),
+                   Keep { adopt_hash: false, new_pending: true });
+        // user-owned 수정 + 임베드=마지막 적용본(vendor 무변경) → 보존만(dpkg 동형 — 병치 불요).
+        assert_eq!(decide_file_action("soul.md", embed, true, Some("MY-SOUL"),
+                       Some(eh.as_str()), false),
+                   Keep { adopt_hash: false, new_pending: false });
+        // user-owned 는 force 여도 보존(기존 ★B2 계약 불변).
+        assert_eq!(decide_file_action("soul.md", embed, true, Some("MY-SOUL"),
+                       Some(eh.as_str()), true),
+                   Keep { adopt_hash: false, new_pending: false });
+    }
+
+    /// ★커스터마이즈 절충(②③④) 통합: .new 병치·.user 보존·.pristine 미러·병합 원장·해소 경로 박제.
+    #[test]
+    fn install_threeway_sides_pristine_and_pending_lifecycle() {
+        let _g = PACK_ENV_LOCK.lock().unwrap();
+        let saved = std::env::var(ENV_PACK_DIR).ok();
+        let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
+        let td = std::env::temp_dir().join(format!("cys-pack-threeway-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        std::env::set_var(ENV_PACK_DIR, &td);
+        std::env::set_var(ENV_CONFIG_DIR, td.join("cysclaude"));
+
+        let get = |rel: &str| PACK_ALL.iter().find(|(r, _)| *r == rel).map(|(_, c)| *c)
+            .unwrap_or_else(|| panic!("팩에 {rel} 부재"));
+        let sys_a = "README.md";  // system·비수정 → 갱신 + pristine 미러
+        let user_b = "soul.md";   // user-owned·수정 + vendor 전진 → 보존 + .new + pending
+        let sys_c = "acl.json";   // system·수정 → 치유 + .user + pending
+        std::fs::create_dir_all(&td).unwrap();
+        for (rel, stale) in [(sys_a, "OLD-INSTALLED"), (user_b, "USER-SOUL"), (sys_c, "SYS-DRIFT")] {
+            std::fs::write(td.join(rel), stale).unwrap();
+        }
+        // sys_a=비수정 증명(설치-당시 해시), user_b=마지막 적용본이 embed 와 다름(vendor 전진) 증명.
+        let manifest = serde_json::json!({
+            sys_a: content_hash("OLD-INSTALLED"),
+            user_b: content_hash("OLD-SOUL-BASE"),
+        });
+        std::fs::write(td.join(INSTALL_MANIFEST), manifest.to_string()).unwrap();
+
+        install(false).expect("install 실패");
+        let read = |rel: &str| std::fs::read_to_string(td.join(rel)).unwrap();
+
+        // ① user-owned: 보존 + 신버전 .new 병치 + 원장 new-pending.
+        assert_eq!(read(user_b), "USER-SOUL", "user-owned 보존 불변");
+        assert_eq!(read("soul.md.new"), get(user_b), ".new = 임베드 신버전");
+        // ② system 수정본: 치유(임베드) + 사용자본 .user 보존 + 원장 healed.
+        assert_eq!(read(sys_c), get(sys_c), "system 치유(P0-4 불변)");
+        assert_eq!(read("acl.json.user"), "SYS-DRIFT", "치유 전 사용자본 보존(파괴 0)");
+        let pending = load_merge_pending(&td);
+        assert_eq!(pending.get(user_b).and_then(|e| e["kind"].as_str()), Some("new-pending"));
+        assert_eq!(pending.get(sys_c).and_then(|e| e["kind"].as_str()), Some("healed"));
+        // ③ pristine 미러: 적용된 vendor 본만(sys_a·sys_c), 동결 user-owned(user_b)는 미기록(조상 보존).
+        assert_eq!(read(&format!("{PRISTINE_DIR}/{sys_a}")), get(sys_a));
+        assert_eq!(read(&format!("{PRISTINE_DIR}/{sys_c}")), get(sys_c));
+        assert!(!td.join(PRISTINE_DIR).join(user_b).exists(), "동결 파일 조상은 미갱신");
+        // ④ 멱등: 재실행해도 상태 동일(원장 중복 기록·불필요 rewrite 없음).
+        install(false).expect("재실행 실패");
+        assert_eq!(read(user_b), "USER-SOUL");
+        assert_eq!(load_merge_pending(&td).len(), 2);
+        // ⑤ 해소: 사용자가 vendor 본 채택(디스크=임베드) → .new·원장 항목 자동 청소.
+        std::fs::write(td.join(user_b), get(user_b)).unwrap();
+        install(false).expect("3차 실행 실패");
+        assert!(!td.join("soul.md.new").exists(), "채택 후 .new 청소");
+        assert!(load_merge_pending(&td).get(user_b).is_none(), "채택 후 원장 소거");
+
+        let _ = std::fs::remove_dir_all(&td);
+        match saved { Some(v) => std::env::set_var(ENV_PACK_DIR, v), None => std::env::remove_var(ENV_PACK_DIR) }
+        match saved_cfg { Some(v) => std::env::set_var(ENV_CONFIG_DIR, v), None => std::env::remove_var(ENV_CONFIG_DIR) }
+    }
+
+    /// ★플랜=실제 무드리프트(④): plan_install 분류가 같은 픽스처의 install 실행 결과와 일치.
+    #[test]
+    fn plan_install_matches_actual_install_actions() {
+        let _g = PACK_ENV_LOCK.lock().unwrap();
+        let saved = std::env::var(ENV_PACK_DIR).ok();
+        let saved_cfg = std::env::var(ENV_CONFIG_DIR).ok();
+        let td = std::env::temp_dir().join(format!("cys-pack-plan-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        std::env::set_var(ENV_PACK_DIR, &td);
+        std::env::set_var(ENV_CONFIG_DIR, td.join("cysclaude"));
+
+        std::fs::create_dir_all(&td).unwrap();
+        std::fs::write(td.join("README.md"), "OLD-INSTALLED").unwrap();
+        std::fs::write(td.join("soul.md"), "USER-SOUL").unwrap();
+        std::fs::write(td.join("acl.json"), "SYS-DRIFT").unwrap();
+        let manifest = serde_json::json!({
+            "README.md": content_hash("OLD-INSTALLED"),
+            "soul.md": content_hash("OLD-SOUL-BASE"),
+        });
+        std::fs::write(td.join(INSTALL_MANIFEST), manifest.to_string()).unwrap();
+
+        let items: Vec<(&str, &str)> = PACK_ALL.iter().map(|(r, c)| (*r, *c)).collect();
+        let plan = plan_install(&td, &items, false, env!("CARGO_PKG_VERSION"));
+        assert!(plan.blocked.is_none());
+        assert!(plan.update.iter().any(|r| r == "README.md"), "비수정 → update");
+        assert!(plan.merge_new.iter().any(|r| r == "soul.md"), "user-owned+전진 → merge_new");
+        assert!(plan.heal.iter().any(|r| r == "acl.json"), "system 수정 → heal");
+        // 실제 install 이 플랜과 같은 행동을 하는지 대조.
+        install(false).expect("install 실패");
+        let read = |rel: &str| std::fs::read_to_string(td.join(rel)).unwrap();
+        assert_eq!(read("soul.md"), "USER-SOUL");
+        assert!(td.join("soul.md.new").exists());
+        assert!(td.join("acl.json.user").exists());
+
+        let _ = std::fs::remove_dir_all(&td);
+        match saved { Some(v) => std::env::set_var(ENV_PACK_DIR, v), None => std::env::remove_var(ENV_PACK_DIR) }
+        match saved_cfg { Some(v) => std::env::set_var(ENV_CONFIG_DIR, v), None => std::env::remove_var(ENV_CONFIG_DIR) }
+    }
+
     #[test]
     fn install_ownership_system_forced_user_preserved() {
         let _g = PACK_ENV_LOCK.lock().unwrap();

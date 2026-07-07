@@ -353,6 +353,35 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// 업데이트 드라이런(투명성) — 내장 팩 반영 시 갱신/보존/치유/병합대기/정리를 설치 **전에** 표시(쓰기 0)
+    #[command(name = "pack-plan")]
+    PackPlan {
+        /// force 설치(init-pack --force) 기준으로 판정
+        #[arg(long)]
+        force: bool,
+    },
+    /// 커스터마이즈 병합 — 병합 대기 원장(.merge-pending.json)의 신버전(.new)·보존본(.user)을 검토·해소
+    #[command(name = "pack-merge")]
+    PackMerge {
+        /// 대상 팩 상대경로(예: soul.md, directives/MASTER_DIRECTIVE.md). 생략 시 대기 목록 표시
+        #[arg(long)]
+        file: Option<String>,
+        /// vendor 신버전 채택(내 수정 폐기)
+        #[arg(long)]
+        take_new: bool,
+        /// 내 수정 유지(이번 신버전 병합 대기 해소 — vendor 가 또 전진하면 다시 병치)
+        #[arg(long)]
+        keep_mine: bool,
+        /// AI(claude 헤드리스) 3-way 병합 제안 — 사용자 커스텀 의도를 신버전 베이스라인에 재적용
+        #[arg(long)]
+        ai: bool,
+        /// (healed system 파일 전용) 보존본(.user)을 ~/.cys/local 오버레이로 이동(스킬 shadowing)
+        #[arg(long)]
+        to_local: bool,
+        /// 확인 프롬프트 없이 적용
+        #[arg(long)]
+        yes: bool,
+    },
     /// pro 라이선스("열쇠") 관리 — 검증·설치·typed 진단 (DESIGN-pro-license.md §7)
     License {
         #[command(subcommand)]
@@ -1759,6 +1788,10 @@ fn run(command: Command) -> i32 {
         Command::PackUpdate { from, manifest_url, dry_run } => {
             return run_pack_update(from, manifest_url, dry_run);
         }
+        Command::PackPlan { force } => return run_pack_plan(force),
+        Command::PackMerge { file, take_new, keep_mine, ai, to_local, yes } => {
+            return run_pack_merge(file, take_new, keep_mine, ai, to_local, yes);
+        }
 
         Command::PackManifest { key_id, signed_at, expires_at, min_binary_version } => {
             return run_pack_manifest(key_id, signed_at, expires_at, &min_binary_version);
@@ -2458,32 +2491,37 @@ fn run_skill(action: SkillAction) -> i32 {
             Ok(())
         })(),
         SkillAction::List => (|| {
-            let entries = std::fs::read_dir(&skills_dir).map_err(|_| {
-                format!(
+            if !skills_dir.exists() {
+                return Err(format!(
                     "no skills dir: {} (run cys init-pack)",
                     skills_dir.display()
-                )
-            })?;
-            let mut count = 0;
-            for entry in entries.flatten() {
-                let skill_md = entry.path().join("SKILL.md");
-                let Ok(content) = std::fs::read_to_string(&skill_md) else {
-                    continue;
-                };
-                let (mut name, mut desc) = (String::new(), String::new());
-                for line in content.lines().take(10) {
-                    if let Some(v) = line.strip_prefix("name:") {
-                        name = v.trim().to_string();
-                    } else if let Some(v) = line.strip_prefix("description:") {
-                        desc = v.trim().to_string();
+                ));
+            }
+            // ① 오버레이 shadowing: 팩 스킬 위에 ~/.cys/local/skills 동명 스킬이 이긴다(업데이트 불가침).
+            let mut merged: std::collections::BTreeMap<String, (String, bool)> = Default::default();
+            for (root, local) in [(skills_dir.clone(), false), (cys::pack::local_dir().join("skills"), true)] {
+                let Ok(entries) = std::fs::read_dir(&root) else { continue };
+                for entry in entries.flatten() {
+                    let Ok(content) = std::fs::read_to_string(entry.path().join("SKILL.md")) else {
+                        continue;
+                    };
+                    let (mut name, mut desc) = (String::new(), String::new());
+                    for line in content.lines().take(10) {
+                        if let Some(v) = line.strip_prefix("name:") {
+                            name = v.trim().to_string();
+                        } else if let Some(v) = line.strip_prefix("description:") {
+                            desc = v.trim().to_string();
+                        }
+                    }
+                    if !name.is_empty() {
+                        merged.insert(name, (desc, local));
                     }
                 }
-                if !name.is_empty() {
-                    println!("{name}\t{desc}");
-                    count += 1;
-                }
             }
-            if count == 0 {
+            for (name, (desc, local)) in &merged {
+                println!("{name}\t{desc}{}", if *local { "\t[local]" } else { "" });
+            }
+            if merged.is_empty() {
                 println!("(no skills yet — `cys skill new <name> --description \"...\"`)");
             }
             Ok(())
@@ -2492,7 +2530,9 @@ fn run_skill(action: SkillAction) -> i32 {
             if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
                 return Err("name must be kebab-case ascii (a-z0-9-)".into());
             }
-            let path = skills_dir.join(&name).join("SKILL.md");
+            // ① 오버레이 우선(local shadowing) → 팩 폴백.
+            let local = cys::pack::local_dir().join("skills").join(&name).join("SKILL.md");
+            let path = if local.exists() { local } else { skills_dir.join(&name).join("SKILL.md") };
             let content = std::fs::read_to_string(&path)
                 .map_err(|_| format!("no skill '{name}' ({})", path.display()))?;
             println!("{content}");
@@ -3786,35 +3826,80 @@ fn compose_directive(role: &str) -> Result<String, String> {
         ));
         directive.push_str(&memory);
     }
-    // 스킬 색인(표지) 동봉 — 본문은 필요 시 `cys skill show <name>`으로 점진 로드
-    let mut index = String::new();
-    if let Ok(entries) = std::fs::read_dir(dir.join("skills")) {
-        for entry in entries.flatten() {
-            if let Ok(content) = std::fs::read_to_string(entry.path().join("SKILL.md")) {
-                let (mut name, mut desc) = (String::new(), String::new());
-                for line in content.lines().take(10) {
-                    if let Some(v) = line.strip_prefix("name:") {
-                        name = v.trim().to_string();
-                    } else if let Some(v) = line.strip_prefix("description:") {
-                        desc = v.trim().to_string();
+    // 스킬 색인(표지) 동봉 — 본문은 필요 시 `cys skill show <name>`으로 점진 로드.
+    // ① 오버레이: ~/.cys/local/skills 가 동명 팩 스킬을 shadowing(업데이트 불가침 사용자 커스텀).
+    let scan_skills = |root: &std::path::Path| -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(root) {
+            for entry in entries.flatten() {
+                if let Ok(content) = std::fs::read_to_string(entry.path().join("SKILL.md")) {
+                    let (mut name, mut desc) = (String::new(), String::new());
+                    for line in content.lines().take(10) {
+                        if let Some(v) = line.strip_prefix("name:") {
+                            name = v.trim().to_string();
+                        } else if let Some(v) = line.strip_prefix("description:") {
+                            desc = v.trim().to_string();
+                        }
                     }
-                }
-                if !name.is_empty() {
-                    index.push_str(&format!("- {name}: {desc}\n"));
+                    if !name.is_empty() {
+                        out.push((name, desc));
+                    }
                 }
             }
         }
+        out
+    };
+    let mut skill_index: std::collections::BTreeMap<String, (String, bool)> = Default::default();
+    for (name, desc) in scan_skills(&dir.join("skills")) {
+        skill_index.insert(name, (desc, false));
     }
-    if !index.is_empty() {
+    for (name, desc) in scan_skills(&cys::pack::local_dir().join("skills")) {
+        skill_index.insert(name, (desc, true)); // 동명 → local 이 이긴다(shadowing)
+    }
+    if !skill_index.is_empty() {
         directive.push_str("\n\n■ 보유 스킬 색인 (본문: `cys skill show <name>`)\n");
-        directive.push_str(&index);
+        for (name, (desc, local)) in &skill_index {
+            directive.push_str(&format!(
+                "- {name}: {desc}{}\n",
+                if *local { " [local 오버레이]" } else { "" }
+            ));
+        }
+    }
+    // ① 사용자 로컬 디렉티브 오버레이(~/.cys/local/directives/<ROLE>_DIRECTIVE.local.md) —
+    // 업데이트·치유가 절대 건드리지 않는 사용자 영역. 안전핵 키워드 줄은 strip(오버라이드 동일
+    // 필터·⑥ 경계). 아래 render_block 의 SAFETY_CORE_REASSERT last-word 가 항상 뒤따르게 한다.
+    let mut local_appended = false;
+    if let Some(stem) = directive_path.file_name().and_then(|n| n.to_str()) {
+        let local_name = format!("{}.local.md", stem.trim_end_matches(".md"));
+        let local_path = cys::pack::local_dir().join("directives").join(&local_name);
+        if let Ok(raw) = std::fs::read_to_string(&local_path) {
+            let (clean, warnings) = cys::overrides::sanitize_local_directive(&raw);
+            for w in &warnings {
+                eprintln!("[directive] ⚠ {w}");
+            }
+            if !clean.trim().is_empty() {
+                directive.push_str(&format!(
+                    "\n\n■ 사용자 로컬 지침 ({} — 오버레이 · 업데이트 불가침 · 안전핵 뒤집기 불가)\n",
+                    local_path.display()
+                ));
+                directive.push_str(clean.trim_end());
+                directive.push('\n');
+                local_appended = true;
+            }
+        }
     }
     // 사용자 오버라이드(취향·운영 노브) — 스킬 색인 뒤. PACK 밖 파일이라 install 불가침·
     // 정식 directive 무동결. render_block이 SAFETY_CORE_REASSERT를 항상 최후에 둬(last-word)
     // 사용자 텍스트가 안전핵을 못 뒤집는다. 파일 부재 시 빈 문자열(회귀 0).
     let expert = std::env::var("CYS_OVERRIDE_EXPERT").map(|v| v == "1").unwrap_or(false);
     let ov = cys::overrides::load_overrides(role, expert);
-    directive.push_str(&cys::overrides::render_block(&ov));
+    let ov_block = cys::overrides::render_block(&ov);
+    if ov_block.is_empty() && local_appended {
+        // 오버라이드 파일이 없어도 로컬 지침이 붙었으면 안전핵 재선언이 최후(last-word)여야 한다(⑥).
+        directive.push_str(cys::overrides::SAFETY_CORE_REASSERT);
+    } else {
+        directive.push_str(&ov_block);
+    }
     // T4-3 ②: 런타임 카탈로그 플레이스holder 치환 — 정적 본문에 `$action_catalog`가 있으면
     // 실제 레지스트리(edit_kinds::EditKind)에서 파생한 카탈로그로 교체(하드코딩 미주입 = Max
     // 토큰효율 + 반드리프트). 플레이스홀더 부재 시 무변(회귀 0). 단건 상세는 on-demand
@@ -6441,6 +6526,416 @@ fn consume_reinject_pending(base: &std::path::Path) -> Result<(usize, usize), St
 }
 
 /// `cys pack-update` 진입점(§2-② 전체 흐름). --from(핵심)·--manifest-url(부차).
+/// ④ 투명성: 내장 팩 반영 드라이런 — install_into 와 **같은 판정 함수**(pack::decide_file_action)를
+/// 쓰는 pack::plan_install 로 갱신/보존/치유/병합대기/정리를 설치 전에 보여준다(쓰기 0·플랜≠실제 드리프트 0).
+fn run_pack_plan(force: bool) -> i32 {
+    let dir = cys::pack::pack_dir();
+    let items: Vec<(&str, &str)> = cys::pack::PACK_ALL.iter().map(|(r, c)| (*r, *c)).collect();
+    let plan = cys::pack::plan_install(&dir, &items, force, env!("CARGO_PKG_VERSION"));
+    if let Some(reason) = &plan.blocked {
+        println!("⛔ 설치 차단: {reason}");
+        return 1;
+    }
+    let section = |title: &str, rels: &[String], note: &str| {
+        if rels.is_empty() {
+            return;
+        }
+        println!("\n{title} ({}건){}", rels.len(), if note.is_empty() { String::new() } else { format!(" — {note}") });
+        for r in rels {
+            println!("  {r}");
+        }
+    };
+    println!("팩 반영 플랜 (대상: {} · 바이너리 {} · 쓰기 없음)", dir.display(), env!("CARGO_PKG_VERSION"));
+    section("🔄 자동 갱신", &plan.update, "비수정 — 그대로 갱신됨");
+    section("✨ 신규 생성", &plan.create, "");
+    section("🛠 강제 치유", &plan.heal, "system 수정본 — 덮기 전 사용자본을 <파일>.user 로 보존");
+    section("⏸ 보존+병합 대기", &plan.merge_new, "user-owned 수정본 유지 + 신버전 <파일>.new 병치 → cys pack-merge");
+    section("🔒 보존", &plan.keep_user, "user-owned 수정본 — 건드리지 않음");
+    section("🗑 정리(폐기 파일)", &plan.prune_delete, "임베드에서 제거된 비수정 파일");
+    section("🗑→🔒 폐기지만 보존", &plan.prune_keep_modified, "수정본이라 삭제하지 않음");
+    println!("\n= 변화 없음(최신) {}건", plan.unchanged);
+    let pending = cys::pack::load_merge_pending(&dir);
+    if !pending.is_empty() {
+        println!("※ 기존 병합 대기 {}건 — `cys pack-merge` 로 검토", pending.len());
+    }
+    println!("※ 사용자 전용 오버레이(~/.cys/local — 디렉티브 append·스킬 shadowing·훅 후행)는 업데이트가 절대 건드리지 않음");
+    0
+}
+
+/// ③ 커스터마이즈 병합: 병합 대기 원장 목록·해소. 해소 경로 4종 —
+///   --take-new(신버전 채택) · --keep-mine(내 수정 유지·이번 신버전 소화) ·
+///   diff3/--ai 3-way 병합(base=.pristine 조상) · --to-local(healed system 파일을 오버레이로 이동).
+/// system(healed) 파일은 rel 로 되쓰기 금지 — 다음 기동 install 이 다시 치유(P0-4)하므로
+/// 지원 경로는 to-local(스킬 shadowing)뿐임을 명시한다.
+fn run_pack_merge(
+    file: Option<String>,
+    take_new: bool,
+    keep_mine: bool,
+    ai: bool,
+    to_local: bool,
+    yes: bool,
+) -> i32 {
+    let dir = cys::pack::pack_dir();
+    let mut pending = cys::pack::load_merge_pending(&dir);
+    let Some(rel) = file else {
+        // 목록 모드
+        if pending.is_empty() {
+            println!("병합 대기 없음 — 커스터마이즈와 vendor 팩이 정합 상태입니다.");
+            return 0;
+        }
+        println!("병합 대기 {}건:", pending.len());
+        for (rel, e) in pending.iter() {
+            let kind = e.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
+            let side = e.get("side").and_then(|v| v.as_str()).unwrap_or("?");
+            let ver = e.get("version").and_then(|v| v.as_str()).unwrap_or("?");
+            match kind {
+                "new-pending" => println!(
+                    "  ⏸ {rel} — 내 수정본 유지 중, vendor {ver} 신버전이 {side} 에 대기\n     → cys pack-merge --file {rel} [--take-new|--keep-mine|--ai]"
+                ),
+                "healed" => println!(
+                    "  🛠 {rel} — vendor {ver} 로 치유됨, 내 수정본은 {side} 에 보존\n     → cys pack-merge --file {rel} [--to-local|--keep-mine(보존본 정리)]"
+                ),
+                _ => println!("  ? {rel} ({kind})"),
+            }
+        }
+        return 0;
+    };
+    // rel 검증(원장 기반 — 경로 traversal 차단: 원장에 있는 키만 처리).
+    let Some(entry) = pending.get(&rel).cloned() else {
+        eprintln!("'{rel}' 은 병합 대기 목록에 없음 — `cys pack-merge` 로 목록 확인");
+        return 1;
+    };
+    let kind = entry.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
+    let target = dir.join(&rel);
+    let embed_now: Option<&str> = cys::pack::PACK_ALL
+        .iter()
+        .find(|(r, _)| *r == rel.as_str())
+        .map(|(_, c)| *c);
+    let confirm = |prompt: &str| -> bool {
+        if yes {
+            return true;
+        }
+        print!("{prompt} [y/N] ");
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        let _ = std::io::stdin().read_line(&mut line);
+        matches!(line.trim(), "y" | "Y" | "yes")
+    };
+    // 원장·병치 파일 해소 공통부.
+    let resolve = |pending: &mut serde_json::Map<String, serde_json::Value>, side_suffix: &str| {
+        pending.remove(&rel);
+        cys::pack::save_merge_pending(&dir, pending);
+        let _ = std::fs::remove_file(dir.join(format!("{rel}{side_suffix}")));
+    };
+    // user-owned 해소 시 매니페스트 base 전진(같은 vendor 버전으로 .new 재병치 방지).
+    let advance_manifest_base = |content: &str| {
+        let mpath = dir.join(cys::pack::INSTALL_MANIFEST);
+        let mut m: std::collections::BTreeMap<String, String> = std::fs::read_to_string(&mpath)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        m.insert(rel.clone(), cys::pack::content_hash_pub(content));
+        if let Ok(json) = serde_json::to_string_pretty(&m) {
+            let _ = cys::pack::write_atomic(&mpath, json.as_bytes());
+        }
+    };
+    match kind {
+        "new-pending" => {
+            let new_path = dir.join(format!("{rel}.new"));
+            let theirs = match std::fs::read_to_string(&new_path) {
+                Ok(s) => s,
+                Err(_) => match embed_now {
+                    Some(c) => c.to_string(),
+                    None => {
+                        eprintln!("{rel}.new 부재 + 임베드에도 없음 — 원장만 정리");
+                        resolve(&mut pending, ".new");
+                        return 0;
+                    }
+                },
+            };
+            let ours = std::fs::read_to_string(&target).unwrap_or_default();
+            if take_new {
+                if confirm(&format!("'{rel}' 을 vendor 신버전으로 교체(내 수정 폐기)?")) {
+                    if let Err(e) = cys::pack::write_atomic(&target, theirs.as_bytes()) {
+                        eprintln!("쓰기 실패: {e}");
+                        return 1;
+                    }
+                    advance_manifest_base(&theirs);
+                    resolve(&mut pending, ".new");
+                    println!("✅ {rel} ← vendor 신버전 채택");
+                }
+                return 0;
+            }
+            if keep_mine {
+                advance_manifest_base(&theirs); // 이번 신버전은 '본 것'으로 — vendor 재전진 시에만 재병치
+                resolve(&mut pending, ".new");
+                println!("✅ {rel} — 내 수정 유지(이번 vendor 신버전 해소)");
+                return 0;
+            }
+            // 3-way 병합: base = .pristine 조상(사용자가 fork 한 시점의 vendor 본).
+            let base_path = dir.join(cys::pack::PRISTINE_DIR).join(&rel);
+            let base = std::fs::read_to_string(&base_path).ok();
+            let merged: Option<String> = if ai {
+                ai_three_way_merge(&rel, base.as_deref(), &ours, &theirs)
+            } else {
+                diff3_merge(base.as_deref(), &ours, &theirs)
+            };
+            match merged {
+                Some(m) if m == ours => {
+                    println!("병합 결과 = 현재 내 수정본과 동일(vendor 변경이 이미 반영됨) — 해소만 수행");
+                    advance_manifest_base(&theirs);
+                    resolve(&mut pending, ".new");
+                    0
+                }
+                Some(m) => {
+                    println!("── 병합 제안 diff (내 수정본 → 병합본) ──");
+                    print_unified_diff(&ours, &m);
+                    if confirm(&format!("'{rel}' 에 병합본 적용?")) {
+                        if let Err(e) = cys::pack::write_atomic(&target, m.as_bytes()) {
+                            eprintln!("쓰기 실패: {e}");
+                            return 1;
+                        }
+                        advance_manifest_base(&theirs);
+                        // 병합본의 새 조상 = 이번 vendor 본(다음 3-way 정확성).
+                        let _ = std::fs::create_dir_all(base_path.parent().unwrap_or(&dir));
+                        let _ = cys::pack::write_atomic(&base_path, theirs.as_bytes());
+                        resolve(&mut pending, ".new");
+                        println!("✅ {rel} ← 3-way 병합 적용");
+                    } else {
+                        println!("보류 — 원장 유지. --take-new/--keep-mine 또는 수동 편집 후 재실행");
+                    }
+                    0
+                }
+                None => {
+                    println!(
+                        "자동 병합 불가(충돌 또는 도구 부재). 선택지:\n\
+                         \x20 cys pack-merge --file {rel} --take-new   # vendor 신버전 채택\n\
+                         \x20 cys pack-merge --file {rel} --keep-mine # 내 수정 유지\n\
+                         \x20 cys pack-merge --file {rel} --ai        # AI 3-way 병합 제안\n\
+                         \x20 수동: {rel} 과 {rel}.new 를 직접 병합 후 --keep-mine 으로 해소"
+                    );
+                    1
+                }
+            }
+        }
+        "healed" => {
+            let user_path = dir.join(format!("{rel}.user"));
+            if to_local {
+                // 스킬 등 system 파일의 사용자본을 오버레이로 승격 — vendor 무결성(치유)과 공존.
+                let local_root = cys::pack::local_dir();
+                let dest = local_root.join(&rel);
+                if let Some(parent) = dest.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                match std::fs::read_to_string(&user_path) {
+                    Ok(content) => {
+                        if let Err(e) = cys::pack::write_atomic(&dest, content.as_bytes()) {
+                            eprintln!("오버레이 쓰기 실패: {e}");
+                            return 1;
+                        }
+                        // ⑥ 사용자 스킬 WARN 게이트(BLOCK 아님) — 로컬 승격 시 1회 정적 스캔(스킬 디렉토리 단위).
+                        if rel.starts_with("skills/") {
+                            if let Some(skill_dir) = dest.parent() {
+                                skillscan_warn(skill_dir);
+                            }
+                        }
+                        resolve(&mut pending, ".user");
+                        println!(
+                            "✅ {rel} 사용자본 → {} (오버레이 — 업데이트 불가침{})",
+                            dest.display(),
+                            if rel.starts_with("skills/") { " · 동명 스킬 shadowing" } else { "" }
+                        );
+                        0
+                    }
+                    Err(e) => {
+                        eprintln!("{} 읽기 실패: {e}", user_path.display());
+                        1
+                    }
+                }
+            } else if keep_mine || take_new {
+                // healed 의 '해소' = 보존본 정리(vendor 본 유지가 이미 디스크 상태).
+                if confirm(&format!("'{rel}' 보존본({rel}.user) 정리(vendor 본 유지 확정)?")) {
+                    resolve(&mut pending, ".user");
+                    println!("✅ {rel} — vendor 본 유지 확정, 보존본 정리");
+                }
+                0
+            } else {
+                println!(
+                    "'{rel}' 은 system 파일 — 직접 되쓰기는 다음 기동 때 다시 치유(P0-4)되므로 지원하지 않음.\n\
+                     \x20 cys pack-merge --file {rel} --to-local  # 사용자본을 ~/.cys/local 오버레이로(스킬 shadowing)\n\
+                     \x20 cys pack-merge --file {rel} --keep-mine # vendor 본 유지 확정(보존본 정리)\n\
+                     보존본 위치: {}",
+                    user_path.display()
+                );
+                0
+            }
+        }
+        other => {
+            eprintln!("알 수 없는 원장 kind '{other}' — 수동 확인 필요");
+            1
+        }
+    }
+}
+
+/// diff3 -m 3-way 병합(결정론) — base 부재·diff3 부재·충돌이면 None(호출측이 대안 안내).
+fn diff3_merge(base: Option<&str>, ours: &str, theirs: &str) -> Option<String> {
+    let base = base?;
+    let tmp = std::env::temp_dir().join(format!("cys-merge-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).ok()?;
+    let (po, pb, pt) = (tmp.join("ours"), tmp.join("base"), tmp.join("theirs"));
+    std::fs::write(&po, ours).ok()?;
+    std::fs::write(&pb, base).ok()?;
+    std::fs::write(&pt, theirs).ok()?;
+    let out = std::process::Command::new("diff3")
+        .arg("-m")
+        .args([&po, &pb, &pt])
+        .output()
+        .ok()?;
+    let _ = std::fs::remove_dir_all(&tmp);
+    // exit 0 = 무충돌 병합, 1 = 충돌(마커 포함 출력), 2+ = 에러.
+    if out.status.code() == Some(0) {
+        String::from_utf8(out.stdout).ok()
+    } else {
+        None
+    }
+}
+
+/// AI 3-way 병합(차별점 ③) — claude 헤드리스로 '사용자 커스텀 의도를 신버전 베이스라인에 재적용'.
+/// 산출물은 제안일 뿐 — 호출측이 diff 를 보여주고 승인받아 적용한다(producer≠approver).
+fn ai_three_way_merge(rel: &str, base: Option<&str>, ours: &str, theirs: &str) -> Option<String> {
+    // 본문 인라인(파일 경로 금지) — 경로를 주면 헤드리스가 파일 읽기 도구 라운드·권한에 걸려
+    // hang/지연한다(실측). 인라인이면 단발 생성으로 끝난다. 총량 상한으로 컨텍스트 폭주 방지.
+    const AI_MERGE_MAX: usize = 200_000;
+    if ours.len() + theirs.len() + base.map_or(0, |b| b.len()) > AI_MERGE_MAX {
+        eprintln!("파일이 너무 커서 AI 인라인 병합 불가({AI_MERGE_MAX}B 초과) — 수동 병합 후 --keep-mine 로 해소하라");
+        return None;
+    }
+    let base_block = match base {
+        Some(b) => format!("<<<공통 조상(내가 수정을 시작한 시점의 vendor 본)>>>\n{b}\n<<<끝>>>\n"),
+        None => String::from("(공통 조상 없음 — 2-way: 내 수정 의도를 추론해 보존하라)\n"),
+    };
+    let prompt = format!(
+        "다음은 cys 팩 파일 '{rel}' 의 3-way 병합 요청이다.\n\
+         {base_block}\
+         <<<내 수정본(의도를 보존해야 할 대상)>>>\n{ours}\n<<<끝>>>\n\
+         <<<vendor 신버전(새 베이스라인)>>>\n{theirs}\n<<<끝>>>\n\
+         규칙: vendor 신버전을 베이스로 삼고, 내 수정본이 조상 대비 바꾼 **의도**를 신버전 위에 재적용하라. \
+         충돌 시 내 수정 의도를 우선하되 vendor 의 구조 변화를 존중하라. \
+         출력은 병합된 파일의 **전체 내용만** — 설명·코드펜스·머리말 금지."
+    );
+    println!("(AI 병합 제안 생성 중 — claude 헤드리스, 최대 180초…)");
+    // ★세션 env 스크럽(cysd scrub_claude_session_env 동형): claude 세션 안에서 실행하면 자식이
+    // child-session 으로 강등·hang 하는 문제 차단. + 폴링 타임아웃(무한 대기 금지).
+    let child = std::process::Command::new("claude")
+        .args(["-p", &prompt, "--output-format", "text"])
+        .env_remove("CLAUDE_CODE_SESSION_ID")
+        .env_remove("CLAUDE_CODE_CHILD_SESSION")
+        .env_remove("CLAUDECODE")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    let result = child.ok().and_then(|mut c| {
+        // stdout 은 별도 스레드로 동시 드레인 — 자식이 파이프 버퍼(64KB+)를 채우고 write 블록,
+        // 부모는 try_wait 대기하는 상호 데드락을 차단한다(병합 파일은 64KB 를 넘을 수 있음).
+        let drain = c.stdout.take().map(|mut out| {
+            std::thread::spawn(move || {
+                use std::io::Read;
+                let mut s = String::new();
+                let _ = out.read_to_string(&mut s);
+                s
+            })
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+        let status = loop {
+            match c.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) => {
+                    if std::time::Instant::now() > deadline {
+                        let _ = c.kill();
+                        let _ = c.wait(); // zombie 수거(드레인 스레드도 EOF 로 종료)
+                        eprintln!("claude 헤드리스 180초 타임아웃 — diff3/수동 경로를 사용하라");
+                        break None;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+                Err(_) => break None,
+            }
+        };
+        let stdout = drain.and_then(|h| h.join().ok()).unwrap_or_default();
+        match status {
+            Some(st) if st.success() => {
+                let s = stdout.trim_end().to_string();
+                if s.is_empty() { None } else { Some(s) }
+            }
+            _ => None,
+        }
+    });
+    if result.is_none() {
+        eprintln!("claude 헤드리스 병합 제안 실패 — diff3/수동 경로를 사용하라");
+    }
+    result
+}
+
+/// 경량 unified diff 출력(외부 의존 0) — 병합 제안 검토용 시각화.
+fn print_unified_diff(old: &str, new: &str) {
+    let ol: Vec<&str> = old.lines().collect();
+    let nl: Vec<&str> = new.lines().collect();
+    // 단순 LCS 없이 앞뒤 공통 접두/접미 제거 후 중간 블록만 표시(검토용 — 정밀 diff 는 도구 몫).
+    let mut start = 0;
+    while start < ol.len() && start < nl.len() && ol[start] == nl[start] {
+        start += 1;
+    }
+    let (mut oe, mut ne) = (ol.len(), nl.len());
+    while oe > start && ne > start && ol[oe - 1] == nl[ne - 1] {
+        oe -= 1;
+        ne -= 1;
+    }
+    if start == oe && start == ne {
+        println!("(변경 없음)");
+        return;
+    }
+    println!("@@ 줄 {}~ (구 {}줄 → 신 {}줄) @@", start + 1, oe - start, ne - start);
+    for l in &ol[start..oe] {
+        println!("- {l}");
+    }
+    for l in &nl[start..ne] {
+        println!("+ {l}");
+    }
+}
+
+/// ⑥ 사용자 스킬 정적 스캔 WARN 게이트(BLOCK 금지 — SkillSpector 연구의 WARN 원칙).
+/// javis_skillscan.py(`scan <스킬 디렉토리>`)가 팩에 있으면 스캔해 발견사항을 경고로만 출력한다.
+/// 사용자 오버레이는 사용자 책임 영역 — 차단하면 자기발화·커스터마이즈가 막힌다(WARN-not-BLOCK).
+fn skillscan_warn(skill_dir: &std::path::Path) {
+    let scanner = cys::pack::pack_dir().join("bin/javis_skillscan.py");
+    if !scanner.exists() {
+        return;
+    }
+    match std::process::Command::new("python3")
+        .arg(&scanner)
+        .arg("scan")
+        .arg(skill_dir)
+        .output()
+    {
+        Ok(o) => {
+            let out = String::from_utf8_lossy(&o.stdout);
+            let flagged = out.contains("[BLOCK]")
+                || out.contains("CRITICAL")
+                || out.contains("HIGH")
+                || out.contains("MEDIUM");
+            if flagged {
+                eprintln!("⚠ skillscan WARN — 차단 아님(사용자 오버레이는 사용자 책임 영역), 검토 권장:");
+                for line in out.trim().lines().take(20) {
+                    eprintln!("  {line}");
+                }
+            }
+        }
+        Err(_) => {} // python3 부재 등 — WARN 게이트는 best-effort
+    }
+}
+
 fn run_pack_update(from: Option<String>, manifest_url: Option<String>, dry_run: bool) -> i32 {
     // 성공 경로는 종료코드(i32)를 싣는다: 0=완전 성공, EXIT_REINJECT_DEGRADED=디스크는 반영됐으나
     // 라이브 노드 reinject 실패(성공 침묵 포장 금지). 에러 경로(Err)는 외부에서 1로 매핑.

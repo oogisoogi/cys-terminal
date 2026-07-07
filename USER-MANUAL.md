@@ -381,6 +381,10 @@ cys skill list / show <name> / run <name> / new   # 경험을 스킬로 영속·
   0이 되면 자동 교대됩니다(무손실).
 - 수동 팩 업데이트: `cys pack-update --from <디렉터리>` (pack.tar.gz + pack-manifest.json +
   .minisig). 서명·신선도·replay 검증은 전건 fail-closed입니다.
+- **업데이트 전 미리보기**: `cys pack-plan` — 무엇이 갱신/보존/치유/병합대기/정리되는지
+  설치 전에 표시합니다(쓰기 0). 팩을 커스터마이즈해 쓰고 있다면 §12.7을 꼭 읽으세요 —
+  수정본은 파괴되지 않고 `.new`(신버전 병치)/`.user`(보존본)로 관리되며 `cys pack-merge`로
+  병합합니다.
 - 진단·수리: `cys doctor [--fix]` — 팩 스큐·stale lock·고아 소켓·훅 등록을 진단하고,
   `--fix`는 사용자 데이터·팩 본체·DB를 건드리지 않는 범위만 수리합니다.
 
@@ -452,6 +456,46 @@ cys license install / status    # 서명 라이선스 설치·진단 (검증 전
 cys pack-repair-channel         # 채널 상태 진단·복구
 cys pack-downgrade-to-free      # pro → free 강등의 유일한 경로 (명시적)
 ```
+
+### 12.7 커스터마이징 — 업데이트와 공존하는 방법
+
+팩·앱을 자기에게 맞게 고쳐 쓰는 것은 지원되는 사용 방식입니다. 다만 **어디를 고치느냐**에
+따라 업데이트와의 관계가 다릅니다. 원칙은 하나 — *출하 파일을 직접 고치지 말고, 사용자
+전용 계층에 두면 업데이트가 절대 건드리지 않습니다.*
+
+**사용자 전용 오버레이 `~/.cys/local/`** (업데이트·치유·정리가 존재 자체를 모르는 영역):
+
+| 위치 | 효과 |
+|---|---|
+| `local/directives/<ROLE>_DIRECTIVE.local.md` | 역할 지침 **뒤에 자동 append** (예: `WORKER_DIRECTIVE.local.md`에 "보고는 존댓말로") |
+| `local/skills/<이름>/SKILL.md` | 동명 팩 스킬을 **shadowing**(내 버전이 이김) · 자작 스킬 추가 |
+| `local/hooks/<이벤트>.d/*.sh` | 팩 훅 **뒤에 후행 실행** (관측 전용 — 에이전트 차단 불가) |
+| `local/notes/` | 자유 메모 영역 (`USER-NOTES.md` 등 — 관례상 여기에) |
+
+단, 오버레이는 안전핵(정지 경계·복원 프로토콜·중단 스위치·운영 헌장)을 뒤집을 수 없습니다 —
+해당 키워드 줄은 주입에서 자동 제외되고, 안전핵 재선언이 항상 마지막에 붙습니다. 로컬 스킬은
+승격 시 정적 스캔 **경고**(차단 아님)를 출력합니다 — 사용자 책임 영역입니다.
+
+**출하 파일을 이미 직접 고쳤다면** — 업데이트가 파괴하지 않습니다:
+
+- **user-owned 파일**(디렉티브·soul.md·CLAUDE.md·schedule.json): 수정본은 **절대 덮지 않고**,
+  vendor 신버전이 나오면 `<파일>.new`로 옆에 병치됩니다(병합 대기).
+- **system 파일**(bin·hooks·skills 등): 무결성을 위해 vendor 본으로 치유되지만, 덮기 **전에**
+  내 수정본을 `<파일>.user`로 보존합니다(파괴 0).
+
+```bash
+cys pack-plan                 # 업데이트 전 드라이런 — 갱신/보존/치유/병합대기/정리를 미리 표시
+cys pack-merge                # 병합 대기 목록
+cys pack-merge --file <경로> --take-new    # vendor 신버전 채택
+cys pack-merge --file <경로> --keep-mine   # 내 수정 유지 (이번 신버전 소화)
+cys pack-merge --file <경로>               # diff3 3-way 자동 병합 (조상=.pristine)
+cys pack-merge --file <경로> --ai          # AI 3-way 병합 — 내 수정 "의도"를 신버전 위에 재적용
+cys pack-merge --file skills/<이름>/SKILL.md --to-local   # 스킬 수정본을 오버레이로 승격(권장)
+```
+
+앱 번들(.app/설치 폴더) 내부 수정은 지원하지 않습니다 — 업데이트가 번들을 통째로 교체하며
+코드사이닝이 깨집니다. 위 오버레이 채널을 사용하세요. 테마·키바인딩·스케줄·페르소나 노브는
+각각 전용 채널(§4 테마 버튼·§12.5 persona·§8 schedule)이 이미 업데이트와 무관하게 보존됩니다.
 
 ---
 
