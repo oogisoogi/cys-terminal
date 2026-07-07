@@ -73,6 +73,8 @@ interface PaneRuntime {
   fit: FitAddon;
   unlisten: (() => void)[];
   observer: ResizeObserver;
+  // 바닥 고정 재적용 — 리사이즈(fitPane) 뒤 뷰포트가 바닥에서 밀려나면 복귀시킨다.
+  snapToBottom: () => void;
 }
 
 // ---------- T5 사용량 관측 배지 (pane 헤더) ----------
@@ -1539,6 +1541,32 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
   term.loadAddon(fit);
   term.open(termHost);
 
+  // ── 출력 따라가기(바닥 고정) ──
+  // xterm은 뷰포트가 정확히 바닥일 때만 새 출력을 따라간다 — 초기 크기(120x35)→fit 리플로우,
+  // attach 스냅샷 재생, pane 분할 리사이즈로 한 번 바닥에서 어긋나면 이후 출력이 스크롤백으로만
+  // 쌓여 하단 프롬프트 입력줄이 가려진다(수동 스크롤 강요). 출력 write 완료·리사이즈 후 바닥으로
+  // 스냅하고, 사용자가 휠로 위로 올리면 해제(히스토리 읽기 보호), 바닥 복귀·키 입력 시 재고정.
+  let follow = true;
+  const atBottom = () => {
+    const b = term.buffer.active;
+    return b.viewportY >= b.baseY;
+  };
+  const snapToBottom = () => {
+    if (follow && !atBottom()) term.scrollToBottom();
+  };
+  termHost.addEventListener(
+    "wheel",
+    (e: WheelEvent) => {
+      // 위로 스크롤 = 즉시 해제 — rAF 판정까지 기다리면 스트리밍 중 write 스냅이 먼저 끌어내려
+      // 사용자가 위로 못 올라가는 경주가 생긴다. 실제 위치 판정은 xterm이 휠을 처리한 뒤(rAF).
+      if (e.deltaY < 0) follow = false;
+      requestAnimationFrame(() => {
+        follow = atBottom();
+      });
+    },
+    { passive: true },
+  );
+
   // WKWebView IME(한글 등 CJK) 조합 가드: 조합 중 keydown(keyCode 229/isComposing)을
   // xterm이 일반 키로 처리하면 자모가 분리 입력된다 — 조합 완성분만 onData로 흐르게 차단.
   term.attachCustomKeyEventHandler((e) => {
@@ -1554,6 +1582,7 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
   // promise 체인으로 같은 pane의 모든 입력을 발사 순서대로 보장한다.
   let sendChain: Promise<unknown> = Promise.resolve();
   const sendRaw = (data: string) => {
+    follow = true; // 입력 = 프롬프트 사용 의사 — 바닥 고정 재개(xterm scrollOnUserInput과 정합)
     sendChain = sendChain
       .then(() => invoke("send_input", { socket, surfaceId: sid, data }))
       .catch(() => {});
@@ -1667,10 +1696,10 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
     exited_event: string;
   };
   const un1 = await listen(ev.output_event, (e) => {
-    term.write(b64ToBytes(e.payload as string));
+    term.write(b64ToBytes(e.payload as string), snapToBottom);
   });
   const un2 = await listen(ev.exited_event, () => {
-    term.write("\r\n\x1b[31m[surface exited]\x1b[0m\r\n");
+    term.write("\r\n\x1b[31m[surface exited]\x1b[0m\r\n", snapToBottom);
   });
   // listen 등록을 마친 뒤에 스트림을 시작해야 초기 화면 snapshot(프롬프트)이 유실되지 않는다
   // (런치 시 첫 pane 빈 화면 버그 — snapshot이 listen 전에 emit되던 race 차단).
@@ -1683,7 +1712,7 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
   });
   observer.observe(termHost);
 
-  const rt: PaneRuntime = { sid, socket, el, termHost, titleEl, usageEl, term, fit, unlisten: [un1, un2], observer };
+  const rt: PaneRuntime = { sid, socket, el, termHost, titleEl, usageEl, term, fit, unlisten: [un1, un2], observer, snapToBottom };
   panes.set(paneKey(sid, socket), rt);
   return rt;
 }
@@ -1692,6 +1721,7 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
 function fitPane(rt: PaneRuntime) {
   if (rt.termHost.offsetWidth < 60 || rt.termHost.offsetHeight < 40) return;
   rt.fit.fit();
+  rt.snapToBottom(); // 리사이즈 리플로우가 뷰포트를 바닥에서 밀어내는 경우 복귀
   invoke("resize_surface", { socket: rt.socket, surfaceId: rt.sid, rows: rt.term.rows, cols: rt.term.cols }).catch(() => {});
 }
 
