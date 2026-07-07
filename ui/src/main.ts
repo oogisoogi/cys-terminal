@@ -140,7 +140,7 @@ let ccHwTimer: number | null = null;
 let ccClockTimer: number | null = null;
 let ccUptimeBase = 0;
 let ccUptimeFetchedAt = 0;
-let ccTab: "live" | "eff" | "skills" | "sessions" | "weekly" | "learn" | "board" | "tasks" | "feed" = "live";
+let ccTab: "live" | "eff" | "skills" | "sessions" | "weekly" | "learn" | "board" | "tasks" | "feed" | "office" = "live";
 let ccEffWindow = "today";
 let ccSkillsWindow = "today";
 let ccSessionsWindow = "7d";
@@ -339,7 +339,7 @@ async function refreshWeekly() {
   }
 }
 
-function setCcTab(view: "live" | "eff" | "skills" | "sessions" | "weekly" | "learn" | "board" | "tasks" | "feed") {
+function setCcTab(view: "live" | "eff" | "skills" | "sessions" | "weekly" | "learn" | "board" | "tasks" | "feed" | "office") {
   ccTab = view;
   document.getElementById("cc-view-live")!.hidden = view !== "live";
   document.getElementById("cc-view-eff")!.hidden = view !== "eff";
@@ -350,6 +350,7 @@ function setCcTab(view: "live" | "eff" | "skills" | "sessions" | "weekly" | "lea
   document.getElementById("cc-view-board")!.hidden = view !== "board";
   document.getElementById("cc-view-tasks")!.hidden = view !== "tasks";
   document.getElementById("cc-view-feed")!.hidden = view !== "feed";
+  document.getElementById("cc-view-office")!.hidden = view !== "office";
   document.querySelectorAll("#cc-tabs .cc-tab").forEach((b) =>
     b.classList.toggle("active", (b as HTMLElement).dataset.view === view),
   );
@@ -365,6 +366,24 @@ function setCcTab(view: "live" | "eff" | "skills" | "sessions" | "weekly" | "lea
   if (view === "board") refreshBoard();
   if (view === "tasks") refreshTasks();
   if (view === "feed") refreshFeed();
+  if (view === "office") openOfficeView();
+}
+
+// 메타버스 오피스 탭 — 로컬 브리지(127.0.0.1:8642, 3D 실시간 오피스)를 iframe으로 내장.
+// 탭 진입 시에만 로드(상시 연결 방지)·브리지 부재 시 기동 안내만 표시.
+const OFFICE_URL = "http://127.0.0.1:8642/";
+async function openOfficeView() {
+  const frame = document.getElementById("cc-office-frame") as HTMLIFrameElement | null;
+  const hint = document.getElementById("cc-office-hint");
+  if (!frame || !hint) return;
+  try {
+    await fetch(OFFICE_URL + "world", { signal: AbortSignal.timeout(1500) });
+    hint.hidden = true;
+    if (!frame.src) frame.src = OFFICE_URL;
+  } catch {
+    hint.hidden = false;
+    frame.removeAttribute("src");
+  }
 }
 
 // D5: 스킬 버튼 보드 — 카탈로그 큐레이션 렌더 + 일회용 워커 실행 + 산출물 회수(터미널 입력 0회).

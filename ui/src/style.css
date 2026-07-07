@@ -634,3 +634,7 @@ body.cc-glance #cc-view-feed .feed-item button { font-size: 16px; padding: 10px 
 @media (prefers-reduced-motion: reduce) {
   .ws-tab-spinner, .dept-spinner { animation: none; border-top-color: var(--accent); }
 }
+
+/* 메타버스 오피스 탭 (cc-view-office) — 브리지 iframe 전면 채움 */
+#cc-view-office { display: flex; flex-direction: column; height: 100%; }
+#cc-view-office iframe { flex: 1; width: 100%; min-height: 480px; border: 0; background: #05080f; }
