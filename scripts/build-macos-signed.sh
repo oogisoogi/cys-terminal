@@ -40,6 +40,9 @@ esac
 HOST_ARCH_TARGET=$([ "$(uname -m)" = "arm64" ] && echo aarch64-apple-darwin || echo x86_64-apple-darwin)
 if [ "$TARGET" != "$HOST_ARCH_TARGET" ]; then
   TAURI_TARGET_ARGS=(--target "$TARGET"); BUNDLE_BASE="target/$TARGET/release/bundle"
+  # 크로스 빌드: bundle-prep.sh(beforeBuildCommand)가 사이드카 cys/cysd를 이 타깃으로
+  # 크로스 빌드하도록 CYS_TARGET 전파 — 없으면 host(arm64) 사이드카가 실려 x64 앱이 깨진다.
+  export CYS_TARGET="$TARGET"
 else
   TAURI_TARGET_ARGS=(); BUNDLE_BASE="target/release/bundle"
 fi
@@ -112,7 +115,7 @@ echo "  ✓ runtime Mach-O ${SIGN_N}개 재서명 (python/node=entitlements·git
 #   (`tauri build --bundles dmg`는 .app을 재빌드해 역참조를 되돌리므로 사용 불가 — 실측 확인).
 echo "== 앱 번들 빌드(서명만·공증 보류) v$VERSION =="
 env -u APPLE_ID -u APPLE_PASSWORD -u APPLE_TEAM_ID -u APPLE_API_KEY -u APPLE_API_ISSUER \
-  bun x @tauri-apps/cli build "${TAURI_TARGET_ARGS[@]}" --bundles app
+  bun x @tauri-apps/cli build ${TAURI_TARGET_ARGS[@]+"${TAURI_TARGET_ARGS[@]}"} --bundles app
 
 APP="$BUNDLE_BASE/macos/cys.app"
 DMG="$BUNDLE_BASE/dmg/cys_${VERSION}_${DMG_ARCH}.dmg"
