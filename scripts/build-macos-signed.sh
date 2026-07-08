@@ -20,6 +20,31 @@ set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 VERSION=$(grep -m1 '"version"' src-tauri/tauri.conf.json | sed -E 's/.*"([0-9][0-9.]*)".*/\1/')
 
+# ── 타깃 아키텍처(무인자=호스트 네이티브 — arm64 경로 완전 불변) ──
+# 사용: scripts/build-macos-signed.sh [aarch64-apple-darwin|x86_64-apple-darwin]
+# arm64 호스트에서 x86_64를 넘기면 크로스빌드 — prep-mac-runtime.sh 도 같은 타깃으로 런타임을 교체한다.
+TARGET="${1:-}"
+if [ -z "$TARGET" ]; then
+  case "$(uname -m)" in
+    arm64)  TARGET=aarch64-apple-darwin ;;
+    x86_64) TARGET=x86_64-apple-darwin ;;
+    *) echo "unknown host arch $(uname -m)"; exit 2 ;;
+  esac
+fi
+case "$TARGET" in
+  aarch64-apple-darwin) DMG_ARCH=aarch64; DIST_ARCH=arm64 ;;   # Tauri DMG 명명 규칙과 일치
+  x86_64-apple-darwin)  DMG_ARCH=x64;     DIST_ARCH=x64   ;;
+  *) echo "지원하지 않는 타깃: $TARGET (aarch64-apple-darwin|x86_64-apple-darwin)"; exit 2 ;;
+esac
+# 호스트와 타깃이 다르면(크로스빌드) tauri build 에 --target 을 전달하고 산출물 경로에 타깃 세그먼트가 낀다.
+HOST_ARCH_TARGET=$([ "$(uname -m)" = "arm64" ] && echo aarch64-apple-darwin || echo x86_64-apple-darwin)
+if [ "$TARGET" != "$HOST_ARCH_TARGET" ]; then
+  TAURI_TARGET_ARGS=(--target "$TARGET"); BUNDLE_BASE="target/$TARGET/release/bundle"
+else
+  TAURI_TARGET_ARGS=(); BUNDLE_BASE="target/release/bundle"
+fi
+echo "== 대상 아키텍처: $TARGET (DMG=$DMG_ARCH · bundle=$BUNDLE_BASE) =="
+
 # ── 자격증명 fail-closed 검증 ──
 : "${APPLE_SIGNING_IDENTITY:?필요: export APPLE_SIGNING_IDENTITY='Developer ID Application: NAME (TEAMID)'}"
 if [ -n "${APPLE_NOTARY_PROFILE:-}" ]; then
@@ -45,9 +70,14 @@ fi
 # 공증이 "signature invalid / hardened runtime 미적용"으로 거부. tauri build **전에** 개별 재서명해
 # .app 안으로 Developer ID 서명본이 실리게 한다. ★codesign --deep 금지(entitlement 오염·실행 차단) —
 # inside-out(라이브러리 먼저·실행 바이너리 나중) 개별 서명. 인터프리터(python/node JIT)는 entitlements 적용.
-if [ ! -x "src-tauri/runtime/python/bin/python3" ]; then
-  echo "== 동봉 런타임 준비(호스트 아키텍처) =="
-  bash scripts/prep-mac-runtime.sh
+# 런타임이 대상 타깃과 다른 아키텍처면(직전 빌드가 다른 arch) 강제 재준비 — arch 혼입 방지.
+# .prep-target 마커로 현재 런타임 아키텍처를 추적한다(없으면 안전측 재준비).
+RT_MARKER="src-tauri/runtime/.prep-target"
+RT_CUR="$(cat "$RT_MARKER" 2>/dev/null || echo '')"
+if [ ! -x "src-tauri/runtime/python/bin/python3" ] || [ "$RT_CUR" != "$TARGET" ]; then
+  echo "== 동봉 런타임 준비($TARGET) =="
+  bash scripts/prep-mac-runtime.sh "$TARGET"
+  printf '%s' "$TARGET" > "$RT_MARKER"
 fi
 echo "== 동봉 runtime Mach-O inside-out 재서명 (Developer ID + hardened + timestamp) =="
 ENT="src-tauri/entitlements.plist"
@@ -82,10 +112,10 @@ echo "  ✓ runtime Mach-O ${SIGN_N}개 재서명 (python/node=entitlements·git
 #   (`tauri build --bundles dmg`는 .app을 재빌드해 역참조를 되돌리므로 사용 불가 — 실측 확인).
 echo "== 앱 번들 빌드(서명만·공증 보류) v$VERSION =="
 env -u APPLE_ID -u APPLE_PASSWORD -u APPLE_TEAM_ID -u APPLE_API_KEY -u APPLE_API_ISSUER \
-  bun x @tauri-apps/cli build --bundles app
+  bun x @tauri-apps/cli build "${TAURI_TARGET_ARGS[@]}" --bundles app
 
-APP="target/release/bundle/macos/cys.app"
-DMG="target/release/bundle/dmg/cys_${VERSION}_aarch64.dmg"
+APP="$BUNDLE_BASE/macos/cys.app"
+DMG="$BUNDLE_BASE/dmg/cys_${VERSION}_${DMG_ARCH}.dmg"
 
 # ── git-core 빌트인 dedup (Tauri 역참조 되돌리기) — 공유 스크립트로 통일 ──
 # 로직·기준점(libexec/git-core/git)·자기제외·동일디렉토리 링크·잔존 중복본 가드는
@@ -165,7 +195,8 @@ else
 fi
 
 echo "== 배포본 정리 + 자동업데이트 매니페스트 =="
-cp "$DMG" "dist-mac/cys-${VERSION}-macos-arm64.dmg"
-sh scripts/make-update-manifest.sh "$VERSION" idoforgod cys-terminal >/dev/null
-echo "✓ 공증 빌드 완료: dist-mac/cys-${VERSION}-macos-arm64.dmg"
+mkdir -p dist-mac
+cp "$DMG" "dist-mac/cys-${VERSION}-macos-${DIST_ARCH}.dmg"
+sh scripts/make-update-manifest.sh "$VERSION" idoforgod cys-terminal >/dev/null 2>&1 || true
+echo "✓ 공증 빌드 완료: dist-mac/cys-${VERSION}-macos-${DIST_ARCH}.dmg"
 echo "  → ad-hoc 재서명·xattr 우회 불필요. gh release 발행은 오너 승인 후."
