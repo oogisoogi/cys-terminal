@@ -20,7 +20,7 @@ export type ImeEvent =
   | { kind: "compositionstart" }
   | { kind: "compositionupdate" }
   | { kind: "compositionend" }
-  | { kind: "onData"; data: string }
+  | { kind: "onData"; data: string; duplicate?: boolean }
   | { kind: "blur" };
 
 /** send=PTY로 보낼 바이트, debug=cysImeDebug 채널 로그(평시 미출력). */
@@ -121,8 +121,18 @@ export function imeStep(state: ImeState, event: ImeEvent): ImeResult {
       break;
     }
     case "onData": {
-      // (no-op 안전장치: 잔여 pending 있으면 순서 보존 후 전송) 뒤이어 완성 음절을 그대로 PTY로.
+      actions.push({ debug: `onData data="${event.data}"${event.duplicate ? " DUP" : ""} pending="${pending}"` });
+      // 프로필 D(cys-neo, macOS 26.5.1 WKWebView): xterm(Terminal._inputEvent)가 음절 첫 자모의
+      // insertText 커밋을 triggerDataEvent로 onData에 유출한다. 같은 자모를 아래 input 경로가 이미
+      // pending에 버퍼·확정하므로 이 onData의 data는 중복(선행 자모 유출)이다. main.ts 배선이
+      // 'insertText(한글) 디스패치 중 동기 발화'를 감지해 duplicate로 표시한다 → 잔여 pending(직전
+      // 음절 확정분)은 순서 보존해 flush하되 유출된 data는 폐기(전송 금지)한다.
       flush("onData");
+      if (event.duplicate) {
+        actions.push({ debug: `DROP(insertText-leak) "${event.data}"` });
+        break;
+      }
+      // 비-중복(프로필 A 표준 composition·비-WKWebView Windows·순서보존 안전장치): 완성 음절을 그대로 PTY로.
       actions.push({ send: event.data });
       break;
     }

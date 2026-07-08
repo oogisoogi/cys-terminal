@@ -4,7 +4,7 @@
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
-import { imeStep, initialImeState, type ImeEvent } from "./ime";
+import { imeStep, initialImeState, isHangulText, type ImeEvent } from "./ime";
 import { shellQuote, shellQuoteJoin } from "./shellquote";
 import { DEFAULT_BG, readableForeground } from "./theme";
 import { reorderWorkspace, reorderGroup } from "./reorder";
@@ -1670,10 +1670,19 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
     }
   };
 
+  // ★프로필 D 유출 감지(cys-neo, macOS 26.5.1 WKWebView): xterm의 Terminal._inputEvent가
+  // inputType==='insertText'인 조합 첫 자모를 triggerDataEvent로 onData에 그대로 흘려보낸다
+  // (음절 첫 자모 유출 = 이중 전송). 아래 WKWebView input 경로가 그 자모를 pending에 버퍼·확정하므로
+  // 이 onData는 중복이다. 'input'(한글 insertText) 디스패치 중에 동기로 발화한 onData만 중복으로
+  // 표시하기 위해, 부모 노드의 캡처 리스너로 유출 대상 자모를 기록한다(캡처 단계는 textarea 자체
+  // 리스너 — xterm _inputEvent 포함 — 보다 먼저 실행되므로 유출 시점을 정확히 포착).
+  let insertLeak: string | null = null;
+
   term.onData((data) => {
     // 완성 음절은 그대로 PTY로 — 잔여 pending이 있으면 리듀서가 순서 보존 후 함께 전송(안전장치).
-    // Windows 등 비-WKWebView에선 input 핸들러 미배선이라 pending이 항상 비어 순수 send(data)와 동일.
-    applyIme({ kind: "onData", data });
+    // Windows 등 비-WKWebView에선 input 핸들러·insertLeak 감지 미배선이라 insertLeak이 항상 null →
+    // duplicate=false → 순수 send(data)와 동일(회귀 0). WKWebView에서 insertText 자모 유출만 폐기.
+    applyIme({ kind: "onData", data, duplicate: insertLeak !== null && data === insertLeak });
   });
 
   // ★F: 위 조합 상태 머신은 macOS WKWebView 전용 우회다. Windows WebView2 등 Chromium 계열은
@@ -1686,6 +1695,22 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
   if (isWKWebView) {
     const ta = term.textarea;
     if (ta) {
+      // ★프로필 D 유출 표식: 'input'(inputType==='insertText' && 한글) 디스패치가 시작될 때
+      // insertLeak에 그 자모를 기록하고, 디스패치가 끝나면 해제한다. 부모 노드의 캡처 리스너는
+      // textarea 자체 리스너(xterm _inputEvent 캡처 + 아래 리듀서 input 버블)보다 먼저 실행되므로,
+      // xterm이 유출 onData를 발화하는 순간 insertLeak이 이미 세팅돼 있어 term.onData가 중복으로
+      // 판정할 수 있다. 버블 리스너는 target 리스너 이후(디스패치 종료 시) 실행돼 표식을 해제한다.
+      // 자모 유출(insertText)에만 한정 — Space·제어·붙여넣기·비한글·표준 composition onData는 무영향.
+      const imeHost = ta.parentElement ?? ta;
+      imeHost.addEventListener(
+        "input",
+        (e) => {
+          const ie = e as InputEvent;
+          insertLeak = ie.inputType === "insertText" && ie.data && isHangulText(ie.data) ? ie.data : null;
+        },
+        true, // 캡처 — textarea 리스너보다 먼저
+      );
+      imeHost.addEventListener("input", () => { insertLeak = null; }); // 버블 — 디스패치 종료 후 해제
       ta.addEventListener("input", (e) => {
         const ie = e as InputEvent;
         applyIme({ kind: "input", inputType: ie.inputType, data: ie.data });

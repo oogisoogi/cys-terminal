@@ -24,6 +24,9 @@ function run(events: ImeEvent[], start: ImeState = initialImeState()) {
 const input = (inputType: string, data: string | null): ImeEvent => ({ kind: "input", inputType, data });
 const keydown = (keyCode: number, key: string): ImeEvent => ({ kind: "keydown", keyCode, key });
 const onData = (data: string): ImeEvent => ({ kind: "onData", data });
+// Profile D 유출용: xterm(Terminal._inputEvent)가 insertText 자모를 triggerDataEvent로 흘려보낸
+// 중복 onData. main.ts 배선이 'insertText(한글) 디스패치 중 동기 발화'를 감지해 duplicate로 표시한다.
+const onDataDup = (data: string): ImeEvent => ({ kind: "onData", data, duplicate: true });
 
 describe("Profile C — 혼성(신규 버그): insertText 자모 커밋 후 표준 composition 진행", () => {
   it("insertText 'ㄴ' → compositionstart → onData '너' ⇒ 정확히 '너'만 전송(자모 유출 없음)", () => {
@@ -172,6 +175,80 @@ describe("구멍① — keydown keyCode≠229 프로필(자모 유출 방어)", 
   it("keydown 계측: keydown(229,'Process')가 debug 라인을 남긴다", () => {
     const r = run([keydown(229, "Process")]);
     expect(r.debugs).toContain('keydown key="Process" code=229');
+  });
+});
+
+describe("Profile D — cys-neo(신규 실기기 버그): xterm _inputEvent insertText 자모 유출(이중 전송)", () => {
+  // 근본 원인: macOS 26.5.1 WKWebView에서 음절은 insertText(첫 자모 커밋) → insertReplacementText
+  // (조합 진행)로 pending에 버퍼되는데(표준 composition 이벤트 없음), xterm의 Terminal._inputEvent가
+  // inputType==='insertText'인 그 첫 자모를 triggerDataEvent로 onData에 그대로 흘려보낸다.
+  // → 완성 음절은 리듀서 input 경로가(pending flush) 보내고, 첫 자모는 onData가 또 보내 이중 전송.
+  // 관측된 실기기 트레이스($TMPDIR/cys-ime.log)의 각 FLUSH(onData)는 '다음 음절의 유출 onData'가
+  // 직전 음절 pending을 flush한 것이다(유출 onData는 현재 음절 자모를 나르며 직전 pending을 확정).
+  //
+  // event.data 확정 근거:
+  //  (a) xterm 소스 browser/Terminal.ts:1176 _inputEvent — inputType==='insertText' && data &&
+  //      (!ev.composed || !_keyDownSeen)일 때 triggerDataEvent(ev.data). insertReplacementText는
+  //      inputType이 달라 유출 안 됨 → '음절 첫 자모'만 유출(= 화면상 선행 자모).
+  //  (b) 화면 실측 "ㅎ한ㄷ들ㅇ이 깨지진ㄷ다" — 음절마다 선행 자모(첫 insertText 커밋)가 덧붙음.
+  //  ★깨 예외: 쌍자음 ㄲ은 Shift(keyCode 16)를 누른 채 입력 → insertText 직전 Shift keydown이
+  //   _keyDownSeen=true로 만들어 xterm 가드 (!ev.composed || !_keyDownSeen)를 false로 뒤집어
+  //   그 음절만 유출이 억제된다(트레이스에서 깨 앞에만 keydown Shift가 있고 유출 onData가 없음).
+  const trace: ImeEvent[] = [
+    // 한 (첫 음절 — flush할 직전 pending 없음)
+    onDataDup("ㅎ"), input("insertText", "ㅎ"), keydown(229, "ㅎ"),
+    input("insertReplacementText", "하"), keydown(229, "ㅏ"),
+    input("insertReplacementText", "한"), keydown(229, "ㄴ"),
+    input("insertReplacementText", "한"),
+    // 들 (유출 onData "ㄷ"가 직전 "한"을 flush)
+    onDataDup("ㄷ"), input("insertText", "ㄷ"), keydown(229, "ㄷ"),
+    input("insertReplacementText", "드"), keydown(229, "ㅡ"),
+    input("insertReplacementText", "들"), keydown(229, "ㄹ"),
+    input("insertReplacementText", "들"),
+    // 이 (유출 onData "ㅇ"가 "들"을 flush → 이는 Space keydown이 flush)
+    onDataDup("ㅇ"), input("insertText", "ㅇ"), keydown(229, "ㅇ"),
+    input("insertReplacementText", "이"), keydown(229, "ㅣ"),
+    input("insertReplacementText", "이"),
+    keydown(32, " "),          // 비229 Space → FLUSH(keydown) "이"
+    onData(" "),               // Space 문자(비유출) → " " 전송
+    input("insertText", " "),  // 한글 아님 → no-op
+    // 깨 (Shift 유지 쌍자음 → 유출 onData 없음)
+    keydown(16, "Shift"),
+    input("insertText", "ㄲ"), keydown(229, "ㄲ"),
+    input("insertReplacementText", "깨"), keydown(229, "ㅐ"),
+    input("insertReplacementText", "꺳"), keydown(229, "ㅈ"),
+    input("insertReplacementText", "깨"),
+    // 진 (유출 onData "지"가 "깨"를 flush)
+    onDataDup("지"), input("insertText", "지"), keydown(229, "ㅣ"),
+    input("insertReplacementText", "진"), keydown(229, "ㄴ"),
+    input("insertReplacementText", "진"),
+    // 다 (유출 onData "ㄷ"가 "진"을 flush)
+    onDataDup("ㄷ"), input("insertText", "ㄷ"), keydown(229, "ㄷ"),
+    input("insertReplacementText", "다"), keydown(229, "ㅏ"),
+    input("insertReplacementText", "다"),
+    onData(" "),               // 끝 Space onData가 "다"를 flush(FLUSH(onData) "다") + " " 전송
+    keydown(32, " "),          // pending 비어 flush no-op
+    input("insertText", " "),  // no-op
+  ];
+
+  it("실기기 트레이스: 이중 전송 없이 정확히 '한들이 깨진다 '만 전송(선행 자모 유출 0)", () => {
+    const r = run(trace);
+    // 수정 전에는 "ㅎ한ㄷ들ㅇ이 깨지진ㄷ다 "(음절마다 선행 자모 유출, 깨만 정상).
+    expect(r.bytes).toBe("한들이 깨진다 ");
+    expect(r.state.pending).toBe("");
+  });
+
+  it("duplicate onData는 잔여 pending을 순서 보존 flush하고 유출 data는 폐기", () => {
+    const r = run([onDataDup("ㄷ")], { pending: "한" });
+    expect(r.sends).toEqual(["한"]);      // 직전 음절 "한"은 보존, 유출 "ㄷ"는 폐기
+    expect(r.bytes).toBe("한");
+    expect(r.state.pending).toBe("");
+    expect(r.debugs).toContain('DROP(insertText-leak) "ㄷ"');
+  });
+
+  it("비-duplicate onData는 기존대로 pending flush 후 data 전송(회귀 방지 — Profile A/#순서보존)", () => {
+    const r = run([onData("녕")], { pending: "안" });
+    expect(r.sends).toEqual(["안", "녕"]);
   });
 });
 
