@@ -334,12 +334,143 @@ fn detect_lang() -> String {
             .output()
         {
             let loc = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !loc.is_empty() && loc.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-                return format!("{loc}.UTF-8");
+            if !loc.is_empty() {
+                return macos_valid_utf8_locale(&loc);
             }
         }
     }
     "en_US.UTF-8".into()
+}
+
+/// macOS: `locale -a` 가 보고하는 설치된 로케일 목록(실패 시 빈 Vec → 폴백 경로).
+#[cfg(target_os = "macos")]
+fn installed_utf8_locales() -> Vec<String> {
+    std::process::Command::new("locale")
+        .arg("-a")
+        .output()
+        .ok()
+        .map(|out| {
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// AppleLocale → 실제로 설치된 UTF-8 로케일. 설치 목록을 조회해 normalize_locale에 위임한다.
+#[cfg(target_os = "macos")]
+fn macos_valid_utf8_locale(apple_locale: &str) -> String {
+    normalize_locale(apple_locale, &installed_utf8_locales())
+}
+
+/// AppleLocale(비표준 스크립트 서브태그·키워드 포함 가능)를 설치된 UTF-8 로케일로 정규화한다.
+/// 예: ko_Kore_KR → ko_KR.UTF-8, zh_Hans_CN → zh_CN.UTF-8. 설치 목록을 인자로 받아 순수·테스트 가능.
+/// 절대 "C"/"POSIX"/미설치 로케일을 반환하지 않는다 — 실패해도 항상 설치 보장된 en_US.UTF-8.
+#[cfg(target_os = "macos")]
+fn normalize_locale(apple_locale: &str, installed: &[String]) -> String {
+    // '@' 이후 키워드(calendar=gregorian 등) 제거
+    let base = apple_locale.split('@').next().unwrap_or("").trim();
+    // 소문자화 + '-','_' 제거 → UTF-8==utf8==UTF8 동치 비교
+    let norm = |s: &str| s.to_lowercase().replace(['-', '_'], "");
+    let is_installed = |cand: &str| installed.iter().any(|i| norm(i) == norm(cand));
+
+    // 1) 직접: ko_KR → ko_KR.UTF-8
+    let direct = format!("{base}.UTF-8");
+    if is_installed(&direct) {
+        return direct;
+    }
+
+    // 2) 스크립트/변형 서브태그 제거: 첫 토큰=언어, 마지막=지역, 중간은 버림
+    let parts: Vec<&str> = base.split('_').filter(|t| !t.is_empty()).collect();
+    if parts.len() >= 3 {
+        let cand = format!("{}_{}.UTF-8", parts[0], parts[parts.len() - 1]);
+        if is_installed(&cand) {
+            return cand;
+        }
+    }
+
+    // 3) 언어만으로: "{lang}_"로 시작하고 UTF-8인 첫 설치 로케일
+    if let Some(lang) = parts.first() {
+        let prefix = format!("{lang}_");
+        if let Some(hit) = installed
+            .iter()
+            .find(|i| i.starts_with(&prefix) && norm(i).contains("utf8"))
+        {
+            return hit.clone();
+        }
+    }
+
+    // 4) 최종 폴백: macOS에 항상 설치된 en_US.UTF-8 (절대 C/POSIX 아님)
+    "en_US.UTF-8".to_string()
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod locale_tests {
+    use super::normalize_locale;
+
+    // 가짜 설치 목록: 폴백이 "C"/"POSIX"를 잘못 고르지 않음을 증명하려 일부러 포함한다.
+    fn installed() -> Vec<String> {
+        ["C", "POSIX", "ko_KR.UTF-8", "en_US.UTF-8", "zh_CN.UTF-8", "ja_JP.UTF-8"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn direct_match_ko_kr() {
+        assert_eq!(normalize_locale("ko_KR", &installed()), "ko_KR.UTF-8");
+    }
+
+    #[test]
+    fn strips_script_subtag_ko_kore_kr() {
+        // 핵심 버그: 비표준 스크립트 서브태그 Kore 제거 → 설치된 ko_KR.UTF-8
+        assert_eq!(normalize_locale("ko_Kore_KR", &installed()), "ko_KR.UTF-8");
+    }
+
+    #[test]
+    fn strips_script_subtag_zh_hans_cn() {
+        assert_eq!(normalize_locale("zh_Hans_CN", &installed()), "zh_CN.UTF-8");
+    }
+
+    #[test]
+    fn strips_keyword_after_at() {
+        assert_eq!(
+            normalize_locale("ko_KR@calendar=gregorian", &installed()),
+            "ko_KR.UTF-8"
+        );
+    }
+
+    #[test]
+    fn language_only_falls_to_region() {
+        // ko(언어만) → "ko_"로 시작하는 첫 UTF-8 로케일
+        assert_eq!(normalize_locale("ko", &installed()), "ko_KR.UTF-8");
+    }
+
+    #[test]
+    fn unknown_locale_falls_back_to_en_us() {
+        // 완전 미지 → en_US.UTF-8 (절대 C/POSIX 아님)
+        assert_eq!(normalize_locale("xx_Yyyy_ZZ", &installed()), "en_US.UTF-8");
+    }
+
+    #[test]
+    fn empty_installed_still_en_us_never_c() {
+        // 설치 목록이 비어도(=locale -a 실패) 절대 C가 아니라 en_US.UTF-8
+        assert_eq!(normalize_locale("ko_KR", &[]), "en_US.UTF-8");
+    }
+
+    #[test]
+    fn script_subtag_region_missing_falls_to_language() {
+        // 3-part인데 지역 재구성(zh_HK)이 미설치 → 분기2 미스 → 분기3 언어폴백(zh_ 첫 UTF-8)
+        assert_eq!(normalize_locale("zh_Hant_HK", &installed()), "zh_CN.UTF-8");
+    }
+
+    #[test]
+    fn two_part_unknown_region_falls_to_language() {
+        // 2-part(분기2 SKIP)인데 direct(ko_KP.UTF-8) 미설치 → 분기3 언어폴백(ko_ 첫 UTF-8)
+        assert_eq!(normalize_locale("ko_KP", &installed()), "ko_KR.UTF-8");
+    }
 }
 
 /// CYS_* 우선, 구 JAVIS_*/AITERM_* 폴백 — README가 약속한 CYS_* 이름이 실제로 동작하게 한다
@@ -1337,6 +1468,15 @@ impl Daemon {
         builder.cwd(&cwd_str);
         builder.env("TERM", "xterm-256color");
         builder.env("LANG", &self.config.lang);
+        // macOS 방어심층: portable-pty는 데몬 env 전체를 자식에 상속한다. GUI/launchd env에
+        // LC_ALL/LC_CTYPE(예: C)가 끼어 있으면 우선순위상 LANG을 이겨 한글 입력이 다시 깨진다.
+        // 상속된 LC_ALL을 제거하고 LC_CTYPE를 검증된 UTF-8 로케일로 고정해 그 경로를 봉인한다.
+        // (Windows 무영향 — cfg로 격리.)
+        #[cfg(target_os = "macos")]
+        {
+            builder.env_remove("LC_ALL");
+            builder.env("LC_CTYPE", &self.config.lang);
+        }
         // RC-6(T3 발견): Windows 번들 embeddable Python은 open() 기본 인코딩이 cp1252라 UTF-8(한글)
         // 팩 파일 읽기가 UnicodeDecodeError로 크래시. pane에서 도는 python(hooks·javis_*.py)이 UTF-8을
         // 기본으로 쓰게 PYTHONUTF8=1 주입(unix 무영향·이미 UTF-8). cys-dept는 자체 export로 보강.
