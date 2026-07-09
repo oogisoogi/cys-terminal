@@ -5398,9 +5398,11 @@ mod tests {
             done_w.store(true, std::sync::atomic::Ordering::SeqCst);
         });
 
-        // 200회 반복은 정상(수정) 코드에서 수백 ms 내 완료된다. 넉넉히 30초를 주고,
-        // 그 안에 done 신호가 없으면 교착으로 단정한다.
-        let deadline = Instant::now() + Duration::from_secs(30);
+        // ★보정 갱신(2026-07-10 실측): 200회 반복이 정상 코드에서도 17~19초 걸린다(로컬 M-series 21회
+        // 실측 — 반복당 ~85ms, 초기 "수백 ms" 보정은 데몬 성장으로 만료). 30초 데드라인은 CI 공유 러너가
+        // 느린 날(스위트 41.7s→50.4s 변동 실측) 거짓 교착 판정을 냈다(v0.12.36 릴리스 2연속 차단).
+        // 진짜 AB-BA 교착은 영원히 멈추므로 데드라인 상향은 검출력을 깎지 않는다 → 180초.
+        let deadline = Instant::now() + Duration::from_secs(180);
         while Instant::now() < deadline {
             if done.load(std::sync::atomic::Ordering::SeqCst) {
                 break;
