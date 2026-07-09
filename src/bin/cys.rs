@@ -499,7 +499,7 @@ enum Command {
         #[arg(long)]
         cwd: Option<String>,
     },
-    /// Boot the standard node set — 설치된 CLI만 자동 감지·기동·지침 주입 (worker claude + reviewer agy/codex/grok). CSO는 3단 정책상 띄우지 않는다
+    /// Boot the standard node set — 설치된 CLI만 자동 감지·기동·지침 주입. 표준 편성 4종(CSO 먼저 + worker claude + reviewer agy/codex) + 선택 grok
     Boot {
         /// Working directory for launched nodes
         #[arg(long)]

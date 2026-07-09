@@ -390,7 +390,7 @@ fn decide_auto_restore(
             cys_path.to_string_lossy().into_owned(),
         ));
     }
-    // PATH 선두주입 — pane 자식(state.rs)과 동일 유틸 재사용(중복 구현 금지). 이미 포함이면 None(무주입).
+    // PATH 재합성 — pane 자식(state.rs)과 동일 유틸 재사용(중복 구현 금지). 무변경이면 None(무주입).
     if let Some(newp) = cys::runtime_prefixed_path(exe_dir, current_path) {
         env.push(("PATH".to_string(), newp));
     }

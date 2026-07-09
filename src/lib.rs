@@ -129,20 +129,229 @@ pub fn runtime_bin_dirs(exe_dir: &Path) -> Vec<PathBuf> {
     dirs
 }
 
+/// pane/자식 프로세스에 물릴 PATH 를 계산 — 결과가 현행과 다르면 Some(주입값), 무변경이면 None.
+/// **이중 의미론**: unix = 현행 그대로(exe_dir + 번들 runtime bins 를 선두 주입, 나머지 보존) —
+/// pane 이 로그인 셸(-l)이라 프로파일이 PATH 를 복원하므로 stale 스냅샷 문제가 없다.
+/// Windows = 레지스트리에서 신선 PATH 를 재합성한다. 데몬은 자기 기동 시점 PATH 스냅샷을 자식에 물리는데,
+/// 실행 중엔 WM_SETTINGCHANGE 를 못 받아 레지스트리 PATH 변경(claude 사후 설치 등)이 반영되지 않는다 →
+/// spawn 마다 HKLM/HKCU 에서 신선 PATH 를 읽어 재합성 = 새 PowerShell 창과 등가(compose_pane_path 참조).
 pub fn runtime_prefixed_path(exe_dir: &Path, current_path: &str) -> Option<String> {
     let sep = if cfg!(windows) { ';' } else { ':' };
     let mut prefixes: Vec<String> = vec![exe_dir.to_string_lossy().into_owned()];
     for d in runtime_bin_dirs(exe_dir) {
         prefixes.push(d.to_string_lossy().into_owned());
     }
-    let add: Vec<String> = prefixes
-        .into_iter()
-        .filter(|p| !current_path.split(sep).any(|e| e == p.as_str()))
-        .collect();
-    if add.is_empty() {
+    #[cfg(windows)]
+    {
+        // ★Windows stale PATH: 데몬은 WM_SETTINGCHANGE 를 못 받아 레지스트리 PATH 변경(claude 사후 설치)이
+        // 프로세스 PATH 스냅샷에 반영 안 됨 → spawn 마다 레지스트리에서 신선 PATH 재합성 = 새 PowerShell 등가.
+        // 어떤 실패도 현행보다 나빠지지 않게(fail-open): fresh=None 이면 아래 compose 가 프로세스 PATH 폴백.
+        let fresh = windows_registry_path();
+        let home = home_dir();
+        let appdata = std::env::var_os("APPDATA").map(PathBuf::from);
+        let user_bins: Vec<String> = windows_user_bin_dirs(&home, appdata.as_deref())
+            .into_iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        let composed = compose_pane_path(&prefixes, fresh.as_deref(), &user_bins, current_path, sep);
+        // 기존 계약 유지: 결과가 현행과 같으면 None(무주입). 레지스트리 재합성이 보통 값을 바꾼다.
+        if composed == current_path {
+            return None;
+        }
+        return Some(composed);
+    }
+    #[cfg(not(windows))]
+    {
+        // unix: 현행 그대로 — pane 이 로그인 셸(-l)이라 프로파일이 PATH 를 복원(stale PATH 무영향).
+        let add: Vec<String> = prefixes
+            .into_iter()
+            .filter(|p| !current_path.split(sep).any(|e| e == p.as_str()))
+            .collect();
+        if add.is_empty() {
+            return None;
+        }
+        Some(format!("{}{}{}", add.join(&sep.to_string()), sep, current_path))
+    }
+}
+
+/// Windows `%VAR%` 전개(ExpandEnvironmentStrings 의미론 근사) — OS 무관 컴파일(순수·테스트 가능).
+/// 짝을 이룬 `%..%` 만 치환하고, **미지 변수·미종결 %·빈 이름(%%)은 원문 그대로 보존**(안전 폴백:
+/// 레지스트리 REG_EXPAND_SZ 의 %USERPROFILE% 등을 프로세스 env 로 전개하되 못 푼 건 깨뜨리지 않는다).
+pub fn expand_windows_env(s: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '%' {
+            if let Some(rel) = chars[i + 1..].iter().position(|&c| c == '%') {
+                let close = i + 1 + rel;
+                let name: String = chars[i + 1..close].iter().collect();
+                if !name.is_empty() {
+                    if let Some(val) = lookup(&name) {
+                        out.push_str(&val); // %VAR% → 값
+                    } else {
+                        out.extend(chars[i..=close].iter()); // 미지 변수: %NAME% 원문 유지
+                    }
+                    i = close + 1;
+                    continue;
+                }
+                // 빈 이름(%%): 첫 % 만 리터럴로 밀어 원문(%%)을 보존.
+                out.push('%');
+                i += 1;
+                continue;
+            }
+            // 미종결 %: 리터럴.
+            out.push('%');
+            i += 1;
+            continue;
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Windows 사용자 bin 후보(belt-and-braces) — claude native 설치 위치 `%USERPROFILE%\.local\bin` 와
+/// npm 전역 `%APPDATA%\npm`. 설치기가 레지스트리 등록을 빠뜨려도 잡히게 is_dir 게이트 없이 무조건 포함
+/// (셸은 없는 PATH 항목을 무시·claude 설치 직후 재시작 없이 발견). OS 무관 컴파일(순수·테스트 가능).
+pub fn windows_user_bin_dirs(home: &Path, appdata: Option<&Path>) -> Vec<PathBuf> {
+    let mut v = vec![home.join(".local").join("bin")];
+    if let Some(a) = appdata {
+        v.push(a.join("npm"));
+    }
+    v
+}
+
+/// pane PATH 최종 합성(순서·dedup 규칙 · **Windows 전용 의미론** · OS 무관 컴파일). 순서:
+/// `[prefixes: exe_dir + 번들 runtime bins]` ; `process_path 전체(현행 순서 그대로 보존)` ;
+/// `fresh_base(신선 레지스트리 머신;유저) 중 신규분만 append` ; `user_bins 중 신규분만 append`.
+/// ★MAJ#1(fail-open): 부모가 프로세스 PATH 선두에 의도 주입한 항목(pyenv/nvm shim 등, 레지스트리에 없는
+/// 것)의 precedence 를 강등하지 않는다 — 버그 본질은 claude 디렉터리 '발견 가능'이지 '선두'가 아니라,
+/// 레지스트리 신규분은 append 로 충분(프로세스 PATH 에 claude 가 없으니 append 로 발견됨). 레지스트리가
+/// 새로 주는 게 없으면 composed==current 가 더 자주 성립 → None(무주입) 계약도 더 잘 보존된다.
+/// 단, prefixes(동봉 runtime)는 항상 선두 — 레지스트리 유입 python 등에 절대 밀리지 않는다.
+/// ★MAJ#2(dedup): Windows PATH 는 case-insensitive 이므로 비교 키를 **소문자 정규화 + 후행 경로구분자
+/// (`\`·`/`) 트림**으로 만든다(출력은 원문=최초 등장 형태 유지). casing 변형·후행 슬래시 중복이 잔존해
+/// env 블록 32767자 한계를 넘겨 CreateProcess 가 실패(pane 미기동)하는 꼬리위험을 막는다. 빈 항목 제거.
+/// fresh_base=None 이면 base=프로세스 PATH(현행 폴백).
+pub fn compose_pane_path(
+    prefixes: &[String],
+    fresh_base: Option<&str>,
+    user_bins: &[String],
+    process_path: &str,
+    sep: char,
+) -> String {
+    // Windows 비교 키: 소문자 + 후행 '\'·'/' 트림. 출력엔 안 쓰고 dedup 판정에만.
+    fn norm_key(s: &str) -> String {
+        s.trim_end_matches(['\\', '/']).to_lowercase()
+    }
+    let mut items: Vec<&str> = Vec::new();
+    for p in prefixes {
+        items.push(p.as_str());
+    }
+    for e in process_path.split(sep) {
+        items.push(e);
+    }
+    if let Some(fb) = fresh_base {
+        for e in fb.split(sep) {
+            items.push(e);
+        }
+    }
+    for u in user_bins {
+        items.push(u.as_str());
+    }
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out: Vec<&str> = Vec::new();
+    for it in items {
+        if it.is_empty() {
+            continue;
+        }
+        if seen.insert(norm_key(it)) {
+            out.push(it);
+        }
+    }
+    out.join(&sep.to_string())
+}
+
+/// Windows 레지스트리에서 신선 PATH 재합성(머신;유저) — 실행 중 데몬이 못 받는 WM_SETTINGCHANGE 를 우회.
+/// HKLM `...\Session Manager\Environment` + HKCU `Environment` 의 `Path` 를 관례대로 머신;유저 순 결합,
+/// REG_EXPAND_SZ 의 %VAR% 는 프로세스 env 로 수동 전개. 성공 hive 만 사용·둘 다 실패면 None(fail-open).
+#[cfg(windows)]
+pub fn windows_registry_path() -> Option<String> {
+    use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+    let machine = read_registry_string(
+        HKEY_LOCAL_MACHINE,
+        r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
+        "Path",
+    );
+    let user = read_registry_string(HKEY_CURRENT_USER, "Environment", "Path");
+    // %VAR% 는 로그인 후 불변인 프로세스 env(USERPROFILE 등)로 전개 — pane 이 볼 값과 등가.
+    let expand = |raw: String| expand_windows_env(&raw, |k| std::env::var(k).ok());
+    match (machine, user) {
+        (Some(m), Some(u)) => Some(format!("{};{}", expand(m), expand(u))),
+        (Some(m), None) => Some(expand(m)),
+        (None, Some(u)) => Some(expand(u)),
+        (None, None) => None,
+    }
+}
+
+/// 레지스트리 문자열 값 읽기(REG_SZ·REG_EXPAND_SZ, NOEXPAND 로 원문 취득 후 상위에서 수동 전개).
+/// 2-pass: 1) 필요한 바이트 크기 질의 → 2) 버퍼 채움. 실패(값 부재 등)면 None(fail-open).
+#[cfg(windows)]
+fn read_registry_string(
+    hkey: windows_sys::Win32::System::Registry::HKEY,
+    subkey: &str,
+    value: &str,
+) -> Option<String> {
+    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+    use windows_sys::Win32::System::Registry::{
+        RegGetValueW, RRF_NOEXPAND, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ,
+    };
+    let sub: Vec<u16> = subkey.encode_utf16().chain(std::iter::once(0)).collect();
+    let val: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
+    let flags = RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND;
+    // 1-pass: 크기 질의(데이터 포인터 NULL).
+    let mut size: u32 = 0;
+    let rc = unsafe {
+        RegGetValueW(
+            hkey,
+            sub.as_ptr(),
+            val.as_ptr(),
+            flags,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut size,
+        )
+    };
+    if rc != ERROR_SUCCESS || size == 0 {
         return None;
     }
-    Some(format!("{}{}{}", add.join(&sep.to_string()), sep, current_path))
+    // 2-pass: u16 버퍼(바이트→워드, 널 여유 +1).
+    let mut buf: Vec<u16> = vec![0u16; (size as usize / 2) + 1];
+    let mut size2 = (buf.len() * 2) as u32;
+    let rc2 = unsafe {
+        RegGetValueW(
+            hkey,
+            sub.as_ptr(),
+            val.as_ptr(),
+            flags,
+            std::ptr::null_mut(),
+            buf.as_mut_ptr() as *mut core::ffi::c_void,
+            &mut size2,
+        )
+    };
+    if rc2 != ERROR_SUCCESS {
+        return None;
+    }
+    let n = (size2 as usize / 2).min(buf.len());
+    let slice = &buf[..n];
+    let end = slice.iter().position(|&c| c == 0).unwrap_or(slice.len());
+    let s = String::from_utf16_lossy(&slice[..end]);
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
 }
 
 /// 홈 디렉토리(RC-7 공용). Windows는 HOME 미설정이 기본이라 `env::var("HOME")`은 빈값으로 폴백돼
@@ -363,6 +572,112 @@ mod tests {
         fs::remove_dir_all(rt.join("uv")).unwrap();
         assert_eq!(runtime_bin_dirs(&macos).len(), 3, "uv 부재 시 3개");
         fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn expand_windows_env_cases() {
+        // %VAR% 전개(mac 에서 Windows 로직 검증 — 순수 fn 직접 호출).
+        let lk = |k: &str| match k {
+            "USERPROFILE" => Some(r"C:\Users\cys".to_string()),
+            "APPDATA" => Some(r"C:\Users\cys\AppData\Roaming".to_string()),
+            _ => None,
+        };
+        // 전개.
+        assert_eq!(
+            expand_windows_env(r"%USERPROFILE%\.local\bin", lk),
+            r"C:\Users\cys\.local\bin"
+        );
+        // 미지 변수는 원문 유지.
+        assert_eq!(expand_windows_env(r"%NOPE%\bin", lk), r"%NOPE%\bin");
+        // 변수 없음: 그대로.
+        assert_eq!(expand_windows_env(r"C:\Windows\System32", lk), r"C:\Windows\System32");
+        // 연속 변수(경계 인접).
+        assert_eq!(
+            expand_windows_env(r"%USERPROFILE%%APPDATA%", lk),
+            r"C:\Users\cysC:\Users\cys\AppData\Roaming"
+        );
+        // 빈 이름(%%)·미종결 %는 원문 보존(안전 폴백).
+        assert_eq!(expand_windows_env(r"50%%off", lk), r"50%%off");
+        assert_eq!(expand_windows_env(r"tail%USERPROFILE", lk), r"tail%USERPROFILE");
+        // 빈 문자열.
+        assert_eq!(expand_windows_env("", lk), "");
+    }
+
+    #[test]
+    fn windows_user_bin_dirs_composition() {
+        let home = Path::new(r"C:\Users\cys");
+        let appdata = PathBuf::from(r"C:\Users\cys\AppData\Roaming");
+        let with = windows_user_bin_dirs(home, Some(&appdata));
+        let got: Vec<String> = with.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        // 경로 구분자는 호스트 OS 규약이라 컴포넌트 존재로 검증(mac 에서도 무결).
+        assert_eq!(got.len(), 2);
+        assert!(got[0].contains(".local") && got[0].ends_with("bin"), "local/bin: {got:?}");
+        assert!(got[1].ends_with("npm"), "appdata/npm: {got:?}");
+        // APPDATA 부재 시 .local/bin 만.
+        let none = windows_user_bin_dirs(home, None);
+        assert_eq!(none.len(), 1);
+    }
+
+    #[test]
+    fn compose_pane_path_rules() {
+        let sep = ';';
+        let prefixes = vec![r"C:\app\bin".to_string(), r"C:\app\runtime\python".to_string()];
+        let user_bins = vec![r"C:\Users\cys\.local\bin".to_string(), r"C:\Users\cys\AppData\Roaming\npm".to_string()];
+        // ① 낡은 프로세스 PATH(.local\bin 없음) + 신선 레지스트리(.local\bin 있음) →
+        //    새 순서: prefixes ; process ; fresh 신규분 ; user_bins 신규분. .local\bin 정확히 1회.
+        let fresh = r"C:\Windows\System32;C:\Users\cys\.local\bin";
+        let process = r"C:\Windows\System32;C:\stale";
+        let out = compose_pane_path(&prefixes, Some(fresh), &user_bins, process, sep);
+        let parts: Vec<&str> = out.split(sep).collect();
+        assert_eq!(parts[0], r"C:\app\bin", "prefix 선두: {out}");
+        assert_eq!(parts[1], r"C:\app\runtime\python", "runtime 2순위: {out}");
+        let local_count = parts.iter().filter(|&&p| p == r"C:\Users\cys\.local\bin").count();
+        assert_eq!(local_count, 1, "user bin 정확히 1회(레지스트리·user_bins 중복 dedup): {out}");
+        assert!(parts.contains(&r"C:\stale"), "세션 유래 항목 보존: {out}");
+        // 세션 유래(process) 항목이 fresh 신규분(.local\bin)보다 앞 — precedence 보존(MAJ#1).
+        let stale_idx = parts.iter().position(|&p| p == r"C:\stale").unwrap();
+        let local_idx = parts.iter().position(|&p| p == r"C:\Users\cys\.local\bin").unwrap();
+        assert!(stale_idx < local_idx, "process 항목이 레지스트리 신규분보다 앞: {out}");
+        // System32 도 dedup(레지스트리·프로세스 중복) — 1회.
+        assert_eq!(parts.iter().filter(|&&p| p == r"C:\Windows\System32").count(), 1, "전체 dedup: {out}");
+
+        // ② 레지스트리 None → base=프로세스 PATH(현행 동작 등가). prefix 후 프로세스 항목 보존.
+        let out2 = compose_pane_path(&prefixes, None, &user_bins, process, sep);
+        let parts2: Vec<&str> = out2.split(sep).collect();
+        assert_eq!(parts2[0], r"C:\app\bin");
+        assert!(parts2.contains(&r"C:\stale") && parts2.contains(&r"C:\Windows\System32"));
+        // user_bins 는 여전히 포함(fresh 에 없어도 belt-and-braces).
+        assert!(parts2.contains(&r"C:\Users\cys\.local\bin"));
+
+        // ④ 빈 항목 제거·중복 전면 dedup.
+        let out3 = compose_pane_path(&prefixes, Some(";;C:\\dup"), &[], "C:\\dup;C:\\app\\bin;", sep);
+        let parts3: Vec<&str> = out3.split(sep).collect();
+        assert!(!parts3.iter().any(|p| p.is_empty()), "빈 항목 없음: {out3}");
+        assert_eq!(parts3.iter().filter(|&&p| p == r"C:\dup").count(), 1, "dup 1회: {out3}");
+        assert_eq!(parts3.iter().filter(|&&p| p == r"C:\app\bin").count(), 1, "prefix dup 1회: {out3}");
+
+        // (a) MAJ#1 핀: 프로세스 PATH 선두의 shim(레지스트리에 없음)이 prefixes 바로 다음·레지스트리 항목보다 앞.
+        let out_a = compose_pane_path(&prefixes, Some(r"C:\reg\bin"), &[], r"C:\shim\bin;C:\other", sep);
+        let pa: Vec<&str> = out_a.split(sep).collect();
+        assert_eq!(pa[0], r"C:\app\bin");
+        assert_eq!(pa[1], r"C:\app\runtime\python");
+        assert_eq!(pa[2], r"C:\shim\bin", "process 선두 shim 이 prefixes 직후: {out_a}");
+        let shim_idx = pa.iter().position(|&p| p == r"C:\shim\bin").unwrap();
+        let reg_idx = pa.iter().position(|&p| p == r"C:\reg\bin").unwrap();
+        assert!(shim_idx < reg_idx, "shim 이 레지스트리 항목보다 앞: {out_a}");
+
+        // (b) MAJ#2 핀: casing·후행 '\' 변형은 동일 항목으로 dedup(Windows case-insensitive) — 1회만.
+        let out_b = compose_pane_path(&[], Some(r"C:\WINDOWS\System32"), &[], r"C:\Windows\System32\", sep);
+        let pb: Vec<&str> = out_b.split(sep).collect();
+        assert_eq!(pb.len(), 1, "casing·후행슬래시 변형 dedup=1개: {out_b}");
+        assert_eq!(pb[0], r"C:\Windows\System32\", "출력은 원문(최초 등장=process 형태) 유지: {out_b}");
+
+        // (c) ★순서보장 핀(박사님 통찰): fresh_base 에 경쟁 python(C:\Python312)이 있어도 동봉 runtime 이 항상 앞.
+        let out_c = compose_pane_path(&prefixes, Some(r"C:\Python312"), &[], "", sep);
+        let pc: Vec<&str> = out_c.split(sep).collect();
+        let rt_idx = pc.iter().position(|&p| p == r"C:\app\runtime\python").unwrap();
+        let py_idx = pc.iter().position(|&p| p == r"C:\Python312").unwrap();
+        assert!(rt_idx < py_idx, "동봉 runtime 이 레지스트리 유입 python 보다 앞(절대 밀리지 않음): {out_c}");
     }
 
     #[test]
