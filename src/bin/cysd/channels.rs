@@ -470,7 +470,10 @@ fn spawn_bridge(
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
+        // CREATE_NO_WINDOW 동시 지정 — creation_flags 는 덮어쓰기라 hide_console() 별도 호출과
+        // 병용 불가. 없으면 콘솔 없는 cysd가 띄우는 장수 브리지(cmd /C)마다 콘솔 창이 뜬다.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
     }
     let child = cmd.spawn().map_err(|e| format!("bridge spawn failed: {e}"))?;
     let pid = child.id();

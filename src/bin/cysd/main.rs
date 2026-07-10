@@ -454,6 +454,13 @@ fn spawn_office_bridge(state_dir: std::path::PathBuf) {
                 .env("HUD_STATE_DIR", state_dir.join("office-bridge"))
                 .stdin(std::process::Stdio::null())
                 .kill_on_drop(true);
+            {
+                // Windows: 콘솔 없는 cysd가 콘솔 자식(python3.exe)을 그냥 스폰하면 새 콘솔 창이
+                // 할당된다(Win11 기본터미널=WT → AppData 경로 제목의 검은 상주 탭). 브리지는
+                // 장수 프로세스라 앱 기동마다 빈 터미널 창이 함께 뜨던 실사고(2026-07-10)의 주범.
+                use crate::state::HideConsole;
+                cmd.hide_console();
+            }
             if let Some(newp) =
                 cys::runtime_prefixed_path(exe_dir_ref, &std::env::var("PATH").unwrap_or_default())
             {
@@ -656,11 +663,13 @@ fn extract_phoenix_embed(
 /// ★B1③: 추출된 phoenix self-test — `<python> <script> --selftest` 가 exit 0 + "selftest ok" 응답이면 통과.
 /// 실행성만 확인(데몬·상태 무접촉). 실패=false(호출측이 정리 후 디스크 폴백).
 fn phoenix_self_test(python: &str, script: &std::path::Path) -> bool {
+    use crate::state::HideConsole;
     let out = std::process::Command::new(python)
         .arg(script)
         .arg("--selftest")
         .env("CYS_NO_AUTOSTART", "1")
         .stdin(std::process::Stdio::null())
+        .hide_console()
         .output();
     match out {
         Ok(o) => o.status.success() && String::from_utf8_lossy(&o.stdout).contains("selftest ok"),
@@ -910,6 +919,11 @@ fn run_auto_restore_once(
         cmd.env(k, v);
     }
     cmd.stdin(std::process::Stdio::null());
+    {
+        // Windows: 콜드부트 auto-restore(launch-agent 등)가 수십 초 돌며 콘솔 창을 띄우지 않게.
+        use crate::state::HideConsole;
+        cmd.hide_console();
+    }
     match open_restore_log(log_path) {
         Some(f) => {
             // stderr 는 clone 으로 같은 파일에 합류. clone 실패 시 null 이 아니라 inherit(증거 보존).

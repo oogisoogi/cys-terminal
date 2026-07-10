@@ -1109,6 +1109,7 @@ async fn agy_listen_ports(pid: u32) -> Vec<u16> {
 /// 한 포트로 RetrieveUserQuotaSummary 프로브 (async curl -sk, self-signed 수용·2s 타임아웃).
 /// 성공 시 Gemini 쿼터 RateWindow, 아니면 None(잘못된 포트·실패).
 async fn agy_quota_probe(port: u16) -> Option<Vec<RateWindow>> {
+    use crate::state::HideConsole;
     let url = format!("https://127.0.0.1:{port}/{AGY_SVC}/RetrieveUserQuotaSummary");
     let fut = tokio::process::Command::new("curl")
         .args([
@@ -1128,6 +1129,8 @@ async fn agy_quota_probe(port: u16) -> Option<Vec<RateWindow>> {
             "--",
             &url,
         ])
+        // Windows: 주기 프로브가 콘솔 창을 반복 플래시하지 않게(콘솔 없는 cysd의 콘솔 자식).
+        .hide_console()
         .output();
     let out = tokio::time::timeout(Duration::from_secs(3), fut)
         .await
