@@ -245,8 +245,9 @@ PY
 }
 
 # 데몬 소켓의 live(미exited) surface role 목록을 출력(줄당 1개·role 없으면 '-'). cys list 파싱(read-only).
+# ★NO_AUTOSTART(identify autostart 감사 2026-07-10): 읽기 프로브가 죽은 소켓에서 cysd를 되살리지 않게.
 dept_live_roles(){
-  CYS_SOCKET="$1" "$CYS" list 2>/dev/null | python3 - <<'PY'
+  CYS_NO_AUTOSTART=1 CYS_SOCKET="$1" "$CYS" list 2>/dev/null | python3 - <<'PY'
 import sys
 for line in sys.stdin:
     f=line.rstrip("\n").split("\t")
@@ -619,7 +620,9 @@ PY
   down)
     name="${2:?usage: cys-dept down <name>}"
     sock="$(dept_sock "$name")"
-    pid=$(CYS_SOCKET="$sock" "$CYS" identify 2>/dev/null | python3 -c "import json,sys;print(json.load(sys.stdin).get('daemon_pid',''))" 2>/dev/null || true)
+    # ★NO_AUTOSTART(감사 2026-07-10): 죽은 부서 down 시 identify가 cysd를 되살려 그걸 kill하던 낭비 spawn 제거
+    # — 실패 시 pid 빈값이면 아래가 kill을 건너뛰고 rm+reg_remove로 진행(종국 상태 동일).
+    pid=$(CYS_NO_AUTOSTART=1 CYS_SOCKET="$sock" "$CYS" identify 2>/dev/null | python3 -c "import json,sys;print(json.load(sys.stdin).get('daemon_pid',''))" 2>/dev/null || true)
     # orphan 방지(오너 ③): kill 후 데몬 사망 확인·잔존 시 SIGKILL(down이 데몬 살린 채 reg_remove→orphan 재발 차단).
     if [ -n "${pid:-}" ]; then
       graceful_kill "$pid"
@@ -641,7 +644,7 @@ for n,e in d.items():
     if e.get('socket')==s: print(n); break
 PY
 )
-    pid=$(CYS_SOCKET="$sock" "$CYS" identify 2>/dev/null | python3 -c "import json,sys;print(json.load(sys.stdin).get('daemon_pid',''))" 2>/dev/null || true)
+    pid=$(CYS_NO_AUTOSTART=1 CYS_SOCKET="$sock" "$CYS" identify 2>/dev/null | python3 -c "import json,sys;print(json.load(sys.stdin).get('daemon_pid',''))" 2>/dev/null || true)
     if [ -n "${pid:-}" ]; then
       graceful_kill "$pid"
     fi
@@ -674,8 +677,8 @@ PY
       exit 9
     fi
     # 살아있음이 확인됐으니 identify는 실 데몬에 연결(autostart 없음). 구 버전(검증 게이트)·pid(kill 대상) 취득.
-    oldver="$(CYS_SOCKET="$sock" "$CYS" identify 2>/dev/null | python3 -c "import json,sys;print(json.load(sys.stdin).get('version',''))" 2>/dev/null || true)"
-    pid=$(CYS_SOCKET="$sock" "$CYS" identify 2>/dev/null | python3 -c "import json,sys;print(json.load(sys.stdin).get('daemon_pid',''))" 2>/dev/null || true)
+    oldver="$(CYS_NO_AUTOSTART=1 CYS_SOCKET="$sock" "$CYS" identify 2>/dev/null | python3 -c "import json,sys;print(json.load(sys.stdin).get('version',''))" 2>/dev/null || true)"
+    pid=$(CYS_NO_AUTOSTART=1 CYS_SOCKET="$sock" "$CYS" identify 2>/dev/null | python3 -c "import json,sys;print(json.load(sys.stdin).get('daemon_pid',''))" 2>/dev/null || true)
     # 방어적 재확인(ping↔identify 사이 경합으로 pid 비면 중단 — 위와 동일 근거).
     if [ -z "${pid:-}" ]; then
       echo "[cys-dept] $name pid 미확인 — rotate 중단(소유자 사망 미확인·유령 중복 방지)" >&2
@@ -694,7 +697,7 @@ PY
     # launch 재귀 호출: 소켓이 죽었으니 새 바이너리로 재spawn. CYS_ROLE 그대로 상속(게이트 통과 주체 동일).
     # launch stdout은 로그로 흘리고, 아래서 새 버전을 확정 출력한다.
     bash "$0" launch "$name" || { echo "[cys-dept] ERROR: $name rotate 재기동 실패" >&2; exit 1; }
-    newver="$(CYS_SOCKET="$sock" "$CYS" identify 2>/dev/null | python3 -c "import json,sys;print(json.load(sys.stdin).get('version',''))" 2>/dev/null || true)"
+    newver="$(CYS_NO_AUTOSTART=1 CYS_SOCKET="$sock" "$CYS" identify 2>/dev/null | python3 -c "import json,sys;print(json.load(sys.stdin).get('version',''))" 2>/dev/null || true)"
     # ★검증 게이트(지시3): Rust/UI 성공 판정·사람 로그 확인용 — 마지막 줄에 확정 출력.
     echo "rotated $name: v${oldver:-?}→v${newver:-?}"
     ;;

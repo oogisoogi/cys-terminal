@@ -2706,12 +2706,16 @@ async function addWorkspace(): Promise<Workspace> {
   return ws;
 }
 
-// 부서 socket 경로(~/.local/state/cys-dept-<name>/cys.sock)에서 원래 부서명 역산.
+// 부서 socket 경로에서 원래 부서명 역산 — unix(~/.local/state/cys-dept-<name>/cys.sock)와
+// ★Windows named pipe(\\.\pipe\cys-dept-<name> — RC-4 규약·dept_socket_path 정합) 양쪽 지원(2026-07-10).
 // rename으로 ws.name이 바뀌어도 socket은 불변이므로, 재-launch가 '다른 소켓 새 데몬'을 만들어
-// 원래 데몬을 고아화하는 것을 막는다(시나리오4).
+// 원래 데몬을 고아화하는 것을 막는다(시나리오4). Windows 분기 이전엔 null→ws.name 폴백으로 이 가드가
+// Windows에서 무동작(rename 후 재-launch가 고아 유발)이었다 — 분기 추가로 가드가 비로소 작동한다.
 function deptNameFromSocket(sock: string | undefined): string | null {
   const m = /\/cys-dept-(.+?)\/cys\.sock$/.exec(sock ?? "");
-  return m ? m[1] : null;
+  if (m) return m[1];
+  const w = /^\\\\\.\\pipe\\cys-dept-(.+)$/.exec(sock ?? "");
+  return w ? w[1] : null;
 }
 
 // 멀티마스터 F4: 새 '부서 workspace' 런칭 = 새 부서 데몬 spawn(cys-dept launch 단일 진입점).
@@ -3240,7 +3244,11 @@ function showSkewBadge(
 
 // 배지 클릭(수동) — 확인 1회 후 force=true로 순차 교대(메인→부서). app.restart 없는 경로라 토스트까지 책임.
 async function manualRotateSkewed(appVer: string, heldMain: boolean, heldDepts: SkewedDept[]) {
-  if (rotatingDaemon) return;
+  if (rotatingDaemon) {
+    // 리뷰 2R MIN-C: 자동 교대·주기 재검 진행 중 클릭이 조용히 무시돼 "안 눌림"으로 보이던 무피드백 해소.
+    toast("feed", "교대 진행 중", "데몬 교대·재검이 진행 중입니다 — 잠시 후 다시 시도하세요.");
+    return;
+  }
   const nodes = (heldMain ? 1 : 0) + heldDepts.length;
   const ok = await confirmModal(
     `데몬 교대 (새 버전 v${appVer})`,

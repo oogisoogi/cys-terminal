@@ -65,7 +65,14 @@ command -v xcrun >/dev/null || { echo "✗ Xcode Command Line Tools 필요(xcrun
 if ! security find-identity -v -p codesigning 2>/dev/null | grep -q "Developer ID Application"; then
   echo "✗ Keychain에 'Developer ID Application' 인증서 없음 — Apple Developer에서 발급·설치 필요"; exit 2
 fi
-[ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ] || echo "⚠ TAURI_SIGNING_PRIVATE_KEY 미설정 — 자동업데이트 .sig 미생성(설치 DMG는 정상)"
+# ★fail-closed 승격(2026-07-10 · v0.12.35 빌드 1차 실패 원인): 구 경고문("미설정이어도 설치 DMG는 정상")은
+# 실동작과 표류 — tauri.conf createUpdaterArtifacts 때문에 tauri build가 빌드 말미(~20분 후)에 hard-fail한다.
+# 20분 낭비 대신 여기서 3초 만에 명확히 실패시킨다(다른 자격증명 검증과 동형).
+if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
+  echo "✗ TAURI_SIGNING_PRIVATE_KEY 미설정 — tauri build가 updater 아티팩트 서명에서 실패한다(빌드 말미 hard-fail)." >&2
+  echo "  설정: export TAURI_SIGNING_PRIVATE_KEY=\"\$(cat ~/.tauri/cys-updater.key)\" TAURI_SIGNING_PRIVATE_KEY_PASSWORD=\"\"" >&2
+  exit 2
+fi
 
 # ── 동봉 런타임 준비 + inside-out 재서명 (RC-22/T6b — 공증 필수) ──
 # tauri.conf.json bundle.resources("runtime/")는 Contents/Resources/runtime 으로 실리지만 Tauri는

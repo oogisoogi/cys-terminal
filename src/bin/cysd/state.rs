@@ -2250,14 +2250,19 @@ fn mac_lc_path_prefix(dirs: &[std::path::PathBuf]) -> Option<String> {
 }
 
 /// 로그인 프로파일(path_helper)이 동봉 runtime을 PATH 뒤로 강등한 뒤 실행되는 -c 명령에서 재선두주입해
-/// 동봉 git/python3/uv/node가 /usr/bin CLT-shim을 이기게 한다. runtime 부재(개발/비동봉)면 None(no-op).
-/// cysd 자기 exe_dir(Contents/MacOS) 기준 runtime_bin_dirs와 단일화.
+/// 동봉 git/python3/uv/node가 /usr/bin CLT-shim을 이기게 한다.
+/// ★-lc 확장(2026-07-10): `zsh -lc`(비대화형 로그인)는 .zshrc를 읽지 않아(ZDOTDIR 실측 증명), claude가
+/// .zshrc에만 PATH 등록된 소비자 맥에서 명령 pane이 claude를 못 찾는다 → runtime 뒤·"$PATH" 앞에
+/// ~/.local/bin을 함께 재선두주입해 대화형 pane(-l·.zshrc 적용)과 우선순위를 일관화한다.
+/// cysd 자기 exe_dir(Contents/MacOS) 기준 runtime_bin_dirs와 단일화. runtime 부재(개발)여도 .local/bin은 주입.
 #[cfg(target_os = "macos")]
 fn mac_runtime_lc_prefix() -> Option<String> {
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))?;
-    mac_lc_path_prefix(&cys::runtime_bin_dirs(&exe_dir))
+    let mut dirs = cys::runtime_bin_dirs(&exe_dir);
+    dirs.push(cys::home_dir().join(".local").join("bin"));
+    mac_lc_path_prefix(&dirs)
 }
 
 /// 오너 완화책 ① 기본 내장 룰: 로그인 만료·401·토큰 만료를 즉시 감지한다.
@@ -2365,6 +2370,16 @@ mod tests {
         assert!(p.contains("'/quote'\\''d/uv'"), "내부 따옴표 이스케이프: {p}");
         // dirs 비면 None(no-op).
         assert_eq!(mac_lc_path_prefix(&[]), None, "빈 dirs → None");
+    }
+
+    // ★-lc 확장 회귀 핀(2026-07-10): -lc 재선두주입에 ~/.local/bin 포함 — zsh -lc가 .zshrc를 안 읽어
+    // claude(.zshrc 등록) 미발견이던 소비자 맥 경계 해소. runtime 부재(테스트 바이너리 exe_dir)여도 주입.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_runtime_lc_prefix_includes_user_local_bin() {
+        let p = mac_runtime_lc_prefix().expect("~/.local/bin 추가로 dirs가 비지 않음");
+        assert!(p.contains("/.local/bin"), "~/.local/bin 재선두주입: {p}");
+        assert!(p.ends_with(":\"$PATH\"; "), "말미 $PATH 확장 보존: {p}");
     }
 
     // ── RC-13 회귀 핀(agy 요구): Windows 부서 상태 격리 슬러그 ──

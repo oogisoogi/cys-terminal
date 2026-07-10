@@ -3747,7 +3747,21 @@ fn run_boot(cwd: Option<String>) -> i32 {
             ok
         };
         if !found {
-            println!("· {agent}: CLI '{bin}' 미설치 — 건너뜀");
+            // 부트스트랩 무력화 사태(2026-07-09) UX 후속: worker·cso가 claude 미설치(또는 PATH 미발견)로
+            // 조용히 skip되면 사용자는 "pane 0개"의 원인을 모른다 — 설치 힌트를 병기해 자가 진단 가능하게.
+            let hint = match *agent {
+                "claude" => {
+                    if cfg!(windows) {
+                        " (설치: PowerShell에서 `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작)"
+                    } else {
+                        " (설치: `curl -fsSL https://claude.ai/install.sh | bash` 후 새 탭)"
+                    }
+                }
+                "codex" => " (설치: `npm i -g @openai/codex` — 선택 리뷰어)",
+                "gemini" => " (Antigravity CLI `agy` — 선택 리뷰어)",
+                _ => " (선택 노드 — 미설치면 건너뜀이 정상)",
+            };
+            println!("· {agent}: CLI '{bin}' 미설치 — 건너뜀{hint}");
             continue;
         }
         if live_roles.contains(*role) {
