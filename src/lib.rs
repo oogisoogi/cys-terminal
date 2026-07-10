@@ -71,6 +71,18 @@ pub fn socket_path() -> PathBuf {
     }
 }
 
+/// Windows named pipe busy-retry 정책 — CLI(cys)·GUI(cys-app) 클라이언트 공용 **단일 진실**
+/// (이원 정의는 정책 변경 시 샷건 서저리). ERROR_PIPE_BUSY(os error 231, "모든 파이프
+/// 인스턴스가 사용 중")는 데몬 다운이 아니라 listening 인스턴스 순간 소진(정상 혼잡)이다 —
+/// 서버(cysd 리스너 풀)는 accept 직후 인스턴스를 재생성하므로 잠깐 기다리면 열린다.
+/// Microsoft 파이프 클라이언트 계약상 busy 는 대기·재시도가 필수(WaitNamedPipe 관례)이며,
+/// 재시도 없는 1회 open 은 멀티 노드 동시 RPC 에서 상시 실패한다(2026-07-10 Windows 실사고).
+/// 그 외 오류(파이프 부재 = 데몬 다운 등)는 즉시 반환이 계약이다(autostart 판단은 호출부 몫).
+/// 전 OS에서 컴파일되는 pub 상수라 비-Windows 테스트가 정책 불변을 박제할 수 있다.
+pub const PIPE_BUSY_ERROR: i32 = 231;
+pub const PIPE_BUSY_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
+pub const PIPE_BUSY_RETRY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// 동봉 runtime PATH 선두 주입(RC-5 · 공용 — cysd PTY 자식·GUI 직스폰이 공유, 중복 구현 금지).
 /// `exe_dir`(바이너리 폴더) + Windows 자기완결 설치의 `<install>\runtime\{python, git\cmd, git\usr\bin}`
 /// 중 **실재하는** 디렉토리를 `current_path` 앞에 (중복 제거) 얹은 새 PATH를 반환. 얹을 게 없으면

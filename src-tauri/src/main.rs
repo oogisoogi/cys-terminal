@@ -53,21 +53,20 @@ async fn connect_to(socket: &std::path::Path) -> Result<Stream, String> {
     use tokio::net::windows::named_pipe::ClientOptions;
     // ERROR_PIPE_BUSY(os error 231, "모든 파이프 인스턴스가 사용 중") busy-retry — 231은 데몬
     // 생존·listening 인스턴스 순간 소진(정상 혼잡)이므로 짧게 재시도하면 열린다(tokio 문서
-    // 표준 패턴·Microsoft WaitNamedPipe 관례). 재시도 없는 1회 open 은 앱 기동 fan-out
-    // (daemon_status + pane별 attach + event forwarder 동시 연결)에서 상시 "startup failed …
-    // os error 231"이 됐다(2026-07-10 Windows 실사고 — 워크스페이스/pane 렌더 전체 불능).
-    // 그 외 오류(파이프 부재 = 데몬 다운 등)는 즉시 반환한다.
-    const ERROR_PIPE_BUSY: i32 = 231;
+    // 표준 패턴). 재시도 없는 1회 open 은 앱 기동 fan-out(daemon_status + pane별 attach +
+    // event forwarder 동시 연결)에서 상시 "startup failed … os error 231"이 됐다(2026-07-10
+    // Windows 실사고 — 워크스페이스/pane 렌더 전체 불능). 그 외 오류(파이프 부재 = 데몬
+    // 다운 등)는 즉시 반환한다. 정책 상수는 CLI(cys)와 공용 단일 진실인 lib(cys::PIPE_BUSY_*).
     let name = socket.to_string_lossy().into_owned();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + cys::PIPE_BUSY_RETRY_DEADLINE;
     loop {
         match ClientOptions::new().open(&name) {
             Ok(s) => return Ok(Box::new(s) as Stream),
             Err(e)
-                if e.raw_os_error() == Some(ERROR_PIPE_BUSY)
+                if e.raw_os_error() == Some(cys::PIPE_BUSY_ERROR)
                     && std::time::Instant::now() < deadline =>
             {
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                tokio::time::sleep(cys::PIPE_BUSY_RETRY_INTERVAL).await;
             }
             Err(e) => return Err(format!("cannot connect to cysd pipe: {e}")),
         }

@@ -1065,33 +1065,21 @@ fn connect_raw() -> Result<std::os::unix::net::UnixStream, String> {
         .map_err(|e| format!("cannot connect to cysd at {}: {e}", path.display()))
 }
 
-/// Windows named pipe busy-retry 정책. ERROR_PIPE_BUSY(os error 231, "모든 파이프 인스턴스가
-/// 사용 중")는 "데몬 다운"이 아니라 "listening 인스턴스 순간 소진"(정상 혼잡)이다 — 서버는
-/// accept 직후 인스턴스를 재생성하므로 잠깐 기다리면 열린다. Microsoft 파이프 클라이언트
-/// 계약상 busy 는 대기·재시도가 필수(WaitNamedPipe 관례)이며, 재시도 없는 1회 open 은 멀티
-/// 노드(master·cso·worker·reviewer) 동시 RPC 에서 상시 실패한다(2026-07-10 Windows 실사고).
-/// 231을 데몬 다운으로 오판하면 connect()의 sibling cysd autostart 까지 헛발동한다.
-/// (Windows arm 은 이 호스트에서 컴파일/실행 불가 — 정책 상수를 모듈 최상위로 빼 비-Windows
-///  테스트가 '재시도 간격 non-zero·마감 > 간격' 불변을 박제한다.)
-#[cfg_attr(not(windows), allow(dead_code))]
-const PIPE_BUSY_ERROR: i32 = 231;
-#[cfg_attr(not(windows), allow(dead_code))]
-const PIPE_BUSY_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
-#[cfg_attr(not(windows), allow(dead_code))]
-const PIPE_BUSY_RETRY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
-
 /// ERROR_PIPE_BUSY(231) 한정 bounded 재시도로 named pipe 를 연다. 그 외 오류(파이프 부재
 /// ERROR_FILE_NOT_FOUND = 데몬 다운 등)는 즉시 반환 — autostart 판단은 호출부 몫.
+/// 231을 데몬 다운으로 오판하면 connect()의 sibling cysd autostart 까지 헛발동한다
+/// (2026-07-10 Windows 실사고). 정책 상수는 GUI(cys-app)와 공용 단일 진실인 lib(cys::PIPE_BUSY_*)
+/// — 근거·계약은 그 정의부 주석 참조. 비-Windows 테스트가 정책 불변을 박제한다.
 #[cfg(windows)]
 fn open_pipe_busy_retry(path: &std::path::Path) -> std::io::Result<std::fs::File> {
-    let deadline = std::time::Instant::now() + PIPE_BUSY_RETRY_DEADLINE;
+    let deadline = std::time::Instant::now() + cys::PIPE_BUSY_RETRY_DEADLINE;
     loop {
         match std::fs::OpenOptions::new().read(true).write(true).open(path) {
             Err(e)
-                if e.raw_os_error() == Some(PIPE_BUSY_ERROR)
+                if e.raw_os_error() == Some(cys::PIPE_BUSY_ERROR)
                     && std::time::Instant::now() < deadline =>
             {
-                std::thread::sleep(PIPE_BUSY_RETRY_INTERVAL);
+                std::thread::sleep(cys::PIPE_BUSY_RETRY_INTERVAL);
             }
             other => return other,
         }
@@ -8059,17 +8047,19 @@ mod tests {
     #[test]
     fn pipe_busy_retry_policy_is_bounded_and_nonzero() {
         assert_eq!(
-            PIPE_BUSY_ERROR, 231,
+            cys::PIPE_BUSY_ERROR, 231,
             "ERROR_PIPE_BUSY 는 Win32 상수 231 — 바뀌면 busy 분기가 영영 안 탄다"
         );
         assert!(
-            !PIPE_BUSY_RETRY_INTERVAL.is_zero(),
-            "busy-retry 간격이 0이면 100% CPU busy spin: {PIPE_BUSY_RETRY_INTERVAL:?}"
+            !cys::PIPE_BUSY_RETRY_INTERVAL.is_zero(),
+            "busy-retry 간격이 0이면 100% CPU busy spin: {:?}",
+            cys::PIPE_BUSY_RETRY_INTERVAL
         );
         assert!(
-            PIPE_BUSY_RETRY_DEADLINE > PIPE_BUSY_RETRY_INTERVAL,
-            "마감({PIPE_BUSY_RETRY_DEADLINE:?}) ≤ 간격({PIPE_BUSY_RETRY_INTERVAL:?})이면 \
-             사실상 재시도 없는 1회 open 으로 회귀한다"
+            cys::PIPE_BUSY_RETRY_DEADLINE > cys::PIPE_BUSY_RETRY_INTERVAL,
+            "마감({:?}) ≤ 간격({:?})이면 사실상 재시도 없는 1회 open 으로 회귀한다",
+            cys::PIPE_BUSY_RETRY_DEADLINE,
+            cys::PIPE_BUSY_RETRY_INTERVAL
         );
     }
 
