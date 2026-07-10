@@ -637,4 +637,7 @@ body.cc-glance #cc-view-feed .feed-item button { font-size: 16px; padding: 10px 
 
 /* 메타버스 오피스 탭 (cc-view-office) — 브리지 iframe 전면 채움 */
 #cc-view-office { display: flex; flex-direction: column; height: 100%; }
+/* hidden 속성 복원 — author display:flex가 UA hidden(display:none)을 덮어 타 탭에서도
+   오피스가 상시 렌더되던 leak 봉인(CORS 수정으로 3D가 실로드되며 가시화된 잠복 버그). */
+#cc-view-office[hidden] { display: none; }
 #cc-view-office iframe { flex: 1; width: 100%; min-height: 480px; border: 0; background: #05080f; }
