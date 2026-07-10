@@ -233,21 +233,38 @@ canvas.addEventListener('wheel', e=>{
   userZoom = Math.max(0.35, Math.min(2.2, userZoom + e.deltaY*0.0006));
   orbit.lastInput = performance.now();
 }, {passive:true});
-// 건물 fit 프레이밍 — 기본 카메라 거리·타깃을 뷰포트(창 크기)와 건물(층수)에 연동.
-// 창을 늘리면 건물도 함께 커지고 줄이면 함께 준다(요청 2026-07-10 · 세로 80%·가로 86% 채움).
+// 건물 fit 프레이밍 — 건물 8코너를 실제 투영해 "모든 코너가 화면 안(97%)에 들어가는
+// 최소 카메라 거리"를 이분탐색. 정의상 잘림 불가 + 최대 확대이며, 창 비율·층수·회전각
+// 어디서든 성립(각도 근사식은 내려다보는 시점의 상단 근접을 놓쳐 과확대·잘림 — 실사고).
+const _fitCam = new THREE.PerspectiveCamera(48, 1, 0.1, 220);
+const _fitV = new THREE.Vector3();
 function refitCam(){
   const topY = buildingTopY + 2.2;                       // 옥상 구조물·간판 여유
-  const t = Math.tan(camera.fov*Math.PI/360);
-  const dV = (topY/2)/(t*0.95);                          // 세로 95% 채움 (꽉 차게 — 오너 지시)
-  const halfW = Math.hypot(SLAB_W, SLAB_D)/2 + 1.2;      // 대각 시점 유효 반폭
-  const dH = halfW/(t*camera.aspect*0.95);               // 가로 제약
-  fitR = Math.max(8, Math.min(58, Math.max(dV, dH)));
-  baseTy = topY/2;                                        // 타깃 = 건물 중앙
+  const hw = SLAB_W/2 + 0.8, hd = SLAB_D/2 + 0.8, ty = topY/2;
+  baseTy = ty;                                            // 타깃 = 건물 중앙
+  _fitCam.fov = camera.fov; _fitCam.aspect = camera.aspect; _fitCam.updateProjectionMatrix();
+  const ok = (r)=>{
+    _fitCam.position.set(
+      Math.sin(orbit.theta)*Math.sin(orbit.phi)*r,
+      Math.cos(orbit.phi)*r + ty,
+      Math.cos(orbit.theta)*Math.sin(orbit.phi)*r);
+    _fitCam.lookAt(0, ty, 0); _fitCam.updateMatrixWorld();
+    for (let sx=-1; sx<=1; sx+=2) for (let sy=0; sy<=1; sy++) for (let sz=-1; sz<=1; sz+=2){
+      _fitV.set(sx*hw, sy*topY, sz*hd).project(_fitCam);
+      if (Math.abs(_fitV.x) > 0.97 || Math.abs(_fitV.y) > 0.97 || _fitV.z > 1) return false;
+    }
+    return true;
+  };
+  let lo = 8, hi = 58;
+  if (ok(lo)) { fitR = lo; return; }
+  for (let i=0; i<16; i++){ const m = (lo+hi)/2; if (ok(m)) hi = m; else lo = m; }
+  fitR = hi;
 }
 orbit.tx = 0; orbit.tz = 0;
 function updateCamera(dt){
   if (performance.now()-orbit.lastInput > 9000 && !camGoal.active) orbit.theta += 0.0005;
   if (camGoal.active && camGoal.until && performance.now() > camGoal.until) releaseCam();
+  if (!camGoal.active) refitCam(); // 회전(자동·드래그)·창 변화에 연속 재프레이밍 — lerp가 스무딩
   const gr = camGoal.active ? camGoal.r : fitR*userZoom;
   const gtx = camGoal.active ? camGoal.tx : 0;
   const gty = camGoal.active ? camGoal.ty : baseTy;
