@@ -74,7 +74,43 @@
   #tl-slider{flex:1}
   #tl-label{font-size:14px;color:#8ce7ff;min-width:90px;text-align:right}
   #panel .note{font-size:13px;color:#5f81a0;margin-top:6px;line-height:1.5}
+  /* ── 임베드(CC iframe) 컴팩트 모드 ──────────────────────────────────
+     위 절대 px는 대형 풀스크린 모니터 튜닝 — CC 패널 뷰포트(논리 ~1000×530)에선
+     HUD가 3D를 지배(티커 700px=폭 70%·chat bottom 252px=화면 중앙 점유·겹침).
+     iframe 감지(.embed — </style> 직후 스크립트) 시에만 축소·재배치. 브라우저
+     직접 열람(풀스크린)은 불변. 인라인 스타일 요소만 !important. */
+  .embed #hud-tl h1{font-size:15px;letter-spacing:.5px}
+  .embed #hud-tl .sub{font-size:10px;margin-top:2px}
+  .embed #hud-tl .stats{font-size:12px;margin-top:3px}
+  .embed #conn{width:9px;height:9px;margin-right:4px}
+  .embed #ticker{top:56px;width:min(38vw,340px);font-size:10px;line-height:1.45;
+    max-height:42vh;overflow:hidden}
+  .embed #ticker .h{font-size:11px;margin-bottom:3px}
+  .embed #legend{font-size:10px}
+  .embed #legend i{width:9px;height:9px;margin-right:5px}
+  .embed #legend div{margin-top:3px}
+  .embed #clock{font-size:12px}
+  .embed #paused{font-size:20px;letter-spacing:4px}
+  .embed #chat{width:min(44vw,400px);bottom:48px;padding:7px}
+  .embed #chat-log{height:80px;font-size:11px}
+  .embed #chat-target{font-size:10px;max-width:100px}
+  .embed #chat-input{font-size:11px;padding:5px}
+  .embed #chat button, .embed #btnbar button{font-size:10px;padding:4px 7px}
+  .embed #btnbar{bottom:8px}
+  .embed #timeline{bottom:6px;width:46%;padding:4px 9px}
+  .embed #timeline span{font-size:10px !important}
+  .embed #tl-label{font-size:10px;min-width:60px}
+  .embed #panel{width:min(88vw,380px);bottom:52px;padding:10px}
+  .embed #panel h2{font-size:14px}
+  .embed #panel .meta{font-size:11px}
+  .embed #panel textarea{font-size:12px;height:48px}
+  .embed #panel button{font-size:12px;padding:5px 10px}
+  .embed #panel .note{font-size:10px}
+  .embed #talk{width:280px;padding:8px}
+  .embed #talk input{font-size:11px}
 </style>
+<script>/* CC iframe 임베드 감지 — 첫 페인트 전 동기 적용(깜빡임 0) */
+if (window.self !== window.top) document.documentElement.classList.add("embed");</script>
 </head>
 <body>
 <canvas id="scene"></canvas>
