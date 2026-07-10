@@ -32,6 +32,10 @@ BIND = "127.0.0.1"
 PORT = int(os.environ.get("HUD_PORT", "8642"))  # 8765는 이 장비에서 선점 실측 → 회피
 FLEET_POLL_SECS = float(os.environ.get("HUD_POLL", "2.0"))
 CYS = os.environ.get("HUD_CYS_BIN", "cys")
+# Windows: 이 브리지는 콘솔 없는 cysd가 NO_WINDOW로 띄운다 — 콘솔 자식(cys.exe)을 그냥
+# 스폰하면 새 콘솔 창이 할당된다(상주 events 자식 = AppData 경로 제목의 검은 WT 탭 실사고
+# 2026-07-11). 이 파일의 모든 subprocess 호출에 **NOWIN 을 전개해 숨긴다. 타 OS 무동작.
+NOWIN = {"creationflags": 0x08000000} if os.name == "nt" else {}
 BACKLOG_FX_SECS = 90.0   # 이보다 오래된 이벤트는 상태만 반영, fx(연출) 억제 — 콜드스타트 폭주 방지
 CMD_MAX_LEN = 2000       # 조작 지시 텍스트 상한
 
@@ -530,7 +534,7 @@ def peek_surface(key, lines=12):
     """직원 응답 회수(#2 대화) — read-screen 단발 조회 (상시 폴링 아님·관측 전용)."""
     try:
         r = subprocess.run([CYS, "read-screen", "--surface", key, "--lines", "40"],
-                           capture_output=True, text=True, timeout=10)
+                           capture_output=True, text=True, timeout=10, **NOWIN)
         if r.returncode != 0:
             return None
         txt = ANSI_RE.sub("", r.stdout)
@@ -542,7 +546,7 @@ def peek_surface(key, lines=12):
 
 def run_json(args, timeout=10):
     try:
-        out = subprocess.run([CYS] + args, capture_output=True, text=True, timeout=timeout)
+        out = subprocess.run([CYS] + args, capture_output=True, text=True, timeout=timeout, **NOWIN)
         if out.returncode != 0:
             return None
         return json.loads(out.stdout)
@@ -571,7 +575,7 @@ def events_loop(world, hub, poke):
     while True:
         proc = subprocess.Popen(
             [CYS, "events", "--reconnect", "--cursor-file", cursor],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1, **NOWIN)
         try:
             for line in proc.stdout:
                 try:
@@ -684,12 +688,12 @@ class Handler(BaseHTTPRequestHandler):
         # 전달이라 shell 해석 표면 없음. 주입은 surface.input_injected 이벤트로
         # 데몬→브리지→SSE로 되돌아와 화면에 배달 연출로 확인된다(동시성).
         r1 = subprocess.run([CYS, "send", "--surface", key, "--", text],
-                            capture_output=True, text=True, timeout=10)
+                            capture_output=True, text=True, timeout=10, **NOWIN)
         if r1.returncode != 0:
             return self._cmd_result(502, False,
                                     "send_failed: " + (r1.stderr or "")[:120], cleaned)
         r2 = subprocess.run([CYS, "send-key", "--surface", key, "Return"],
-                            capture_output=True, text=True, timeout=10)
+                            capture_output=True, text=True, timeout=10, **NOWIN)
         if r2.returncode != 0:
             return self._cmd_result(502, False,
                                     "return_failed: " + (r2.stderr or "")[:120], cleaned)
