@@ -236,12 +236,12 @@ canvas.addEventListener('wheel', e=>{
 // 건물 fit 프레이밍 — 기본 카메라 거리·타깃을 뷰포트(창 크기)와 건물(층수)에 연동.
 // 창을 늘리면 건물도 함께 커지고 줄이면 함께 준다(요청 2026-07-10 · 세로 80%·가로 86% 채움).
 function refitCam(){
-  const topY = buildingTopY + 2.6;                       // 옥상 구조물·간판 여유
+  const topY = buildingTopY + 2.2;                       // 옥상 구조물·간판 여유
   const t = Math.tan(camera.fov*Math.PI/360);
-  const dV = (topY/2 + 1.0)/(t*0.80);                    // 세로 제약
-  const halfW = Math.hypot(SLAB_W, SLAB_D)/2 + 1.6;      // 대각 시점 유효 반폭
-  const dH = halfW/(t*camera.aspect*0.86);               // 가로 제약
-  fitR = Math.max(10, Math.min(58, Math.max(dV, dH)));
+  const dV = (topY/2)/(t*0.95);                          // 세로 95% 채움 (꽉 차게 — 오너 지시)
+  const halfW = Math.hypot(SLAB_W, SLAB_D)/2 + 1.2;      // 대각 시점 유효 반폭
+  const dH = halfW/(t*camera.aspect*0.95);               // 가로 제약
+  fitR = Math.max(8, Math.min(58, Math.max(dV, dH)));
   baseTy = topY/2;                                        // 타깃 = 건물 중앙
 }
 orbit.tx = 0; orbit.tz = 0;
