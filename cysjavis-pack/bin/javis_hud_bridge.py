@@ -614,6 +614,10 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Vary", "Origin")
         if cache:
             self.send_header("Cache-Control", "max-age=86400")
+        else:
+            # HTML·API는 항상 최신 강제 — WKWebView(iframe)가 무헤더 응답을 휴리스틱
+            # 캐시해 구버전 HUD가 재시작 후에도 잔존하는 것 차단(벤더 JS만 위 max-age).
+            self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
 
