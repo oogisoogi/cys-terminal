@@ -641,6 +641,9 @@ body.cc-glance #cc-view-feed .feed-item button { font-size: 16px; padding: 10px 
    panel을 flex column으로 전환해 잔여 높이를 header/tabs를 제외하고 iframe까지 flex로 전달한다.
    min-height:0 = flex 기본 min-height:auto 수축 함정 차단. 타 탭은 기존 스크롤 문서 모델 불변. */
 body.cc-office #cc-panel { display: flex; flex-direction: column; }
+/* 짝 규칙(Directive): display 명시가 [hidden](display:none·specificity 열세)을 무력화 —
+   오피스 탭에서 CC 닫기 버튼이 안 듣던 회귀의 원인. display를 명시하면 반드시 이 짝을 단다. */
+body.cc-office #cc-panel[hidden] { display: none; }
 body.cc-office #cc-body { flex: 1; min-height: 0; max-width: none; width: 100%; }
 body.cc-office #cc-view-office { flex: 1; min-height: 0; }
 #cc-view-office { display: flex; flex-direction: column; }
