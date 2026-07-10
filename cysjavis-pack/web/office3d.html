@@ -226,17 +226,29 @@ addEventListener('pointermove', e=>{
   orbit.phi = Math.max(0.12, Math.min(1.4, orbit.phi));
   px=e.clientX; py=e.clientY; orbit.lastInput=performance.now();
 });
-let userR = 30, baseTy = 6.4;
+let fitR = 30, userZoom = 1, baseTy = 6.4, buildingTopY = FLOOR_H; // buildWorld가 옥상 y 갱신
 const camGoal = { active:false, r:30, tx:0, ty:6.4, tz:0, until:0, kind:null };
 canvas.addEventListener('wheel', e=>{
-  userR = Math.max(9, Math.min(55, userR + e.deltaY*0.016));
+  // 휠 줌 = fit 기준 대비 배율 — 리사이즈·층수 변화의 refit과 공존(절대 r 조작이던 구 userR 대체).
+  userZoom = Math.max(0.35, Math.min(2.2, userZoom + e.deltaY*0.0006));
   orbit.lastInput = performance.now();
 }, {passive:true});
+// 건물 fit 프레이밍 — 기본 카메라 거리·타깃을 뷰포트(창 크기)와 건물(층수)에 연동.
+// 창을 늘리면 건물도 함께 커지고 줄이면 함께 준다(요청 2026-07-10 · 세로 80%·가로 86% 채움).
+function refitCam(){
+  const topY = buildingTopY + 2.6;                       // 옥상 구조물·간판 여유
+  const t = Math.tan(camera.fov*Math.PI/360);
+  const dV = (topY/2 + 1.0)/(t*0.80);                    // 세로 제약
+  const halfW = Math.hypot(SLAB_W, SLAB_D)/2 + 1.6;      // 대각 시점 유효 반폭
+  const dH = halfW/(t*camera.aspect*0.86);               // 가로 제약
+  fitR = Math.max(10, Math.min(58, Math.max(dV, dH)));
+  baseTy = topY/2;                                        // 타깃 = 건물 중앙
+}
 orbit.tx = 0; orbit.tz = 0;
 function updateCamera(dt){
   if (performance.now()-orbit.lastInput > 9000 && !camGoal.active) orbit.theta += 0.0005;
   if (camGoal.active && camGoal.until && performance.now() > camGoal.until) releaseCam();
-  const gr = camGoal.active ? camGoal.r : userR;
+  const gr = camGoal.active ? camGoal.r : fitR*userZoom;
   const gtx = camGoal.active ? camGoal.tx : 0;
   const gty = camGoal.active ? camGoal.ty : baseTy;
   const gtz = camGoal.active ? camGoal.tz : 0;
@@ -265,6 +277,7 @@ addEventListener('keydown', e=>{ if (e.key === 'Escape') releaseCam(); });
 function resize(){
   renderer.setSize(innerWidth, innerHeight);
   camera.aspect = innerWidth/innerHeight; camera.updateProjectionMatrix();
+  refitCam(); // 창 크기 변화 → 건물 프레이밍 즉시 재계산(연동의 핵심)
 }
 addEventListener('resize', resize); resize();
 
@@ -869,6 +882,7 @@ function buildWorld(w){
   const roofY = (Math.max(...deps.map(d=>d.floor), 1) + 1) * FLOOR_H;
   FLOORS = [0, ...deps.map(d=>d.floor*FLOOR_H), roofY].sort((x,y)=>x-y)
     .filter((v,i,arr)=>i===0 || v-arr[i-1] > 0.3);
+  buildingTopY = roofY; refitCam();          // 층수 변화 → 건물 프레이밍 재계산(창 크기 연동과 동일 경로)
   FLOOR_NAMES.clear();
   FLOOR_NAMES.set(0, '로비');
   deps.forEach(d=>FLOOR_NAMES.set(Math.round(d.floor*FLOOR_H*10)/10, d.id));
