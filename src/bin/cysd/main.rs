@@ -122,6 +122,8 @@ async fn main() {
     schedule::spawn_scheduler(Arc::clone(&daemon));
     usage::spawn_usage_collector(Arc::clone(&daemon));
     usage::spawn_agy_collector(Arc::clone(&daemon));
+    // CC "🏢 오피스" 탭의 상시 가용성 — 메타버스 오피스 브리지(127.0.0.1:8642) 자동기동.
+    spawn_office_bridge(crate::state::state_dir(&socket_path));
     // C0: 채널 부팅 재조정(고아 선-kill→새 토큰 재스폰) — 이벤트버스·state 준비 후(§2.1-2).
     // 불사조 복원 프로토콜의 "채널 재조정" 단계. 그 다음 주기 sweep(재배달·타임아웃·재스폰) 등록.
     channels::reconcile(&daemon);
@@ -410,6 +412,80 @@ fn decide_auto_restore(
         ],
         env,
     }
+}
+
+/// 메타버스 오피스 브리지(팩 javis_hud_bridge.py · 127.0.0.1 한정) 자동기동 — CC "🏢 오피스" 탭이
+/// 수동 python3 기동 없이 항상 열리게 한다. 단일 인스턴스 가드: HUD 포트가 이미 listen 중이면
+/// (선행 cysd·수동 기동) 스폰하지 않는다 — 동일 서버 누적이 구조적으로 0(자원 거버넌스 '누적·미종료' 차단).
+/// 사망·부재는 60s 주기 재확인이 이어받고(KeepAlive), cysd 정상 종료 시 kill_on_drop이 자식을 동반 정리한다.
+/// CYS_NO_OFFICE_BRIDGE=1 opt-out · 팩에 브리지 부재(구팩)면 조용히 skip.
+/// python 해석·PATH·cys 주입은 auto-restore(★B3)와 동일 SOT(bundled_python3·runtime_prefixed_path).
+fn spawn_office_bridge(state_dir: std::path::PathBuf) {
+    if cys::env_compat("CYS_NO_OFFICE_BRIDGE").map(|v| v == "1").unwrap_or(false) {
+        eprintln!("[cysd] office-bridge skipped (CYS_NO_OFFICE_BRIDGE=1)");
+        return;
+    }
+    let script = cys::pack::pack_dir().join("bin").join("javis_hud_bridge.py");
+    if !script.is_file() {
+        return; // 구팩(브리지 미배포) — 다음 팩 업데이트가 채운다.
+    }
+    let port: u16 = std::env::var("HUD_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8642);
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+    tokio::spawn(async move {
+        let exe_dir_ref = exe_dir.as_deref().unwrap_or_else(|| std::path::Path::new("."));
+        let python = bundled_python3(exe_dir_ref).unwrap_or_else(|| "python3".to_string());
+        let log_path = state_dir.join("office-bridge.log");
+        loop {
+            // 단일 인스턴스 가드 — 이미 서비스 중(선행 데몬·수동 기동)이면 스폰하지 않고 재확인만.
+            if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                continue;
+            }
+            let mut cmd = tokio::process::Command::new(&python);
+            cmd.arg(&script)
+                // 브리지의 cys 호출이 라이벌 데몬을 autostart하는 재귀 차단(auto-restore와 동일 계약).
+                .env("CYS_NO_AUTOSTART", "1")
+                // 런타임 상태는 팩 트리 밖으로(팩 본체 오염 0 — 팩 편입 계약 HUD_STATE_DIR).
+                .env("HUD_STATE_DIR", state_dir.join("office-bridge"))
+                .stdin(std::process::Stdio::null())
+                .kill_on_drop(true);
+            if let Some(newp) =
+                cys::runtime_prefixed_path(exe_dir_ref, &std::env::var("PATH").unwrap_or_default())
+            {
+                cmd.env("PATH", newp);
+            }
+            let cys_name = if cfg!(windows) { "cys.exe" } else { "cys" };
+            let cys_path = exe_dir_ref.join(cys_name);
+            if cys_path.is_file() {
+                cmd.env("HUD_CYS_BIN", &cys_path); // 사이드카 cys 절대경로(PHOENIX_CYS 주입과 동일 패턴)
+            }
+            match std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+                Ok(log) => {
+                    if let Ok(err) = log.try_clone() {
+                        cmd.stderr(err);
+                    }
+                    cmd.stdout(log);
+                }
+                Err(_) => {
+                    cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+                }
+            }
+            match cmd.spawn() {
+                Ok(mut child) => {
+                    eprintln!("[cysd] office-bridge spawned (127.0.0.1:{port})");
+                    let _ = child.wait().await; // 사망 감지 → 아래 백오프 후 루프가 재스폰 판단
+                    eprintln!("[cysd] office-bridge exited — 60s 후 재확인");
+                }
+                Err(e) => eprintln!("[cysd] office-bridge spawn failed: {e}"),
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        }
+    });
 }
 
 /// ★B3: 동봉 runtime python3 절대경로(exe 옆 번들). runtime_bin_dirs(pane 자식과 동일 SOT)에서 python3 실행파일을

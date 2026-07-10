@@ -140,7 +140,7 @@ let ccHwTimer: number | null = null;
 let ccClockTimer: number | null = null;
 let ccUptimeBase = 0;
 let ccUptimeFetchedAt = 0;
-let ccTab: "live" | "eff" | "skills" | "sessions" | "weekly" | "learn" | "board" | "tasks" | "feed" | "office" = "live";
+let ccTab: "live" | "eff" | "skills" | "sessions" | "weekly" | "learn" | "board" | "tasks" | "feed" | "office" = "office";
 let ccEffWindow = "today";
 let ccSkillsWindow = "today";
 let ccSessionsWindow = "7d";
@@ -226,6 +226,9 @@ function setCcOpen(open: boolean) {
   document.getElementById("cc-panel")!.hidden = !open;
   if (open) {
     applyCcDensity(ccDensity); // 저장된 밀도 모드 복원(class·버튼 라벨)
+    // 기본 탭(오피스) 정합: index.html 초기 hidden/active와 ccTab 상태를 열 때마다 동기화.
+    // glance 밀도는 applyCcDensity→applyGlanceFace가 이미 면(live/tasks)을 강제했으므로 건드리지 않는다.
+    if (ccDensity !== "glance") setCcTab(ccTab);
     refreshControlCenter();
     refreshHw();
     tickCc();
@@ -377,7 +380,9 @@ async function openOfficeView() {
   const hint = document.getElementById("cc-office-hint");
   if (!frame || !hint) return;
   try {
-    await fetch(OFFICE_URL + "world", { signal: AbortSignal.timeout(1500) });
+    // no-cors: 도달성 프로브만(응답은 opaque). tauri://localhost → http://127.0.0.1 은
+    // 교차출처라 CORS-fetch는 ACAO 없이 reject되어 브리지가 살아있어도 hint에 갇혔다(근본 수리).
+    await fetch(OFFICE_URL + "world", { mode: "no-cors", signal: AbortSignal.timeout(1500) });
     hint.hidden = true;
     if (!frame.src) frame.src = OFFICE_URL;
   } catch {

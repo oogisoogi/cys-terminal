@@ -147,6 +147,20 @@ def allowed_origins(port):
             "tauri://localhost", "http://tauri.localhost"}
 
 
+def cors_header_for(method, origin, origins):
+    """GET 읽기 응답에 붙일 CORS 허용 origin 판정 (순수 함수 — 자기공격 테스트 대상).
+
+    CC(tauri webview·교차출처)의 /world 프로브 fetch가 응답을 읽을 수 있게
+    allowlist(조작 게이트와 동일 SOT=allowed_origins) 정확 일치 + GET 한정으로만
+    Access-Control-Allow-Origin을 에코한다. 그 외(POST·미지 origin·"null"·부재)는
+    전부 None(무헤더 = deny-by-default) — 원격 웹페이지의 localhost 읽기 차단 불변.
+    POST /command 방어(커스텀 헤더=preflight 강제·OPTIONS 무조건 deny)도 불변.
+    """
+    if method == "GET" and origin is not None and origin in origins:
+        return origin
+    return None
+
+
 def gate_command(body, token_header, expected_token, origin, origins, known_keys):
     """조작 요청 판정 (순수 함수 — 자기공격 테스트 대상).
 
@@ -594,6 +608,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        allow = cors_header_for(self.command, self.headers.get("Origin"), self.origins)
+        if allow:
+            self.send_header("Access-Control-Allow-Origin", allow)
+            self.send_header("Vary", "Origin")
         if cache:
             self.send_header("Cache-Control", "max-age=86400")
         self.end_headers()
