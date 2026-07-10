@@ -1428,18 +1428,28 @@ async fn stop_dept_daemon_by_socket(socket: String) -> Result<(), String> {
     Ok(())
 }
 
+/// A안(2026-07-11 오너 승인): 교대·설치 게이트가 세는 "지킬 세션" = **role 또는 agent 가 붙은
+/// 살아있는 surface**만. 맨 셸 pane(role·agent 모두 없음)은 drain+restore 가 되살리므로 무손실
+/// 자동 교대를 막지 않는다 — 종전 '살아있는 pane 전부' 기준은 기본 pane 1개만으로 자동 교대가
+/// 영영 보류돼, 사용자가 taskkill 로 데몬을 죽여야 업데이트되던 실사고(2026-07-10 Windows)의 근원.
+/// 한계(명시): 맨 pane에서 role 미claim 프로그램을 수동 실행 중이면 그 포그라운드 상태는 교대 시
+/// 복원되지 않는다(pane 자체는 복원됨).
+fn session_blocks_rotation(s: &Value) -> bool {
+    if s["exited"].as_bool().unwrap_or(true) {
+        return false;
+    }
+    let has = |k: &str| s[k].as_str().map(|v| !v.is_empty()).unwrap_or(false);
+    has("role") || has("agent")
+}
+
 /// 부서 소켓의 살아있는 세션 수 — live_session_count(메인 데몬 전용·기본 소켓 하드코딩)의 부서판.
-/// rotate_dept_daemon force 가드용. 판정 규칙은 live_session_count와 동일(exited!=true=live)하되 대상만
-/// 부서 소켓으로 파라미터화(rpc_on). 조회 실패는 호출부에서 0으로 접어 보수적으로 처리.
+/// rotate_dept_daemon force 가드용. 판정 규칙은 live_session_count와 동일(session_blocks_rotation)하되
+/// 대상만 부서 소켓으로 파라미터화(rpc_on). 조회 실패는 호출부에서 0으로 접어 보수적으로 처리.
 async fn dept_live_session_count(sock: &std::path::Path) -> Result<u64, String> {
     let r = rpc_on(sock, "surface.list", json!({})).await?;
     let n = r["surfaces"]
         .as_array()
-        .map(|a| {
-            a.iter()
-                .filter(|s| !s["exited"].as_bool().unwrap_or(true))
-                .count() as u64
-        })
+        .map(|a| a.iter().filter(|s| session_blocks_rotation(s)).count() as u64)
         .unwrap_or(0);
     Ok(n)
 }
@@ -1613,11 +1623,7 @@ async fn live_session_count() -> Result<u64, String> {
     let r = rpc("surface.list", json!({})).await?;
     let n = r["surfaces"]
         .as_array()
-        .map(|a| {
-            a.iter()
-                .filter(|s| !s["exited"].as_bool().unwrap_or(true))
-                .count() as u64
-        })
+        .map(|a| a.iter().filter(|s| session_blocks_rotation(s)).count() as u64)
         .unwrap_or(0);
     Ok(n)
 }
@@ -1971,6 +1977,23 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A안 회귀 박제(2026-07-11 오너 승인): 교대 게이트는 role/agent 붙은 세션만 지킨다.
+    /// 맨 셸 pane(role·agent 없음)이 다시 게이트에 잡히면 기본 pane 1개만으로 자동 교대가
+    /// 영영 보류돼 "taskkill 없인 데몬이 안 바뀐다" 실사고가 재발한다 — 그 회귀를 여기서 잡는다.
+    #[test]
+    fn bare_pane_does_not_block_rotation_but_role_or_agent_does() {
+        let bare = json!({"exited": false, "role": null, "agent": null});
+        let exited_agent = json!({"exited": true, "role": "worker", "agent": "claude"});
+        let roled = json!({"exited": false, "role": "master", "agent": null});
+        let agented = json!({"exited": false, "role": null, "agent": "claude"});
+        let empty_strings = json!({"exited": false, "role": "", "agent": ""});
+        assert!(!session_blocks_rotation(&bare), "맨 pane은 자동 교대를 막지 않는다");
+        assert!(!session_blocks_rotation(&exited_agent), "죽은 세션은 세지 않는다");
+        assert!(session_blocks_rotation(&roled), "role claim 세션은 보호");
+        assert!(session_blocks_rotation(&agented), "agent 세션은 보호");
+        assert!(!session_blocks_rotation(&empty_strings), "빈 문자열은 미부착으로 취급");
+    }
 
     // HUD-2: open_url 화이트리스트 — https·허용 도메인만 통과, 위장 host(userinfo/서브도메인 사칭) 차단.
     #[test]
