@@ -644,7 +644,8 @@ body.cc-office #cc-panel { display: flex; flex-direction: column; }
 /* 짝 규칙(Directive): display 명시가 [hidden](display:none·specificity 열세)을 무력화 —
    오피스 탭에서 CC 닫기 버튼이 안 듣던 회귀의 원인. display를 명시하면 반드시 이 짝을 단다. */
 body.cc-office #cc-panel[hidden] { display: none; }
-body.cc-office #cc-body { flex: 1; min-height: 0; max-width: none; width: 100%; }
+/* zoom:1 — 오피스 3D는 fit 카메라가 창에 이미 연동. 자동 배율(--panel-zoom×창비율)이 겹치면 이중 스케일. */
+body.cc-office #cc-body { flex: 1; min-height: 0; max-width: none; width: 100%; zoom: 1; }
 body.cc-office #cc-view-office { flex: 1; min-height: 0; }
 #cc-view-office { display: flex; flex-direction: column; }
 /* hidden 속성 복원 — author display:flex가 UA hidden(display:none)을 덮어 타 탭에서도
