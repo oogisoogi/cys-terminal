@@ -226,7 +226,9 @@ body.ws-reordering { cursor: grabbing; -webkit-user-select: none; user-select: n
   font-family: -apple-system, "Pretendard Variable", system-ui, sans-serif;
 }
 #cc-panel[hidden] { display: none; }
-/* Control Center 본문 zoom (Cmd +/-/0) — host #cc-panel(fixed)·사이드바 제외, #cc-body만 확대 */
+/* Control Center 본문 zoom — 합성값: 수동(Cmd +/-/0) × 창비율 자동 배율(산식=ccscale.ts).
+   host #cc-panel(fixed)·사이드바·헤더·탭 스트립 제외, #cc-body만 확대.
+   오피스 탭은 body.cc-office #cc-body zoom:1 고정(하단 짝 규칙) — 3D는 fit 카메라가 창 연동의 진실. */
 #cc-body { zoom: var(--panel-zoom, 1); }
 #cc-header {
   position: sticky; top: 0; z-index: 2; display: flex; align-items: center; gap: 12px;

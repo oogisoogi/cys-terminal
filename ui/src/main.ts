@@ -9,6 +9,7 @@ import { shellQuote, shellQuoteJoin } from "./shellquote";
 import { DEFAULT_BG, readableForeground } from "./theme";
 import { reorderWorkspace, reorderGroup } from "./reorder";
 import { deptPlaceholderLabel } from "./deptlabel";
+import { ccEffectiveZoom } from "./ccscale";
 
 declare global {
   interface Window {
@@ -1246,13 +1247,13 @@ function applyZoom(delta: number | null) {
 // sticky 헤더·탭은 1.0x 유지). 사이드바(ft/feed)는 터미널 작업공간 폭이라 zoom 비대상(터미널 fit 회귀 방지).
 let panelZoom = Math.min(2, Math.max(0.6, Number(localStorage.getItem("cys-panel-zoom")) || 1)); // NaN·범위밖 방어
 // CC 자동 배율 — 창 크기에 CC 본문을 비례 연동(오너 요청 2026-07-12: 모든 버튼·섹션이 창과 함께 커지고 작아지게).
-// 기준창(820×760)=1.0x, 가로·세로 중 작은 비율 채택(어느 축을 줄여도 함께 줄어듦). 수동 Cmd +/-는 곱으로 합성.
-// 오피스 탭은 CSS에서 zoom:1 고정 — 3D는 fit 카메라가 이미 창에 연동되므로 이중 스케일 금지.
-const CC_SCALE_BASE_W = 820, CC_SCALE_BASE_H = 760;
-const ccAutoScale = (): number =>
-  Math.min(2.2, Math.max(0.7, Math.min(window.innerWidth / CC_SCALE_BASE_W, window.innerHeight / CC_SCALE_BASE_H)));
+// 배율 산식·클램프·합성 상한은 ccscale.ts(순수 로직·단위테스트 대상). 수동 Cmd +/-는 곱으로 합성.
+// 오피스 탭은 CSS에서 zoom:1 고정 — 3D는 fit 카메라가 이미 창에 연동되므로 이중 스케일 금지(수동 zoom도 무효, 정책 확정 2026-07-12).
 function applyPanelZoomVar() {
-  document.documentElement.style.setProperty("--panel-zoom", (panelZoom * ccAutoScale()).toFixed(3));
+  document.documentElement.style.setProperty(
+    "--panel-zoom",
+    ccEffectiveZoom(panelZoom, window.innerWidth, window.innerHeight).toFixed(3),
+  );
 }
 applyPanelZoomVar(); // 마운트 시 저장된 배율 복원
 let panelZoomResizeTimer: number | undefined;
