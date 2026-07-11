@@ -1597,6 +1597,13 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
   // xterm이 일반 키로 처리하면 자모가 분리 입력된다 — 조합 완성분만 onData로 흐르게 차단.
   term.attachCustomKeyEventHandler((e) => {
     if (e.isComposing || e.keyCode === 229) return false;
+    // ★Shift+Enter → 줄바꿈(LF) 전송·submit(CR) 차단. claude CLI 등 멀티라인 입력용.
+    //   xterm 기본은 Enter·Shift+Enter를 모두 \r로 보내 Shift+Enter도 즉시 실행돼 버린다(회귀 증상).
+    //   keydown에서만 처리(keypress/keyup 중복 방지). sendRaw는 아래 정의(클로저·이벤트 시점 실행이라 안전).
+    if (e.type === "keydown" && e.key === "Enter" && e.shiftKey) {
+      sendRaw("\n");
+      return false;
+    }
     // ★붙여넣기(F2): Ctrl/Cmd+V·Ctrl+Shift+V 를 xterm이 \x16(literal)로 삼키지 않게 false 반환 →
     // 브라우저 네이티브 paste 이벤트가 발화되고 아래 paste 리스너가 클립보드를 PTY로 보낸다.
     // (WebView2에서 xterm 기본 붙여넣기가 안 먹던 문제 — permission 불요의 clipboardData 경로.)
