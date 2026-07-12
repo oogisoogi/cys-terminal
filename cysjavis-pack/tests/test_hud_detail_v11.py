@@ -393,9 +393,9 @@ class VerdictFx(unittest.TestCase):
 class HeatBuckets(unittest.TestCase):
     def test_ratio_arithmetic(self):
         w = make_world({"worker": "surface:1"})
-        # active 판정을 강제하기 위해 최근 hook 주입
+        # active 판정을 강제하기 위해 최근 hook 주입 (P2-3: hooks 는 정식 키로 키잉 — 미주석 시 bare)
         now = time.time()
-        w.hooks[1].append(now)
+        w.hooks["surface:1"].append(now)
         for _ in range(3):
             w.accumulate_heat(now)
         hour = time.localtime(now).tm_hour
@@ -446,7 +446,7 @@ class TopFrame(unittest.TestCase):
         # ③ prev_top 락 내부화 회귀 — board도 1회만·변경 시 재방출
         w = make_world({"worker": "surface:1"})
         now = time.time()
-        w.hooks[1].append(now)
+        w.hooks["surface:1"].append(now)   # P2-3: hooks 정식 키 키잉(미주석 시 bare)
         w.accumulate_heat(now)
         self.assertIsNotNone(w.top_frame("board", now=now))
         self.assertIsNone(w.top_frame("board", now=now))          # 동일 → None
