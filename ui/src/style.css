@@ -71,6 +71,9 @@ body.wsbar-resizing { cursor: col-resize; -webkit-user-select: none; user-select
   font-size: 11px; font-weight: 700; letter-spacing: .04em;
   color: #6e7681; text-transform: uppercase;
 }
+/* 제목이 축소를 흡수(ellipsis) — 좁은 폭에서 헤더가 2단으로 랩되지 않게(폭 불변식: 헤더는 항상 1줄) */
+#wsbar-head > span { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#wsbar-head button { flex: none; }
 #ws-tabs {
   flex: 1; display: flex; flex-direction: column; gap: 2px;
   overflow-y: auto; padding: 2px 8px 10px;

@@ -2,7 +2,7 @@
 // 오너 요청 2026-07-12: ①사이드바 폭을 마우스 드래그로 조절 ②글자 크기 조절 — 둘 다 localStorage 영속.
 // 폭 하한은 헤더 버튼(＋부서/＋)이 잘리지 않는 선, 상한은 터미널 작업공간 잠식 방지.
 
-export const WSBAR_W_MIN = 140;
+export const WSBAR_W_MIN = 176; // 140이면 헤더(제목+버튼4)가 2단 랩(높이 33→70px) — 랩 없는 실측 하한(성찰 후속 2026-07-12)
 export const WSBAR_W_MAX = 520;
 export const WSBAR_W_DEFAULT = 216;
 export const WSBAR_FONT_MIN = 0.8;

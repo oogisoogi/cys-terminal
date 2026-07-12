@@ -57,6 +57,17 @@ def main() -> int:
             check(abs(w0 - 216) < 2, f"기본폭 216px (got {w0})")
             check(pg.evaluate("!!document.getElementById('wsbar-drag')"), "드래그 핸들 존재")
 
+            # 최소폭 경계: 크게 왼쪽으로 드래그 → 하한(176) 클램프 + 헤더 1줄 유지(≤40px — 140px 시절 2단 랩 회귀 방지)
+            hb0 = pg.evaluate("(() => { const r = document.getElementById('wsbar-drag').getBoundingClientRect(); return {x: r.x + r.width/2, y: r.y + 200}; })()")
+            pg.mouse.move(hb0["x"], hb0["y"]); pg.mouse.down()
+            pg.mouse.move(hb0["x"] - 300, hb0["y"], steps=6); pg.mouse.up()
+            pg.wait_for_timeout(200)
+            wmin = pg.evaluate("document.getElementById('wsbar').getBoundingClientRect().width")
+            hh = pg.evaluate("document.getElementById('wsbar-head').getBoundingClientRect().height")
+            check(abs(wmin - 176) < 2, f"최소폭 클램프 176px (got {wmin})")
+            check(hh <= 40, f"최소폭에서 헤더 1줄 유지 ≤40px (got {hh})")
+            pg.dblclick("#wsbar-drag"); pg.wait_for_timeout(150)  # 기본폭 복귀 후 본 시나리오 진행
+
             # 드래그: 216 → +140
             hb = pg.evaluate("(() => { const r = document.getElementById('wsbar-drag').getBoundingClientRect(); return {x: r.x + r.width/2, y: r.y + 200}; })()")
             pg.mouse.move(hb["x"], hb["y"]); pg.mouse.down()
