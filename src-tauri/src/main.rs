@@ -921,9 +921,11 @@ fn spawn_org_restore(app: AppHandle) {
             );
             return;
         }
+        // hq_ok를 done에 실어 부서가 있을 때도 본부(HQ) 복원 실패가 묻히지 않게 한다(침묵 실패 차단 —
+        // 이 작업의 목적). error 페이즈는 '본부 실패 + 부서 없음' 전면 실패만 담당(위).
         let _ = app.emit(
             "restore-progress",
-            json!({"phase": "done", "ok": ok, "fail": fail}),
+            json!({"phase": "done", "hq_ok": hq_ok, "ok": ok, "fail": fail}),
         );
     });
 }
