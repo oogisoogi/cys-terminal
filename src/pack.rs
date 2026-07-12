@@ -1952,6 +1952,12 @@ mod tests {
         let keep = FileAction::Keep { adopt_hash: false, new_pending: false };
         assert_eq!(decide_file_action("memory/MEMORY.md", embed, true, Some("LIVE-STATE"),
                        Some(content_hash(embed).as_str()), false), keep, "① 수정본 원복 금지");
+        // ①-w(Windows 최다 발생 실측 2026-07-12): 팩 python 도구가 상태 파일을 텍스트 모드
+        // (open("w")·newline 미지정)로 쓰면 Windows 에서 LF→CRLF 자동 변환 — 논리 내용이 같아도
+        // 바이트가 달라져 구버전에서는 매 스윕 '수정됨'→치유(원복)였다. seed-once 는 내용·해시
+        // 비교 **이전**의 조기 반환이라 개행 변형에도 불가침이다.
+        assert_eq!(decide_file_action("memory/MEMORY.md", "A\nB\n", true, Some("A\r\nB\r\n"),
+                       Some(content_hash("A\nB\n").as_str()), false), keep, "①-w CRLF 재직렬화 원복 금지");
         assert_eq!(decide_file_action("round/SESSION_STATE.md", embed, true, Some("LIVE-STATE"),
                        None, true), keep, "② force 여도 불가침");
         assert_eq!(decide_file_action("round/RECOVERY.md", embed, true, None,

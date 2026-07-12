@@ -40,6 +40,21 @@ seed-once는 "지금 존재하는 파일"을 보호한다. **구버전에서 이
 5. 복원 후에는 seed-once 보호로 다시 원복되지 않는다 — 재발 확인:
    `python3 ~/.cys/pack/bin/javis_preflight.py --json | grep C62`.
 
+## Windows 사용자 특이사항 (이 계열 최다 발생 플랫폼)
+
+Windows에서 이 사고가 가장 잦았던 기전(실측): 팩 python 도구(javis_memory.py·
+javis_memory_inject.py 등)가 상태 파일을 텍스트 모드(`open("w")`, newline 미지정)로
+쓰므로 Windows에서 LF→CRLF 자동 변환된다. **내용이 논리적으로 같아도 바이트가
+달라져**, 구버전에서는 노드가 색인을 재직렬화만 해도 매 스윕 '수정됨' 판정 →
+치유(원복)됐다. 게다가 Windows는 hook 경로 계열 결손으로 부트 ⓪ `--fix`의 전량 스윕
+트리거 빈도 자체가 높아 두 요인이 곱해졌다.
+
+seed-once는 내용·해시 비교 **이전**에 보호하므로 CRLF 변형에도 불가침이다 —
+Windows의 상태·기억 원복도 이 릴리스로 봉인된다(회귀 핀: pack.rs
+`is_seed_once_classification_and_behavior` ①-w). 반면 `bin/*` 등 system 파일이 CRLF로
+변형되면 여전히 치유되며 이는 올바른 방향이다 — bash/python 스크립트는 LF가 정답이라
+치유가 곧 자가 교정이다.
+
 ## bin/ 코드 수정본(.user)에 대하여
 
 `bin/*.py`는 여전히 system 등급이다(배포 무결성 anti-skew — 의도된 설계). 라이브에서
