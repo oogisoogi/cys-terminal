@@ -569,7 +569,7 @@ fn spawn_auto_restore(
                         PhoenixResolve::Ready { script, cleanup } => {
                             let mut run_args = vec![script.to_string_lossy().into_owned()];
                             run_args.extend(tail);
-                            loop_auto_restore(&program, &run_args, &env, &log_path);
+                            loop_auto_restore(&daemon, &program, &run_args, &env, &log_path);
                             // temp 누수 0: 추출본은 실행 후 정리(디스크 폴백은 cleanup=None).
                             if let Some(dir) = cleanup {
                                 let _ = std::fs::remove_dir_all(&dir);
@@ -785,17 +785,19 @@ fn autorestore_retry_delay() -> std::time::Duration {
 /// auto-restore 자식을 실행하고 exit 계약에 따라 처리한다. 비0(단 5·6 제외)은 delay 후 정확히 1회 재시도한다
 /// — 재시도의 멱등성은 phoenix 의 lease·liveness 재산정에 맡긴다(수동 복원이 이미 끝났으면 재시도는 NOOP·중복 스폰 0).
 fn loop_auto_restore(
+    daemon: &std::sync::Arc<Daemon>,
     program: &str,
     args: &[String],
     env: &[(String, String)],
     log_path: &std::path::Path,
 ) {
+    let daemon = daemon.clone();
     let program = program.to_string();
     let args = args.to_vec();
     let env = env.to_vec();
     let log_path = log_path.to_path_buf();
     loop_auto_restore_with(
-        |_attempt| run_auto_restore_once(&program, &args, &env, &log_path),
+        |_attempt| run_auto_restore_once(&daemon, &program, &args, &env, &log_path),
         autorestore_retry_delay(),
     );
 }
@@ -906,8 +908,15 @@ fn guard_restore_panic<F: FnOnce()>(log_path: &std::path::Path, body: F) -> bool
     }
 }
 
-/// 자식 1회 실행 — stdout/stderr 를 phoenix-restore.log(폴백 포함)에 append. exit code 반환(None=스폰 실패).
+/// 자식 1회 실행 — stdout/stderr 를 phoenix-restore.log(폴백 포함)에 append. exit code 반환(None=스폰 실패/대기 실패).
+/// ★T6: status()→spawn()+wait() 전환. spawn 직후 무블로킹 최우선으로 pid+start_time 을 확보해,
+/// Some(start_time)일 때만 RestoreRootGuard 로 restore_roots 에 등록한다(자식이 살아있는 동안만
+/// authoritative 면제 창을 연다·게이트=handlers.rs). 관측 실패(None)면 bounded retry 후에도 None 이면
+/// **등록 없이** 진행하고(면제 없음 — phoenix 2회 재시도 경로가 커버) 자식은 반드시 wait/reap 한다(좀비 0).
+/// guard 는 함수 종료(정상·early return·panic unwind)에서 Drop 되어 등록을 해제한다. exit 매핑은
+/// 기존 status().code() 계약과 동형(0/5/6/비0/None).
 fn run_auto_restore_once(
+    daemon: &std::sync::Arc<Daemon>,
     program: &str,
     args: &[String],
     env: &[(String, String)],
@@ -944,10 +953,32 @@ fn run_auto_restore_once(
                 .stderr(std::process::Stdio::inherit());
         }
     }
-    match cmd.status() {
-        Ok(s) => Some(s.code().unwrap_or(-1)),
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
         Err(e) => {
             eprintln!("[cysd] auto-restore spawn failed: {e}");
+            return None;
+        }
+    };
+    let pid = child.id();
+    // spawn 직후 다른 blocking 없이 최우선으로 start_time 확보(publication race 최소화·C2).
+    // bounded retry(3회) — 갓 스폰된 자식이 프로세스표에 반영될 짧은 창을 흡수한다.
+    let start_time = {
+        let mut st = None;
+        for _ in 0..3 {
+            if let Some(s) = crate::state::peer_start_time(pid) {
+                st = Some(s);
+                break;
+            }
+        }
+        st
+    };
+    // Some(start_time)일 때만 등록 — None 은 restore_roots 에 저장 금지(면제 없음·fail-safe).
+    let _guard = start_time.map(|s| crate::state::RestoreRootGuard::new(daemon.clone(), pid, s));
+    match child.wait() {
+        Ok(s) => Some(s.code().unwrap_or(-1)),
+        Err(e) => {
+            eprintln!("[cysd] auto-restore wait failed: {e}");
             None
         }
     }
