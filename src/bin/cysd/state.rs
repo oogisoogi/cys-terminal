@@ -774,6 +774,65 @@ pub struct Daemon {
     /// (W4) 전 surface reader 스레드의 vt100 파서 패닉 격리 누적 횟수(데몬 health 신호).
     /// surface별 카운터(Surface::parser_panics)의 데몬 전체 합산 — status(org.status)에 노출한다.
     pub parser_panics_total: AtomicU64,
+    /// ★T6: auto-restore가 스폰한 phoenix restore 프로세스의 (pid, start_time) 등록부.
+    /// authoritative(타이핑 가드 면제) 게이트의 restore-root allowlist — 이 목록에 있는 pid의
+    /// **살아있는 자손만, 복원이 도는 동안만** 면제받는다(RestoreRootGuard가 수명 관리). 콜드부트
+    /// phoenix 복원이 launch-agent로 부서장을 fresh-fallback 주입할 때 typing_guard에 막혀 부활이
+    /// 실패하던 dept-4 결함을 좁게 연다 — surface.create 임의-cmd 자식·HUD bridge는 이 목록에
+    /// 오르지 않으므로 면제 대상이 아니다. (pid, start_time)로 pid 재사용을 fail-closed 구분한다.
+    pub restore_roots: Mutex<Vec<(u32, u64)>>,
+}
+
+/// ★T6 RAII: auto-restore가 스폰한 phoenix restore 프로세스를 restore_roots에 등록하고, Drop에서
+/// **반드시** 제거한다. 이 수명이 authoritative 면제의 유일한 창 — 정상 종료·early return·panic
+/// unwind 모든 경로에서 Drop이 등록 해제를 보장해 복원 종료 후 잔존 자손이 면제받는 것을 막는다.
+/// Mutex poison에도 안전하게 제거한다(lock().unwrap_or_else(into_inner)).
+pub(crate) struct RestoreRootGuard {
+    daemon: Arc<Daemon>,
+    pid: u32,
+    start_time: u64,
+}
+
+impl RestoreRootGuard {
+    /// 등록 즉시 push. 호출측은 **Some(start_time)을 얻은 뒤에만** 생성한다(None은 등록 금지).
+    pub(crate) fn new(daemon: Arc<Daemon>, pid: u32, start_time: u64) -> Self {
+        daemon
+            .restore_roots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((pid, start_time));
+        Self {
+            daemon,
+            pid,
+            start_time,
+        }
+    }
+}
+
+impl Drop for RestoreRootGuard {
+    fn drop(&mut self) {
+        let mut roots = self
+            .daemon
+            .restore_roots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // 자신의 (pid, start_time) 항목 하나만 제거 — 같은 pid 다중 등록에도 정확히 한 개만.
+        if let Some(i) = roots
+            .iter()
+            .position(|&(p, s)| p == self.pid && s == self.start_time)
+        {
+            roots.remove(i);
+        }
+    }
+}
+
+/// 단일 pid의 현재 start_time(초)만 조회 — pid 재사용 식별(캐시 히트·restore-root 재검증)용
+/// 경량 lookup. (T6에서 handlers.rs→state.rs로 이동해 게이트·caller_cache가 단일 구현을 공유한다.)
+pub(crate) fn peer_start_time(pid: u32) -> Option<u64> {
+    let mut sys = sysinfo::System::new();
+    let p = sysinfo::Pid::from_u32(pid);
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[p]), true);
+    sys.process(p).map(|proc| proc.start_time())
 }
 
 /// T6 Control Center 소비 트래커 — in-memory(재시작 리셋, 가동시간 의미론과 동일).
@@ -1174,6 +1233,7 @@ impl Daemon {
             analytics: Mutex::new(analytics_conn),
             channels: Mutex::new(channels_conn),
             parser_panics_total: AtomicU64::new(0),
+            restore_roots: Mutex::new(Vec::new()),
         });
         // 재시작에도 오늘 소비/비용/모델믹스/스파크라인 보존 — 최근 12h usage_records 리플레이.
         crate::analytics::seed_consumption(&daemon);

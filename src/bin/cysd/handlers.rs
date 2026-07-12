@@ -179,7 +179,7 @@ fn resolve_caller_surface(daemon: &Daemon, caller_pid: u32) -> Option<u64> {
                 // start_time이 None(합성 주입)이거나 대상 프로세스를 못 찾으면 캐시를 신뢰한다.
                 match cached_start {
                     Some(cs) => {
-                        if peer_start_time(caller_pid).is_none_or(|now| now == *cs) {
+                        if crate::state::peer_start_time(caller_pid).is_none_or(|now| now == *cs) {
                             return *sid;
                         }
                         // start_time 불일치 → pid 재사용 → 아래로 떨어져 재해석
@@ -237,14 +237,6 @@ fn resolve_caller_surface(daemon: &Daemon, caller_pid: u32) -> Option<u64> {
         }
     }
     found
-}
-
-/// 단일 pid의 현재 start_time(초)만 조회 — 캐시 히트 시 pid 재사용 식별용 경량 lookup.
-fn peer_start_time(pid: u32) -> Option<u64> {
-    let mut sys = sysinfo::System::new();
-    let p = sysinfo::Pid::from_u32(pid);
-    sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[p]), true);
-    sys.process(p).map(|proc| proc.start_time())
 }
 
 /// T1-3 송신 ACL: ~/.cys/pack/acl.json 의 role→role 정책 평가 + from 신원 검증.
@@ -4068,7 +4060,8 @@ mod tests {
 
         // 현재 살아있는 실제 pid: 데몬 자기 프로세스. 그 진짜 start_time을 구한다.
         let live_pid = std::process::id();
-        let real_start = peer_start_time(live_pid).expect("self process must be visible");
+        let real_start =
+            crate::state::peer_start_time(live_pid).expect("self process must be visible");
 
         // ── 시나리오 1: incarnation 불일치 ──
         // 옛 CLI가 stale pane으로 해석돼 캐시됐고 그 뒤 pid가 재사용됐다고 가정.
