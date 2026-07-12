@@ -781,22 +781,28 @@ fn last_app_version_path() -> std::path::PathBuf {
 enum PendingUpdatePlan {
     /// 마커 없음 + 스탬프가 현재 버전과 일치 → 정상 정상상태, 아무 것도 안 함.
     Skip,
-    /// 스탬프 부재(최초 설치) → 스탬프만 기록하고 팩반영·복원은 스킵(복원할 topology 없음·온보딩이 팩 처리).
+    /// 스탬프 부재 + 기존 설치 증거 없음(진짜 최초 설치) → 스탬프만 기록·팩반영·복원 스킵(복원할 topology 없음·온보딩이 팩 처리).
     RecordStampOnly,
     /// 마커 존재(인앱 업데이트) OR 스탬프≠현재버전(홈페이지 수동설치) → 팩반영 + 성공 시 조직 복원.
     Apply,
 }
 
 /// 발동 조건 = 마커 존재 OR 버전변경 감지. 마커가 최우선(구버전이 이 릴리스로 올라올 때 마커를 남김).
+/// prior_state_exists = 기존 설치 증거(~/.cys/pack/.pack-version 존재). 스탬프 부재(≤0.12.50엔 스탬프
+/// 파일 자체가 없다) 시 이 증거로 '전환기 기존 사용자의 홈페이지 수동설치'(Apply)와 '진짜 최초
+/// 설치'(RecordStampOnly)를 가른다 — 오너가 홈페이지 설치본을 배포할 예정이라 이 경로가 실경로다.
 fn decide_pending_update(
     marker_exists: bool,
     stamp: Option<&str>,
     current_version: &str,
+    prior_state_exists: bool,
 ) -> PendingUpdatePlan {
     if marker_exists {
         return PendingUpdatePlan::Apply;
     }
     match stamp {
+        // 스탬프 부재 + 기존 설치 증거 있음 = 전환기 기존 사용자(≤0.12.50)가 홈페이지로 0.12.51+ 설치 → 복원 필요.
+        None if prior_state_exists => PendingUpdatePlan::Apply,
         None => PendingUpdatePlan::RecordStampOnly,
         Some(v) if v != current_version => PendingUpdatePlan::Apply,
         Some(_) => PendingUpdatePlan::Skip,
@@ -820,7 +826,9 @@ fn maybe_apply_pending_update(app: &AppHandle) {
     let stamp = std::fs::read_to_string(&stamp_path)
         .ok()
         .map(|s| s.trim().to_string());
-    match decide_pending_update(marker_exists, stamp.as_deref(), current) {
+    // 기존 설치 증거 — 디스크 팩 버전 파일(check_pack_update:1711·install_pack_update:1895와 동일 SOT).
+    let prior_state = cys::pack::pack_dir().join(".pack-version").exists();
+    match decide_pending_update(marker_exists, stamp.as_deref(), current, prior_state) {
         PendingUpdatePlan::Skip => return,
         PendingUpdatePlan::RecordStampOnly => {
             // 최초 설치 — 복원할 topology가 없다. 스탬프만 기록해 다음 재시작을 정상상태로 만든다.
@@ -2127,13 +2135,17 @@ mod tests {
     #[test]
     fn decide_pending_update_marker_or_version_change() {
         use PendingUpdatePlan::*;
-        // 마커 최우선 — 스탬프 상태와 무관하게 Apply(구버전이 이 릴리스로 올라올 때 남긴 마커).
-        assert_eq!(decide_pending_update(true, None, "0.12.51"), Apply, "마커=Apply(스탬프 부재)");
-        assert_eq!(decide_pending_update(true, Some("0.12.51"), "0.12.51"), Apply, "마커=Apply(스탬프 동일해도)");
-        // 마커 없음: 스탬프 부재=최초 설치=스탬프만, 버전변경=Apply, 동일=Skip.
-        assert_eq!(decide_pending_update(false, None, "0.12.51"), RecordStampOnly, "스탬프 부재=최초설치");
-        assert_eq!(decide_pending_update(false, Some("0.12.50"), "0.12.51"), Apply, "버전변경(홈페이지 수동설치)=Apply");
-        assert_eq!(decide_pending_update(false, Some("0.12.51"), "0.12.51"), Skip, "동일 버전·마커 없음=Skip");
+        // 마커 최우선 — 스탬프·prior_state와 무관하게 Apply(구버전이 이 릴리스로 올라올 때 남긴 마커).
+        assert_eq!(decide_pending_update(true, None, "0.12.51", false), Apply, "마커=Apply(스탬프 부재)");
+        assert_eq!(decide_pending_update(true, Some("0.12.51"), "0.12.51", false), Apply, "마커=Apply(스탬프 동일해도)");
+        // ★결함2: 스탬프 부재 × prior_state — 기존 설치 증거로 전환기 홈페이지 설치 vs 진짜 최초 설치를 가른다.
+        assert_eq!(decide_pending_update(false, None, "0.12.51", true), Apply, "스탬프 부재+기존설치=전환기 홈페이지설치=Apply");
+        assert_eq!(decide_pending_update(false, None, "0.12.51", false), RecordStampOnly, "스탬프 부재+기존설치 없음=진짜 최초설치");
+        // 버전변경/동일은 prior_state와 무관(회귀 핀 — Some(stamp)이면 prior_state를 보지 않는다).
+        assert_eq!(decide_pending_update(false, Some("0.12.50"), "0.12.51", false), Apply, "버전변경(홈페이지 수동설치)=Apply");
+        assert_eq!(decide_pending_update(false, Some("0.12.50"), "0.12.51", true), Apply, "버전변경=Apply(prior_state 무관)");
+        assert_eq!(decide_pending_update(false, Some("0.12.51"), "0.12.51", false), Skip, "동일 버전·마커 없음=Skip");
+        assert_eq!(decide_pending_update(false, Some("0.12.51"), "0.12.51", true), Skip, "동일 버전=Skip(prior_state 무관)");
     }
 
     // HUD-2: open_url 화이트리스트 — https·허용 도메인만 통과, 위장 host(userinfo/서브도메인 사칭) 차단.
