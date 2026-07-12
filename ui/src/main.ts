@@ -3941,6 +3941,29 @@ async function start() {
     toast("health", "⚠ 팩 일부 미각성", p.message ?? "디스크 팩은 갱신됐으나 일부 노드 reinject 보류/실패(라이브 유지).");
   });
 
+  // (T4) 업데이트 후 조직 복원 진행(restore-progress·spawn_org_restore emit) — '직원 복귀 중' 가시화.
+  await listen("restore-progress", (e) => {
+    const p = (e.payload ?? {}) as { phase?: string; ok?: number; fail?: number; detail?: string };
+    if (p.phase === "start") {
+      stickyToast("restore", "feed", "👥 직원 복귀 중", "노드 세션 복원 중… (본부·부서)");
+    } else if (p.phase === "done") {
+      dismissToast("restore");
+      const ok = p.ok ?? 0;
+      const fail = p.fail ?? 0;
+      if (fail > 0) toast("health", "⚠ 직원 복귀 일부 실패", `부서 복원 성공 ${ok} · 실패 ${fail} — 상태를 점검하세요.`);
+      else toast("watchdog", "✅ 직원 복귀 완료", `노드 세션 복원 완료 (부서 ${ok}).`);
+    } else if (p.phase === "error") {
+      dismissToast("restore");
+      toast("health", "복원 실패", p.detail ?? "노드 복원 실행에 실패했습니다.");
+    }
+  });
+
+  // (T4) init-pack 실패 등 backend update-error 가시화 — 이제껏 UI 리스너 부재로 침묵하던 갭 해소.
+  await listen("update-error", (e) => {
+    const msg = typeof e.payload === "string" ? e.payload : "업데이트 후 처리 중 오류가 발생했습니다.";
+    toast("health", "업데이트 경고", msg);
+  });
+
   // 시작 시 + 6시간마다 백그라운드 업데이트 확인 (조용히 — 있으면 badge·toast)
   checkForUpdate(true);
   setInterval(() => checkForUpdate(true), 6 * 3600 * 1000);
