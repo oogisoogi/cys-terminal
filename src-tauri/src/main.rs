@@ -769,19 +769,65 @@ fn pending_restore_path() -> std::path::PathBuf {
     cys::home_dir().join(".cys/.pending-restore")
 }
 
-/// 업데이트로 인한 재시작이면(마커 존재) 두 가지를 한다:
+/// (T1) 마지막으로 팩반영·복원을 완료한 앱 버전 스탬프 경로. 홈페이지 수동 설치(.app 번들만 교체·
+/// 복귀 마커 없음)를 '버전변경'으로 감지하는 진실원 — 인앱 업데이트(마커)와 수동 설치(스탬프) 두
+/// 경로 모두에서 재시작 후 팩반영·복원이 돌게 한다. pending_restore_path와 같은 ~/.cys 아래에 둔다.
+fn last_app_version_path() -> std::path::PathBuf {
+    cys::home_dir().join(".cys/.last-app-version")
+}
+
+/// (T1) 재시작 후 팩반영·복원을 돌릴지 판정 — 부작용(파일·프로세스) 없는 순수 함수(단위테스트 대상).
+#[derive(Debug, PartialEq, Eq)]
+enum PendingUpdatePlan {
+    /// 마커 없음 + 스탬프가 현재 버전과 일치 → 정상 정상상태, 아무 것도 안 함.
+    Skip,
+    /// 스탬프 부재(최초 설치) → 스탬프만 기록하고 팩반영·복원은 스킵(복원할 topology 없음·온보딩이 팩 처리).
+    RecordStampOnly,
+    /// 마커 존재(인앱 업데이트) OR 스탬프≠현재버전(홈페이지 수동설치) → 팩반영 + 성공 시 조직 복원.
+    Apply,
+}
+
+/// 발동 조건 = 마커 존재 OR 버전변경 감지. 마커가 최우선(구버전이 이 릴리스로 올라올 때 마커를 남김).
+fn decide_pending_update(
+    marker_exists: bool,
+    stamp: Option<&str>,
+    current_version: &str,
+) -> PendingUpdatePlan {
+    if marker_exists {
+        return PendingUpdatePlan::Apply;
+    }
+    match stamp {
+        None => PendingUpdatePlan::RecordStampOnly,
+        Some(v) if v != current_version => PendingUpdatePlan::Apply,
+        Some(_) => PendingUpdatePlan::Skip,
+    }
+}
+
+/// 업데이트(인앱 재시작 OR 홈페이지 수동설치로 인한 버전변경)이면 두 가지를 한다:
 ///  ① 새 기능 배포 — 새 cys 바이너리에 embed된 팩(pack.rs include_str! + build.rs PACK_SKILLS)을
 ///     `cys init-pack --no-install-hook`으로 ~/.cys/pack에 반영한다. --no-install-hook: hook 등록은
 ///     최초 설치/launch-agent에서 끝나므로 매 업데이트마다 settings.json을 건드리지 않는다(.bak-cys
 ///     백업 파괴·활성 프로필 재직렬화 방지 — 적대검증 serious). force 없이 호출하므로 preserve-gate가
 ///     사용자 수정 파일을 보존하고 비수정·신규만 갱신한다.
-///  ② 자동복귀 — 팩 반영 성공 시에만 `cys restore --include-master`로 노드를 session_id resume
-///     재런칭(작업 무손실). init-pack 실패 시 마커를 보존하고 복원을 보류해, 노드가 구 디렉티브로
-///     조용히 각성하는 침묵 실패를 막는다(적대검증 fatal). restore는 멱등(run_restore cys.rs:3791).
+///  ② 자동복귀 — 팩 반영 성공 시에만 조직 전체(본부+등록 부서) 노드를 복원(T2 spawn_org_restore).
+///     init-pack 실패 시 마커·스탬프를 보존하고 복원을 보류해, 노드가 구 디렉티브로 조용히 각성하는
+///     침묵 실패를 막는다(적대검증 fatal). restore는 멱등(run_restore).
 fn maybe_apply_pending_update(app: &AppHandle) {
     let marker = pending_restore_path();
-    if !marker.exists() {
-        return;
+    let stamp_path = last_app_version_path();
+    let current = env!("CARGO_PKG_VERSION");
+    let marker_exists = marker.exists();
+    let stamp = std::fs::read_to_string(&stamp_path)
+        .ok()
+        .map(|s| s.trim().to_string());
+    match decide_pending_update(marker_exists, stamp.as_deref(), current) {
+        PendingUpdatePlan::Skip => return,
+        PendingUpdatePlan::RecordStampOnly => {
+            // 최초 설치 — 복원할 topology가 없다. 스탬프만 기록해 다음 재시작을 정상상태로 만든다.
+            let _ = std::fs::write(&stamp_path, current);
+            return;
+        }
+        PendingUpdatePlan::Apply => {}
     }
     // ① 새 팩(새 기능) 반영 — 성공 여부를 검사한다(침묵 실패 차단).
     let mut init_cmd = std::process::Command::new(resolve_sidecar(if cfg!(windows) { "cys.exe" } else { "cys" }));
@@ -792,7 +838,7 @@ fn maybe_apply_pending_update(app: &AppHandle) {
         .map(|s| s.success())
         .unwrap_or(false);
     if !pack_ok {
-        // 실패 — 마커를 보존(다음 재시작에 재시도)하고 노드 복원을 보류한다. 구 디렉티브로
+        // 실패 — 마커·스탬프를 보존(다음 재시작에 재시도)하고 노드 복원을 보류한다. 구 디렉티브로
         // 조용히 각성하는 것을 막고 사용자에게 알린다.
         let _ = app.emit(
             "update-error",
@@ -800,12 +846,86 @@ fn maybe_apply_pending_update(app: &AppHandle) {
         );
         return;
     }
-    // 성공 후에만 마커 제거 + 자동복귀.
+    // 성공 후에만 마커 제거 + 스탬프 전진 + 조직 복원. (마커 없는 버전변경 경로면 remove_file은 no-op.)
     let _ = std::fs::remove_file(&marker);
-    let mut restore_cmd = std::process::Command::new(resolve_sidecar(if cfg!(windows) { "cys.exe" } else { "cys" }));
-    restore_cmd.arg("restore").arg("--include-master");
-    no_console(&mut restore_cmd);
-    let _ = restore_cmd.spawn();
+    let _ = std::fs::write(&stamp_path, current);
+    spawn_org_restore(app.clone());
+}
+
+/// (T2) `cys restore --include-master`를 사이드카로 1회 실행한다. socket=Some이면 그 부서 소켓
+/// 대상(CYS_SOCKET), None이면 기본(본부) 소켓. CYS_NO_AUTOSTART=1로 죽은 소켓에 빈 cysd가
+/// autostart되는 것을 막는다(살아있는 대상에만 호출하므로 평시 무영향인 심층방어). 반환=성공 여부.
+async fn run_sidecar_restore(socket: Option<std::path::PathBuf>) -> bool {
+    tokio::task::spawn_blocking(move || {
+        let mut cmd = std::process::Command::new(resolve_sidecar(if cfg!(windows) { "cys.exe" } else { "cys" }));
+        cmd.arg("restore").arg("--include-master");
+        cmd.env("CYS_NO_AUTOSTART", "1"); // 죽은 소켓에 빈 데몬 autostart 금지(사이드카 CLI 가드)
+        if let Some(sock) = socket {
+            cmd.env(cys::ENV_SOCKET, sock);
+        }
+        no_console(&mut cmd);
+        cmd.status().map(|s| s.success()).unwrap_or(false)
+    })
+    .await
+    .unwrap_or(false)
+}
+
+/// (T2) 업데이트 후 조직 전체 복원 — setup 완료를 막지 않도록 백그라운드 태스크로 순차 실행하며
+/// restore-progress를 emit한다(update-progress emit 스타일 동형). 본부=기본 소켓 사이드카 restore →
+/// list_depts() 순회: 부서 데몬이 살아있으면 사이드카 restore(부서 소켓), 죽었으면 기존 launch 경로
+/// (launch_dept_daemon)로 재기동한다 — 재기동된 부서 데몬은 콜드부트 auto-restore로 노드를 되살린다
+/// (src/bin/cysd/main.rs). run_restore 멱등이라 콜드부트 복원과 겹쳐도 안전.
+fn spawn_org_restore(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let _ = app.emit("restore-progress", json!({"phase": "start"}));
+        // 본부(기본 소켓) — setup의 ensure_daemon으로 이미 가동 확정.
+        let hq_ok = run_sidecar_restore(None).await;
+        // 부서 순회 — 등록 부서(depts.json)만 대상(유령 부서 재-launch 차단).
+        let mut ok = 0usize;
+        let mut fail = 0usize;
+        if let Ok(reg) = list_depts() {
+            if let Some(depts) = reg.get("depts").and_then(|d| d.as_object()) {
+                for (name, meta) in depts {
+                    let sock = meta
+                        .get("socket")
+                        .and_then(|s| s.as_str())
+                        .map(std::path::PathBuf::from)
+                        .unwrap_or_else(|| dept_socket_path(name));
+                    // 생존확인(org_fleet 동형·2초 timeout) — identify 응답 = 데몬 살아있음.
+                    let alive = tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        rpc_oneshot(&sock, "system.identify", json!({})),
+                    )
+                    .await
+                    .map(|r| r.is_ok())
+                    .unwrap_or(false);
+                    let dept_ok = if alive {
+                        run_sidecar_restore(Some(sock.clone())).await
+                    } else {
+                        // 죽은 부서 → 기존 launch 경로 재사용(콜드부트 auto-restore가 노드 부활).
+                        launch_dept_daemon(app.clone(), name.clone()).await.is_ok()
+                    };
+                    if dept_ok {
+                        ok += 1;
+                    } else {
+                        fail += 1;
+                    }
+                }
+            }
+        }
+        if !hq_ok && ok == 0 && fail == 0 {
+            // 본부 복원조차 못 돌고 부서도 없음 = 복원 경로 자체 실패 → 가시화(UI health 토스트).
+            let _ = app.emit(
+                "restore-progress",
+                json!({"phase": "error", "detail": "본부 노드 복원 실행 실패"}),
+            );
+            return;
+        }
+        let _ = app.emit(
+            "restore-progress",
+            json!({"phase": "done", "ok": ok, "fail": fail}),
+        );
+    });
 }
 
 /// D5/P1: UI 발 키 전송 — surface.send_key RPC 래퍼. send_input(send_text)과 달리 Return 등 키 전송 가능.
@@ -1993,6 +2113,19 @@ mod tests {
         assert!(session_blocks_rotation(&roled), "role claim 세션은 보호");
         assert!(session_blocks_rotation(&agented), "agent 세션은 보호");
         assert!(!session_blocks_rotation(&empty_strings), "빈 문자열은 미부착으로 취급");
+    }
+
+    /// (T1) 재시작 후 팩반영·복원 발동 판정 — 마커(인앱 업데이트) OR 버전변경(홈페이지 수동설치).
+    #[test]
+    fn decide_pending_update_marker_or_version_change() {
+        use PendingUpdatePlan::*;
+        // 마커 최우선 — 스탬프 상태와 무관하게 Apply(구버전이 이 릴리스로 올라올 때 남긴 마커).
+        assert_eq!(decide_pending_update(true, None, "0.12.51"), Apply, "마커=Apply(스탬프 부재)");
+        assert_eq!(decide_pending_update(true, Some("0.12.51"), "0.12.51"), Apply, "마커=Apply(스탬프 동일해도)");
+        // 마커 없음: 스탬프 부재=최초 설치=스탬프만, 버전변경=Apply, 동일=Skip.
+        assert_eq!(decide_pending_update(false, None, "0.12.51"), RecordStampOnly, "스탬프 부재=최초설치");
+        assert_eq!(decide_pending_update(false, Some("0.12.50"), "0.12.51"), Apply, "버전변경(홈페이지 수동설치)=Apply");
+        assert_eq!(decide_pending_update(false, Some("0.12.51"), "0.12.51"), Skip, "동일 버전·마커 없음=Skip");
     }
 
     // HUD-2: open_url 화이트리스트 — https·허용 도메인만 통과, 위장 host(userinfo/서브도메인 사칭) 차단.
