@@ -543,7 +543,8 @@ class SnapshotShape(unittest.TestCase):
         node = snap["departments"][0]["nodes"][0]
         self.assertIn("progress", node)
         self.assertIn("run", node)
-        self.assertEqual(snap["v"], 1)   # 계약 버전 불변
+        self.assertIn("dept_label", node)   # v2: 표시 전용 라벨 필드 추가
+        self.assertEqual(snap["v"], 2)   # v2 부서 한정 키 계약
 
 
 if __name__ == "__main__":

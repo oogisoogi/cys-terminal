@@ -49,7 +49,7 @@
   `dept` 필드 부재(구 cys 조합) 시 display_name 정규화 폴백 + 1회 경고 로그.
 - **소켓 캐리(M1 — depts.json 재독 기각)**: 노드별 socket을 World에 스냅샷 캐리
   (`self.sockets[full_key] = socket|None`). /command·/peek는 **스냅샷의 socket**으로
-  `cys send [--socket <path>] --surface surface:N` 실행 — 재독 레이스·3중 파서·부재 fail모드
+  `cys [--socket <path>] send --surface surface:N` 실행(--socket은 clap 전역 플래그 — 서브커맨드 앞 배치, 구현 정합화 v2.1.1) — 재독 레이스·3중 파서·부재 fail모드
   3건 동시 소거. 키에 대응 socket 미존재 = unknown_target 거부(fail-closed).
 - 키 전면 전환: prev_nodes·known_keys·heat_acc·progress/run·blocked[].key.
 - **CMD_KEY_RE 교체(C2/M5)**: `^[a-z0-9_-]{1,32}@surface:\d{1,8}$` — gate_command(199)·/peek(1218)
@@ -107,7 +107,9 @@
   **apply_usage 본부 스코프**·**despawn fallback 정식 키**·리플레이 관용.
   음성검증: v1 코드에 신규 테스트 → FAIL 실측.
 - e2e(office_detail_gate 확장): 합성 월드 v2 키 + 동번호 2부서에서 fx 정확 타깃 1개 +
-  **mock /peek가 수신 키== 정식 키 전체임을 단언(fragment 잘림 회귀 방지)** +
+  **mock /peek가 수신 키==정식 키 전체임을 단언 + 적대 키(`…#raw` fragment 문자 포함
+  불투명 토큰) 왕복 단언(v2.1.1 — 정식 키의 @·:는 URL-safe라 정식 키만으론 인코딩 음성검증이
+  공허함을 구현 중 실측, encodeURIComponent를 load-bearing으로 만드는 강화)** +
   **본부 fleet 키 == 이벤트 키(main@surface:N) 정합 단정**.
 - 실기 결정타 2건: ①중복 번호 부서에 진행률 주입 → 그 부서 아바타에만 링
   ②부서 pane에 오피스 /command → **그 부서** 도달(input_injected 왕복) = 오배달 수리 입증.
