@@ -525,7 +525,10 @@ class Preflight:
             return True
         return False  # report 모드: 관찰만, 부작용 없음
 
-    # ── 공용 수리: cys init-pack (누락 템플릿만 재설치 — 사용자 수정본 불가침) ──
+    # ── 공용 수리: cys init-pack — 누락 항목 재설치 + 비수정 파일 신버전 갱신 + **수정된
+    #    system 파일은 임베드로 치유**(수정본 <rel>.user 보존·C62 원장 보고). 불가침은
+    #    user-owned(디렉티브·soul·CLAUDE·schedule)·seed-once(memory/·round 상태)뿐이다.
+    #    (구 문구 "사용자 수정본 불가침"은 user-owned에만 참 — 오독이 실사고를 낳아 시정.) ──
     def repair_via_init_pack(self):
         if self._init_pack_ran is not None:
             return self._init_pack_ran
@@ -3504,6 +3507,47 @@ class Preflight:
         else:
             self.add(cid, PASS, "doc-code SOT 대조 OK(경로형 토큰 %d건 실재)" % checked)
 
+    # ── C62 팩 치유 원장 가시화 (2026-07-12 치유 원복 사고 시정) ──
+    # init-pack이 수정된 system 파일을 임베드로 되돌리면(healed) 수정본은 <rel>.user로,
+    # user-owned 신버전은 <rel>.new로 병치되고 .merge-pending.json 원장에 기록되는데, 이
+    # 원장을 아무도 읽지 않아 라이브 수정 소실이 무통보로 반복됐다(로컬·배포 사용자 양쪽
+    # 실측 사고). 부트 ⓪ 출력에 병합 대기를 올려 치유 발생을 관측 가능하게 한다.
+    # 체크 목록 '마지막' 고정: 같은 런의 --fix(repair_via_init_pack)가 남긴 신규 원장까지
+    # 이 런에서 보여야 한다. 읽기 전용(report 병렬 안전)·WARN(READY 미차단).
+    def c62_pack_heal_ledger(self):
+        cid = "C62.pack-heal-ledger"
+        if self.skipped(cid):
+            return
+        ledger = os.path.join(pack_dir(), ".merge-pending.json")
+        if not os.path.isfile(ledger):
+            self.add(cid, PASS, "병합 대기 0건 (원장 없음)")
+            return
+        try:
+            with open(ledger, encoding="utf-8") as f:
+                pending = json.load(f)
+            if not isinstance(pending, dict):
+                raise ValueError("원장 루트가 객체가 아님")
+        except Exception as e:
+            self.add(cid, WARN, "병합 원장 파싱 실패(%s) — %s 수동 확인" % (e, ledger))
+            return
+        healed = sorted(r for r, v in pending.items()
+                        if isinstance(v, dict) and v.get("kind") == "healed")
+        newp = sorted(r for r, v in pending.items()
+                      if isinstance(v, dict) and v.get("kind") == "new-pending")
+        if not healed and not newp:
+            self.add(cid, PASS, "병합 대기 0건")
+            return
+        parts = []
+        if healed:
+            parts.append("★원복(healed) %d건 — 라이브 수정이 배포 원본으로 되돌려짐(수정본은 <파일>.user 보존): %s%s"
+                         % (len(healed), ", ".join(healed[:8]),
+                            " 외 %d건" % (len(healed) - 8) if len(healed) > 8 else ""))
+        if newp:
+            parts.append("신버전 대기(.new) %d건: %s%s"
+                         % (len(newp), ", ".join(newp[:8]),
+                            " 외 %d건" % (len(newp) - 8) if len(newp) > 8 else ""))
+        self.add(cid, WARN, "; ".join(parts) + " — `cys pack-merge`로 검토(가치 있는 수정은 vendor 승격 제보)")
+
     def run(self):
         # 의도된 호출 순서(불변식). C25를 C18보다 먼저: C25의 --fix(파일 설치·색인 등재)가
         # 정합을 만든 뒤 C18이 verify해야 같은 런에서 FAIL/FIXED 플랩(NOT READY 헛사이클)이
@@ -3534,6 +3578,8 @@ class Preflight:
             self.c54_loc_cap, self.c55_grill_gate, self.c56_dept_hook_leak,
             self.c57_temp_hook_leak, self.c58_trust_harden, self.c59_guard_wiring,
             self.c60_gate_wiring, self.c61_doc_code_sot,
+            # C62는 마지막 고정 — 같은 런의 --fix가 남긴 치유 원장까지 이 런에서 보이게.
+            self.c62_pack_heal_ledger,
         ]
         # --fix/dry/safe 는 공유 상태(repair_via_init_pack 메모이즈·settings.json 원자적
         # 쓰기·planned 버퍼)를 갖는 변이 경로라 전면 직렬 유지. report 모드만 병렬화한다.

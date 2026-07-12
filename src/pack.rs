@@ -342,6 +342,19 @@ pub(crate) fn is_user_owned(rel: &str) -> bool {
         || rel == "schedule.json"
 }
 
+/// ★B2-2(치유 원복 사고 시정 · 2026-07-12): **seed-once 상태 파일** — 팩이 부재 시에만 시드로
+/// 설치하고, 존재하면 force 여도 불가침. memory/(장기기억 색인·시드 본문)·round/SESSION_STATE.md
+/// (복원 단일 진실)·round/RECOVERY.md 는 설치 후 노드가 계속 갱신하는 런타임 상태라 임베드와 항상
+/// 달라지는데, system 등급이면 init-pack 전량 스윕(부트 ⓪ preflight --fix 가 결손 1건에도 호출)마다
+/// vendor 골격으로 원복돼 기억·상태가 주기 소실된다(실측: 로컬 원장 healed 0.12.46~47 3건 + 배포
+/// 사용자 기계 동일 사고 4회차). round/ 의 정적 계약(TOOL_RESULT_VOCAB·catalog·video-archetypes)은
+/// 상태가 아니므로 system 유지 — 상태 파일만 좁게 열거한다. 의도적 초기화 = 파일 삭제 후 init-pack.
+pub(crate) fn is_seed_once(rel: &str) -> bool {
+    rel.starts_with("memory/")
+        || rel == "round/SESSION_STATE.md"
+        || rel == "round/RECOVERY.md"
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // ★사용자 커스터마이즈 절충 계층 (2026-07-07 오너 승인 6층 로드맵의 ②③④ 코어)
 //   문제: system 파일은 매 install 강제 치유(P0-4)로 사용자 수정이 소실, user-owned 는
@@ -393,6 +406,10 @@ pub(crate) fn decide_file_action(
     manifest_hash: Option<&str>,
     force: bool,
 ) -> FileAction {
+    // ★B2-2 seed-once 상태: 존재하면 불가침(force 여도·읽기 실패여도) — 부재 시에만 아래 시드 설치.
+    if exists && is_seed_once(rel) {
+        return FileAction::Keep { adopt_hash: false, new_pending: false };
+    }
     // ★B2 user-owned 영구 보존 (force 여도) — 읽기 성공 + 내용 상이일 때.
     if exists && is_user_owned(rel) {
         if let Some(d) = disk {
@@ -512,7 +529,7 @@ pub fn plan_install(
             }
             FileAction::Keep { new_pending: true, .. } => plan.merge_new.push(rel.to_string()),
             FileAction::Keep { .. } => {
-                if is_user_owned(rel) && disk.as_deref() != Some(content) {
+                if (is_user_owned(rel) || is_seed_once(rel)) && disk.as_deref() != Some(content) {
                     plan.keep_user.push(rel.to_string());
                 } else {
                     plan.unchanged += 1;
@@ -524,7 +541,7 @@ pub fn plan_install(
     let embedded: std::collections::HashSet<&str> = items.iter().map(|(rel, _)| *rel).collect();
     if !embedded.is_empty() {
         for (rel, mh) in manifest.iter() {
-            if embedded.contains(rel.as_str()) || is_user_owned(rel) {
+            if embedded.contains(rel.as_str()) || is_user_owned(rel) || is_seed_once(rel) {
                 continue;
             }
             match std::fs::read_to_string(dir.join(rel)) {
@@ -638,7 +655,10 @@ pub fn install(force: bool) -> Result<(usize, usize), String> {
 /// prune·매니페스트·다운그레이드 차단·.pack-version 기록·격리 config·exec bit를 수행한다.
 /// embed PACK_ALL iter(기존 경로)와 staged-tree iter(무중단 채널)가 같은 로직을 공유한다(중복 0·회귀 0).
 /// 다운그레이드 가드 비교 기준은 `target_version`(env! 직접 참조 제거 — staged 입력은 자기 버전을 넘김).
-/// force=false: 사용자 수정 파일 불가침 + 비수정 파일은 입력 신버전으로 자동 갱신. 반환: (written, kept).
+/// force=false: user-owned(디렉티브·soul·CLAUDE·schedule)·seed-once(상태·기억) 불가침, **수정된
+/// system 파일은 임베드로 치유**(사용자본 `<rel>.user` 보존), 비수정 파일은 입력 신버전으로 자동 갱신.
+/// ("사용자 수정 파일 불가침" 구 문구는 user-owned 등급에만 참인데 전체로 읽혀 배포 현장의 오판을
+/// 낳았다 — 2026-07-12 치유 원복 사고 시정.) 반환: (written, kept).
 /// `transactional`: false면 embed/cysd/init-pack 경로 — 종전대로 마지막에 `.pack-version`을
 /// best-effort 기록하고 `.install-manifest.json` 영속도 best-effort(외부 동작 불변). true면
 /// 무중단 pack-update 트랜잭션(apply_pack_transactional) 경로 — ⓐ`.pack-version`을 여기서
@@ -813,8 +833,8 @@ pub fn install_into<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(
                 .collect();
             let mut pruned = 0;
             for rel in stale {
-                if is_user_owned(&rel) {
-                    continue; // ★B2: user 소유(디렉티브·헌법·CLAUDE)는 영구 보존 — prune 대상 제외
+                if is_user_owned(&rel) || is_seed_once(&rel) {
+                    continue; // ★B2: user 소유·seed-once 상태는 영구 보존 — prune 대상 제외
                 }
                 let path = dir.join(&rel);
                 match std::fs::read_to_string(&path) {
@@ -1885,6 +1905,32 @@ mod tests {
                   "directives/CEO_TEMPLATE.md", "sub/schedule.json"] {
             assert!(!is_user_owned(s), "system 여야: {s}");
         }
+    }
+
+    #[test]
+    fn is_seed_once_classification_and_behavior() {
+        // ★B2-2 분류: 런타임 상태(기억·복원 진실)만 seed-once — round/ 정적 계약은 system 유지.
+        for st in ["memory/MEMORY.md", "memory/feedback_autonomous-pilot-mandate.md",
+                   "round/SESSION_STATE.md", "round/RECOVERY.md"] {
+            assert!(is_seed_once(st), "seed-once 여야: {st}");
+        }
+        for s in ["round/TOOL_RESULT_VOCAB.md", "round/capability_catalog.json",
+                  "round/video-archetypes/cinematic/workflow.json", "bin/javis_memory.py"] {
+            assert!(!is_seed_once(s), "system 여야: {s}");
+        }
+        // ★행동 박제(치유 원복 사고 회귀 핀): 존재하는 seed-once 상태는
+        //   ① 수정돼 있어도 치유(Write) 금지, ② force 여도 불가침, ③ 읽기 실패(disk=None)여도 불가침.
+        let embed = "SKELETON";
+        let keep = FileAction::Keep { adopt_hash: false, new_pending: false };
+        assert_eq!(decide_file_action("memory/MEMORY.md", embed, true, Some("LIVE-STATE"),
+                       Some(content_hash(embed).as_str()), false), keep, "① 수정본 원복 금지");
+        assert_eq!(decide_file_action("round/SESSION_STATE.md", embed, true, Some("LIVE-STATE"),
+                       None, true), keep, "② force 여도 불가침");
+        assert_eq!(decide_file_action("round/RECOVERY.md", embed, true, None,
+                       Some(content_hash(embed).as_str()), false), keep, "③ 읽기 실패도 불가침");
+        // ④ 부재 시에는 시드 설치(Write) — seed-once 가 신규 설치까지 막으면 안 된다.
+        assert_eq!(decide_file_action("memory/MEMORY.md", embed, false, None, None, false),
+                   FileAction::Write { heal_user_copy: false }, "④ 부재 시 시드 설치");
     }
 
     #[test]

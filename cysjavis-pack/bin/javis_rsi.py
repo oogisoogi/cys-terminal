@@ -169,7 +169,7 @@ def _recommend_learn(reason, topic):
             "feed 패널 또는 'cys feed reply <id> allow'로 승인 시에만 학습 착수. directive §4: 추천까지만 자율." % (reason, topic))
     try:
         subprocess.run(["cys", "feed", "push", "--kind", "learn_proposal",
-                        "--title", "[RSI 학습 추천] " + reason, "--body", body],
+                        "--title", "[RSI 학습 추천 · %s] %s" % (reason, topic), "--body", body],
                        capture_output=True, timeout=5)
     except Exception:
         pass

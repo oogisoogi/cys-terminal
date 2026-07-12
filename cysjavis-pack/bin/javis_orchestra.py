@@ -1085,7 +1085,7 @@ def _recommend_learn_once(reason, topic, marker_key):
     try:
         os.makedirs(learn_dir, exist_ok=True)
         r = subprocess.run(["cys", "feed", "push", "--kind", "learn_proposal",
-                            "--title", "[RSI 학습 추천] " + reason, "--body", body],
+                            "--title", "[RSI 학습 추천 · %s] %s" % (reason, topic), "--body", body],
                            capture_output=True, timeout=5)
         if r.returncode == 0:
             open(marker, "w").close()

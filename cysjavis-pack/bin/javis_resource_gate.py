@@ -14,7 +14,8 @@
 
 기본 임계(우리 자원 거버넌스 실사고 기준):
   servers  soft 2  / hard 3     (watchdog '3개+' 규칙과 정합 — 사후 kill 전에 사전 차단)
-  nodes    soft 8  / hard 12
+  nodes    soft 12 / hard 18(+동적: max(18, 12 + 활성 부서수*5) — 부서 소켓 존재 기준,
+           2026-07-06 CSO 위임 오탐 수정. --nodes-hard 명시 지정 시 그 값 그대로 우선)
   load     soft 1.0×ncpu / hard 2.0×ncpu
   context  soft 50 / hard 60    (60% 도달 전 저장 후 /clear 규칙)
 
@@ -47,6 +48,23 @@ SERVER_EXCLUDE_PATTERNS = [
     r"tsserver", r"copilot",
 ]
 NODE_PATTERNS = [r"claude(\s|$)", r"\bagy\b", r"\bcodex\b", r"\bgemini\b"]
+# ★2026-07-11 CSO(CEO B승인): codex 노드 1개 = node wrapper + darwin-arm64 vendor native 2프로세스가
+# 둘 다 \bcodex\b 매칭 → 이중계수. vendor native를 제외해 codex는 wrapper 1개만 계수(계수 인플레이션 차단).
+NODE_EXCLUDE_PATTERNS = [r"codex-darwin-arm64"]
+
+# ★2026-07-06 CSO 위임(master 승인): nodes hard_block 오탐 수정 — A(정적상향)+B(동적 부서가산).
+# 부서 1개 상시 기동만으로도 정적 임계(구 12)를 넘어 오탐하던 문제. 부서 소켓 존재=활성 부서로
+# 세어 그만큼 임계를 완화한다(전면 동적화(C안)는 보류·백로그 — 이번은 A+B만 채택).
+NODES_HARD_DEFAULT = 18   # STEP A 정적 floor(구 12) — depts 0~1일 때도 이 완화는 유지
+NODES_HARD_BASE = 12      # STEP B 동적 가산 base — depts>=2부터 동적값이 floor를 추월
+NODES_HARD_PER_DEPT = 5
+DEPT_SOCKET_GLOB = "~/.local/state/cys-dept-*/cys.sock"
+
+
+def _active_dept_count():
+    """부서 소켓(cys-dept-*/cys.sock) 존재 개수 = 활성 부서 수(소켓 파일 존재=기동중)."""
+    import glob
+    return len(glob.glob(os.path.expanduser(DEPT_SOCKET_GLOB)))
 
 
 def _ps_lines():
@@ -94,7 +112,7 @@ def measure(a):
         errors.append("nodes(ps)")
         nodes = None
     else:
-        nodes = _count_matching(lines, NODE_PATTERNS)
+        nodes = _count_matching(lines, NODE_PATTERNS, NODE_EXCLUDE_PATTERNS)
 
     if a.load_override is not None:
         load1 = a.load_override
@@ -105,11 +123,22 @@ def measure(a):
             errors.append("load(getloadavg)")
             load1 = None
     ncpu = os.cpu_count() or 1
+
+    # STEP B: --nodes-hard가 argparse 기본값(NODES_HARD_DEFAULT)에서 명시적으로 바뀌지 않았으면
+    # 동적 계산 적용, 바뀌었으면(테스트 주입 등) 그 값 그대로 우선 — 동적계산 생략.
+    active_depts = _active_dept_count()
+    if a.nodes_hard != NODES_HARD_DEFAULT:
+        nodes_hard_effective = a.nodes_hard
+    else:
+        nodes_hard_effective = max(NODES_HARD_DEFAULT,
+                                    NODES_HARD_BASE + active_depts * NODES_HARD_PER_DEPT)
+
     return {"servers": servers, "nodes": nodes,
             "load1": round(load1, 2) if load1 is not None else None,
             "ncpu": ncpu,
             "load_ratio": round(load1 / ncpu, 3) if load1 is not None else None,
-            "context_pct": a.context, "measure_errors": errors}
+            "context_pct": a.context, "measure_errors": errors,
+            "active_depts": active_depts, "nodes_hard_effective": nodes_hard_effective}
 
 
 def evaluate(m, a):
@@ -123,7 +152,7 @@ def evaluate(m, a):
                        "hard": hard, "level": level})
 
     add("servers", m["servers"], a.servers_soft, a.servers_hard)
-    add("nodes", m["nodes"], a.nodes_soft, a.nodes_hard)
+    add("nodes", m["nodes"], a.nodes_soft, m["nodes_hard_effective"])
     add("load_ratio", m["load_ratio"], a.load_soft_ratio, a.load_hard_ratio)
     add("context_pct", m["context_pct"], a.context_soft, a.context_hard)
 
@@ -178,7 +207,7 @@ def cmd_classify(a):
     lines = sys.stdin.read().splitlines()
     result = {
         "servers": _count_matching(lines, SERVER_PATTERNS, SERVER_EXCLUDE_PATTERNS),
-        "nodes": _count_matching(lines, NODE_PATTERNS),
+        "nodes": _count_matching(lines, NODE_PATTERNS, NODE_EXCLUDE_PATTERNS),
     }
     print(json.dumps(result, ensure_ascii=False))
     return EXIT_ALLOW
@@ -336,8 +365,8 @@ def main(argv=None):
     c.add_argument("--json", action="store_true")
     c.add_argument("--servers-soft", type=int, default=2)
     c.add_argument("--servers-hard", type=int, default=3)
-    c.add_argument("--nodes-soft", type=int, default=8)
-    c.add_argument("--nodes-hard", type=int, default=12)
+    c.add_argument("--nodes-soft", type=int, default=12)
+    c.add_argument("--nodes-hard", type=int, default=NODES_HARD_DEFAULT)
     c.add_argument("--load-soft-ratio", type=float, default=1.0)
     c.add_argument("--load-hard-ratio", type=float, default=2.0)
     c.add_argument("--context-soft", type=float, default=50.0)
