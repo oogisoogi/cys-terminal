@@ -604,7 +604,7 @@ mod tests {
     fn compose_unix_pane_path_appends_local_bin() {
         // Mac 핫픽스 회귀 핀: claude native 설치기(2.1.207)가 rc 무수정임이 실측 확인 →
         // ~/.local/bin 을 is_dir 게이트 없이 무조건 말미 append(발견 목적·기존 precedence 불강등).
-        let home = Path::new("/Users/tester");
+        let home = Path::new("/home/fixture-user");
         let local = home.join(".local").join("bin").to_string_lossy().into_owned();
         let prefixes = vec!["/opt/app/bin".to_string()];
         // ① current_path 에 없으면 맨 뒤에 append — prefixes 는 선두.
