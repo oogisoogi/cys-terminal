@@ -142,8 +142,9 @@ pub fn runtime_bin_dirs(exe_dir: &Path) -> Vec<PathBuf> {
 }
 
 /// pane/자식 프로세스에 물릴 PATH 를 계산 — 결과가 현행과 다르면 Some(주입값), 무변경이면 None.
-/// **이중 의미론**: unix = 현행 그대로(exe_dir + 번들 runtime bins 를 선두 주입, 나머지 보존) —
-/// pane 이 로그인 셸(-l)이라 프로파일이 PATH 를 복원하므로 stale 스냅샷 문제가 없다.
+/// **이중 의미론**: unix = exe_dir + 번들 runtime bins 선두 주입 + `~/.local/bin` 말미 append(나머지 보존) —
+/// 로그인 셸(-l) 프로파일이 PATH 를 복원하나 claude native 설치기가 rc 를 수정하지 않음이 실측 확인되어
+/// `~/.local/bin` 은 belt-and-braces 로 직접 append 한다(compose_unix_pane_path 참조).
 /// Windows = 레지스트리에서 신선 PATH 를 재합성한다. 데몬은 자기 기동 시점 PATH 스냅샷을 자식에 물리는데,
 /// 실행 중엔 WM_SETTINGCHANGE 를 못 받아 레지스트리 PATH 변경(claude 사후 설치 등)이 반영되지 않는다 →
 /// spawn 마다 HKLM/HKCU 에서 신선 PATH 를 읽어 재합성 = 새 PowerShell 창과 등가(compose_pane_path 참조).
@@ -174,16 +175,44 @@ pub fn runtime_prefixed_path(exe_dir: &Path, current_path: &str) -> Option<Strin
     }
     #[cfg(not(windows))]
     {
-        // unix: 현행 그대로 — pane 이 로그인 셸(-l)이라 프로파일이 PATH 를 복원(stale PATH 무영향).
-        let add: Vec<String> = prefixes
-            .into_iter()
-            .filter(|p| !current_path.split(sep).any(|e| e == p.as_str()))
-            .collect();
-        if add.is_empty() {
-            return None;
-        }
-        Some(format!("{}{}{}", add.join(&sep.to_string()), sep, current_path))
+        // unix: 로그인 셸(-l) 프로파일이 PATH 를 복원하지만, claude native 설치기(2.1.207)가 rc 를
+        // 수정하지 않음이 실측 확인되어 ~/.local/bin 은 belt-and-braces 로 무조건 append 한다.
+        let _ = sep; // unix 합성은 compose_unix_pane_path 가 ':' 고정 사용.
+        compose_unix_pane_path(&prefixes, &home_dir(), current_path)
     }
+}
+
+/// unix pane PATH 합성(순수·테스트 가능 · **unix 전용 의미론** · OS 무관 컴파일). 순서:
+/// `[prefixes: exe_dir + 번들 runtime bins] 중 신규분 선두` ; `current_path 전체(순서 그대로 보존)` ;
+/// `~/.local/bin(claude native 설치 위치) 신규분 말미 append`. claude 설치기가 ~/.zshrc 를 수정하지
+/// 않아(수동 안내만 출력·실측) 프로파일 복원만으론 claude 가 영원히 미발견 → windows_user_bin_dirs 의
+/// belt-and-braces 를 unix 로 대칭 확장, is_dir 게이트 없이 무조건 append(셸은 없는 PATH 항목을 무시).
+/// append 인 이유는 MAJ#1 과 동일: 발견이 목적 — 기존 항목의 precedence 를 강등하지 않는다.
+/// dedup 은 unix 관례대로 case-sensitive 단순 비교. 결과가 현행과 같으면 None(무변경 계약 유지).
+pub fn compose_unix_pane_path(prefixes: &[String], home: &Path, current_path: &str) -> Option<String> {
+    let sep = ':';
+    let add: Vec<&str> = prefixes
+        .iter()
+        .map(String::as_str)
+        .filter(|p| !current_path.split(sep).any(|e| e == *p))
+        .collect();
+    let local_bin = home.join(".local").join("bin").to_string_lossy().into_owned();
+    let append_local = !current_path.split(sep).any(|e| e == local_bin)
+        && !add.iter().any(|p| *p == local_bin);
+    if add.is_empty() && !append_local {
+        return None;
+    }
+    let mut composed = String::new();
+    if !add.is_empty() {
+        composed.push_str(&add.join(&sep.to_string()));
+        composed.push(sep);
+    }
+    composed.push_str(current_path);
+    if append_local {
+        composed.push(sep);
+        composed.push_str(&local_bin);
+    }
+    Some(composed)
 }
 
 /// Windows `%VAR%` 전개(ExpandEnvironmentStrings 의미론 근사) — OS 무관 컴파일(순수·테스트 가능).
@@ -548,11 +577,49 @@ mod tests {
         let cur = format!("/usr/bin{sep}/bin");
         let got = runtime_prefixed_path(exe, &cur).expect("exe_dir 미포함이면 Some");
         assert!(got.starts_with("/opt/cysapp/bin"), "exe_dir 선두 주입: {got}");
-        assert!(got.ends_with(&cur), "기존 PATH 보존(제거 없음): {got}");
-        // 이미 PATH에 있으면(중복) 얹지 않는다 → None(무변경). (windows는 runtime 하위 dir가
-        // 실재하면 Some일 수 있으나 이 합성 경로엔 없음.)
-        let already = format!("/opt/cysapp/bin{sep}/usr/bin");
-        assert_eq!(runtime_prefixed_path(exe, &already), None, "중복이면 무변경");
+        #[cfg(windows)]
+        {
+            assert!(got.ends_with(&cur), "기존 PATH 보존(제거 없음): {got}");
+            // 이미 PATH에 있으면(중복) 얹지 않는다 → None(무변경). (windows는 runtime 하위 dir가
+            // 실재하면 Some일 수 있으나 이 합성 경로엔 없음.)
+            let already = format!("/opt/cysapp/bin{sep}/usr/bin");
+            assert_eq!(runtime_prefixed_path(exe, &already), None, "중복이면 무변경");
+        }
+        #[cfg(not(windows))]
+        {
+            // 갱신 사유: unix 브랜치가 ~/.local/bin 을 무조건 append 하게 되어(claude 설치기 rc
+            // 무수정 실측 대응) 합성 결과가 `…:cur:~/.local/bin` — ends_with(&cur) 단정을 교체.
+            let local = home_dir().join(".local").join("bin").to_string_lossy().into_owned();
+            assert!(
+                got.ends_with(&format!("{cur}{sep}{local}")),
+                "기존 PATH 보존 + ~/.local/bin 말미 append: {got}"
+            );
+            // prefixes 도 ~/.local/bin 도 이미 있으면 → None(무변경).
+            let already = format!("/opt/cysapp/bin{sep}/usr/bin{sep}{local}");
+            assert_eq!(runtime_prefixed_path(exe, &already), None, "중복이면 무변경");
+        }
+    }
+
+    #[test]
+    fn compose_unix_pane_path_appends_local_bin() {
+        // Mac 핫픽스 회귀 핀: claude native 설치기(2.1.207)가 rc 무수정임이 실측 확인 →
+        // ~/.local/bin 을 is_dir 게이트 없이 무조건 말미 append(발견 목적·기존 precedence 불강등).
+        let home = Path::new("/Users/tester");
+        let local = home.join(".local").join("bin").to_string_lossy().into_owned();
+        let prefixes = vec!["/opt/app/bin".to_string()];
+        // ① current_path 에 없으면 맨 뒤에 append — prefixes 는 선두.
+        let out = compose_unix_pane_path(&prefixes, home, "/usr/bin:/bin").expect("Some");
+        assert_eq!(out, format!("/opt/app/bin:/usr/bin:/bin:{local}"));
+        // ② 이미 있으면 중복 append 하지 않는다(부정 케이스).
+        let cur2 = format!("{local}:/usr/bin");
+        let out2 = compose_unix_pane_path(&prefixes, home, &cur2).expect("Some");
+        assert_eq!(out2, format!("/opt/app/bin:{cur2}"));
+        // ③ prefixes·~/.local/bin 모두 기존재 → None(무변경 계약).
+        let cur3 = format!("/opt/app/bin:/usr/bin:{local}");
+        assert_eq!(compose_unix_pane_path(&prefixes, home, &cur3), None);
+        // ④ append 가 기존 항목 순서를 바꾸지 않는다(선두 의도 주입 강등 금지 — MAJ#1 대칭).
+        let out4 = compose_unix_pane_path(&prefixes, home, "/custom/shim:/usr/bin:/bin").expect("Some");
+        assert_eq!(out4, format!("/opt/app/bin:/custom/shim:/usr/bin:/bin:{local}"));
     }
 
     #[cfg(target_os = "macos")]
