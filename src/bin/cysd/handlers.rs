@@ -179,7 +179,7 @@ fn resolve_caller_surface(daemon: &Daemon, caller_pid: u32) -> Option<u64> {
                 // start_time이 None(합성 주입)이거나 대상 프로세스를 못 찾으면 캐시를 신뢰한다.
                 match cached_start {
                     Some(cs) => {
-                        if peer_start_time(caller_pid).is_none_or(|now| now == *cs) {
+                        if crate::state::peer_start_time(caller_pid).is_none_or(|now| now == *cs) {
                             return *sid;
                         }
                         // start_time 불일치 → pid 재사용 → 아래로 떨어져 재해석
@@ -237,14 +237,6 @@ fn resolve_caller_surface(daemon: &Daemon, caller_pid: u32) -> Option<u64> {
         }
     }
     found
-}
-
-/// 단일 pid의 현재 start_time(초)만 조회 — 캐시 히트 시 pid 재사용 식별용 경량 lookup.
-fn peer_start_time(pid: u32) -> Option<u64> {
-    let mut sys = sysinfo::System::new();
-    let p = sysinfo::Pid::from_u32(pid);
-    sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[p]), true);
-    sys.process(p).map(|proc| proc.start_time())
 }
 
 /// T1-3 송신 ACL: ~/.cys/pack/acl.json 의 role→role 정책 평가 + from 신원 검증.
@@ -362,20 +354,65 @@ fn typing_guard_secs() -> u64 {
         .unwrap_or(3)
 }
 
-/// authoritative(타이핑 가드 면제) 권한 가드 — defense-in-depth (agy R1 지적1 · codex R2 강화).
-/// 권위 주입(launch-agent/reinject)만 면제를 받게 한다: 발신 surface role이 master/cso일 때만
-/// 허용하고, 미해소 외부 caller(None — raw RPC)와 worker·reviewer는 거부한다. launch-agent는
-/// 조상 추적으로 master surface(Some)로 해소되므로 정상 허용된다. 비권위 노드가 `authoritative`로
-/// 사람-입력 보호(typing_guard)를 무력화하는 것을 막는다(1차 방어는 cys CLI가 authoritative 미노출).
-fn authoritative_caller_ok(daemon: &Daemon, from_sid: Option<u64>) -> bool {
-    // 미해소 caller(None — 어떤 surface의 자손도 아닌 외부 raw RPC)는 면제하지 않는다
-    // (codex R2: None=>true는 외부 raw RPC가 우회 가능한 신원 모델 구멍). launch-agent/reinject는
-    // master가 실행하므로 resolve_caller_surface의 조상 추적(cys→shell→claude=master surface)으로
-    // Some(master)로 해소되어 정상 허용된다 — None 분기에 기대지 않는다.
-    from_sid
+/// authoritative(타이핑 가드 면제) restore-root 분기 — caller_pid 의 32-hop 조상 중 restore_roots 에
+/// 등록된 pid 가 있고 그 pid 의 현재 start_time 이 등록값과 일치할 때만 true. resolve_caller_surface·
+/// caller_cache 와 완전 독립이다(별도 sysinfo 새로고침·캐시 미사용 — 공유 자료구조 오염 0). start_time
+/// 재조회를 lookup 으로 주입해 관측실패(None) 경로를 결정론 테스트한다. fail-closed: 복원 미진행(빈
+/// 목록)·미등록 조상·start_time 불일치/관측실패 = false. Some(current)==Some(registered) 만 허용한다.
+fn caller_in_restore_root(
+    daemon: &Daemon,
+    caller_pid: u32,
+    start_time_lookup: impl Fn(u32) -> Option<u64>,
+) -> bool {
+    let roots = {
+        let g = daemon.restore_roots.lock().unwrap_or_else(|e| e.into_inner());
+        if g.is_empty() {
+            // 복원 미진행 — 면제 창이 닫혀 있음(빠른 경로: sysinfo 새로고침 회피).
+            return false;
+        }
+        g.clone()
+    };
+    let mut sys = sysinfo::System::new();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    let mut cur = caller_pid;
+    for _ in 0..32 {
+        if let Some(&(_, registered_start)) = roots.iter().find(|(p, _)| *p == cur) {
+            // A5(pid 재사용)·A6(관측실패) fail-closed: 현재 start_time 재조회가 등록값과
+            // Some==Some 로 일치할 때만 허용. None(관측실패)·불일치는 거부한다.
+            return start_time_lookup(cur) == Some(registered_start);
+        }
+        match sys
+            .process(sysinfo::Pid::from_u32(cur))
+            .and_then(|p| p.parent())
+        {
+            Some(parent) if parent.as_u32() != cur && parent.as_u32() > 1 => {
+                cur = parent.as_u32();
+            }
+            _ => break,
+        }
+    }
+    false
+}
+
+/// authoritative(타이핑 가드 면제) 권한 가드 — defense-in-depth (agy R1 지적1 · codex R2 강화 · T6 확장).
+/// 두 경로만 면제한다: (a) 발신 surface role∈{master,cso} — 권위 노드의 직접 주입(불변). (b) auto-restore
+/// 가 스폰한 phoenix restore 프로세스(restore_roots)의 **살아있는 자손**, 복원이 도는 동안만 — 콜드부트
+/// 부서장 fresh-fallback 부활(dept-4)이 typing_guard 에 막히던 결함을 좁게 연다. 미해소 외부 caller
+/// (None — raw RPC)·worker·reviewer·surface.create 임의-cmd 자식·HUD bridge 는 어느 경로에도 안 들어
+/// 거부된다(fail-closed). launch-agent 는 master 실행이면 (a), phoenix 복원 자손이면 (b)로 해소된다.
+fn authoritative_caller_ok(daemon: &Daemon, from_sid: Option<u64>, caller_pid: Option<u32>) -> bool {
+    // (a) 권위 노드(master/cso) — 기존 불변식(role 자체가 권한 메커니즘).
+    if from_sid
         .and_then(|sid| daemon.get_surface(sid))
         .and_then(|s| s.role.lock().unwrap().clone())
         .map_or(false, |r| r == "master" || r == "cso")
+    {
+        return true;
+    }
+    // (b) restore-root 의 살아있는 자손 — 복원 진행 중에만(restore_roots 비면 caller_in_restore_root 즉시 false).
+    caller_pid.map_or(false, |pid| {
+        caller_in_restore_root(daemon, pid, crate::state::peer_start_time)
+    })
 }
 
 /// 컨텍스트 임계(%) — 절대지침의 60% 사이클을 결정론으로 발화하는 기준.
@@ -867,7 +904,8 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             // T3-13 타이핑 가드: 사람이 방금(기본 3초) 입력 중인 pane에 원격 직접 주입 금지.
             // 무음 큐잉 대신 명시 에러 — 후속 send-key Return이 사람의 미완성 입력을
             // 실행해버리는 최악 경로를 차단한다 (--queued는 quiet 대기 배달이라 허용).
-            if !human && !(authoritative && authoritative_caller_ok(daemon, verified_from)) {
+            if !human && !(authoritative && authoritative_caller_ok(daemon, verified_from, caller_pid))
+            {
                 let guard = typing_guard_secs();
                 if guard > 0 {
                     let typing = surface
@@ -1009,7 +1047,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 .get("authoritative")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            if !(authoritative && authoritative_caller_ok(daemon, verified_from)) {
+            if !(authoritative && authoritative_caller_ok(daemon, verified_from, caller_pid)) {
                 let guard = typing_guard_secs();
                 if guard > 0 {
                     let typing = surface
@@ -4068,7 +4106,8 @@ mod tests {
 
         // 현재 살아있는 실제 pid: 데몬 자기 프로세스. 그 진짜 start_time을 구한다.
         let live_pid = std::process::id();
-        let real_start = peer_start_time(live_pid).expect("self process must be visible");
+        let real_start =
+            crate::state::peer_start_time(live_pid).expect("self process must be visible");
 
         // ── 시나리오 1: incarnation 불일치 ──
         // 옛 CLI가 stale pane으로 해석돼 캐시됐고 그 뒤 pid가 재사용됐다고 가정.
@@ -5951,5 +5990,250 @@ mod tests {
             tombs.iter().any(|t| t.as_str() == Some("master")),
             "system.topology가 묘비를 노출하지 않는다: {resp}"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // T6 restore-root allowlist 자기공격 실측 (R4 §3 전건 — 완료 게이트).
+    // 위협모델: 비권위 노드(worker·reviewer)·외부 프로세스·surface.create 임의-cmd 자식이
+    // authoritative 로 typing_guard 를 무력화하는 것을 막는다. 근본한계(제외): same-user
+    // ptrace/task_for_pid 메모리 침투는 어떤 IPC 신원모델로도 불가(위협모델 밖).
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    /// A1·A2·A4·P2: 게이트 단위 판정 — 외부 raw RPC(None)·worker·비권위(HUD bridge류)는 deny,
+    /// master role 은 allow(role 경로 불변). restore_roots 가 비어 있어 (b) 분기는 즉시 false.
+    #[test]
+    fn authoritative_gate_unit_denies_nonauthoritative() {
+        let daemon = claim_daemon();
+        let worker = make_surface(&daemon, Some("worker-1"));
+        let master = make_surface(&daemon, Some("master"));
+        let self_pid = std::process::id();
+        // A1: 외부 raw RPC(from_sid None·caller None) — deny.
+        assert!(
+            !authoritative_caller_ok(&daemon, None, None),
+            "외부 raw RPC(None) 가 면제됐다 (A1)"
+        );
+        // A2: worker surface — deny(restore_roots 빔 → (b) false, role 아님 → (a) false).
+        assert!(
+            !authoritative_caller_ok(&daemon, Some(worker), Some(self_pid)),
+            "worker 의 authoritative 가 면제됐다 (A2)"
+        );
+        // A4: HUD bridge류(비권위 해소 + restore-root 아님, caller 조상 없음) — deny.
+        assert!(
+            !authoritative_caller_ok(&daemon, Some(worker), None),
+            "비권위+무조상(HUD bridge류) 가 면제됐다 (A4)"
+        );
+        // P2: master surface — allow(role 경로 불변·restore_roots 무관).
+        assert!(
+            authoritative_caller_ok(&daemon, Some(master), Some(self_pid)),
+            "master role 의 authoritative 면제가 깨졌다 (P2 회귀)"
+        );
+    }
+
+    /// A5·A6·A7(빈 목록)·allow(hop0): caller_in_restore_root 의 fail-closed 계약을 결정론으로 고정.
+    /// self 프로세스를 root 로 등록하고 start_time lookup 을 주입해 관측실패·불일치 경로를 시간의존 없이 단정.
+    #[test]
+    fn restore_root_gate_unit_fail_closed() {
+        let daemon = claim_daemon();
+        let self_pid = std::process::id();
+        let real_start =
+            crate::state::peer_start_time(self_pid).expect("self process must be visible");
+
+        // A7(복원 미진행): restore_roots 빔 → 어떤 caller 도 deny.
+        assert!(
+            !caller_in_restore_root(&daemon, self_pid, crate::state::peer_start_time),
+            "빈 restore_roots 에서 면제됐다 (A7)"
+        );
+
+        daemon.restore_roots.lock().unwrap().push((self_pid, real_start));
+
+        // allow(hop0): 등록 pid 본인 + start_time 일치 → allow(면제 메커니즘 성립).
+        assert!(
+            caller_in_restore_root(&daemon, self_pid, crate::state::peer_start_time),
+            "등록 pid + start_time 일치인데 면제되지 않았다"
+        );
+        // A6(관측실패): 현재 start_time None → deny(Some==Some 아님).
+        assert!(
+            !caller_in_restore_root(&daemon, self_pid, |_| None),
+            "start_time 관측실패(None) 가 면제됐다 (A6 fail-closed)"
+        );
+        // A5(pid 재사용): 등록값과 다른 start_time → deny.
+        assert!(
+            !caller_in_restore_root(&daemon, self_pid, |_| Some(real_start.wrapping_add(1))),
+            "start_time 불일치(pid 재사용) 가 면제됐다 (A5 fail-closed)"
+        );
+    }
+
+    /// A7(guard drop 후 잔존 자손): RestoreRootGuard 살아있는 동안만 면제, Drop 후 restore_roots 가
+    /// 비고 자손 authoritative 는 deny. RAII 수명이 면제 창의 유일 경계임을 고정한다.
+    #[test]
+    fn restore_root_gate_denies_after_guard_drop() {
+        let daemon = claim_daemon();
+        let self_pid = std::process::id();
+        let real_start =
+            crate::state::peer_start_time(self_pid).expect("self process must be visible");
+        {
+            let _g = crate::state::RestoreRootGuard::new(daemon.clone(), self_pid, real_start);
+            assert!(
+                caller_in_restore_root(&daemon, self_pid, crate::state::peer_start_time),
+                "guard 살아있는 동안 자손 면제가 안 됐다"
+            );
+        }
+        // guard drop → 등록 해제.
+        assert!(
+            daemon.restore_roots.lock().unwrap().is_empty(),
+            "guard drop 후 restore_roots 가 비지 않았다"
+        );
+        assert!(
+            !caller_in_restore_root(&daemon, self_pid, crate::state::peer_start_time),
+            "guard drop 후 잔존 자손이 면제됐다 (A7)"
+        );
+    }
+
+    /// P1 다중홉: restore-root(self) 의 **실 자식**(sleep)이 조상 walk(child→self=root)로 면제되는지
+    /// 실측 — 진짜 phoenix(root)→launch-agent(자손) 시나리오의 walk 경로를 검증. 가시성 대기는
+    /// 시간의존이 아니라 sysinfo 프로세스표 반영 대기(관측 게이트)다.
+    #[test]
+    fn restore_root_gate_allows_real_descendant() {
+        let daemon = claim_daemon();
+        let self_pid = std::process::id();
+        let real_start =
+            crate::state::peer_start_time(self_pid).expect("self process must be visible");
+        daemon.restore_roots.lock().unwrap().push((self_pid, real_start));
+
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep child");
+        let child_pid = child.id();
+        // sysinfo 가 자식+부모연결을 반영할 때까지 대기(관측 창).
+        let mut visible = false;
+        for _ in 0..100 {
+            if crate::state::peer_start_time(child_pid).is_some() {
+                visible = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let allowed =
+            caller_in_restore_root(&daemon, child_pid, crate::state::peer_start_time);
+        let _ = child.kill();
+        let _ = child.wait(); // 좀비 0
+        assert!(visible, "sleep 자식이 프로세스표에 보이지 않았다(관측 실패)");
+        assert!(
+            allowed,
+            "restore-root(self) 의 실 자식이 조상 walk 로 면제되지 않았다 (P1 다중홉)"
+        );
+    }
+
+    /// P1 dispatch: restore-root 자손의 authoritative send_text·send_key **둘 다** typing_guard 를
+    /// 면제받는다. 발신자는 caller_cache 로 worker 로 해소돼 role 경로(a)는 실패 — 오직 restore-root
+    /// 경로(b)만이 면제를 부여함을 증명한다(hop0: self 를 root 로 등록하고 self 를 caller 로).
+    #[test]
+    fn authoritative_restore_root_descendant_bypasses_both_send_paths() {
+        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let (daemon, dir) =
+            daemon_with_acl("restore-root-p1", r#"{"default":"allow","rules":[]}"#);
+
+        let target = make_surface(&daemon, Some("worker-1"));
+        let target_s = daemon.get_surface(target).unwrap();
+
+        // 발신자는 비권위(worker) 로 해소 → role 경로(a) 실패.
+        let sender = make_surface(&daemon, Some("worker-9"));
+        let self_pid = std::process::id();
+        bind_caller(&daemon, self_pid, sender);
+
+        // 복원 진행: self_pid 를 restore-root 로 등록(실 start_time).
+        let real_start =
+            crate::state::peer_start_time(self_pid).expect("self process must be visible");
+        daemon.restore_roots.lock().unwrap().push((self_pid, real_start));
+
+        // P1a: send_text authoritative → restore-root 경로(b)로 면제(typing_guard 아님).
+        *target_s.last_human_input.lock().unwrap() = Some(std::time::Instant::now());
+        let rt = Request {
+            id: json!(1),
+            method: "surface.send_text".into(),
+            params: json!({ "surface_id": target, "text": "x", "quiet": true, "authoritative": true }),
+        };
+        let Reply::Single(resp_t) = dispatch(&daemon, rt, Some(self_pid)) else {
+            panic!("expected single reply");
+        };
+        assert_ne!(
+            resp_t.pointer("/error/code"),
+            Some(&json!("typing_guard")),
+            "restore-root 자손의 send_text authoritative 가 막혔다 (P1a): {resp_t}"
+        );
+
+        // P1b: send_key authoritative → 동일 경로로 면제.
+        *target_s.last_human_input.lock().unwrap() = Some(std::time::Instant::now());
+        let rk = Request {
+            id: json!(2),
+            method: "surface.send_key".into(),
+            params: json!({ "surface_id": target, "key": "Return", "authoritative": true }),
+        };
+        let Reply::Single(resp_k) = dispatch(&daemon, rk, Some(self_pid)) else {
+            panic!("expected single reply");
+        };
+        assert_ne!(
+            resp_k.pointer("/error/code"),
+            Some(&json!("typing_guard")),
+            "restore-root 자손의 send_key authoritative 가 막혔다 (P1b): {resp_k}"
+        );
+
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A3(surface.create 임의-cmd 자식): **복원 진행 중이라도** restore-root subtree 밖의 발신자는
+    /// deny. 등록된 root 는 발신자의 조상이 아닌 별개 자식 프로세스(sleep) — surface.create 임의-cmd
+    /// 자식·HUD bridge 처럼 restore-root subtree 밖 노드를 시뮬레이션한다. 조상 walk 가 root 를 만나지
+    /// 못해 (b) 실패 → typing_guard.
+    ///
+    /// codex R3-04 의 "state spawn→register barrier" 대신 계보 시뮬레이션을 쓴 근거: narrow
+    /// restore-root 설계는 surface.create 등록 창을 (b) 분기와 무관하게 만든다(restore_roots 엔
+    /// auto-restore phoenix root 만 오르고 surface.create 자식은 절대 안 오른다). 따라서 등록 창
+    /// barrier 를 프로덕션 spawn→register 경로에 심는 것은 추가 커버리지 없이 프로덕션을 오염시킨다 —
+    /// "subtree 밖 발신자는 복원 중에도 deny"가 그 성질의 충실한 결정론 핀이다.
+    #[test]
+    fn authoritative_non_restore_root_denied_during_active_restore() {
+        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let (daemon, dir) =
+            daemon_with_acl("restore-root-a3", r#"{"default":"allow","rules":[]}"#);
+
+        let target = make_surface(&daemon, Some("worker-1"));
+        let target_s = daemon.get_surface(target).unwrap();
+        *target_s.last_human_input.lock().unwrap() = Some(std::time::Instant::now());
+
+        // 복원 진행 중: 등록 root 는 self 의 자손(sleep) — self 의 조상 walk 는 이 pid 를 만나지 않는다.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep child");
+        let child_pid = child.id();
+        let child_start = crate::state::peer_start_time(child_pid).unwrap_or(0);
+        daemon.restore_roots.lock().unwrap().push((child_pid, child_start));
+
+        // 발신자 = 이 테스트 프로세스(self) — child 는 self 의 자손이지 조상이 아니다.
+        let sender = make_surface(&daemon, Some("worker-9"));
+        let self_pid = std::process::id();
+        bind_caller(&daemon, self_pid, sender);
+
+        let rt = Request {
+            id: json!(1),
+            method: "surface.send_text".into(),
+            params: json!({ "surface_id": target, "text": "x", "quiet": true, "authoritative": true }),
+        };
+        let Reply::Single(resp) = dispatch(&daemon, rt, Some(self_pid)) else {
+            panic!("expected single reply");
+        };
+        let _ = child.kill();
+        let _ = child.wait(); // 좀비 0
+        assert_eq!(
+            resp.pointer("/error/code"),
+            Some(&json!("typing_guard")),
+            "restore-root subtree 밖 발신자의 authoritative 가 복원 중 우회했다 (A3 누수): {resp}"
+        );
+
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
