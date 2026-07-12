@@ -331,15 +331,7 @@ pub fn content_hash_pub(content: &str) -> String {
 /// P0-4 수리: 과거 `_ =>` catch-all 이 매니페스트 부재·읽기 실패까지 'user 수정'으로 오판해 phoenix(system)를
 /// 영구 동결시켜 배포 스큐를 냈다 — 이 분류가 그 근원을 대체한다(CLAUDE.md.template 은 .template 이라 system).
 pub(crate) fn is_user_owned(rel: &str) -> bool {
-    rel.ends_with("_DIRECTIVE.md")
-        || rel == "soul.md"
-        || rel.ends_with("/soul.md")
-        || rel == "CLAUDE.md"
-        || rel.ends_with("/CLAUDE.md")
-        // ★B2-1(W3): schedule.json 은 사용자가 `cys schedule add` 로 편집하는 혼합 파일 — 팩 강제갱신이 덮으면
-        // 사용자 잡이 소실(비가역 데이터 손실)된다. user 소유로 보존하고, built-in 잡(phoenix-*)은 데몬 부트 시
-        // 코드가 idempotent ensure 한다(cysd schedule::ensure_builtin_jobs). 기본 잡 드리프트(복구 가능) < 사용자 잡 소실.
-        || rel == "schedule.json"
+    ownership(rel) == Ownership::User
 }
 
 /// ★B2-2(치유 원복 사고 시정 · 2026-07-12): **seed-once 상태 파일** — 팩이 부재 시에만 시드로
@@ -350,9 +342,45 @@ pub(crate) fn is_user_owned(rel: &str) -> bool {
 /// 사용자 기계 동일 사고 4회차). round/ 의 정적 계약(TOOL_RESULT_VOCAB·catalog·video-archetypes)은
 /// 상태가 아니므로 system 유지 — 상태 파일만 좁게 열거한다. 의도적 초기화 = 파일 삭제 후 init-pack.
 pub(crate) fn is_seed_once(rel: &str) -> bool {
-    rel.starts_with("memory/")
+    ownership(rel) == Ownership::SeedOnce
+}
+
+/// 팩 파일 소유권 3등급 — 분류 SOT는 아래 `ownership()` 단일 함수다(성찰 후속 2026-07-12).
+/// 화이트리스트가 술어 2개(is_user_owned/is_seed_once)로 분산되면 교집합(이중 등급) 시 동작이
+/// 호출 순서에 숨는다 — 단일 match 가 배타 등급 하나만 반환하게 구조로 보장한다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Ownership {
+    /// 임베드 진실(기본값) — 불일치 시 강제 치유(P0-4)·비수정 자동 갱신·prune 대상.
+    System,
+    /// 사용자 주권(디렉티브·soul·CLAUDE·schedule) — 영구 보존, 임베드 신버전은 `.new` 병치.
+    User,
+    /// 런타임 상태(memory/·round 상태) — 부재 시에만 시드, 존재하면 force 여도 불가침.
+    SeedOnce,
+}
+
+/// 소유권 분류 단일 SOT. 우선순위 **SeedOnce > User > System** — 상태 경로 밑에 user 패턴
+/// 이름이 오는 가상 케이스(예: memory/CLAUDE.md)에서 '상태 보존(불가침)'이 '병합 병치(.new)'보다
+/// 안전측이며, decide_file_action 의 기존 검사 순서(seed-once 조기 반환)와 동형이다.
+pub(crate) fn ownership(rel: &str) -> Ownership {
+    if rel.starts_with("memory/")
         || rel == "round/SESSION_STATE.md"
         || rel == "round/RECOVERY.md"
+    {
+        return Ownership::SeedOnce;
+    }
+    if rel.ends_with("_DIRECTIVE.md")
+        || rel == "soul.md"
+        || rel.ends_with("/soul.md")
+        || rel == "CLAUDE.md"
+        || rel.ends_with("/CLAUDE.md")
+        // ★B2-1(W3): schedule.json 은 사용자가 `cys schedule add` 로 편집하는 혼합 파일 — 팩 강제갱신이 덮으면
+        // 사용자 잡이 소실(비가역 데이터 손실)된다. user 소유로 보존하고, built-in 잡(phoenix-*)은 데몬 부트 시
+        // 코드가 idempotent ensure 한다(cysd schedule::ensure_builtin_jobs). 기본 잡 드리프트(복구 가능) < 사용자 잡 소실.
+        || rel == "schedule.json"
+    {
+        return Ownership::User;
+    }
+    Ownership::System
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1931,6 +1959,24 @@ mod tests {
         // ④ 부재 시에는 시드 설치(Write) — seed-once 가 신규 설치까지 막으면 안 된다.
         assert_eq!(decide_file_action("memory/MEMORY.md", embed, false, None, None, false),
                    FileAction::Write { heal_user_copy: false }, "④ 부재 시 시드 설치");
+    }
+
+    #[test]
+    fn ownership_single_sot_priority_and_exclusivity() {
+        // 우선순위 핀(SeedOnce > User): 상태 경로 밑에 user 패턴 이름이 오는 가상 케이스는
+        // '상태 보존(불가침)'이 '병합 병치(.new)'보다 안전측 — ownership() 문서의 규정을 박제.
+        assert_eq!(ownership("memory/CLAUDE.md"), Ownership::SeedOnce);
+        assert_eq!(ownership("memory/X_DIRECTIVE.md"), Ownership::SeedOnce);
+        // 등급 대표 핀.
+        assert_eq!(ownership("soul.md"), Ownership::User);
+        assert_eq!(ownership("round/SESSION_STATE.md"), Ownership::SeedOnce);
+        assert_eq!(ownership("bin/javis_phoenix.py"), Ownership::System);
+        // 술어 래퍼 배타성: 단일 SOT 의 배타 등급이므로 어떤 rel 에서도 동시 참 불가.
+        for rel in ["memory/CLAUDE.md", "memory/MEMORY.md", "soul.md", "CLAUDE.md",
+                    "round/SESSION_STATE.md", "round/capability_catalog.json",
+                    "schedule.json", "bin/javis_phoenix.py"] {
+            assert!(!(is_user_owned(rel) && is_seed_once(rel)), "이중 등급: {rel}");
+        }
     }
 
     #[test]
