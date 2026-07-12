@@ -102,9 +102,19 @@ class RouteSpoolRun(unittest.TestCase):
         self.assertEqual(w.run["surface:5"]["done_today"], 1)  # 롤오버 후 리셋되어 다시 1
 
 
+def world_with_surfaces(pairs):
+    """(role, ref) 목록으로 부서별 1 surface씩 배치 — 부서 간 ref 중복 재현용."""
+    w = B.World()
+    w.departments = [{"department": "d%d" % i, "surfaces": [
+        {"role": role, "surface_ref": ref, "surface_id": i}]}
+        for i, (role, ref) in enumerate(pairs)]
+    return w
+
+
 class Attribution(unittest.TestCase):
-    def test_explicit_key_wins(self):
-        w = make_world({"worker": "surface:1"})
+    def test_explicit_unique_key_wins(self):
+        # 전역 유일 key는 role보다 우선
+        w = make_world({"worker": "surface:1", "boss": "surface:99"})
         self.assertEqual(B.attribute_spool(
             {"key": "surface:99", "payload": {"agent": "worker"}}, w), "surface:99")
 
@@ -125,6 +135,44 @@ class Attribution(unittest.TestCase):
                       w, coal)
         self.assertEqual(w.blocked[0]["task"], "X")
         self.assertIsNone(w.blocked[0]["key"])   # 미귀속 → key:null 로 남김
+
+
+class AttributionUniqueness(unittest.TestCase):
+    """전역 유일 게이트 — surface_ref는 부서 데몬별이라 충돌 가능(오귀속 봉쇄)."""
+
+    def test_unique_ref_attributes(self):
+        w = world_with_surfaces([("worker", "surface:5"), ("cso", "surface:9")])
+        self.assertEqual(w.ref_count("surface:5"), 1)
+        self.assertEqual(B.attribute_spool(
+            {"key": "surface:5", "payload": {}}, w), "surface:5")
+
+    def test_duplicate_ref_falls_back_to_role_success(self):
+        # surface:5 가 두 부서에 중복 → key 게이트 실패 → agent=gemini 유일 role 폴백
+        w = world_with_surfaces([("worker", "surface:5"), ("cso", "surface:5"),
+                                 ("gemini", "surface:8")])
+        self.assertEqual(w.ref_count("surface:5"), 2)
+        self.assertEqual(B.attribute_spool(
+            {"key": "surface:5", "payload": {"agent": "gemini"}}, w), "surface:8")
+
+    def test_duplicate_ref_role_fail_is_none(self):
+        # 중복 ref + role 폴백도 실패 → 미귀속(None) (오정보보다 정직한 공백)
+        w = world_with_surfaces([("worker", "surface:5"), ("cso", "surface:5")])
+        self.assertIsNone(B.attribute_spool(
+            {"key": "surface:5", "payload": {"agent": "ghost"}}, w))
+
+    def test_absent_ref_falls_back_to_role(self):
+        # fleet에 없는 ref(n=0)도 유일 아님 → role 폴백
+        w = make_world({"worker": "surface:1"})
+        self.assertEqual(B.attribute_spool(
+            {"key": "surface:404", "payload": {"agent": "worker"}}, w), "surface:1")
+
+    def test_duplicate_ref_blocked_leaves_no_wrong_key(self):
+        # 중복 ref blocked → 오귀속 대신 role 폴백 실패 시 key:null
+        w = world_with_surfaces([("worker", "surface:5"), ("cso", "surface:5")])
+        coal = B.Coalescer()
+        B.route_spool({"ts": time.time(), "type": "task.blocked", "key": "surface:5",
+                       "payload": {"task": "T", "blocked_by": ["d"], "agent": "ghost"}}, w, coal)
+        self.assertIsNone(w.blocked[0]["key"])
 
 
 class RouteSpoolBlocked(unittest.TestCase):
@@ -393,6 +441,95 @@ class TopFrame(unittest.TestCase):
         self.assertIsNotNone(fr)
         self.assertEqual(fr["field"], "blocked")
         self.assertIsNone(w.top_frame("blocked"))   # 변화 없음 → None
+
+    def test_board_dedup_and_reemit_on_change(self):
+        # ③ prev_top 락 내부화 회귀 — board도 1회만·변경 시 재방출
+        w = make_world({"worker": "surface:1"})
+        now = time.time()
+        w.hooks[1].append(now)
+        w.accumulate_heat(now)
+        self.assertIsNotNone(w.top_frame("board", now=now))
+        self.assertIsNone(w.top_frame("board", now=now))          # 동일 → None
+        w.cost_cache = {"ts": now, "value": {"usd": 1.5, "tokens": 100}}
+        self.assertIsNotNone(w.top_frame("board", now=now))       # 값 변경 → 재방출
+
+
+class SpoolRotate(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.path = os.path.join(self.tmp, "evt_spool.jsonl")
+        self._orig = B.SPOOL_ROTATE_BYTES
+
+    def tearDown(self):
+        B.SPOOL_ROTATE_BYTES = self._orig   # 전역 상한 원복
+
+    def test_below_threshold_noop(self):
+        with open(self.path, "w") as f:
+            f.write('{"type":"a","payload":{}}\n')
+        size = os.path.getsize(self.path)
+        rotated, leftover, off = B.maybe_rotate_spool(self.path, size)  # 기본 4MB 미만
+        self.assertFalse(rotated)
+        self.assertEqual(leftover, [])
+        self.assertEqual(off, size)
+        self.assertTrue(os.path.exists(self.path))   # 파일 유지
+
+    def test_drain_rotation_resets_offset(self):
+        B.SPOOL_ROTATE_BYTES = 5
+        with open(self.path, "w") as f:
+            f.write('{"type":"a","payload":{}}\n')
+        size = os.path.getsize(self.path)          # > 5, 완전 드레인(offset==size)
+        rotated, leftover, off = B.maybe_rotate_spool(self.path, size)
+        self.assertTrue(rotated)
+        self.assertEqual(off, 0)                    # offset 리셋
+        self.assertEqual(leftover, [])              # 잔여 없음
+        self.assertFalse(os.path.exists(self.path))            # 원본 rename됨(방출자가 새로 생성)
+        self.assertFalse(os.path.exists(self.path + ".old"))   # .old 삭제됨
+
+    def test_landing_write_not_lost(self):
+        # 마지막 tail~rename 창에 착지한 완결 줄을 offset 이후 내용으로 재현 → 무유실 회수
+        B.SPOOL_ROTATE_BYTES = 5
+        drained = '{"type":"a","payload":{}}\n'        # 이미 소비한 부분
+        landing = '{"type":"late","payload":{}}\n'     # 창에서 착지한 부분
+        with open(self.path, "w") as f:
+            f.write(drained + landing)
+        offset = len(drained.encode())                 # tail이 여기까지 소비했다고 가정
+        rotated, leftover, off = B.maybe_rotate_spool(self.path, offset)
+        self.assertTrue(rotated)
+        self.assertEqual(off, 0)
+        self.assertEqual([e["type"] for e in leftover], ["late"])   # 착지분 회수
+        self.assertFalse(os.path.exists(self.path + ".old"))
+
+    def test_no_rotation_when_far_below_threshold(self):
+        B.SPOOL_ROTATE_BYTES = 10 ** 9
+        with open(self.path, "w") as f:
+            f.write('{"type":"a","payload":{}}\n')
+        rotated, _, _ = B.maybe_rotate_spool(self.path, os.path.getsize(self.path))
+        self.assertFalse(rotated)
+
+
+class CoalescerShared(unittest.TestCase):
+    def test_single_instance_budget_capped(self):
+        c = B.Coalescer(budget=5)
+        allowed = sum(1 for _ in range(20) if c.allow("x.event", "surface:1", now=100.0))
+        self.assertEqual(allowed, 5)   # 고정 now → 리필 0 → 정확히 예산만 (2배 아님)
+
+    def test_thread_safe_no_overshoot(self):
+        import threading as _t
+        c = B.Coalescer(budget=50)
+        results = []
+        rlock = _t.Lock()
+
+        def worker():
+            local = sum(1 for _ in range(200) if c.allow("x.event", "surface:1", now=100.0))
+            with rlock:
+                results.append(local)
+
+        threads = [_t.Thread(target=worker) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(sum(results), 50)   # 락 + 고정 now → 총 허용 == 예산 (초과·경합 손실 0)
 
 
 class SnapshotShape(unittest.TestCase):

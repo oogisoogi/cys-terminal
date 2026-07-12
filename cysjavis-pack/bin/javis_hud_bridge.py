@@ -48,6 +48,7 @@ EVT_SPOOL_PATH = os.path.join(STATE_DIR, "evt_spool.jsonl")
 EVT_OFFSET_PATH = os.path.join(STATE_DIR, "evt_spool.offset")
 PRESENCE_HEAT_PATH = os.path.join(STATE_DIR, "presence_heat.json")
 SPOOL_POLL_SECS = 1.0
+SPOOL_ROTATE_BYTES = 4 * 1024 * 1024   # spool 무제한 성장 봉인 — 드레인 상태에서만 로테이션
 KANBAN_POLL_SECS = 5.0
 VERDICT_POLL_SECS = 5.0
 BOARD_PERSIST_SECS = 60.0   # 히트 영속·비용 캐시 갱신 주기
@@ -124,26 +125,28 @@ class Coalescer:
         self.budget = budget
         self.bucket = budget
         self.bucket_ts = None  # 첫 allow의 now 기준으로 지연 초기화 (시간축 혼선 방지)
+        self._lock = threading.Lock()   # events_loop·spool_loop 공유 → allow() 스레드 안전
 
     def allow(self, name, surface_id, now=None):
         now = time.monotonic() if now is None else now
-        if self.bucket_ts is None:
+        with self._lock:
+            if self.bucket_ts is None:
+                self.bucket_ts = now
+            # 전역 예산 (초당 리필 · 음수 경과 가드)
+            self.bucket = min(self.budget,
+                              self.bucket + max(0.0, now - self.bucket_ts) * self.budget)
             self.bucket_ts = now
-        # 전역 예산 (초당 리필 · 음수 경과 가드)
-        self.bucket = min(self.budget,
-                          self.bucket + max(0.0, now - self.bucket_ts) * self.budget)
-        self.bucket_ts = now
-        if self.bucket < 1:
-            return False
-        win = ALERT_COALESCE.get(name)
-        if win is not None:
-            key = (name, surface_id)
-            last = self.last_seen.get(key)
-            if last is not None and (now - last) < win:
+            if self.bucket < 1:
                 return False
-            self.last_seen[key] = now
-        self.bucket -= 1
-        return True
+            win = ALERT_COALESCE.get(name)
+            if win is not None:
+                key = (name, surface_id)
+                last = self.last_seen.get(key)
+                if last is not None and (now - last) < win:
+                    return False
+                self.last_seen[key] = now
+            self.bucket -= 1
+            return True
 
 
 # ------------------------------------------------------- 조작 게이트 (T3 · §R4 해제)
@@ -363,6 +366,17 @@ class World:
                     for s in d.get("surfaces", []) if s.get("surface_ref")}
 
     # --- 오피스 디테일 v1.1 ---
+    def ref_count(self, key):
+        """fleet에서 surface_ref == key 인 surface 수 (락 내 카운트).
+
+        surface 번호는 부서 데몬별이라 전역 유일이 아니다(실측 다수 충돌) — 귀속 전 유일성 판정용.
+        """
+        if not key:
+            return 0
+        with self.lock:
+            return sum(1 for d in self.departments for s in d.get("surfaces", [])
+                       if s.get("surface_ref") == key)
+
     def role_key(self, role):
         """role 문자열이 fleet에서 유일한 surface에 매칭되면 그 key, 아니면 None (귀속 규칙 2순위)."""
         if not role:
@@ -404,34 +418,39 @@ class World:
                     if presence == "active":
                         acc["active"][hour] += 1
 
-    def board_snapshot(self, now):
+    def _board_value(self):
+        """전광판 값 구성 — 호출자가 self.lock을 보유한 상태에서만 호출(락프리·재진입 방지)."""
+        return {"heat": {k: [round(a / t, 3) if t else 0.0
+                             for a, t in zip(v["active"], v["total"])]
+                         for k, v in self.heat_acc.items()},
+                "cost_today": dict(self.cost_cache["value"])}
+
+    def board_snapshot(self, now=None):
         """전광판 데이터 (기능 12) — 24h 히트 비율 + 오늘 비용(캐시)."""
         with self.lock:
-            heat = {}
-            for key, acc in self.heat_acc.items():
-                heat[key] = [round(a / t, 3) if t else 0.0
-                             for a, t in zip(acc["active"], acc["total"])]
-            return {"heat": heat, "cost_today": dict(self.cost_cache["value"])}
+            return self._board_value()
 
     def top_frame(self, field, now=None):
-        """상단 필드가 직전값과 다르면 patch_top 프레임, 같으면 None (직전값 비교 후 갱신)."""
-        now = time.time() if now is None else now
-        if field == "blocked":
-            with self.lock:
+        """상단 필드가 직전값과 다르면 patch_top 프레임, 같으면 None.
+
+        값 구성·prev_top 비교·갱신을 **단일 self.lock 안**에서 수행한다 — "스레드별 상이 field"
+        암묵 규약에 의존하지 않도록 불변식을 제거(동일 field 동시호출도 안전). board 값은 락 재획득
+        없이 _board_value()로 인라인(RLock 미사용)해 이중 획득을 피한다.
+        """
+        with self.lock:
+            if field == "blocked":
                 val = [dict(b) for b in self.blocked]
-        elif field == "kanban":
-            with self.lock:
+            elif field == "kanban":
                 val = json.loads(json.dumps(self.kanban))
-        elif field == "review":
-            with self.lock:
+            elif field == "review":
                 val = json.loads(json.dumps(self.review))
-        elif field == "board":
-            val = self.board_snapshot(now)
-        else:
-            return None
-        if self.prev_top.get(field) == val:
-            return None
-        self.prev_top[field] = val
+            elif field == "board":
+                val = self._board_value()
+            else:
+                return None
+            if self.prev_top.get(field) == val:
+                return None
+            self.prev_top[field] = val
         return {"t": "patch_top", "field": field, "value": val}
 
     def snapshot(self):
@@ -470,10 +489,7 @@ class World:
                 "blocked": [dict(b) for b in self.blocked],
                 "kanban": self.kanban,
                 "review": self.review,
-                "board": {"heat": {k: [round(a / t, 3) if t else 0.0
-                                       for a, t in zip(v["active"], v["total"])]
-                                   for k, v in self.heat_acc.items()},
-                          "cost_today": dict(self.cost_cache["value"])},
+                "board": self._board_value(),   # snapshot은 이미 self.lock 보유
             }
 
 
@@ -600,9 +616,14 @@ def route_event(ev, world, coal, now=None):
 
 # --------------------------------------------------- EVT spool → 프레임 (§2·§3)
 def attribute_spool(entry, world):
-    """spool 항목 노드 귀속 (계약 §3): key 명시 > payload.agent==role 유일 일치 > None."""
+    """spool 항목 노드 귀속 (계약 §3 + EVENT_CONTRACT 전역 유일 게이트).
+
+    surface_ref는 부서 데몬별 번호라 전역 유일이 아니다 — key가 fleet에서 **정확히 1개** surface에만
+    존재할 때만 귀속하고, 중복(또는 부재)이면 payload.agent==role 유일 일치로 폴백, 그마저 없으면
+    미귀속(None). 틀린 귀속(오정보)보다 미귀속(정직한 공백)이 낫다.
+    """
     key = entry.get("key")
-    if isinstance(key, str) and key:
+    if isinstance(key, str) and key and world.ref_count(key) == 1:
         return key
     return world.role_key((entry.get("payload") or {}).get("agent"))
 
@@ -713,6 +734,30 @@ def tail_spool(path, offset):
         except (ValueError, UnicodeDecodeError):
             continue           # 깨진 줄 skip
     return entries, offset + len(chunk)
+
+
+def maybe_rotate_spool(path, offset):
+    """드레인 상태에서 offset이 상한 초과 시 spool 로테이션. 순수 로직 (tmpdir 테스트 대상).
+
+    반환 (rotated:bool, leftover_entries:list, new_offset:int). 호출자는 이번 폴에서 신규 항목
+    0(드레인)일 때만 호출한다. 방출자(javis_event._spool_append)는 open→write(1줄 원자)→close
+    **단발**이라 os.replace(rename) 이후의 append는 새 파일(O_CREAT)에 착지한다 — 이 가정 위에서
+    교체 직전 창(마지막 tail~rename 사이)에 착지한 완결 줄은 .old를 기존 offset부터 한 번 더
+    tail해 회수한다(무유실). 이후 .old 삭제·offset=0.
+    """
+    if offset <= SPOOL_ROTATE_BYTES:
+        return False, [], offset
+    old = path + ".old"
+    try:
+        os.replace(path, old)
+    except OSError:
+        return False, [], offset
+    leftover, _ = tail_spool(old, offset)   # rename 직전 착지분 회수
+    try:
+        os.remove(old)
+    except OSError:
+        pass
+    return True, leftover, 0
 
 
 # ---------------------------------------------------- 칸반 스캐너 (기능 9 · §2)
@@ -975,10 +1020,9 @@ def fleet_loop(world, hub, poke):
         poke.clear()
 
 
-def events_loop(world, hub, poke):
+def events_loop(world, hub, poke, coal):
     os.makedirs(STATE_DIR, exist_ok=True)
     cursor = os.path.join(STATE_DIR, "cursor.seq")
-    coal = Coalescer()
     while True:
         proc = subprocess.Popen(
             [CYS, "events", "--reconnect", "--cursor-file", cursor],
@@ -1053,12 +1097,15 @@ def persist_heat(world):
         pass
 
 
-def spool_loop(world, hub):
-    """EVT spool tail → route_spool → SSE (1s 폴링·오프셋 영속·truncate 감지)."""
-    coal = Coalescer()
+def spool_loop(world, hub, coal):
+    """EVT spool tail → route_spool → SSE (1s 폴링·오프셋 영속·truncate 감지·상한 로테이션)."""
     offset = _load_offset(EVT_OFFSET_PATH)
     while True:
         entries, offset = tail_spool(EVT_SPOOL_PATH, offset)
+        if not entries:   # 드레인 상태에서만 로테이션 시도 (무제한 성장 봉인)
+            rotated, entries, offset = maybe_rotate_spool(EVT_SPOOL_PATH, offset)
+            if rotated:
+                _save_offset(EVT_OFFSET_PATH, offset)   # offset=0 즉시 영속
         if entries:
             for entry in entries:
                 frames, _ = route_spool(entry, world, coal)
@@ -1285,9 +1332,10 @@ def main():
     }
     load_heat(world)                       # 히트 링 복원 (재시작 생존)
     world.cost_cache = {"ts": time.time(), "value": read_cost_today(TRANSCRIPTS_DB)}
+    coal = Coalescer()                     # fx 전역 초당 예산 = 단일 인스턴스 (events·spool 공유)
     threading.Thread(target=fleet_loop, args=(world, hub, poke), daemon=True).start()
-    threading.Thread(target=events_loop, args=(world, hub, poke), daemon=True).start()
-    threading.Thread(target=spool_loop, args=(world, hub), daemon=True).start()
+    threading.Thread(target=events_loop, args=(world, hub, poke, coal), daemon=True).start()
+    threading.Thread(target=spool_loop, args=(world, hub, coal), daemon=True).start()
     threading.Thread(target=kanban_loop, args=(world, hub), daemon=True).start()
     threading.Thread(target=verdict_loop, args=(world, hub), daemon=True).start()
     threading.Thread(target=board_loop, args=(world, hub), daemon=True).start()
