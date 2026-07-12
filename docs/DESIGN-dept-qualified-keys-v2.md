@@ -76,9 +76,31 @@
 - **emitter 이관 추적**: `--surface` 사용처 grep 목록화 → 정식 키 상향 완료를 goal③의
   완료 게이트로(그 전까지 귀속 점진임을 §2에 명시).
 
-### Phase 2 (독립 후속·별도 승인): 부서 이벤트 멀티 구독
-- (socket,slug)별 `cys events --socket` fan-out·cursor per-socket — 부서 훅 연출·활동도 회복.
-  자원 +5 구독(거버넌스 점검 동반).
+### Phase 2 — 부서 이벤트 멀티 구독 + emitter 이관 (2026-07-12 오너 승인 · 상세 스펙)
+
+**P2-1 구독 슈퍼바이저**: events 구독을 (slug,socket)별 fan-out. fleet 폴 주기마다 타깃
+집합({main:None} ∪ fleet의 dept/socket)과 실구독을 조정(reconcile) — 신규 부서 spawn·소멸
+부서 reap(terminate). 타깃 상한 12(런어웨이 방지)·재수립 백오프 2s 유지·cursor는
+`cursor-<slug>.seq` per-slug. 전 구독은 공유 Hub·공유 Coalescer(락 보유) 경유.
+`cys [--socket S] events --reconnect --cursor-file …` (--socket 전역 플래그).
+
+**P2-2 route_event slug 문맥**: `route_event(ev, world, coal, slug)` — 키 `f"{slug}@surface:{sid}"`.
+main@ 고정을 일반화. apply_usage도 해당 slug 스코프(C3의 본부 한정을 일반화).
+
+**P2-3 sid 단독 키 맵 정식화(★v1 잠복 결함 2호 수리)**: hooks·line_hist·line_rate·flags가
+surface_id 단독 키 — 멀티 구독 전에도 line_hist/line_rate는 merge_fleet가 전 부서를 sid로
+순회해 **부서 간 activity 오염이 현재도 실재**. 4맵 전부 정식 키로 전환(_node_view·
+accumulate_heat·set_flag/live_flags 등 소비처 동기).
+
+**P2-4 emitter 이관**: 생산자 호출부 grep 실측 0곳 — 이관 = ①`javis_event.py emit --surface auto`
+신설: CYS_SOCKET env(부재=main) → depts.json socket 매칭으로 slug 해석 + `cys identify`로
+surface_ref → 정식 키 자동 조립(해석 실패 시 미귀속 폴백·fail-open 금지) ②EVENT_CONTRACT
+가이드에 `--spool --surface auto` 표준 방출 규약 추가(CYSjavis측 — master 직접).
+
+**P2 검증**: 슈퍼바이저 reconcile(부서 추가/소멸 fixture)·동번호 hook 무충돌(두 데몬 sid 5 훅
+→ 해당 노드만 active)·line_rate 격리·apply_usage slug 스코프·--surface auto 해석 3분기 —
+음성검증: P1 코드에 신규 테스트 FAIL 실측. 실기: 부서 pane 도구 훅 → 해당 부서 아바타만
+활동 연출(오피스 육안).
 
 ## 5. 호환성 매트릭스 (v2.1 — 전이 상태 2행 추가)
 
