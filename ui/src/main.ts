@@ -3088,13 +3088,13 @@ async function checkForUpdate(silent: boolean) {
 
   const badge = document.getElementById("update-badge")!;
   if (updateAvailable) {
-    // 바이너리 우선 — 재시작이 팩도 함께 반영(DESIGN '둘 다 → 바이너리 우선').
+    // (T5) 본체(바이너리) 업데이트는 홈페이지 다운로드 전용 — 인앱 재시작 설치 폐지(오너 정책).
     badge.hidden = false;
     badge.textContent = "!";
     badge.classList.remove("ok");
-    badge.title = `새 버전 ${updateAvailable.version} (재시작 필요)`;
-    if (!silent) promptInstall();
-    else toast("feed", "🔄 업데이트 있음", `새 버전 ${updateAvailable.version} — 상단 Update(재시작)`);
+    badge.title = `새 본체 버전 ${updateAvailable.version} (홈페이지에서 다운로드)`;
+    if (!silent) promptBinaryHomepage();
+    else toast("feed", "🔄 새 본체 버전", `새 본체 ${updateAvailable.version} — 홈페이지(www.cysinsight.com)에서 다운로드`);
   } else if (packUpdateAvailable && !packUpdateAvailable.binary_too_old) {
     // 팩만 변경 + 바이너리 호환 → 무중단 가능(세션·데몬 생존).
     badge.hidden = false;
@@ -3105,13 +3105,13 @@ async function checkForUpdate(silent: boolean) {
     else
       toast("feed", "↻ 무중단 팩 업데이트", `팩 ${packUpdateAvailable.pack_version} — 상단 Update(재시작 없음)`);
   } else if (packUpdateAvailable && packUpdateAvailable.binary_too_old) {
-    // 팩은 있으나 min_binary_version > 설치 바이너리 → 무중단 불가, 바이너리 업데이트 필요.
+    // 팩은 있으나 min_binary_version > 설치 바이너리 → 무중단 불가, 본체 업데이트(홈페이지) 필요(T5 정책).
     badge.hidden = false;
     badge.textContent = "!";
     badge.classList.remove("ok");
-    badge.title = `팩 ${packUpdateAvailable.pack_version}: 바이너리 업데이트 필요`;
-    const msg = `새 팩 ${packUpdateAvailable.pack_version}은 더 새로운 바이너리를 요구합니다 — 바이너리 업데이트(재시작) 후 적용됩니다.`;
-    if (!silent) toast("health", "바이너리 업데이트 필요", msg);
+    badge.title = `팩 ${packUpdateAvailable.pack_version}: 본체 업데이트 필요 (홈페이지에서 다운로드)`;
+    const msg = `새 팩 ${packUpdateAvailable.pack_version}은 더 새로운 본체를 요구합니다 — 홈페이지(www.cysinsight.com)에서 본체 업데이트 후 적용됩니다.`;
+    if (!silent) toast("health", "본체 업데이트 필요", msg);
     else toast("feed", "⚠ 업데이트 있음", msg);
   } else {
     // ★fail-safe: 양쪽 체크가 모두 성공적으로 '없음'을 확인했을 때만 상태를 갱신한다. 장애(체크 실패)
@@ -3129,39 +3129,25 @@ async function checkForUpdate(silent: boolean) {
   }
 }
 
-/// 설치 확인 + 데몬 핸드오프 정책(세션 없으면 자동·있으면 확인).
-async function promptInstall() {
+/// (T5) 본체(바이너리) 업데이트 안내 — 인앱 install_update 폐지, 홈페이지 다운로드 전용(오너 정책).
+/// 새 본체 버전을 알리고 확인 시 다운로드 페이지를 시스템 브라우저로 연다(open_url = Rust HARD
+/// 화이트리스트 게이트). 데몬·세션은 건드리지 않는다(재시작 없음 — 팩 경로 promptPackInstall과 별개).
+async function promptBinaryHomepage() {
   if (!updateAvailable) {
     await checkForUpdate(false);
     return;
   }
   const v = updateAvailable.version;
-  const sessions = (await invoke("live_session_count").catch(() => 0)) as number;
-  let force = false;
-  if (sessions > 0) {
-    // WKWebView는 confirm 지원이 불안정 → 커스텀 모달
-    const ok = await confirmModal(
-      `새 버전 ${v} 설치`,
-      `현재 작업 세션 ${sessions}개가 데몬에 물려 있습니다. 업데이트는 데몬을 재시작하므로 ` +
-        `이 세션들이 종료됩니다.\n\n그래도 지금 설치하시겠습니까? (아니오: 세션을 정리한 뒤 다시 시도)`,
-    );
-    if (!ok) return;
-    force = true;
-  }
-  // 지속형 토스트: 다운로드가 8초를 넘겨도 유지되며 update-progress 리스너가 진행률로 갱신한다.
-  stickyToast("upd-bin", "feed", "⬇ 업데이트 설치", `버전 ${v} 다운로드 준비 중… 완료 후 자동 재시작됩니다.`);
+  const ok = await confirmModal(
+    `새 본체 버전 ${v}`,
+    `새 본체(앱) 버전 ${v}이 있습니다. 본체 업데이트는 홈페이지에서 내려받아 설치합니다.\n\n` +
+      `확인을 누르면 다운로드 페이지(www.cysinsight.com)를 엽니다.`,
+  );
+  if (!ok) return;
   try {
-    await invoke("install_update", { force });
-    // 성공 시 app.restart()로 프로세스가 교체되므로 이 줄에 도달하지 않는다(sticky는 그대로 유지된 채 재시작).
+    await invoke("open_url", { url: "https://www.cysinsight.com" });
   } catch (e) {
-    dismissToast("upd-bin"); // 재시작이 일어나지 않았으므로 진행 토스트를 내린다.
-    const msg = String(e);
-    if (msg.includes("live_sessions:")) {
-      // 가드에 막힘(force 미적용 경로) — 다시 확인 흐름으로
-      await promptInstall();
-    } else {
-      toast("health", "업데이트 설치 실패", msg);
-    }
+    toast("health", "홈페이지 열기 실패", String(e));
   }
 }
 
@@ -3280,10 +3266,17 @@ async function manualRotateSkewed(appVer: string, heldMain: boolean, heldDepts: 
   stickyToast("rotate-daemon", "feed", "↻ 데몬 교대", `새 버전 v${appVer}로 교대 중… 저장 후 세션을 복원합니다.`);
   try {
     if (heldMain) await invoke("rotate_daemon", { force: true });
-    for (const d of heldDepts) await invoke("rotate_dept_daemon", { name: d.name, force: true });
+    // 경미2: rotate_dept_daemon이 반환하는 restore_ok=false(교대 후 부서 노드 복원 실패)를 삼키지 않고 승격.
+    let deptRestoreFailed = false;
+    for (const d of heldDepts) {
+      const info = (await invoke("rotate_dept_daemon", { name: d.name, force: true })) as { restore_ok?: boolean };
+      if (info?.restore_ok === false) deptRestoreFailed = true;
+    }
     dismissToast("rotate-daemon");
     clearSkewBadge();
-    toast("watchdog", "✅ 데몬 교대 완료", `데몬이 v${appVer}로 교대됐습니다. 노드 복원이 진행됩니다.`);
+    if (deptRestoreFailed)
+      toast("health", "⚠ 교대 후 부서 복원 실패", `데몬은 v${appVer}로 교대됐으나 일부 부서 노드 복원이 실패했습니다 — 상태를 점검하세요.`);
+    else toast("watchdog", "✅ 데몬 교대 완료", `데몬이 v${appVer}로 교대됐습니다. 노드 복원이 진행됩니다.`);
   } catch (e) {
     dismissToast("rotate-daemon");
     toast("health", "데몬 교대 실패", String(e));
@@ -3362,9 +3355,9 @@ async function promptPackInstall() {
 }
 
 /// Update 버튼 디스패처 — 가용 업데이트 종류에 따라 경로를 고른다.
-/// 바이너리 우선(재시작이 팩 포함) → 무중단 팩 → 미확인/바이너리 필요 시 수동 재확인.
+/// 본체(바이너리)=홈페이지 다운로드 안내(T5·재시작 없음) → 무중단 팩 → 미확인 시 수동 재확인.
 async function onUpdateButton() {
-  if (updateAvailable) return promptInstall();
+  if (updateAvailable) return promptBinaryHomepage();
   if (packUpdateAvailable && !packUpdateAvailable.binary_too_old) return promptPackInstall();
   return checkForUpdate(false);
 }
@@ -3880,7 +3873,8 @@ async function start() {
   });
 
   // 바이너리 업데이트 진행률(install_update가 emit). chunk=이번 청크 바이트(누적 아님), total=전체(Option→null 가능).
-  // UI에서 누적 합산해 지속형 토스트를 갱신한다. 성공 시 app.restart로 프로세스가 교체되므로 dismiss는 실패 경로(promptInstall catch)만.
+  // ★v0.12.51+ 휴면: 본체 업데이트가 홈페이지 다운로드로 전환돼(T5) install_update가 UI에서 호출되지 않으므로
+  //   이 리스너는 발화하지 않는다 — 백엔드 재활성화 여지를 위해 유지(backend install_update 주석과 짝).
   let updDownloaded = 0;
   await listen("update-progress", (e) => {
     const p = (e.payload ?? {}) as { phase?: string; chunk?: number; total?: number };
@@ -3939,6 +3933,31 @@ async function start() {
     const p = (e.payload ?? {}) as { message?: string };
     dismissToast("upd-pack"); // 진행 토스트를 내리고 아래 경고 토스트로 교대.
     toast("health", "⚠ 팩 일부 미각성", p.message ?? "디스크 팩은 갱신됐으나 일부 노드 reinject 보류/실패(라이브 유지).");
+  });
+
+  // (T4) 업데이트 후 조직 복원 진행(restore-progress·spawn_org_restore emit) — '직원 복귀 중' 가시화.
+  await listen("restore-progress", (e) => {
+    const p = (e.payload ?? {}) as { phase?: string; hq_ok?: boolean; ok?: number; fail?: number; detail?: string };
+    if (p.phase === "start") {
+      stickyToast("restore", "feed", "👥 직원 복귀 중", "노드 세션 복원 중… (본부·부서)");
+    } else if (p.phase === "done") {
+      dismissToast("restore");
+      const ok = p.ok ?? 0;
+      const fail = p.fail ?? 0;
+      // 결함1: 부서가 있어도 본부(HQ) 복원 실패가 묻히지 않게 hq_ok===false를 health로 승격.
+      if (p.hq_ok === false) toast("health", "⚠ 본부 복원 실패 포함", `본부 노드 복원 실패 · 부서 성공 ${ok} · 실패 ${fail} — 상태를 점검하세요.`);
+      else if (fail > 0) toast("health", "⚠ 직원 복귀 일부 실패", `부서 복원 성공 ${ok} · 실패 ${fail} — 상태를 점검하세요.`);
+      else toast("watchdog", "✅ 직원 복귀 완료", `노드 세션 복원 완료 (부서 ${ok}).`);
+    } else if (p.phase === "error") {
+      dismissToast("restore");
+      toast("health", "복원 실패", p.detail ?? "노드 복원 실행에 실패했습니다.");
+    }
+  });
+
+  // (T4) init-pack 실패 등 backend update-error 가시화 — 이제껏 UI 리스너 부재로 침묵하던 갭 해소.
+  await listen("update-error", (e) => {
+    const msg = typeof e.payload === "string" ? e.payload : "업데이트 후 처리 중 오류가 발생했습니다.";
+    toast("health", "업데이트 경고", msg);
   });
 
   // 시작 시 + 6시간마다 백그라운드 업데이트 확인 (조용히 — 있으면 badge·toast)
