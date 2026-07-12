@@ -39,6 +39,20 @@ NOWIN = {"creationflags": 0x08000000} if os.name == "nt" else {}
 BACKLOG_FX_SECS = 90.0   # 이보다 오래된 이벤트는 상태만 반영, fx(연출) 억제 — 콜드스타트 폭주 방지
 CMD_MAX_LEN = 2000       # 조작 지시 텍스트 상한
 
+# 오피스 디테일 v1.1 (§DESIGN-office-detail-v11) — EVT spool·칸반·verdict·전광판 데이터
+JAVIS_ROOT = os.environ.get("JAVIS_ROOT") or os.path.expanduser("~/Desktop/CYSjavis")
+TASKS_DIR = os.path.join(JAVIS_ROOT, "_round", "tasks")
+ROUND_DIR = os.path.join(JAVIS_ROOT, "_round")
+TRANSCRIPTS_DB = os.path.expanduser("~/.cys/transcripts.db")
+EVT_SPOOL_PATH = os.path.join(STATE_DIR, "evt_spool.jsonl")
+EVT_OFFSET_PATH = os.path.join(STATE_DIR, "evt_spool.offset")
+PRESENCE_HEAT_PATH = os.path.join(STATE_DIR, "presence_heat.json")
+SPOOL_POLL_SECS = 1.0
+KANBAN_POLL_SECS = 5.0
+VERDICT_POLL_SECS = 5.0
+BOARD_PERSIST_SECS = 60.0   # 히트 영속·비용 캐시 갱신 주기
+REVIEW_KEEP = 10            # world.review.items 최신 유지 건수
+
 # ---------------------------------------------------------------- 판정 (§5)
 HOOK_ACTIVE_WINDOW = 30.0      # 최근 30s 내 도구 훅 → active
 SELF_REPORT_FRESH = 300.0      # 자기보고 신선 기준
@@ -214,6 +228,17 @@ class World:
         self.flags = defaultdict(dict)  # surface_id → {flag: expiry_ts}
         self.server_room = {}          # pid → {cmd, scoped}
         self.prev_nodes = {}           # key → 직전 노드 스냅샷 (diff용)
+        # 오피스 디테일 v1.1 — 상단 필드·노드 확장 필드
+        self.progress = {}             # node key → {task,stage,pct,detail,ts}  (기능 6)
+        self.run = {}                  # node key → {queued,active,done_today,failed_today} (기능 7)
+        self.run_date = None           # done/failed_today 로컬 날짜 롤오버 기준
+        self.blocked = []              # [{task,blocked_by,key,ts}] (기능 8)
+        self.kanban = {"ts": 0, "tasks": []}    # (기능 9)
+        self.review = {"ts": 0, "items": []}    # (기능 10)
+        self.heat_acc = {}             # node key → {"active":[24],"total":[24]} (기능 12)
+        self.heat_hour = None          # 링 버킷 롤오버 기준 시각(hour)
+        self.cost_cache = {"ts": 0.0, "value": {"usd": None, "tokens": None}}
+        self.prev_top = {}             # patch_top 직전값 비교 (field → value)
 
     # --- 수집 반영 ---
     def note_hook(self, surface_id, ts):
@@ -311,6 +336,9 @@ class World:
                      for r in (u.get("rate") or [])],
             "activity": compute_activity(len(dq), self.line_rate.get(sid, 0.0)),
             "flags": flags,
+            # 오피스 디테일 v1.1 — spool 귀속 노드 상태 (없으면 null)
+            "progress": self.progress.get(s.get("surface_ref")),
+            "run": self.run.get(s.get("surface_ref")),
         }
 
     def _diff_patches(self):
@@ -333,6 +361,78 @@ class World:
         with self.lock:
             return {s.get("surface_ref") for d in self.departments
                     for s in d.get("surfaces", []) if s.get("surface_ref")}
+
+    # --- 오피스 디테일 v1.1 ---
+    def role_key(self, role):
+        """role 문자열이 fleet에서 유일한 surface에 매칭되면 그 key, 아니면 None (귀속 규칙 2순위)."""
+        if not role:
+            return None
+        with self.lock:
+            hits = [s.get("surface_ref") for d in self.departments
+                    for s in d.get("surfaces", []) if s.get("role") == role]
+        return hits[0] if len(hits) == 1 else None
+
+    def roll_run_date(self, now):
+        """로컬 날짜 롤오버 시 전 노드 done/failed_today 리셋 (queued/active는 라이브 카운터라 보존)."""
+        today = time.strftime("%Y-%m-%d", time.localtime(now))
+        if self.run_date != today:
+            self.run_date = today
+            for r in self.run.values():
+                r["done_today"] = 0
+                r["failed_today"] = 0
+
+    def accumulate_heat(self, now):
+        """스냅샷 틱마다 노드별 presence=='active' 시간을 로컬 24버킷 링에 누적 (기능 12)."""
+        with self.lock:
+            hour = time.localtime(now).tm_hour
+            rolled = hour != self.heat_hour
+            self.heat_hour = hour
+            for d in self.departments:
+                for s in d.get("surfaces", []):
+                    key = s.get("surface_ref")
+                    if not key:
+                        continue
+                    sid = s.get("surface_id")
+                    dq = self.hooks.get(sid) or ()
+                    presence, _ = judge_presence(s, now, dq[-1] if dq else None)
+                    acc = self.heat_acc.setdefault(
+                        key, {"active": [0] * 24, "total": [0] * 24})
+                    if rolled:  # 이 시각 버킷은 24h 전 값 → 링 재사용 위해 리셋
+                        acc["active"][hour] = 0
+                        acc["total"][hour] = 0
+                    acc["total"][hour] += 1
+                    if presence == "active":
+                        acc["active"][hour] += 1
+
+    def board_snapshot(self, now):
+        """전광판 데이터 (기능 12) — 24h 히트 비율 + 오늘 비용(캐시)."""
+        with self.lock:
+            heat = {}
+            for key, acc in self.heat_acc.items():
+                heat[key] = [round(a / t, 3) if t else 0.0
+                             for a, t in zip(acc["active"], acc["total"])]
+            return {"heat": heat, "cost_today": dict(self.cost_cache["value"])}
+
+    def top_frame(self, field, now=None):
+        """상단 필드가 직전값과 다르면 patch_top 프레임, 같으면 None (직전값 비교 후 갱신)."""
+        now = time.time() if now is None else now
+        if field == "blocked":
+            with self.lock:
+                val = [dict(b) for b in self.blocked]
+        elif field == "kanban":
+            with self.lock:
+                val = json.loads(json.dumps(self.kanban))
+        elif field == "review":
+            with self.lock:
+                val = json.loads(json.dumps(self.review))
+        elif field == "board":
+            val = self.board_snapshot(now)
+        else:
+            return None
+        if self.prev_top.get(field) == val:
+            return None
+        self.prev_top[field] = val
+        return {"t": "patch_top", "field": field, "value": val}
 
     def snapshot(self):
         """전체 WorldState (계약 v1)."""
@@ -366,6 +466,14 @@ class World:
                 "todo": todo_named,
                 "lobby": {"unassigned": unassigned},
                 "server_room": [dict(pid=k, **v) for k, v in sorted(self.server_room.items())],
+                # 오피스 디테일 v1.1 (전부 additive)
+                "blocked": [dict(b) for b in self.blocked],
+                "kanban": self.kanban,
+                "review": self.review,
+                "board": {"heat": {k: [round(a / t, 3) if t else 0.0
+                                       for a, t in zip(v["active"], v["total"])]
+                                   for k, v in self.heat_acc.items()},
+                          "cost_today": dict(self.cost_cache["value"])},
             }
 
 
@@ -490,6 +598,304 @@ def route_event(ev, world, coal, now=None):
     return frames, poke
 
 
+# --------------------------------------------------- EVT spool → 프레임 (§2·§3)
+def attribute_spool(entry, world):
+    """spool 항목 노드 귀속 (계약 §3): key 명시 > payload.agent==role 유일 일치 > None."""
+    key = entry.get("key")
+    if isinstance(key, str) and key:
+        return key
+    return world.role_key((entry.get("payload") or {}).get("agent"))
+
+
+def route_spool(entry, world, coal, now=None):
+    """EVT spool 항목 1건 → 방출 프레임 목록 (+월드 반영). 순수 로직 (테스트 대상).
+
+    route_event와 동형 시그니처. 반환 (frames, poke). 상태 반영은 항상 수행하고
+    fx 프레임만 Coalescer 예산·백로그 게이트(BACKLOG_FX_SECS)로 억제한다(계약 §2).
+    """
+    now = time.time() if now is None else now
+    typ = entry.get("type")
+    p = entry.get("payload") or {}
+    ts = entry.get("ts") or now
+    backlog = (now - ts) > BACKLOG_FX_SECS
+    key = attribute_spool(entry, world)
+    frames = []
+
+    if typ == "task_progress":
+        task, stage = p.get("task"), p.get("stage")
+        pct = p.get("pct")
+        if key is not None:
+            with world.lock:
+                old = world.progress.get(key)
+                # 동일 (task,stage) pct 미증가 재방출 무시 (계약 재방출 정책 미러)
+                stale = (old and old.get("task") == task and old.get("stage") == stage
+                         and isinstance(pct, (int, float))
+                         and isinstance(old.get("pct"), (int, float))
+                         and pct <= old["pct"])
+                if not stale:
+                    world.progress[key] = {"task": task, "stage": stage, "pct": pct,
+                                           "detail": p.get("detail"), "ts": ts}
+            if not stale and coal.allow(typ, key):
+                frames.append({"t": "fx", "kind": "progress", "key": key,
+                               "task": task, "stage": stage, "pct": pct})
+    elif typ in ("run.queued", "run.started", "run.succeeded", "run.failed"):
+        phase = typ.split(".", 1)[1]
+        if key is not None:
+            with world.lock:
+                world.roll_run_date(now)
+                r = world.run.setdefault(
+                    key, {"queued": 0, "active": None, "done_today": 0, "failed_today": 0})
+                if phase == "queued":
+                    r["queued"] += 1
+                elif phase == "started":
+                    r["queued"] = max(0, r["queued"] - 1)
+                    r["active"] = {"task": p.get("task"), "started": ts}
+                elif phase == "succeeded":
+                    r["active"] = None
+                    r["done_today"] += 1
+                elif phase == "failed":
+                    r["active"] = None
+                    r["failed_today"] += 1
+        if coal.allow(typ, key):
+            frames.append({"t": "fx", "kind": "runcard", "key": key, "phase": phase,
+                           "task": p.get("task"), "summary": p.get("summary")})
+    elif typ == "task.blocked":
+        task = p.get("task")
+        bb = p.get("blocked_by") if isinstance(p.get("blocked_by"), list) else []
+        with world.lock:
+            world.blocked = [b for b in world.blocked if b.get("task") != task]
+            world.blocked.append({"task": task, "blocked_by": bb, "key": key, "ts": ts})
+        if coal.allow(typ, key):
+            frames.append({"t": "fx", "kind": "blocked", "task": task,
+                           "blocked_by": bb, "key": key})
+    elif typ == "task.unblocked":
+        task = p.get("task")
+        with world.lock:
+            world.blocked = [b for b in world.blocked if b.get("task") != task]
+        if coal.allow(typ, key):
+            frames.append({"t": "fx", "kind": "unblocked", "task": task, "key": key})
+
+    if backlog:  # 과거 항목: 상태 반영은 위에서 완료, 연출만 억제
+        frames = [fr for fr in frames if fr.get("t") != "fx"]
+    return frames, False
+
+
+def tail_spool(path, offset):
+    """spool 파일에서 offset 이후 완결 줄만 파싱 → (entries, new_offset). 순수 로직.
+
+    파일 축소/truncate 감지 시 0부터. 미완결 마지막 줄(쓰는 중)은 다음 폴에 넘긴다.
+    깨진 JSON 줄은 skip (음성 케이스).
+    """
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return [], 0
+    if size < offset:          # truncate/축소 → 처음부터
+        offset = 0
+    if size <= offset:
+        return [], offset
+    try:
+        with open(path, "rb") as f:
+            f.seek(offset)
+            data = f.read()
+    except OSError:
+        return [], offset
+    nl = data.rfind(b"\n")
+    if nl == -1:               # 아직 완결 줄 없음
+        return [], offset
+    chunk = data[:nl + 1]
+    entries = []
+    for raw in chunk.split(b"\n"):
+        if not raw.strip():
+            continue
+        try:
+            entries.append(json.loads(raw.decode("utf-8")))
+        except (ValueError, UnicodeDecodeError):
+            continue           # 깨진 줄 skip
+    return entries, offset + len(chunk)
+
+
+# ---------------------------------------------------- 칸반 스캐너 (기능 9 · §2)
+_KANBAN_STATUS = {
+    "done": "done", "complete": "done", "completed": "done", "closed": "done",
+    "in_progress": "doing", "in-progress": "doing", "doing": "doing",
+    "active": "doing", "working": "doing", "running": "doing",
+    "todo": "todo", "pending": "todo", "new": "todo", "open": "todo", "queued": "todo",
+    "blocked": "blocked", "waiting": "blocked",
+}
+
+
+def normalize_status(raw, blocked_by):
+    """실물 status 필드 → todo|doing|done|blocked 정규화. 미완료+선행 미해소는 blocked."""
+    norm = _KANBAN_STATUS.get((raw or "").strip().lower(), "todo")
+    if norm != "done" and blocked_by:
+        return "blocked"
+    return norm
+
+
+def scan_kanban(tasks_dir, now=None):
+    """`$JAVIS_ROOT/_round/tasks/*.json`을 읽어 칸반 뷰로 정규화 (읽기 전용)."""
+    now = time.time() if now is None else now
+    tasks = []
+    try:
+        names = sorted(os.listdir(tasks_dir))
+    except OSError:
+        return {"ts": now, "tasks": []}
+    for fn in names:
+        if not fn.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(tasks_dir, fn)) as f:
+                d = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(d, dict):
+            continue
+        bb = d.get("blocked_by") if isinstance(d.get("blocked_by"), list) else []
+        tasks.append({
+            "id": d.get("id") or fn[:-5],
+            "title": (d.get("title") or "")[:120],
+            "status": normalize_status(d.get("status"), bb),
+            "owner": d.get("owner"),
+            "blocked_by": bb,
+        })
+    return {"ts": now, "tasks": tasks}
+
+
+def scan_dir_mtime(path, suffix):
+    """디렉터리+매칭 파일들의 최대 mtime (스캔 게이트용). 부재/오류 시 0."""
+    latest = 0.0
+    try:
+        latest = os.path.getmtime(path)
+        for fn in os.listdir(path):
+            if fn.endswith(suffix):
+                try:
+                    latest = max(latest, os.path.getmtime(os.path.join(path, fn)))
+                except OSError:
+                    pass
+    except OSError:
+        return 0.0
+    return latest
+
+
+# --------------------------------------------------- verdict 워처 (기능 10 · §2)
+VERDICT_RE = re.compile(r'verdict"?\s*[:=]\s*"?(ACCEPT|REVISE|BLOCK|ESCALATE)', re.I)
+REVIEWER_TOKENS = [("cso", "CSO"), ("agy", "agy"), ("codex", "codex"), ("gemini", "gemini")]
+
+
+def parse_verdict(content, filename):
+    """verdict md 파싱 → {reviewer,verdict,target} 또는 None. 두 실물 형식(`= X`·`: "X"`) 수용.
+
+    reviewer는 파일명 우선·본문 보조에서 추출, target은 파일명에서 reviewer/verdict 토큰 제거 잔여.
+    """
+    m = VERDICT_RE.search(content or "")
+    if not m:
+        return None
+    verdict = m.group(1).upper()
+    low_name = (filename or "").lower()
+    reviewer = None
+    for tok, label in REVIEWER_TOKENS:
+        if tok in low_name:
+            reviewer = label
+            break
+    if reviewer is None:
+        low_body = (content or "").lower()
+        for tok, label in REVIEWER_TOKENS:
+            if tok in low_body:
+                reviewer = label
+                break
+    base = re.sub(r"\.(md|json)$", "", filename or "", flags=re.I)
+    tgt = re.sub(r"(?i)reviewer|verdict|_?(cso|agy|codex|gemini)", "", base)
+    tgt = tgt.strip("_-. ") or None
+    return {"reviewer": reviewer, "verdict": verdict, "target": tgt}
+
+
+def scan_verdicts(round_dir, keep=REVIEW_KEEP):
+    """`*VERDICT*.md` mtime 워치 → 최신 keep건 review 항목 (계약 §2)."""
+    items = []
+    try:
+        names = os.listdir(round_dir)
+    except OSError:
+        return {"ts": time.time(), "items": []}
+    for fn in names:
+        if not (fn.endswith(".md") and "VERDICT" in fn):
+            continue
+        fp = os.path.join(round_dir, fn)
+        try:
+            mtime = os.path.getmtime(fp)
+            with open(fp, encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except OSError:
+            continue
+        parsed = parse_verdict(content, fn)
+        if parsed:
+            parsed["ts"] = mtime
+            items.append(parsed)
+    items.sort(key=lambda x: x["ts"], reverse=True)
+    return {"ts": time.time(), "items": items[:keep]}
+
+
+def verdict_fx(items, seen, now=None):
+    """새 verdict 항목의 fx 프레임 목록. 순수 로직 (테스트 대상).
+
+    route_event·route_spool과 동일한 백로그 정책: 과거(now-ts > BACKLOG_FX_SECS) 항목은
+    seen 등록만 하고 연출을 억제한다 — (재)기동 시 seen이 비어 기존 verdict가 전부 신규로
+    판정돼 fx가 폭주하는 것 방지("켜는 순간의 과거 연출 폭주 방지, 상태 손실 0"). seen은
+    호출자 보유 set으로 in-place 갱신(억제해도 등록해 이후 중복 재방출 차단).
+    """
+    now = time.time() if now is None else now
+    frames = []
+    for it in items:
+        sig = (it.get("reviewer"), it.get("verdict"), it.get("target"), it.get("ts"))
+        if sig in seen:
+            continue
+        seen.add(sig)
+        if (now - (it.get("ts") or now)) <= BACKLOG_FX_SECS:
+            frames.append({"t": "fx", "kind": "verdict", "reviewer": it.get("reviewer"),
+                           "verdict": it.get("verdict"), "target": it.get("target")})
+    return frames
+
+
+# ------------------------------------------------- 전광판 비용 (기능 12 · §5)
+def read_cost_today(db_path, now=None):
+    """transcripts.db를 read-only로 열어 오늘 비용/토큰 best-effort 산출. 불가·오류 시 null.
+
+    스키마를 런타임 조사 — 비용/토큰 컬럼이 있으면 오늘자 합산, 없으면 {usd:null,tokens:null}.
+    이 기능이 브리지를 죽이면 안 되므로 전체를 try/except로 감싼다.
+    """
+    import sqlite3
+    now = time.time() if now is None else now
+    out = {"usd": None, "tokens": None}
+    con = None
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % db_path, uri=True, timeout=2.0)
+        cols = {r[1].lower(): r[1] for r in con.execute("PRAGMA table_info(lines)")}
+        # 오늘 로컬 자정 epoch
+        lt = time.localtime(now)
+        midnight = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1))
+        has_ts = "ts" in cols
+        cost_col = next((cols[c] for c in ("cost_usd", "usd", "cost") if c in cols), None)
+        tok_col = next((cols[c] for c in ("tokens", "total_tokens", "token_count") if c in cols),
+                       None)
+        where = "WHERE ts >= ?" if has_ts else ""
+        args = (midnight,) if has_ts else ()
+        if cost_col:
+            v = con.execute("SELECT SUM(%s) FROM lines %s" % (cost_col, where), args).fetchone()
+            out["usd"] = round(v[0], 4) if v and v[0] is not None else None
+        if tok_col:
+            v = con.execute("SELECT SUM(%s) FROM lines %s" % (tok_col, where), args).fetchone()
+            out["tokens"] = int(v[0]) if v and v[0] is not None else None
+    except Exception:
+        return {"usd": None, "tokens": None}
+    finally:
+        if con is not None:
+            try:
+                con.close()
+            except Exception:
+                pass
+    return out
+
+
 # ------------------------------------------------------------------ 수집 루프
 ARCHIVE_PATH = os.path.join(STATE_DIR, "fx_archive.jsonl")
 ARCHIVE_CAP = 20 * 1024 * 1024   # 20MB 넘으면 뒤 절반 유지
@@ -559,6 +965,7 @@ def fleet_loop(world, hub, poke):
         fleet = run_json(["fleet", "--json"])
         status = run_json(["status", "--json"])
         patches, structural = world.merge_fleet(fleet, status)
+        world.accumulate_heat(time.time())   # 전광판 히트 링 누적 (기능 12)
         if structural:
             hub.publish({"t": "world", "world": world.snapshot()})
         else:
@@ -595,6 +1002,122 @@ def events_loop(world, hub, poke):
         finally:
             proc.terminate()
         time.sleep(2.0)  # 구독 재수립 백오프
+
+
+# --------------------------------------------- 오피스 디테일 v1.1 수집 루프
+def _load_offset(path):
+    try:
+        with open(path) as f:
+            return int(f.read().strip() or 0)
+    except (OSError, ValueError):
+        return 0
+
+
+def _save_offset(path, offset):
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write(str(offset))
+    except OSError:
+        pass
+
+
+def load_heat(world):
+    """부팅 시 히트 링 복원 (브리지 재시작 생존 · §2)."""
+    try:
+        with open(PRESENCE_HEAT_PATH) as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        return
+    acc = d.get("acc")
+    if isinstance(acc, dict):
+        for k, v in acc.items():
+            a = v.get("active"); t = v.get("total")
+            if isinstance(a, list) and len(a) == 24 and isinstance(t, list) and len(t) == 24:
+                world.heat_acc[k] = {"active": a, "total": t}
+    if isinstance(d.get("hour"), int):
+        world.heat_hour = d["hour"]
+
+
+def persist_heat(world):
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with world.lock:
+            payload = {"hour": world.heat_hour,
+                       "acc": {k: dict(v) for k, v in world.heat_acc.items()}}
+        tmp = PRESENCE_HEAT_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        os.replace(tmp, PRESENCE_HEAT_PATH)
+    except OSError:
+        pass
+
+
+def spool_loop(world, hub):
+    """EVT spool tail → route_spool → SSE (1s 폴링·오프셋 영속·truncate 감지)."""
+    coal = Coalescer()
+    offset = _load_offset(EVT_OFFSET_PATH)
+    while True:
+        entries, offset = tail_spool(EVT_SPOOL_PATH, offset)
+        if entries:
+            for entry in entries:
+                frames, _ = route_spool(entry, world, coal)
+                for fr in frames:
+                    hub.publish(fr)
+                    if fr.get("t") == "fx":
+                        archive_fx(entry.get("ts"), fr)
+            _save_offset(EVT_OFFSET_PATH, offset)
+            fr = world.top_frame("blocked")  # blocked[] 변경 시 상단 갱신
+            if fr:
+                hub.publish(fr)
+        time.sleep(SPOOL_POLL_SECS)
+
+
+def kanban_loop(world, hub):
+    """`_round/tasks/*.json` mtime 게이트 스캔 → world.kanban + patch_top (기능 9)."""
+    last = -1.0
+    while True:
+        mt = scan_dir_mtime(TASKS_DIR, ".json")
+        if mt != last:
+            last = mt
+            kb = scan_kanban(TASKS_DIR)
+            with world.lock:
+                world.kanban = kb
+            fr = world.top_frame("kanban")
+            if fr:
+                hub.publish(fr)
+        time.sleep(KANBAN_POLL_SECS)
+
+
+def verdict_loop(world, hub):
+    """`*VERDICT*.md` mtime 워치 → world.review + fx verdict + patch_top (기능 10)."""
+    last = -1.0
+    seen = set()
+    while True:
+        mt = scan_dir_mtime(ROUND_DIR, ".md")
+        if mt != last:
+            last = mt
+            rv = scan_verdicts(ROUND_DIR)
+            with world.lock:
+                world.review = rv     # 상태 반영은 무조건 (백로그 무관·손실 0)
+            for fr in verdict_fx(rv["items"], seen):   # 신선 항목만 fx (과거 억제)
+                hub.publish(fr)
+            fr = world.top_frame("review")
+            if fr:
+                hub.publish(fr)
+        time.sleep(VERDICT_POLL_SECS)
+
+
+def board_loop(world, hub):
+    """히트 링 60s 영속 + 비용 캐시 갱신 + 전광판 patch_top (기능 12)."""
+    while True:
+        time.sleep(BOARD_PERSIST_SECS)
+        world.cost_cache = {"ts": time.time(),
+                            "value": read_cost_today(TRANSCRIPTS_DB)}
+        persist_heat(world)
+        fr = world.top_frame("board")
+        if fr:
+            hub.publish(fr)
 
 
 # ------------------------------------------------------------------ HTTP
@@ -760,8 +1283,14 @@ def main():
             (os.path.join(WEB_DIR, "vendor", "three.module.js"),
              "text/javascript; charset=utf-8", True),
     }
+    load_heat(world)                       # 히트 링 복원 (재시작 생존)
+    world.cost_cache = {"ts": time.time(), "value": read_cost_today(TRANSCRIPTS_DB)}
     threading.Thread(target=fleet_loop, args=(world, hub, poke), daemon=True).start()
     threading.Thread(target=events_loop, args=(world, hub, poke), daemon=True).start()
+    threading.Thread(target=spool_loop, args=(world, hub), daemon=True).start()
+    threading.Thread(target=kanban_loop, args=(world, hub), daemon=True).start()
+    threading.Thread(target=verdict_loop, args=(world, hub), daemon=True).start()
+    threading.Thread(target=board_loop, args=(world, hub), daemon=True).start()
     srv = ThreadingHTTPServer((BIND, PORT), Handler)
     print(f"[hud-bridge] http://{BIND}:{PORT}  (읽기 전용 · 127.0.0.1 한정)", flush=True)
     try:

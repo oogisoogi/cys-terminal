@@ -173,6 +173,34 @@ if (window.self !== window.top) document.documentElement.classList.add("embed");
 import * as THREE from '/vendor/three.module.js';
 const HUD_TOKEN = "__HUD_TOKEN__";   // 브리지가 서빙 시 주입 (파일 직접 열면 조작 비활성)
 
+// ── E2E 검증 훅 (?debug=1 에서만 활성 — 프로덕션 무영향) ──
+// WebGL 화면은 직접 단언 불가하므로 각 디테일 기능의 적용 상태를 카운터/스냅샷으로 노출한다.
+const DEBUG = new URLSearchParams(location.search).get('debug') === '1';
+let taskTip = null;                  // task 전문 말풍선 (#4 · snapshot에서 참조)
+const dbg = DEBUG ? {
+  fx:{}, patchTop:{}, ringPulse:0, verdict:0, reviewConvened:0,
+  runcardFail:0, runcardOk:0, docFrom:0, docNoFrom:0, blockedFx:0, unblockedFx:0,
+  _kanbanCards:0, _boardTs:0, _blockedArrows:0,
+  snapshot(){   // 씬의 실시간 상태를 노드 순회로 집계 (이벤트 카운터와 별개)
+    let gauges=0, rateLeds=0, idle=0, rings=0, runCards=0, papers=0; const ringPcts=[];
+    nodes.forEach(e=>{
+      if (e.set.gaugeFill && e.set.gaugeFill.visible) gauges++;
+      if (e.set.rateLed && e.set.rateLed.visible) rateLeds++;
+      if (e.idleSprite) idle++;
+      if (e.set.progRing && e.set.progRing.visible){ rings++; ringPcts.push(e.data.progress?.pct); }
+      if (e.set.runCards) runCards += e.set.runCards.filter(c=>c.visible).length;
+      if (e.set.activeCard && e.set.activeCard.visible) runCards++;
+      if (e.set.papers) papers += e.set.papers.filter(p=>p.visible).length;
+    });
+    return { gauges, rateLeds, idle, rings, ringPcts, runCards, papers, taskTip: !!taskTip,
+      kanbanCards:this._kanbanCards, boardTs:this._boardTs, blockedArrows:this._blockedArrows,
+      fx:this.fx, patchTop:this.patchTop, ringPulse:this.ringPulse, verdict:this.verdict,
+      reviewConvened:this.reviewConvened, runcardFail:this.runcardFail, runcardOk:this.runcardOk,
+      docFrom:this.docFrom, docNoFrom:this.docNoFrom, blockedFx:this.blockedFx, unblockedFx:this.unblockedFx };
+  }
+} : null;
+if (DEBUG) window.__officeDebug = dbg;
+
 /* ============================================================
    CYSJAVIS 메타버스 오피스 — 리얼리티 렌더러 v2 (Wave 2)
    실물감: 조명·그림자·목재 책상·모니터·의자·관절 있는 사람(포즈 6종)
@@ -365,6 +393,27 @@ function mesh(g, m, x=0, y=0, z=0, shadow=true){
   return o;
 }
 
+// ── 직원 디테일 12종 공유 리소스 (per-frame 할당 금지 — 1회 생성·재사용) ──
+// disposeGroup 화이트리스트에 DG·DM을 포함(아래)해 재구축 시 파괴되지 않게 한다.
+const DG = {
+  gaugeTrack: new THREE.BoxGeometry(0.05, 0.8, 0.05),
+  gaugeFill:  new THREE.BoxGeometry(0.06, 1.0, 0.06),
+  rateTrack:  new THREE.BoxGeometry(0.62, 0.03, 0.02),
+  rateLed:    new THREE.BoxGeometry(0.62, 0.04, 0.025),
+  paper:      new THREE.BoxGeometry(0.2, 0.02, 0.26),
+  tray:       new THREE.BoxGeometry(0.34, 0.03, 0.24),
+  card:       new THREE.BoxGeometry(0.16, 0.01, 0.2),
+  ringTrack:  new THREE.RingGeometry(0.16, 0.22, 28),
+};
+const DM = {
+  gaugeTrack: new THREE.MeshStandardMaterial({ color:0x11202e, roughness:0.6 }),
+  rateTrack:  new THREE.MeshStandardMaterial({ color:0x0a1420, roughness:0.6 }),
+  paper:      new THREE.MeshStandardMaterial({ color:0xe6e0cf, roughness:0.9 }),
+  tray:       new THREE.MeshStandardMaterial({ color:0x2a3644, roughness:0.6, metalness:0.3 }),
+  card:       new THREE.MeshStandardMaterial({ color:0xf0ead6, roughness:0.85 }),
+  ringTrack:  new THREE.MeshBasicMaterial({ color:0x24384a, transparent:true, opacity:0.5, side:THREE.DoubleSide }),
+};
+
 // ---------- 텍스트 스프라이트 ----------
 function textSprite(txt, {size=22, color='#cfeeff', bg=null, pad=8, scale=0.013}={}){
   const c = document.createElement('canvas'), g = c.getContext('2d');
@@ -491,7 +540,43 @@ function makeDeskSet(node, seed){
     new THREE.MeshBasicMaterial({ color:0x6fd8ff, transparent:true, opacity:0,
       side:THREE.DoubleSide }));
   selRing.rotation.x = -Math.PI/2; selRing.position.y = 0.025; S.add(selRing);
-  return { grp:S, person, screen, mug, ring, selRing, chair };
+  // ── 직원 디테일 mesh (색·높이·표시는 update* 함수가 갱신) ──
+  // #1 ctx 게이지 — 책상 옆 세로 바(트랙+필). 필 색·높이는 updateCtxGauge.
+  const gaugeTrack = mesh(DG.gaugeTrack, DM.gaugeTrack, 0.95, 0.9, -0.1, false);
+  const gaugeFill = new THREE.Mesh(DG.gaugeFill, new THREE.MeshBasicMaterial({ color:0x35e0c0, transparent:true }));
+  gaugeFill.position.set(0.95, 0.5, -0.1);
+  S.add(gaugeTrack); S.add(gaugeFill);
+  // #3 rate LED — 모니터 상단 사용률 바(5h 우선). updateRateLed가 길이·색 갱신.
+  const rateTrack = mesh(DG.rateTrack, DM.rateTrack, 0, 1.24, -0.31, false);
+  const rateLed = new THREE.Mesh(DG.rateLed, new THREE.MeshBasicMaterial({ color:0x35e0c0 }));
+  rateLed.position.set(0, 1.24, -0.305);
+  S.add(rateTrack); S.add(rateLed);
+  // #2 모니터 코드 스크롤 — CanvasTexture(내용 갱신은 updateActivity ≥1s 스로틀, 스크롤은 프레임 offset).
+  const codeCanvas = document.createElement('canvas'); codeCanvas.width = 128; codeCanvas.height = 128;
+  const codeTex = new THREE.CanvasTexture(codeCanvas);
+  codeTex.wrapS = codeTex.wrapT = THREE.RepeatWrapping; codeTex.colorSpace = THREE.SRGBColorSpace;
+  screen.material.map = codeTex; screen.material.needsUpdate = true;
+  // #2 서류 더미 3단 (활동 구간별 0~3) — 표시 여부는 updateActivity.
+  const papers = [];
+  for (let i=0;i<3;i++){ const p = mesh(DG.paper, DM.paper, -0.5, 0.71+i*0.022, -0.08+i*0.012, false);
+    p.visible = false; desk.add(p); papers.push(p); }
+  // #7 인박스 트레이 + 큐 카드 스택(최대 5) + 활성 카드. updateRun이 표시 개수 갱신.
+  desk.add(mesh(DG.tray, DM.tray, 0.52, 0.7, 0.18, false));
+  const runCards = [];
+  for (let i=0;i<5;i++){ const c = mesh(DG.card, DM.card, 0.52, 0.72+i*0.013, 0.18, false);
+    c.visible = false; desk.add(c); runCards.push(c); }
+  const activeCard = new THREE.Mesh(DG.card, new THREE.MeshStandardMaterial({ color:0x9fd8ff,
+    roughness:0.7, emissive:0x2a6a90, emissiveIntensity:0.3 }));
+  activeCard.position.set(0.34, 0.78, -0.05); activeCard.rotation.x = -Math.PI/2.6;
+  activeCard.visible = false; desk.add(activeCard);
+  // #6 진행률 링(머리 위) — track(전체 링)+fill(부분호). fill 지오/색은 updateProgress가 pct마다 갱신.
+  const progRing = new THREE.Group(); progRing.position.set(0, 2.3, 0); progRing.visible = false;
+  progRing.add(new THREE.Mesh(DG.ringTrack, DM.ringTrack));
+  const ringFill = new THREE.Mesh(new THREE.RingGeometry(0.16, 0.22, 28, 1, Math.PI/2, 0.001),
+    new THREE.MeshBasicMaterial({ color:0x7fb8e8, side:THREE.DoubleSide }));
+  progRing.add(ringFill); S.add(progRing);
+  return { grp:S, person, screen, mug, ring, selRing, chair,
+    gaugeTrack, gaugeFill, rateLed, codeCanvas, codeTex, papers, runCards, activeCard, progRing, ringFill };
 }
 
 // ---------- 포즈 적용 ----------
@@ -564,12 +649,15 @@ let lobbyAnchor = new THREE.Vector3(0, 0.3, 0);
 let worldMeta = { seq:0, daemonv:'', deps:0, total:0 };
 let lastWorld = null;
 let selected = null;
+let kanbanBoards = [], blockedLines = [];   // #9 부서 칸반 보드 · #8 의존 점선 라인
+let reviewGather = null;                     // #10 리뷰 집결 상태
 
 function disposeGroup(g){
   g.traverse(o=>{
-    if (o.geometry && !Object.values(G).includes(o.geometry)) o.geometry.dispose();
+    if (o.geometry && !Object.values(G).includes(o.geometry) && !Object.values(DG).includes(o.geometry)) o.geometry.dispose();
     if (o.material && !Object.values(M).includes(o.material)
-        && !hairMats.includes(o.material) && !Object.values(roleMats).includes(o.material)){
+        && !hairMats.includes(o.material) && !Object.values(roleMats).includes(o.material)
+        && !Object.values(DM).includes(o.material)){
       (Array.isArray(o.material)?o.material:[o.material]).forEach(m=>{
         if (m.map) m.map.dispose(); m.dispose(); });
     }
@@ -797,6 +885,7 @@ function makeRooftop(roofY){
 
 // 로비 전광판 (실데이터 캔버스)
 let billboard = null, billCanvas = null, billTex = null;
+let boardCanvas = null, boardTex = null, lastBoardDraw = 0;   // #12 전광판(24h 히트맵·비용)
 function makeBillboard(y){
   billCanvas = document.createElement('canvas'); billCanvas.width=512; billCanvas.height=256;
   billTex = new THREE.CanvasTexture(billCanvas); billTex.colorSpace = THREE.SRGBColorSpace;
@@ -842,11 +931,159 @@ function drawBillboard(){
   billTex.needsUpdate = true;
 }
 
+// #9 칸반 벽면 — 부서 층 뒷벽 3열 보드(CanvasTexture, ≥2s 스로틀·patch_top 즉시).
+//  전 보드에 동일 칸반(공유 백로그)을 그린다 — owner→부서 매핑 없이 결정론·게이트 친화.
+function makeKanbanBoard(y){
+  const canvas = document.createElement('canvas'); canvas.width = 512; canvas.height = 256;
+  const tex = new THREE.CanvasTexture(canvas); tex.colorSpace = THREE.SRGBColorSpace;
+  const pane = new THREE.Mesh(new THREE.PlaneGeometry(4.2, 2.1),
+    new THREE.MeshBasicMaterial({ map:tex, transparent:true }));
+  pane.position.set(-3.2, y+1.7, -SLAB_D/2+0.12);       // 좌측 뒷벽(회의실 +x와 겹침 회피)
+  const grp = new THREE.Group(); grp.add(pane);
+  return { grp, canvas, tex, lastDraw:0 };
+}
+function drawKanban(force){
+  const kb = lastWorld && lastWorld.kanban;
+  if (!kb || !kanbanBoards.length) return;
+  const now = performance.now();
+  const cols = [['todo','할일'],['doing','진행'],['done','완료']];
+  let drawn = 0;
+  kanbanBoards.forEach(board=>{
+    if (!force && now - board.lastDraw < 2000) return;   // ≥2s 스로틀
+    board.lastDraw = now;
+    const g = board.canvas.getContext('2d');
+    g.clearRect(0,0,512,256);
+    g.fillStyle = 'rgba(8,18,32,0.92)'; g.fillRect(0,0,512,256);
+    g.strokeStyle = '#3fa8e0'; g.lineWidth = 2; g.strokeRect(3,3,506,250);
+    g.fillStyle = '#9fd8ff'; g.font = '600 20px Menlo,monospace'; g.fillText('KANBAN', 12, 26);
+    let bd = 0;
+    cols.forEach(([st,label],ci)=>{
+      const x = 14 + ci*166;
+      g.fillStyle = '#7fb8e8'; g.font = '600 16px Menlo,monospace'; g.fillText(label, x, 52);
+      let cy = 66;
+      (kb.tasks||[])
+        .filter(t=> st==='doing' ? (t.status==='doing'||t.status==='blocked') : t.status===st)
+        .slice(0,5).forEach(t=>{
+          const blocked = t.status==='blocked';
+          g.fillStyle = blocked ? '#3a1414' : '#0d2c4a'; g.fillRect(x, cy, 150, 30);
+          g.fillStyle = blocked ? '#ff9a9a' : '#cfeeff'; g.font = '14px Menlo,monospace';
+          g.fillText((blocked?'🔒 ':'') + String(t.title||t.id||'').slice(0,14), x+6, cy+20);
+          cy += 36; bd++;
+        });
+    });
+    board.tex.needsUpdate = true; drawn = bd;             // 보드당 카드 수(전 보드 동일)
+  });
+  if (dbg && drawn) dbg._kanbanCards = drawn;
+}
+// #12 로비 전광판 — 노드×24h 히트맵 + 오늘 비용(60s 스로틀·patch_top 즉시).
+function makeBoardBillboard(y){
+  boardCanvas = document.createElement('canvas'); boardCanvas.width = 512; boardCanvas.height = 256;
+  boardTex = new THREE.CanvasTexture(boardCanvas); boardTex.colorSpace = THREE.SRGBColorSpace;
+  lastBoardDraw = 0;
+  const pane = new THREE.Mesh(new THREE.PlaneGeometry(3.4, 1.7),
+    new THREE.MeshBasicMaterial({ map:boardTex, transparent:true }));
+  pane.position.set(-SLAB_W/2+2.2, y+1.85, -SLAB_D/2+0.35);
+  const frame = mesh(new THREE.BoxGeometry(3.6, 1.9, 0.08), M.dark, -SLAB_W/2+2.2, y+1.85, -SLAB_D/2+0.3);
+  const g = new THREE.Group(); g.add(frame); g.add(pane);
+  drawBoard(true);
+  return g;
+}
+function drawBoard(force){
+  if (!boardCanvas) return;
+  const now = performance.now();
+  if (!force && now - lastBoardDraw < 60000) return;      // 60s 스로틀
+  lastBoardDraw = now;
+  const g = boardCanvas.getContext('2d');
+  g.clearRect(0,0,512,256);
+  g.fillStyle = 'rgba(6,16,30,0.95)'; g.fillRect(0,0,512,256);
+  g.strokeStyle = '#3fa8e0'; g.lineWidth = 3; g.strokeRect(4,4,504,248);
+  g.fillStyle = '#7fe3ff'; g.font = '600 26px Menlo,monospace'; g.fillText('24H 히트맵 · 비용', 20, 38);
+  const board = lastWorld && lastWorld.board;
+  const heat = (board && board.heat) || {};
+  let ry = 60;
+  Object.entries(heat).slice(0,6).forEach(([key,arr])=>{
+    g.fillStyle = '#8cc3eb'; g.font = '14px Menlo,monospace';
+    g.fillText(String(key).replace('surface:','S'), 12, ry+14);
+    for (let h=0; h<24 && h<(arr||[]).length; h++){
+      const v = Math.max(0, Math.min(arr[h]||0, 1));
+      g.fillStyle = `rgba(${Math.round(60+v*195)},${Math.round(120+v*60)},${Math.round(200-v*120)},${0.25+v*0.7})`;
+      g.fillRect(70 + h*17, ry, 15, 20);
+    }
+    ry += 27;
+  });
+  const cost = board && board.cost_today;
+  if (cost){                                              // null 필드는 생략
+    let txt = '오늘';
+    if (cost.usd != null) txt += ` $${cost.usd.toFixed(2)}`;
+    if (cost.tokens != null) txt += ` · ${Math.round(cost.tokens/10000)}만 tok`;
+    g.fillStyle = '#ffd77a'; g.font = '600 22px Menlo,monospace'; g.fillText(txt, 20, 242);
+  }
+  boardTex.needsUpdate = true;
+  if (dbg) dbg._boardTs = now;
+}
+// #8 의존 화살표 — blocked[] 중 양측 노드 귀속 시 점선. 미귀속은 칸반 보드 표기로 대체.
+function resolveNode(ref){
+  if (ref == null) return null;
+  if (nodes.has(ref)) return nodes.get(ref);              // 노드 key 직접 참조
+  const rl = String(ref).toLowerCase();
+  for (const e of nodes.values()){
+    if (String(e.data.role||'').toLowerCase() === rl) return e;
+    if (rl.length>3 && String(e.data.task||'').toLowerCase().includes(rl)) return e;
+  }
+  return null;
+}
+function rebuildBlocked(){
+  blockedLines.forEach(l=>{ worldGroup.remove(l);
+    l.geometry.dispose(); l.material.dispose();
+    if (l.userData.lbl){ worldGroup.remove(l.userData.lbl);
+      l.userData.lbl.material.map.dispose(); l.userData.lbl.material.dispose(); } });
+  blockedLines = [];
+  const items = (lastWorld && lastWorld.blocked) || [];
+  let arrows = 0;
+  items.forEach(it=>{
+    const wait = it.key && nodes.get(it.key);
+    if (!wait) return;                                    // 미귀속 → 칸반 보드가 표기
+    (it.blocked_by||[]).forEach(bk=>{
+      const pre = resolveNode(bk);
+      if (!pre || pre === wait) return;
+      const A = wait.group.position.clone().add(new THREE.Vector3(0,1.3,0));
+      const B = pre.group.position.clone().add(new THREE.Vector3(0,1.3,0));
+      const line = new THREE.Line(new THREE.BufferGeometry().setFromPoints([A,B]),
+        new THREE.LineDashedMaterial({ color:0xff9a5a, dashSize:0.25, gapSize:0.18,
+          transparent:true, opacity:0.8 }));
+      line.computeLineDistances(); worldGroup.add(line);
+      const lbl = textSprite('⛔ ' + String(it.task||'').slice(0,16), { size:13, color:'#ffb488' });
+      lbl.position.copy(A.clone().add(B).multiplyScalar(0.5)).add(new THREE.Vector3(0,0.35,0));
+      worldGroup.add(lbl); line.userData.lbl = lbl;
+      blockedLines.push(line); arrows++;
+    });
+  });
+  if (dbg) dbg._blockedArrows = arrows;
+}
+// #10 patch_top review 최신 항목 → 판정 반영(fx verdict 경로와 동일 처리).
+function handleReview(){
+  const items = lastWorld && lastWorld.review && lastWorld.review.items;
+  if (!items || !items.length) return;
+  const it = items[items.length-1];
+  handleVerdict({ reviewer:it.reviewer, verdict:it.verdict, target:it.target });
+}
+// 상단 필드 갱신 프레임 (kanban/review/board/blocked). 미지 필드는 조용히 무시.
+function handlePatchTop(f){
+  if (!lastWorld || !f || !('field' in f)) return;
+  if (dbg) dbg.patchTop[f.field] = (dbg.patchTop[f.field]||0) + 1;
+  lastWorld[f.field] = f.value;
+  if (f.field === 'kanban') drawKanban(true);
+  else if (f.field === 'board') drawBoard(true);
+  else if (f.field === 'blocked') rebuildBlocked();
+  else if (f.field === 'review') handleReview();
+}
+
 function buildWorld(w){
   if (worldGroup) disposeGroup(worldGroup);
   worldGroup = new THREE.Group();
   nodes.clear(); racks.clear();
   links.clear(); ghosts.clear(); meeting = null;    // 재구축 시 파생물 초기화
+  kanbanBoards = []; blockedLines = []; reviewGather = null;
   document.getElementById('b-dismiss').hidden = true;
   lastWorld = w;
   const deps = w.departments || [];
@@ -862,6 +1099,7 @@ function buildWorld(w){
     fg.add(makeMeetingRoom(y, accent));    // 부서 회의실 (직원간·부서간·주인 소집용)
     fg.add(makeLounge(y, accent));         // 휴게 라운지 (소파·빈백·플로어램프)
     fg.add(makePipes(y));                  // 성수동 인더스트리얼 노출 배관
+    const kb = makeKanbanBoard(y); fg.add(kb.grp); kanbanBoards.push(kb);   // #9
     worldGroup.add(fg);
     const slots = slotPositions((d.nodes||[]).length);
     (d.nodes||[]).forEach((n,j)=>{
@@ -875,6 +1113,7 @@ function buildWorld(w){
   lbl0.position.set(-SLAB_W/2-1.8, 1.2, -SLAB_D/2-0.5); fg0.add(lbl0);
   worldGroup.add(fg0);
   worldGroup.add(makeBillboard(0));
+  worldGroup.add(makeBoardBillboard(0));   // #12 24h 히트맵·비용 전광판
   worldGroup.add(makeCafe(0));             // 로비 카페 바
   worldGroup.add(makePingPong(0));         // 탁구대 (빅테크 필수품)
   worldGroup.add(makePopupStore(0));       // 성수동 팝업 스토어 (신상=실데몬 버전)
@@ -915,6 +1154,7 @@ function buildWorld(w){
   worldMeta = { seq:w.seq, daemonv:w.daemon?.version||'', deps:deps.length, total };
   document.getElementById('paused').style.display = w.daemon?.paused ? 'block':'none';
   refreshStats(); drawBillboard();
+  drawKanban(true); rebuildBlocked();      // #9 #8 초기 반영
   if (selected && !nodes.has(selected)) closePanel();
 }
 
@@ -934,6 +1174,7 @@ function addNode(n, deptId, pos, seed){
     anim:{ handupUntil:0, critical:false, rateLimited:false } };
   nodes.set(n.key, ent);
   applyNodeFlags(ent);
+  updateDetails(ent);          // 디테일 12종 초기 반영
 }
 function applyNodeFlags(ent){
   const n = ent.data;
@@ -956,12 +1197,104 @@ function patchNode(key, n){
   if (prev.presence !== n.presence)
     addTick(`${labelOf(key)} ${PRESENCE_KO[prev.presence]||prev.presence} → ${PRESENCE_KO[n.presence]||n.presence}`, 0);
   applyNodeFlags(ent);
-  if (selected === key) fillPanel(ent);
+  updateDetails(ent);          // ctx·activity·rate·run·progress·idle 재반영
   refreshStats();
+  if (selected === key) fillPanel(ent);
 }
 function labelOf(key){
   const e = nodes.get(key);
   return e ? `${e.deptId}·${e.data.role}` : key;
+}
+
+// ---------- 직원 디테일 갱신 (12종 · 이벤트 구동 — per-frame 아님) ----------
+function updateCtxGauge(ent){                       // #1
+  const { gaugeFill:g, gaugeTrack:tr } = ent.set;
+  const pct = ent.data.ctx?.pct;
+  if (pct == null){ g.visible = false; tr.visible = false; ent.gaugeCrit = false; return; }
+  tr.visible = true; g.visible = true;
+  const h = Math.max(0.03, Math.min(pct,100)/100 * 0.8);
+  g.scale.y = h; g.position.y = 0.5 + h/2;          // 아래 앵커
+  g.material.color.setHex(pct>=90 ? 0xff4646 : pct>=60 ? 0xffcc55 : 0x35e0c0);
+  g.material.opacity = 1;
+  ent.gaugeCrit = pct >= 90;                        // ≥90 점멸(프레임 루프)
+}
+function drawCode(ent){                             // #2 모니터 코드 라인 (활동 ∝ 밀도·밝기)
+  const c = ent.set.codeCanvas, g = c.getContext('2d');
+  const act = ent.data.activity || 0;
+  g.fillStyle = '#060a12'; g.fillRect(0,0,128,128);
+  if (ent.data.presence === 'dead'){ ent.set.codeTex.needsUpdate = true; return; }
+  const hue = act > 0.6 ? '#6ee1be' : act > 0.2 ? '#7fb8e8' : '#3a5068';
+  for (let i=0;i<14;i++){
+    g.fillStyle = i % 5 === 0 ? '#c9a86a' : hue;
+    const x = 6 + (i*13 % 22), w = 26 + ((i*37) % 66) * (0.4 + act*0.6);
+    g.globalAlpha = 0.45 + 0.55*Math.min(act*1.4, 1);
+    g.fillRect(x, 4 + i*9, w, 3);
+  }
+  g.globalAlpha = 1; ent.set.codeTex.needsUpdate = true;
+}
+function updateActivity(ent){                        // #2
+  drawCode(ent);                                    // 내용 갱신은 패치 구동(≥1s 스로틀 자연 충족)
+  const act = ent.data.activity || 0;
+  const n = ent.data.presence==='dead' ? 0 : act>=0.75?3: act>=0.5?2: act>=0.25?1:0;
+  ent.set.papers.forEach((p,i)=> p.visible = i < n);
+  ent.codeSpeed = ent.data.presence==='dead' ? 0 : act;   // 스크롤 속도(프레임 루프)
+}
+function updateRateLed(ent){                         // #3
+  const led = ent.set.rateLed, rate = ent.data.rate || [];
+  const r = rate.find(x=>x.label==='5h') || rate[0];
+  const used = r && (r.used_pct ?? r.pct);
+  if (used == null){ led.visible = false; return; }
+  led.visible = true;
+  const frac = Math.max(0, Math.min(used,100))/100;
+  led.scale.x = Math.max(0.02, frac);
+  led.position.x = -0.31 + (0.62*frac)/2;           // 좌측 앵커
+  led.material.color.setHex(used>=90 ? 0xff5a5a : used>=70 ? 0xffcc55 : 0x35e0c0);
+}
+function updateRun(ent){                             // #7
+  const run = ent.data.run;
+  const q = run ? Math.min(run.queued||0, 5) : 0;
+  ent.set.runCards.forEach((c,i)=> c.visible = i < q);
+  if (!ent.failCardUntil) ent.set.activeCard.visible = !!(run && run.active);
+}
+function updateProgress(ent){                        // #6
+  const pr = ent.data.progress, ring = ent.set.progRing, fill = ent.set.ringFill;
+  if (!pr){ ring.visible = false;
+    if (ent.progLabel){ ent.set.grp.remove(ent.progLabel);
+      ent.progLabel.material.map.dispose(); ent.progLabel.material.dispose();
+      ent.progLabel = null; ent.progLabelTxt = null; }
+    return; }
+  ring.visible = true;
+  const pct = Math.max(0, Math.min(pr.pct||0, 100));
+  fill.geometry.dispose();                           // pct 변화 시에만 재생성(이벤트 구동)
+  fill.geometry = new THREE.RingGeometry(0.16, 0.22, 28, 1, Math.PI/2, pct/100*Math.PI*2 || 0.001);
+  fill.material.color.setHex(pct>=90 ? 0x6ee1be : 0x7fb8e8);
+  const txt = `${pr.stage||''} ${pct}%`.trim();
+  if (!ent.progLabel || ent.progLabelTxt !== txt){
+    if (ent.progLabel){ ent.set.grp.remove(ent.progLabel);
+      ent.progLabel.material.map.dispose(); ent.progLabel.material.dispose(); }
+    ent.progLabel = textSprite(txt, { size:15, color:'#bfe6ff' });
+    ent.progLabel.position.set(0, 2.55, 0); ent.set.grp.add(ent.progLabel);
+    ent.progLabelTxt = txt;
+  }
+}
+function updateIdle(ent){                            // #5
+  const n = ent.data, drowsyLike = n.presence==='drowsy' || n.presence==='sleeping';
+  const secs = n.idle_secs;                          // 60s 양자화 값 → 분 단위 표기
+  const txt = (drowsyLike && secs != null)
+    ? `${Math.round(secs/60)}분째 ${n.presence==='sleeping'?'수면':'꾸벅'}` : null;
+  if (!txt){ if (ent.idleSprite){ ent.set.grp.remove(ent.idleSprite);
+      ent.idleSprite.material.map.dispose(); ent.idleSprite.material.dispose();
+      ent.idleSprite = null; ent.idleTxt = null; } return; }
+  if (ent.idleSprite && ent.idleTxt === txt) return;
+  if (ent.idleSprite){ ent.set.grp.remove(ent.idleSprite);
+    ent.idleSprite.material.map.dispose(); ent.idleSprite.material.dispose(); }
+  ent.idleSprite = textSprite(txt, { size:15, color:'#ffcd78', bg:'rgba(20,14,4,.85)' });
+  ent.idleSprite.position.set(0, 2.72, 0); ent.set.grp.add(ent.idleSprite);
+  ent.idleTxt = txt;
+}
+function updateDetails(ent){
+  updateCtxGauge(ent); updateActivity(ent); updateRateLed(ent);
+  updateRun(ent); updateProgress(ent); updateIdle(ent);
 }
 
 // ---------- 연출 (fx) ----------
@@ -1009,10 +1342,23 @@ function fxTool(f){
   burst(ent, ROLE_COLOR[ent.data.role] ?? 0x9fd8ff);
   if (f.phase==='post') addTick(`${labelOf(f.key)} · ${f.tool} ✓`, 0);
 }
-function fxDoc(f){
+function fxDoc(f){                                         // #11 배달 모션
   const to = nodes.get(f.to); if (!to) return;
   linkBump(f.from, f.to);                                  // #5 협업 아크
   const from = f.from ? nodes.get(f.from) : null;
+  addTick(`📄 ${f.from?labelOf(f.from):'외부'} → ${labelOf(f.to)} 배달 ${f.bytes?`(${f.bytes}B)`:''}`, 0);
+  if (pendingCmd && f.to === pendingCmd.key){
+    setPanelStatus(`✅ cys-terminal 반영 확인 (input_injected ${f.bytes||''}B 수신)`, 'ok');
+    if (talkKey === f.to) talkStatus.textContent = `✅ cys-terminal 반영 확인 (${f.bytes||''}B 수신)`;
+    pendingCmd = null;
+  }
+  // from 귀속 + 같은 층 + 유휴 아바타 → 서류 들고 보행 배달. 아니면 종이비행기 아크.
+  if (from && from !== to && Math.abs(from.group.position.y - to.group.position.y) < 0.5
+      && !from.override && !from.walkAnim){
+    startDelivery(from, to); if (dbg) dbg.docFrom++;
+  } else { arcDoc(from, to); if (dbg) dbg.docNoFrom++; }
+}
+function arcDoc(from, to){                                 // 종이비행기 호(arc) — from null 또는 원거리
   const A = from ? from.group.position.clone().add(new THREE.Vector3(0,1.6,0))
                  : lobbyAnchor.clone();
   const B = to.group.position.clone().add(new THREE.Vector3(0,1.6,0));
@@ -1024,13 +1370,19 @@ function fxDoc(f){
   const trail = new THREE.Line(trailG,
     new THREE.LineBasicMaterial({ color:0xffd77a, transparent:true, opacity:0.6 }));
   worldGroup.add(trail);
-  flights.push({ doc, trail, A, B, C, t:0, dur:1.25, toKey:f.to });
-  addTick(`📄 ${f.from?labelOf(f.from):'외부'} → ${labelOf(f.to)} 배달 ${f.bytes?`(${f.bytes}B)`:''}`, 0);
-  if (pendingCmd && f.to === pendingCmd.key){
-    setPanelStatus(`✅ cys-terminal 반영 확인 (input_injected ${f.bytes||''}B 수신)`, 'ok');
-    if (talkKey === f.to) talkStatus.textContent = `✅ cys-terminal 반영 확인 (${f.bytes||''}B 수신)`;
-    pendingCmd = null;
-  }
+  flights.push({ doc, trail, A, B, C, t:0, dur:1.25, toKey:to.data.key });
+}
+function startDelivery(from, to){                          // from 아바타가 서류 들고 to 책상까지 왕복
+  const carry = textSprite('📄', { size:26 });
+  carry.position.set(0.18, 0.5, 0.18); from.set.person.grp.add(carry);
+  const tp = to.group.position;
+  entWalkTo(from, tp.x, tp.z + 1.2, 'stand');
+  from.walkAnim.then = ()=>{                               // 도착 → 서류 전달·복귀 착석
+    fxRipple(to.group.position);
+    from.set.person.grp.remove(carry);
+    carry.material.map.dispose(); carry.material.dispose();
+    entWalkTo(from, from.group.position.x, from.group.position.z + 0.52, 'seat');
+  };
 }
 function fxRipple(pos, color=0x8ce7ff){
   const r = new THREE.Mesh(new THREE.RingGeometry(0.05, 0.1, 32),
@@ -1039,6 +1391,7 @@ function fxRipple(pos, color=0x8ce7ff){
   worldGroup.add(r); ripples.push({ r, life:0.8 });
 }
 function handleFx(f){
+  if (dbg) dbg.fx[f.kind] = (dbg.fx[f.kind]||0) + 1;
   switch(f.kind){
     case 'tool': fxTool(f); break;
     case 'doc': fxDoc(f); break;
@@ -1062,7 +1415,59 @@ function handleFx(f){
       if(led) led.material.color.set(f.on?0x2fe08a:0x30404f);
       addTick(`${f.on?'▶':'■'} scoped 프로세스 ${f.pid}`, 0); break; }
     case 'idle': break;
+    case 'progress': {                                  // #6 진행률 링 갱신 + 펄스 1회
+      const e = nodes.get(f.key); if (e){
+        if (f.pct != null){ e.data.progress = { ...(e.data.progress||{}),
+          task:f.task, stage:f.stage, pct:f.pct }; updateProgress(e); }
+        e.progPulse = 1; if (dbg) dbg.ringPulse++;
+      } break; }
+    case 'runcard': {                                   // #7 작업 카드 실패/완료
+      const e = nodes.get(f.key);
+      if (f.phase === 'failed'){ if (e) flashFailCard(e);
+        addTick(`✗ ${labelOf(f.key)} 작업 실패${f.task?' · '+f.task:''}`, 2);
+        if (dbg) dbg.runcardFail++; }
+      else if (f.phase === 'succeeded'){ if (e) burst(e, 0x6ee1be);
+        addTick(`✓ ${labelOf(f.key)} 작업 완료${f.task?' · '+f.task:''}`, 0);
+        if (dbg) dbg.runcardOk++; }
+      else addTick(`${labelOf(f.key)} 작업 ${f.phase||''}`, 0);
+      break; }
+    case 'blocked':                                     // #8 의존 대기 티커
+      addTick(`⛔ 의존 대기: ${f.task||''}${f.blocked_by?.length?' ← '+f.blocked_by.join(','):''}`, 1);
+      if (dbg) dbg.blockedFx++; break;
+    case 'unblocked':                                   // #8 의존 해소 티커
+      addTick(`✅ 의존 해소: ${f.task||''}`, 0); if (dbg) dbg.unblockedFx++; break;
+    case 'verdict':                                     // #10 리뷰 판정
+      handleVerdict(f); if (dbg) dbg.verdict++; break;
   }
+}
+// #7 실패 카드 플래시 — 활성 카드를 2초간 빨간색으로 세운 뒤 updateRun으로 복원(프레임 루프).
+function flashFailCard(ent){
+  const c = ent.set.activeCard;
+  c.visible = true; c.material.color.setHex(0xff5a5a); c.material.emissive.setHex(0x661010);
+  ent.failCardUntil = performance.now() + 2000;
+}
+// #10 리뷰 라운드 — reviewer 역할 일치 노드를 회의 테이블에 집결·판정색 팝 + 티커.
+const VERDICT_COL = { ACCEPT:0x35e0c0, REVISE:0xffcc55, BLOCK:0xff5a5a, ESCALATE:0xb07fe0 };
+function reviewerNodes(reviewer){
+  const rv = (reviewer||'').toLowerCase(); if (!rv) return [];
+  return [...nodes.values()].filter(e=>{
+    const role = (e.data.role||'').toLowerCase();
+    return role === rv || role === 'reviewer-'+rv || (rv.length>2 && role.endsWith(rv));
+  });
+}
+function handleVerdict(f){
+  const col = VERDICT_COL[f.verdict] || 0x9fd8ff;
+  const matched = reviewerNodes(f.reviewer);
+  addTick(`⚖ ${f.reviewer||''} ${f.verdict||''}${f.target?' · '+f.target:''}`,
+    f.verdict==='BLOCK'?2 : f.verdict==='ACCEPT'?0 : 1);
+  matched.forEach(e=> pop(e, `⚖ ${f.verdict||''}`, '#'+col.toString(16).padStart(6,'0')));
+  if (matched.length){ gatherReview(matched); if (dbg) dbg.reviewConvened++; }
+}
+function gatherReview(members){
+  members.forEach((e,i)=>{ if (e.data.presence==='dead' || e.override || e.walkAnim) return;
+    const ang = (i/members.length)*Math.PI*2;
+    entWalkTo(e, 4.4 + Math.cos(ang)*1.4, -2.2 + Math.sin(ang)*0.9, 'stand'); });
+  reviewGather = { members, until: performance.now() + 8000 };   // 8초 후 자동 복귀
 }
 
 // ---------- 말풍선 (MMORPG 대화 · #2) ----------
@@ -1330,9 +1735,58 @@ canvas.addEventListener('click', e=>{
   }
   closePanel();
 });
+// ---------- task 전문 말풍선 (hover/선택 · #4) ----------
+let taskTipKey = null, lastHover = 0;
+function makeMultilineSprite(lines){
+  const size = 16, pad = 10, c = document.createElement('canvas'), g = c.getContext('2d');
+  g.font = `600 ${size}px 'SF Mono',Menlo,monospace`;
+  const w = Math.ceil(Math.max(1, ...lines.map(l=>g.measureText(l).width))) + pad*2;
+  const h = lines.length*size*1.3 + pad*2;
+  c.width = w; c.height = h;
+  g.font = `600 ${size}px 'SF Mono',Menlo,monospace`;
+  g.fillStyle = 'rgba(8,20,36,0.94)'; g.fillRect(0,0,w,h);
+  g.strokeStyle = 'rgba(120,220,255,.7)'; g.lineWidth = 2; g.strokeRect(1,1,w-2,h-2);
+  g.fillStyle = '#dff0ff'; g.textBaseline = 'top';
+  lines.forEach((l,i)=> g.fillText(l, pad, pad + i*size*1.3));
+  const tex = new THREE.CanvasTexture(c); tex.colorSpace = THREE.SRGBColorSpace;
+  const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map:tex, transparent:true, depthTest:false }));
+  sp.scale.set(w*0.006, h*0.006, 1);
+  return sp;
+}
+function showTaskTip(key){
+  const ent = nodes.get(key);
+  if (!ent || !ent.data.task){ hideTaskTip(); return; }
+  if (taskTipKey === key) return;
+  hideTaskTip();
+  taskTipKey = key;
+  const s = String(ent.data.task).slice(0,80), lines = [];
+  for (let i=0;i<s.length;i+=26) lines.push(s.slice(i,i+26));   // 26자 하드 줄바꿈
+  taskTip = makeMultilineSprite(lines);
+  taskTip.position.copy(ent.group.position).add(new THREE.Vector3(0, 2.95, 0));
+  worldGroup.add(taskTip);
+}
+function hideTaskTip(){
+  if (!taskTip) return;
+  worldGroup.remove(taskTip); taskTip.material.map.dispose(); taskTip.material.dispose();
+  taskTip = null; taskTipKey = null;
+}
+addEventListener('pointermove', e=>{
+  if (dragging || !worldGroup) return;
+  const now = performance.now(); if (now - lastHover < 120) return; lastHover = now;
+  const m = new THREE.Vector2((e.clientX/innerWidth)*2-1, -(e.clientY/innerHeight)*2+1);
+  raycaster.setFromCamera(m, camera);
+  const hits = raycaster.intersectObjects(worldGroup.children, true);
+  let key = null;
+  for (const h of hits){ let o = h.object; while (o && !o.userData.nodeKey) o = o.parent;
+    if (o){ key = o.userData.nodeKey; break; } }
+  if (key) showTaskTip(key);
+  else if (taskTipKey && selected !== taskTipKey) hideTaskTip();
+});
+
 function openPanel(key){
   const ent = nodes.get(key); if (!ent) return;
   selected = key;
+  showTaskTip(key);          // #4 선택 시 task 전문 표시
   fillPanel(ent);
   document.getElementById('chat-target').textContent = '대상: ' + labelOf(key);
   panel.style.display = 'block';
@@ -1346,7 +1800,8 @@ function fillPanel(ent){
     + ` · agent ${n.agent||'—'}<br>task: ${n.task||'—'}`
     + (n.flags?.length ? `<br>flags: ${n.flags.join(', ')}` : '');
 }
-function closePanel(){ selected = null; panel.style.display = 'none'; pendingCmd = null; }
+function closePanel(){ selected = null; panel.style.display = 'none'; pendingCmd = null; hideTaskTip(); }
+if (dbg){ dbg.openPanel = openPanel; }   // 게이트에서 hover/선택 경로(task 전문)를 구동
 document.getElementById('p-close').onclick = closePanel;
 function setPanelStatus(msg, cls){
   const el = document.getElementById('p-status');
@@ -1753,6 +2208,7 @@ function connect(){
     switch(f.t){
       case 'world': buildWorld(f.world); break;
       case 'patch': patchNode(f.key, f.node); break;
+      case 'patch_top': handlePatchTop(f); break;   // #8 #9 #10 #12 상단 필드 갱신
       case 'fx': if (!replay.mode){ handleFx(f); worldMeta.seq++; refreshStats(); } break;
       case 'resync': fetchWorld(); break;
     }
@@ -1769,6 +2225,14 @@ function frame(now){
   nodes.forEach(ent=>{
     applyPose(ent, t, dt);
     const n = ent.data;
+    // 디테일 per-frame(할당 없음): ctx 점멸·코드 스크롤·진행 펄스·실패카드 복원
+    if (ent.gaugeCrit) ent.set.gaugeFill.material.opacity = 0.35 + 0.4*Math.abs(Math.sin(t*4));
+    if (ent.codeSpeed) ent.set.codeTex.offset.y = (ent.set.codeTex.offset.y + dt*(0.05+ent.codeSpeed*0.5)) % 1;
+    if (ent.progPulse > 0){ ent.progPulse = Math.max(0, ent.progPulse - dt*2);
+      ent.set.progRing.scale.setScalar(1 + ent.progPulse*0.3); }
+    if (ent.failCardUntil && now > ent.failCardUntil){ ent.failCardUntil = 0;
+      ent.set.activeCard.material.color.setHex(0x9fd8ff);
+      ent.set.activeCard.material.emissive.setHex(0x2a6a90); updateRun(ent); }
     if (n.presence==='sleeping' && Math.random() < dt*0.4)
       pops.push({ s:(()=>{ const s=textSprite('z',{size:16,color:'#96bede'});
         s.position.copy(ent.group.position).add(new THREE.Vector3(0.3,1.7,0.4));
@@ -1818,12 +2282,19 @@ function frame(now){
       if (w.done === 'seat'){ ent.set.person.setStanding(false); ent.override = null;
         pg.rotation.y = Math.PI; pg.position.set(0, 0.48, 0.52); }
       else ent.override = 'stand';
-      ent.set.person.swing(0); return; }
+      ent.set.person.swing(0);
+      if (w.then){ const fn = w.then; w.then = null; fn(); }   // #11 배달 도착 후속(복귀)
+      return; }
     pg.position.set(w.fx+(w.tx-w.fx)*w.t, w.fy+(w.ty-w.fy)*w.t, w.fz+(w.tz-w.fz)*w.t);
     pg.rotation.y = Math.atan2(w.tx-w.fx, w.tz-w.fz);
     ent.set.person.swing(t*9); });
   const nowMs = performance.now();
   ghosts.forEach((g,k)=>{ if (nowMs - g.ts > 600000) despawnGhost(k); });
+  if (reviewGather && nowMs > reviewGather.until){        // #10 리뷰 집결 자동 복귀
+    reviewGather.members.forEach(e=>{ if (nodes.has(e.data.key) && e.override && !e.walkAnim)
+      entWalkTo(e, e.group.position.x, e.group.position.z + 0.52, 'seat'); });
+    reviewGather = null;
+  }
   if (nowMs - lastLinkT > 1000){ lastLinkT = nowMs; updateLinks(nowMs); }
   weatherTick(dt);
   dayNightTick(dt);
