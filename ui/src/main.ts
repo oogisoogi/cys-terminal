@@ -10,6 +10,7 @@ import { DEFAULT_BG, readableForeground } from "./theme";
 import { reorderWorkspace, reorderGroup } from "./reorder";
 import { deptPlaceholderLabel } from "./deptlabel";
 import { ccEffectiveZoom } from "./ccscale";
+import { clampWsbarWidth, clampWsbarFont, WSBAR_W_DEFAULT, WSBAR_FONT_STEP } from "./wsbar";
 
 declare global {
   interface Window {
@@ -4190,6 +4191,59 @@ document.getElementById("btn-theme")!.addEventListener("click", (e) =>
 // 새 ws를 master로 선언 시 공유 데몬 claim 충돌은 데몬 레벨 claim_denied(cysd handlers.rs·kill 없음)가
 // 비파괴 방어한다(생태계 죽지 않음·거부만). guard-master-claim(Fix2') 부트 자동발동 배선은 별건(헌법 토큰).
 document.getElementById("btn-ws-new")!.addEventListener("click", () => addWorkspace());
+
+// ---------- 사이드바 폭 드래그 + 글자 배율 (오너 요청 2026-07-12) ----------
+// 폭·배율은 CSS 변수(--wsbar-w/--wsbar-font)가 진실원, localStorage 영속. 클램프 산식=wsbar.ts.
+// pane 재렌더는 이중 안전: 각 pane의 ResizeObserver(→fitPane)가 폭 변화에 자동 발화하고,
+// 드래그 종료 시 refitAllPanes()로 전 pane 강제 재적합+xterm 재렌더를 한 번 더 보장한다.
+let wsbarW = clampWsbarWidth(Number(localStorage.getItem("cys-wsbar-w")) || WSBAR_W_DEFAULT);
+let wsbarFont = clampWsbarFont(Number(localStorage.getItem("cys-wsbar-font")) || 1);
+function applyWsbarVars() {
+  document.documentElement.style.setProperty("--wsbar-w", `${wsbarW}px`);
+  document.documentElement.style.setProperty("--wsbar-font", String(wsbarFont));
+}
+applyWsbarVars(); // 마운트 시 저장값 복원
+
+function refitAllPanes() {
+  for (const rt of panes.values()) {
+    fitPane(rt); // 숨김/미배치 pane은 fitPane 내부 가드가 거른다
+    rt.term.refresh(0, rt.term.rows - 1); // PTY rows/cols 불변이어도 화면 재렌더 보장
+  }
+}
+
+const wsbarDrag = document.getElementById("wsbar-drag");
+wsbarDrag?.addEventListener("mousedown", (e0: MouseEvent) => {
+  e0.preventDefault();
+  const startX = e0.clientX, startW = wsbarW;
+  document.body.classList.add("wsbar-resizing");
+  const move = (e: MouseEvent) => {
+    wsbarW = clampWsbarWidth(startW + (e.clientX - startX));
+    applyWsbarVars(); // 드래그 중 실시간 반영 — pane ResizeObserver가 연속 refit(60ms 디바운스)
+  };
+  const up = () => {
+    window.removeEventListener("mousemove", move, true);
+    window.removeEventListener("mouseup", up, true);
+    document.body.classList.remove("wsbar-resizing");
+    localStorage.setItem("cys-wsbar-w", String(wsbarW));
+    refitAllPanes();
+  };
+  window.addEventListener("mousemove", move, true);
+  window.addEventListener("mouseup", up, true);
+});
+wsbarDrag?.addEventListener("dblclick", () => {
+  wsbarW = WSBAR_W_DEFAULT;
+  applyWsbarVars();
+  localStorage.setItem("cys-wsbar-w", String(wsbarW));
+  refitAllPanes();
+});
+
+function applyWsbarFontStep(dir: number) {
+  wsbarFont = clampWsbarFont(wsbarFont + dir * WSBAR_FONT_STEP);
+  applyWsbarVars();
+  localStorage.setItem("cys-wsbar-font", String(wsbarFont));
+}
+document.getElementById("btn-ws-font-minus")?.addEventListener("click", () => applyWsbarFontStep(-1));
+document.getElementById("btn-ws-font-plus")?.addEventListener("click", () => applyWsbarFontStep(+1));
 // 멀티마스터 F4 + ＋부서 자동화(패치5): 새 부서(독립 데몬) workspace 런칭. 부서 번호는 백엔드가 확정.
 const deptBtn = document.getElementById("btn-ws-dept") as HTMLButtonElement | null;
 // 부서 런칭 실행(공통) — placeholder 탭·in-flight 버튼 가드. catalogKey=undefined → 레거시 dept-N.

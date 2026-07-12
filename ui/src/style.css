@@ -49,12 +49,22 @@ html, body {
 
 /* workspace sidebar — 좌측 별도 섹션·항목 가독성(제목 bold + 서브라인 dim) */
 #wsbar {
-  flex: 0 0 216px; min-width: 0;
+  flex: 0 0 var(--wsbar-w, 216px); min-width: 0; /* 폭 = 드래그 핸들(#wsbar-drag)로 조절·영속 */
   display: flex; flex-direction: column;
   background: var(--bar); border-right: 1px solid var(--hairline);
   -webkit-user-select: none; user-select: none;
   overflow: hidden;
 }
+#wsbar-drag {
+  flex: none; width: 5px; cursor: col-resize; margin-left: -2px;
+  background: transparent; z-index: 5;
+}
+#wsbar-drag:hover, body.wsbar-resizing #wsbar-drag { background: rgba(88,166,255,.35); }
+body.wsbar-resizing { cursor: col-resize; -webkit-user-select: none; user-select: none; }
+#btn-ws-font-minus, #btn-ws-font-plus {
+  background: none; border: none; color: #8b949e; cursor: pointer; font-size: 11px; padding: 0 2px;
+}
+#btn-ws-font-minus:hover, #btn-ws-font-plus:hover { color: var(--text, #e2e8f0); }
 #wsbar-head {
   display: flex; align-items: center; justify-content: space-between;
   padding: 10px 12px 6px;
@@ -76,13 +86,14 @@ html, body {
 .ws-tab .ws-title-row {
   display: flex; align-items: center; gap: 6px; min-width: 0;
 }
+/* 사이드바 글자 배율(--wsbar-font·A−/A＋ 버튼·영속) — 고정 2배 하드코딩을 배율로 대체(오너 가독성 요청의 상위 호환 2026-07-12) */
 .ws-tab .ws-name {
   flex: 1; min-width: 0;
-  font-size: 13px; font-weight: 600;
+  font-size: calc(13px * var(--wsbar-font, 1)); font-weight: 600;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .ws-tab .ws-sub {
-  font-size: 11px; color: #8b949e;
+  font-size: calc(11px * var(--wsbar-font, 1)); color: #8b949e;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .ws-tab.active .ws-name { color: #fff; }
@@ -98,7 +109,7 @@ html, body {
 .ws-approve-badge { margin-left: 6px; color: var(--error); font-weight: 700; font-size: 11px; }
 #btn-ws-dept:disabled { opacity: .5; cursor: default; }
 .ws-tab .ws-close {
-  flex: none; opacity: 0; cursor: pointer; color: inherit; font-size: 12px;
+  flex: none; opacity: 0; cursor: pointer; color: inherit; font-size: calc(12px * var(--wsbar-font, 1));
 }
 .ws-tab:hover .ws-close { opacity: .55; }
 .ws-tab .ws-close:hover { opacity: 1; color: var(--error); }
@@ -106,7 +117,7 @@ html, body {
 /* 2-click 삭제 확인 armed 상태 — 위험색 유지(active 탭 hover의 #fff보다 우선), 2.5초 내 hover 이탈해도 노출 유지 */
 .ws-tab .ws-close.close-armed, .ws-tab.active .ws-close.close-armed:hover { opacity: 1; color: var(--error); }
 /* svg가 클릭 target이 되면 mousedown 가드(e.target 비교)가 깨진다 — 이벤트는 span이 받게 */
-.close-armed svg { width: 11px; height: 11px; fill: currentColor; vertical-align: -1.5px; pointer-events: none; }
+.close-armed svg { width: calc(11px * var(--wsbar-font, 1)); height: calc(11px * var(--wsbar-font, 1)); fill: currentColor; vertical-align: -1.5px; pointer-events: none; }
 #btn-ws-new {
   background: none; border: none; color: #8b949e; cursor: pointer; font-size: 14px;
   padding: 0 2px;
