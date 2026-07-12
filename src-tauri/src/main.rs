@@ -776,6 +776,23 @@ fn last_app_version_path() -> std::path::PathBuf {
     cys::home_dir().join(".cys/.last-app-version")
 }
 
+/// GUI 온보딩 완료 마커 — "이 GUI가 이 바이너리 버전에서 온보딩(팩+hook(+win: schtasks))을
+/// **성공** 완료했는가". writer는 GUI 온보딩 성공 경로 단 하나다 — CLI autostart·잔존 schtasks·
+/// ONLOGON 등 어떤 순서로 cysd가 먼저 돌아도 이 마커를 선점할 수 없다(0.12.52 cys-neo 회귀 시정:
+/// 팩 마커(.pack-version) 기반 게이트를 CLI-선행 cysd 스윕이 선점 → ~/.claude hook 영구 미설치 →
+/// "너는 마스터다" 부트스트랩 무력화). ★.pack-version(팩 최신 여부·install 계층 writer)·
+/// .last-app-version(복원 필요 여부·L2 writer)과 질문·작성자가 전부 다르다 — 통합 금지:
+/// .last-app-version은 --no-install-hook 경로(Apply)가 전진시키므로 "스탬프 있음=hook 있음"이 거짓.
+fn gui_onboarded_path() -> std::path::PathBuf {
+    cys::home_dir().join(".cys/.gui-onboarded")
+}
+
+/// GUI 온보딩 실행 여부 — 부작용 없는 순수 판정(단위테스트 대상). 마커 내용이 현재 바이너리
+/// 버전과 정확히 일치할 때만 스킵. 부재·불일치·읽기 실패 = 실행(fail-open — 치유 방향).
+fn needs_gui_onboard(marker: Option<&str>, current_version: &str) -> bool {
+    marker.map(str::trim) != Some(current_version)
+}
+
 /// (T1) 재시작 후 팩반영·복원을 돌릴지 판정 — 부작용(파일·프로세스) 없는 순수 함수(단위테스트 대상).
 #[derive(Debug, PartialEq, Eq)]
 enum PendingUpdatePlan {
@@ -1203,19 +1220,29 @@ async fn maybe_autoregister_launchd() -> bool {
 
 /// 첫 기동 온보딩 공용 단계 — `cys init-pack`으로 팩 파일 + Claude SessionStart hook 등록.
 /// install은 preserve, hook은 중복 dedup(already→skip·.bak-cys 무변경)이라 **멱등** — 반복 실행해도
-/// 안전하다. 단 호출은 setup의 needs_onboard 게이트(pack_current_for)로 조건화됐다(2026-07-12):
-/// 신선 머신·버전 변경·팩 소실(.pack-version/매니페스트 부재)에만 실행 — 평시 부트 비용 제거.
+/// 안전하다. 호출은 setup의 needs_gui_onboard 게이트(.gui-onboarded 마커)로 조건화된다(v4 · 2026-07-12):
+/// 마커 부재(신선 머신·직전 실패)·버전 불일치(업그레이드)에만 실행 — 평시 부트 비용 제거.
 /// Windows·macOS 온보딩이 공유한다(autostart는 OS별로 분리: Windows=schtasks·macOS=launchd).
-/// best-effort — 실패해도 세션은 진행(팩 미설치면 .pack-version 부재 = 다음 부트 게이트 개방 = 재시도).
+/// 반환 = init-pack 성공 여부(★hook 등록 실패도 rc=1 — cys.rs run_init_pack). false면 호출자가
+/// 마커를 기록하지 않아 다음 부트에 재시도된다(best-effort + 재시도 내장). 실패해도 세션은 진행.
 #[cfg(any(windows, target_os = "macos"))]
-fn onboard_init_pack(cys: &std::path::Path) {
+fn onboard_init_pack(cys: &std::path::Path) -> bool {
     let mut init = std::process::Command::new(cys);
     init.arg("init-pack");
     no_console(&mut init);
     match init.status() {
-        Ok(s) if s.success() => eprintln!("[cys-app] onboarding: init-pack ok"),
-        Ok(s) => eprintln!("[cys-app] onboarding: init-pack exited {s}"),
-        Err(e) => eprintln!("[cys-app] onboarding: init-pack spawn failed: {e}"),
+        Ok(s) if s.success() => {
+            eprintln!("[cys-app] onboarding: init-pack ok");
+            true
+        }
+        Ok(s) => {
+            eprintln!("[cys-app] onboarding: init-pack exited {s}");
+            false
+        }
+        Err(e) => {
+            eprintln!("[cys-app] onboarding: init-pack spawn failed: {e}");
+            false
+        }
     }
 }
 
@@ -1224,18 +1251,29 @@ fn onboard_init_pack(cys: &std::path::Path) {
 /// ① `onboard_init_pack`: 팩 + Claude hook 등록(멱등).
 /// ② `cys daemon install`: 기존 schtasks ONLOGON 자동기동 등록 재사용(cys.rs:3139·/F 멱등).
 #[cfg(windows)]
-fn maybe_windows_onboard() {
+fn maybe_windows_onboard() -> bool {
     let cys = resolve_sidecar("cys.exe");
-    onboard_init_pack(&cys);
+    let init_ok = onboard_init_pack(&cys);
     // ② autostart 등록 (기존 cys daemon install = schtasks ONLOGON 재사용, /F 멱등)
     let mut reg = std::process::Command::new(&cys);
     reg.arg("daemon").arg("install");
     no_console(&mut reg);
-    match reg.status() {
-        Ok(s) if s.success() => eprintln!("[cys-app] windows onboarding: daemon install (schtasks) ok"),
-        Ok(s) => eprintln!("[cys-app] windows onboarding: daemon install exited {s}"),
-        Err(e) => eprintln!("[cys-app] windows onboarding: daemon install spawn failed: {e}"),
-    }
+    let reg_ok = match reg.status() {
+        Ok(s) if s.success() => {
+            eprintln!("[cys-app] windows onboarding: daemon install (schtasks) ok");
+            true
+        }
+        Ok(s) => {
+            eprintln!("[cys-app] windows onboarding: daemon install exited {s}");
+            false
+        }
+        Err(e) => {
+            eprintln!("[cys-app] windows onboarding: daemon install spawn failed: {e}");
+            false
+        }
+    };
+    // 둘 다 성공해야 완료 — 부분 실패는 마커 미기록 → 다음 부트 재시도(멱등이라 안전).
+    init_ok && reg_ok
 }
 
 /// macOS 첫 기동 온보딩 — Windows 온보딩의 대칭(RC-17·T5). macOS DMG 소비자는 launchd
@@ -1243,9 +1281,9 @@ fn maybe_windows_onboard() {
 /// 부트스트랩이 미발동했다. autostart는 launchd가 담당하므로 여기서는 Windows와 대칭으로
 /// 팩+Claude hook만 등록한다. init-pack 멱등 — 기존 사용자에 재실행돼도 무해(already→skip·.bak-cys 불변).
 #[cfg(target_os = "macos")]
-fn maybe_macos_onboard() {
+fn maybe_macos_onboard() -> bool {
     let cys = resolve_sidecar("cys");
-    onboard_init_pack(&cys);
+    onboard_init_pack(&cys)
 }
 
 /// Windows: GUI(windows_subsystem)가 콘솔 바이너리(cys/cysd/python3)를 스폰할 때 콘솔 창이
@@ -2090,12 +2128,16 @@ fn main() {
         .setup(|app| {
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
-                // ★온보딩 게이트 캡처 — 반드시 데몬 기동(launchd load·ensure_daemon)보다 먼저 평가한다.
-                // cysd는 부트 시 스스로 팩을 설치하고 .pack-version을 기록하므로(cysd/main.rs 온보딩②),
-                // 캡처가 데몬 기동 뒤면 신선 머신에서 게이트가 '최신'으로 오판해 hook 미설치(T1 회귀).
-                // Directive: 이 순서를 옮기지 마라 — 게이트·온보딩·cysd 스윕의 정합은 이 캡처 시점이 진실이다.
+                // ★온보딩 게이트(v4) — GUI 전용 완료 마커(.gui-onboarded) 기준. 팩 마커(.pack-version)
+                // 기준이던 v3는 CLI autostart·잔존 schtasks 등으로 cysd가 GUI보다 먼저 돈 머신에서
+                // 게이트가 선점돼 ~/.claude hook이 영구 미설치됐다(0.12.52 cys-neo 실사고 — "너는
+                // 마스터다" 부트스트랩 무력화). 이 마커는 GUI 온보딩 성공 경로만 기록하므로 프로세스
+                // 순서와 무관하게 신선 머신 온보딩이 보장된다. 평시 부트 비용 = 마커 read 1회.
                 #[allow(unused_variables)] // 온보딩 경로가 없는 OS(linux CI 등)에서만 미사용
-                let needs_onboard = !cys::pack::pack_current_for(env!("CARGO_PKG_VERSION"));
+                let needs_onboard = needs_gui_onboard(
+                    std::fs::read_to_string(gui_onboarded_path()).ok().as_deref(),
+                    env!("CARGO_PKG_VERSION"),
+                );
                 #[cfg(target_os = "macos")]
                 let launchd_owns = maybe_autoregister_launchd().await;
                 #[cfg(not(target_os = "macos"))]
@@ -2119,17 +2161,22 @@ fn main() {
                 // event-forwarder를 먼저 띄워 init-pack 블로킹이 양방향 이벤트 파이프를 막지 않게 한다(반쪽 부팅 방지).
                 spawn_event_forwarder(handle.clone(), default_socket());
                 // RC-1: Windows 첫 기동 온보딩(팩+hook+autostart schtasks). 멱등.
-                // 게이트(needs_onboard·위 캡처): 신선 머신·버전 변경·팩 소실에만 실행 — 평시 부트의
-                // 사이드카 스폰+전량 스윕+schtasks 재등록 비용 제거(2026-07-12 Win11 이슈 실측).
-                // hook·schtasks만 유실된 상태(팩·마커 무결)의 치유는 doctor --fix·버전 전이가 담당.
+                // 게이트(needs_onboard·위 캡처): 마커 부재(신선·직전 실패)·버전 불일치에만 실행 —
+                // 평시 부트의 사이드카 스폰+전량 스윕+schtasks 재등록 비용 제거(Win11 이슈 실측).
+                // 마커는 온보딩 **성공** 시에만 기록 — hook 등록 실패(init-pack rc=1)도 재시도로 수렴.
+                // hook만 사후 유실된 상태(마커 무결)의 치유는 doctor --fix·버전 전이가 담당.
                 #[cfg(windows)]
-                if needs_onboard {
-                    maybe_windows_onboard();
+                if needs_onboard && maybe_windows_onboard() {
+                    if let Err(e) = std::fs::write(gui_onboarded_path(), env!("CARGO_PKG_VERSION")) {
+                        eprintln!("[cys-app] onboarding marker write failed (다음 부트 재시도): {e}");
+                    }
                 }
                 // RC-17(T5): macOS 첫 기동 온보딩(팩+hook) — Windows 대칭(동일 게이트). autostart는 위 launchd.
                 #[cfg(target_os = "macos")]
-                if needs_onboard {
-                    maybe_macos_onboard();
+                if needs_onboard && maybe_macos_onboard() {
+                    if let Err(e) = std::fs::write(gui_onboarded_path(), env!("CARGO_PKG_VERSION")) {
+                        eprintln!("[cys-app] onboarding marker write failed (다음 부트 재시도): {e}");
+                    }
                 }
                 // 업데이트 재시작 시: 새 팩(새 기능) 반영 + 노드 자동복귀(마커가 있을 때만).
                 maybe_apply_pending_update(&handle);
@@ -2162,6 +2209,19 @@ mod tests {
     }
 
     /// (T1) 재시작 후 팩반영·복원 발동 판정 — 마커(인앱 업데이트) OR 버전변경(홈페이지 수동설치).
+    #[test]
+    /// ★v4 GUI 온보딩 게이트 회귀 핀(0.12.52 cys-neo 실사고) — 마커가 현재 버전과 정확히 일치할
+    /// 때만 스킵. 부재(신선 머신·직전 실패)·구버전·손상 = 실행(fail-open 치유 방향). 이 판정이
+    /// .pack-version 등 팩 상태를 일절 보지 않는 것이 요점 — cysd 선행이 게이트를 선점 못 한다.
+    #[test]
+    fn needs_gui_onboard_only_skips_on_exact_version_match() {
+        assert!(needs_gui_onboard(None, "0.12.53"), "마커 부재 = 온보딩(신선·직전 실패)");
+        assert!(!needs_gui_onboard(Some("0.12.53"), "0.12.53"), "정확 일치 = 스킵");
+        assert!(!needs_gui_onboard(Some("0.12.53\n"), "0.12.53"), "개행 trim 후 일치 = 스킵");
+        assert!(needs_gui_onboard(Some("0.12.52"), "0.12.53"), "구버전 = 온보딩(업그레이드)");
+        assert!(needs_gui_onboard(Some("garbage"), "0.12.53"), "손상 = 온보딩(fail-open)");
+    }
+
     #[test]
     fn decide_pending_update_marker_or_version_change() {
         use PendingUpdatePlan::*;
