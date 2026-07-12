@@ -155,6 +155,9 @@ cys doctor          # 자기진단 (문제 시 --fix)
 
 - 다크 테마 고정 + **배경색 커스텀 피커**(`테마` 버튼). 밝은 배경을 고르면 글자색이 자동
   보정됩니다. OS 라이트/다크 자동 전환은 없습니다.
+- **터미널 폰트 선택**: `테마` 버튼 → 폰트 드롭다운(기본값·Menlo·SF Mono·Cascadia Mono·
+  Consolas·JetBrains Mono·D2Coding 등, 기억됨). 미설치 폰트는 기본 스택으로 자동 폴백,
+  한글 폴백은 항상 보존됩니다.
 - 터미널 폰트 크기: ⌘+ / ⌘- / ⌘0 (8–32px, 기억됨).
 
 ### 4.8 ⌘K Command Palette
@@ -174,6 +177,7 @@ cys doctor          # 자기진단 (문제 시 --fix)
 | ⌘K | Command Palette |
 | ⌘G | Glance/Ops 밀도 전환 |
 | ⌘+ ⌘- ⌘0 | 폰트 크기 |
+| ⇧Enter / ⌥Enter | 프롬프트 줄바꿈(개행 삽입 — 실행 아님) |
 
 ---
 
@@ -183,6 +187,8 @@ cys doctor          # 자기진단 (문제 시 --fix)
 
 surface는 `surface:N` ref로, 역할 등록된 노드는 역할 이름으로 주소화됩니다.
 역할 글롭도 됩니다: `--to 'reviewer-*'` = 리뷰어 전원 브로드캐스트.
+역할 노드 pane은 제목 앞에 역할색 깜박이 점이 표시됩니다(master 파랑 · cso 보라 ·
+worker 초록 · reviewer-gemini 주황 · reviewer-codex 시안 — Control Center와 동일 색).
 
 ```bash
 cys identify                          # 나는 누구인가 (surface ref)

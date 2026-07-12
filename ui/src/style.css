@@ -183,6 +183,11 @@ body.ws-reordering { cursor: grabbing; -webkit-user-select: none; user-select: n
   width: 40px; height: 24px; padding: 0; cursor: pointer;
   background: none; border: 1px solid var(--border); border-radius: 4px;
 }
+#theme-pop select {
+  max-width: 150px; padding: 3px 4px; cursor: pointer; font-size: 12px;
+  background: var(--bar); color: var(--text);
+  border: 1px solid var(--border); border-radius: 4px;
+}
 #theme-pop .theme-pop-reset {
   padding: 5px 8px; cursor: pointer;
   background: var(--bar); color: var(--text);
@@ -227,6 +232,8 @@ body.ws-reordering { cursor: grabbing; -webkit-user-select: none; user-select: n
   white-space: nowrap;
 }
 .pane .pane-title-text { overflow: hidden; text-overflow: ellipsis; }
+/* 역할 신호 점(제목 앞): Control Center cc-dot의 깜박임(cc-blink) 재사용 — 역할색은 JS(setRoleDot)가 채운다 */
+.pane .pane-role-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; animation: cc-blink 1.4s infinite; }
 /* T5 사용량 관측 배지: CTX(컨텍스트%)·rate limit 윈도우 — 데몬 관측치(usage.rs) 표시 */
 .pane .pane-usage { display: flex; gap: 4px; color: #6e7681; font-variant-numeric: tabular-nums; }
 .pane .pane-usage .warn { color: #d29922; }

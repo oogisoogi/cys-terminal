@@ -11,6 +11,7 @@ import { reorderWorkspace, reorderGroup } from "./reorder";
 import { deptPlaceholderLabel } from "./deptlabel";
 import { ccEffectiveZoom } from "./ccscale";
 import { clampWsbarWidth, clampWsbarFont, WSBAR_W_DEFAULT, WSBAR_FONT_STEP } from "./wsbar";
+import { composeFontFamily, FONT_CHOICES, ROLE_COLOR, roleDotColor } from "./appearance";
 
 declare global {
   interface Window {
@@ -69,6 +70,7 @@ interface PaneRuntime {
   socket?: string;
   el: HTMLElement;
   termHost: HTMLElement;
+  roleEl: HTMLElement; // 제목 앞 역할 신호 점(깜박임) — refreshPaneTitles가 role로 채색
   titleEl: HTMLElement;
   usageEl: HTMLElement;
   term: Terminal;
@@ -160,10 +162,7 @@ let ccGlanceFace: "live" | "tasks" =
 // 마지막 org_fleet 스냅샷 — 실시간 이벤트(task.changed/status.changed)가 셀 단위로 패치한다.
 let lastFleet: any = null;
 
-const CC_ROLE_COLOR: Record<string, string> = {
-  master: "#3b82f6", cso: "#8b5cf6", worker: "#00e676",
-  "reviewer-gemini": "#ffa726", "reviewer-codex": "#00d4ff",
-};
+const CC_ROLE_COLOR = ROLE_COLOR; // 역할색 단일 출처 = appearance.ts (pane 역할 점과 공유)
 const CC_STATE: Record<string, { cls: string; label: string }> = {
   working: { cls: "working", label: "작업중" }, idle: { cls: "idle", label: "대기" },
   error: { cls: "error", label: "오류" }, offline: { cls: "offline", label: "오프라인" },
@@ -1243,6 +1242,19 @@ function applyZoom(delta: number | null) {
   }
 }
 
+// 터미널 폰트 선택(cys-font-face · 오너 요청 2026-07-12) — 선택 폰트를 기본 스택 앞에 합성
+// (composeFontFamily · CJK 폴백 보존), null=기본. 폰트 메트릭 변화 → 셀 재계산(applyZoom과 동일 패턴).
+let fontFace: string | null = localStorage.getItem("cys-font-face");
+function applyFontFace(face: string | null) {
+  fontFace = face && face.trim() ? face : null;
+  if (fontFace === null) localStorage.removeItem("cys-font-face");
+  else localStorage.setItem("cys-font-face", fontFace);
+  for (const rt of panes.values()) {
+    rt.term.options.fontFamily = composeFontFamily(fontFace);
+    fitPane(rt);
+  }
+}
+
 // Control Center 본문 전용 zoom — 터미널 fontSize와 분리(배율 단위).
 // WebKit `zoom`을 #cc-body에만 적용(host #cc-panel은 fixed라 zoom 시 위치/스크롤 회귀 → 본문만 확대,
 // sticky 헤더·탭은 1.0x 유지). 사이드바(ft/feed)는 터미널 작업공간 폭이라 zoom 비대상(터미널 fit 회귀 방지).
@@ -1413,6 +1425,16 @@ const isAutoTitle = (t: string | null | undefined) => !t || /^surface \d+$/.test
 const paneTitle = (title: string | null | undefined, liveCwd?: string | null) =>
   isAutoTitle(title) ? liveCwd || "…" : (title as string);
 
+// pane 헤더 역할 점 — CC 깜박이 점(cc-blink)을 역할색으로 제목 앞에 표시(무역할 셸·종료 pane은 숨김).
+function setRoleDot(el: HTMLElement, role: string | null) {
+  const color = roleDotColor(role);
+  el.style.display = color ? "" : "none";
+  if (color) {
+    el.style.background = color;
+    el.title = `역할: ${role}`;
+  }
+}
+
 // 주기적으로 데몬에 물어 자동 제목 pane의 현재 디렉토리(cd 추적)를 갱신.
 // + 외부(CLI launch-agent·cys boot)에서 생성된 역할 노드 surface를 pane으로 자동 입양 —
 //   이게 없으면 노드가 데몬 안에서 헤드리스로만 돌고 화면에 보이지 않는다.
@@ -1440,6 +1462,7 @@ async function refreshPaneTitles() {
         const rt = panes.get(paneKey(s.surface_id, sk));
         if (!rt) continue;
         renderUsage(rt.usageEl, s.exited ? null : s.usage); // 종료 pane은 배지 제거 (혼동 방지)
+        setRoleDot(rt.roleEl, s.exited ? null : s.role); // 역할 점도 동일 주기 갱신
         if (rt.titleEl.isContentEditable) continue; // 이름 편집 중에는 덮어쓰지 않음
         rt.titleEl.textContent = paneTitle(s.title, s.live_cwd) + (s.exited ? " [exited]" : "");
       }
@@ -1453,7 +1476,7 @@ async function refreshPaneTitles() {
         // !w.pending — 런칭 중 placeholder(socket 미정)에는 입양 금지(타 데몬 surface 오입양 차단).
         const ws = workspaces.find((w) => !w.pending && (w.socket ?? undefined) === (sk ?? undefined));
         if (!ws || collectSids(ws.tree).includes(s.surface_id)) continue;
-        await makePane(s.surface_id, s.title, sk);
+        setRoleDot((await makePane(s.surface_id, s.title, sk)).roleEl, s.role); // 입양 즉시 역할 점 채색(다음 틱 대기 없이)
         ws.tree = ws.tree
           ? { type: "split", dir: "row", a: ws.tree, b: { type: "pane", sid: s.surface_id } }
           : { type: "pane", sid: s.surface_id };
@@ -1494,6 +1517,11 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
     if ((e.target as HTMLElement).classList?.contains("pane-close")) return;
     startPaneDrag(e, sid);
   });
+  // 역할 신호 점(오너 요청 2026-07-12): Control Center의 깜박이 점을 제목 앞에 — 역할색 구별.
+  // 색·표시 여부는 refreshPaneTitles(3초 주기)의 setRoleDot이 채운다(생성 시점엔 role 미상 → 숨김).
+  const roleEl = document.createElement("span");
+  roleEl.className = "pane-role-dot";
+  roleEl.style.display = "none";
   const titleEl = document.createElement("span");
   titleEl.className = "pane-title-text";
   titleEl.textContent = paneTitle(title);
@@ -1527,7 +1555,7 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
     if (focusedSid === sid) focusedSid = collectSids(ws.tree)[0] ?? null;
     render();
   });
-  header.append(titleEl, usageEl, closeBtn);
+  header.append(roleEl, titleEl, usageEl, closeBtn);
   header.addEventListener("contextmenu", (e) => {
     e.preventDefault();
     showCtxMenu(e.clientX, e.clientY, [
@@ -1568,9 +1596,8 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
     // 80폭에서 wrap돼 첫 줄(0,0)에 고립 표시된다. fit.fit()은 첫 프롬프트 뒤라 소급 정정 안 됨.
     cols: 120,
     rows: 35,
-    // ★Windows: Latin 등폭폰트(Cascadia Mono/Consolas)를 CJK 폰트보다 앞에 둔다. 아니면 Menlo/SF Mono
-    //   부재 시 xterm가 셀 폭을 CJK 전각폰트(Noto Sans KR)로 측정해 Latin 글자가 넓게 벌어진다(자간 이상).
-    fontFamily: "Menlo, 'SF Mono', 'Cascadia Mono', Consolas, 'Apple SD Gothic Neo', 'Malgun Gothic', 'Noto Sans KR', monospace",
+    // 폰트: 기본 스택(Latin 등폭을 CJK보다 앞에 — 셀 폭 측정 왜곡 방지)·선택 폰트 합성 = appearance.ts.
+    fontFamily: composeFontFamily(fontFace),
     fontSize,
     // 배경 테마: 하드코딩 리터럴 대신 현재 색 상태 참조 — 새 pane도 커스텀 색으로 생성된다.
     theme: { background: currentBg(), foreground: readableForeground(currentBg()) },
@@ -1614,6 +1641,20 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
     // 브라우저 네이티브 paste 이벤트가 발화되고 아래 paste 리스너가 클립보드를 PTY로 보낸다.
     // (WebView2에서 xterm 기본 붙여넣기가 안 먹던 문제 — permission 불요의 clipboardData 경로.)
     if ((e.ctrlKey || e.metaKey) && (e.key === "v" || e.key === "V")) return false;
+    // ★Shift+Enter = 줄바꿈(오너 요청 2026-07-12): Option/Alt+Enter가 보내는 것과 동일한
+    // 바이트(ESC+CR)를 PTY로 전송 — claude 등 CLI가 meta-Enter로 해석해 프롬프트에 개행 삽입.
+    // mac·Windows 공통(플랫폼 분기 불요). keydown에서만 전송하고 keypress/keyup은 흡수해 이중 전송 방지.
+    if (e.key === "Enter" && e.shiftKey && !e.altKey && !e.ctrlKey && !e.metaKey) {
+      if (e.type === "keydown") {
+        // IME 잔여 pending(WKWebView 자모 버퍼)을 개행보다 먼저 확정 — 리듀서 우회 직송이면
+        // ta keydown flush 리스너가 이 핸들러 '뒤'에 돌아 자모가 개행 뒤로 밀린다(순서 역전).
+        // onData 경로의 flush("onData") 선행과 동일한 순서 보장. 뒤따르는 ta keydown 리스너의
+        // 같은 keydown 재디스패치는 pending이 비어 no-op(디버그 계측만 중복).
+        applyIme({ kind: "keydown", keyCode: e.keyCode, key: e.key });
+        sendRaw("\x1b\r");
+      }
+      return false;
+    }
     return true;
   });
 
@@ -1776,7 +1817,7 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
   });
   observer.observe(termHost);
 
-  const rt: PaneRuntime = { sid, socket, el, termHost, titleEl, usageEl, term, fit, unlisten: [un1, un2], observer, snapToBottom };
+  const rt: PaneRuntime = { sid, socket, el, termHost, roleEl, titleEl, usageEl, term, fit, unlisten: [un1, un2], observer, snapToBottom };
   panes.set(paneKey(sid, socket), rt);
   return rt;
 }
@@ -2694,15 +2735,32 @@ function openThemePopover(anchor: HTMLElement) {
   picker.addEventListener("input", () => applyBgColor(picker.value));
   row.appendChild(picker);
 
+  // 폰트 선택(오너 요청 2026-07-12) — 선택지=appearance.ts FONT_CHOICES, 변경 즉시 전 pane 적용.
+  const fontRow = document.createElement("label");
+  fontRow.className = "theme-pop-row";
+  fontRow.textContent = "폰트";
+  const fontSel = document.createElement("select");
+  for (const c of FONT_CHOICES) {
+    const o = document.createElement("option");
+    o.value = c.face ?? "";
+    o.textContent = c.label;
+    fontSel.appendChild(o);
+  }
+  fontSel.value = FONT_CHOICES.some((c) => c.face === fontFace) ? (fontFace ?? "") : "";
+  fontSel.addEventListener("change", () => applyFontFace(fontSel.value || null));
+  fontRow.appendChild(fontSel);
+
   const reset = document.createElement("button");
   reset.className = "theme-pop-reset";
   reset.textContent = "기본값 복원";
   reset.addEventListener("click", () => {
     applyBgColor(null);
     picker.value = DEFAULT_BG;
+    applyFontFace(null);
+    fontSel.value = "";
   });
 
-  pop.append(row, reset);
+  pop.append(row, fontRow, reset);
 
   // 앵커(테마 버튼) 하단에 배치 후 화면 밖으로 나가면 안쪽으로 보정.
   const r = anchor.getBoundingClientRect();
