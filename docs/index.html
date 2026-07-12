@@ -47,9 +47,14 @@
       <a class="btn" id="dl-mac-x64" href="https://github.com/idoforgod/cys-terminal/releases/download/v0.12.50/cys_0.12.50_x64.dmg">DMG 다운로드</a>
     </div>
     <div class="card">
-      <h2>Windows <span style="color:#8b949e;font-size:13px">x64</span></h2>
-      <div class="meta">NSIS 자기완결 설치본(PortableGit·Python 동봉). Authenticode 미서명 — SmartScreen 경고 시 "추가 정보 → 실행".</div>
-      <a class="btn" id="dl-win" href="https://github.com/idoforgod/cys-terminal/releases/download/v0.12.50/cys_0.12.50_x64-setup.exe">설치파일 다운로드</a>
+      <h2>Windows <span style="color:#8b949e;font-size:13px">x64 · 크롬 등</span></h2>
+      <div class="meta">NSIS 자기완결 설치본(PortableGit·Python 동봉). 크롬·엣지 등 일반 브라우저용. SmartScreen 경고 시 "추가 정보 → 실행".</div>
+      <a class="btn" id="dl-win" href="https://github.com/idoforgod/cys-terminal/releases/download/v0.12.50/cys_0.12.50_x64-setup.exe">설치파일(.exe) 다운로드</a>
+    </div>
+    <div class="card">
+      <h2>Windows <span style="color:#8b949e;font-size:13px">x64 · ZIP</span></h2>
+      <div class="meta">동일 설치본의 ZIP 포장 — 인터넷 익스플로러·exe 직다운이 차단되는 환경용. 압축 해제 후 setup.exe 실행.</div>
+      <a class="btn dim" id="dl-win-zip" href="https://github.com/idoforgod/cys-terminal/releases/download/v0.12.50/cys_0.12.50_x64-setup.zip">ZIP 다운로드</a>
     </div>
   </div>
 
@@ -73,6 +78,7 @@ fetch("https://api.github.com/repos/idoforgod/cys-terminal/releases/latest")
     set("dl-mac-arm", asset(/_aarch64\.dmg$/));
     set("dl-mac-x64", asset(/_x64\.dmg$/));
     set("dl-win",     asset(/_x64-setup\.exe$/));
+    set("dl-win-zip", asset(/_x64-setup\.zip$/));
   })
   .catch(() => {});
 </script>
