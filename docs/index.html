@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cys — CYSJavis Terminal 다운로드</title>
+<meta name="description" content="cys(CYSJavis Terminal) 공식 다운로드 — AI 에이전트 오케스트레이션 전용 터미널. macOS(Apple 공증)·Windows 설치파일.">
+<style>
+  :root { --bg:#0d1117; --bar:#161b22; --border:#30363d; --accent:#2f81f7; --text:#c9d1d9; --ok:#3fb950; }
+  * { box-sizing:border-box; margin:0; }
+  body { background:var(--bg); color:var(--text); font:16px/1.6 -apple-system,"SF Pro","Segoe UI",sans-serif;
+         min-height:100vh; display:flex; flex-direction:column; align-items:center; padding:48px 20px; }
+  .brand { font-size:44px; font-weight:800; color:var(--accent); letter-spacing:-.02em; }
+  .tagline { margin-top:8px; color:#8b949e; font-size:17px; text-align:center; }
+  .ver { margin-top:18px; font-size:14px; color:#8b949e; }
+  .ver b { color:var(--ok); font-variant-numeric:tabular-nums; }
+  .cards { margin-top:36px; display:flex; gap:16px; flex-wrap:wrap; justify-content:center; max-width:960px; }
+  .card { background:var(--bar); border:1px solid var(--border); border-radius:14px; padding:24px 26px;
+          width:280px; display:flex; flex-direction:column; gap:10px; }
+  .card h2 { font-size:17px; }
+  .card .meta { font-size:12.5px; color:#8b949e; min-height:38px; }
+  .badge { display:inline-block; font-size:11px; font-weight:700; padding:2px 9px; border-radius:10px;
+           background:rgba(63,185,80,.15); color:var(--ok); margin-left:6px; vertical-align:2px; }
+  a.btn { display:block; text-align:center; background:var(--accent); color:#fff; text-decoration:none;
+          font-weight:700; padding:11px 0; border-radius:9px; margin-top:auto; }
+  a.btn:hover { filter:brightness(1.12); }
+  a.btn.dim { background:#21262d; border:1px solid var(--border); color:var(--text); font-weight:600; }
+  .foot { margin-top:44px; font-size:13px; color:#6e7681; text-align:center; }
+  .foot a { color:#8b949e; }
+  .note { margin-top:14px; font-size:12.5px; color:#6e7681; max-width:640px; text-align:center; }
+</style>
+</head>
+<body>
+  <div class="brand">cys</div>
+  <div class="tagline">CYSJavis Terminal — AI 에이전트 오케스트레이션 전용 터미널<br>멀티 부서 데몬 · 메타버스 오피스 HUD · 세션 영속</div>
+  <div class="ver">최신 버전 <b id="ver">v0.12.50</b> <span id="pub"></span></div>
+
+  <div class="cards">
+    <div class="card">
+      <h2>macOS <span style="color:#8b949e;font-size:13px">Apple Silicon</span><span class="badge">Apple 공증</span></h2>
+      <div class="meta">M1/M2/M3/M4 · Developer ID 서명 + Apple notarization + staple — 경고 없이 열립니다.</div>
+      <a class="btn" id="dl-mac-arm" href="https://github.com/idoforgod/cys-terminal/releases/download/v0.12.50/cys_0.12.50_aarch64.dmg">DMG 다운로드</a>
+    </div>
+    <div class="card">
+      <h2>macOS <span style="color:#8b949e;font-size:13px">Intel</span><span class="badge">Apple 공증</span></h2>
+      <div class="meta">Intel Mac(x86_64) · 동일하게 공증·staple된 DMG.</div>
+      <a class="btn" id="dl-mac-x64" href="https://github.com/idoforgod/cys-terminal/releases/download/v0.12.50/cys_0.12.50_x64.dmg">DMG 다운로드</a>
+    </div>
+    <div class="card">
+      <h2>Windows <span style="color:#8b949e;font-size:13px">x64</span></h2>
+      <div class="meta">NSIS 자기완결 설치본(PortableGit·Python 동봉). Authenticode 미서명 — SmartScreen 경고 시 "추가 정보 → 실행".</div>
+      <a class="btn" id="dl-win" href="https://github.com/idoforgod/cys-terminal/releases/download/v0.12.50/cys_0.12.50_x64-setup.exe">설치파일 다운로드</a>
+    </div>
+  </div>
+
+  <div class="note">설치 후 앱 내 자동 업데이트(Update 배지)로 이후 버전을 받습니다. 전체 버전 목록·변경 내역은 릴리스 페이지에서.</div>
+  <div class="foot">
+    <a href="https://github.com/idoforgod/cys-terminal/releases">전체 릴리스</a> ·
+    <a href="https://github.com/idoforgod/cys-terminal">GitHub 저장소</a>
+  </div>
+
+<script>
+// 최신 릴리스를 동적 반영(rot 방지) — 실패 시 위 정적 v0.12.50 링크가 폴백.
+fetch("https://api.github.com/repos/idoforgod/cys-terminal/releases/latest")
+  .then(r => r.ok ? r.json() : null)
+  .then(rel => {
+    if (!rel || !rel.tag_name) return;
+    const v = rel.tag_name;                       // 예: v0.12.50
+    const asset = re => (rel.assets || []).find(a => re.test(a.name));
+    const set = (id, a) => { const el = document.getElementById(id); if (a && el) el.href = a.browser_download_url; };
+    document.getElementById("ver").textContent = v;
+    if (rel.published_at) document.getElementById("pub").textContent = "· " + rel.published_at.slice(0,10);
+    set("dl-mac-arm", asset(/_aarch64\.dmg$/));
+    set("dl-mac-x64", asset(/_x64\.dmg$/));
+    set("dl-win",     asset(/_x64-setup\.exe$/));
+  })
+  .catch(() => {});
+</script>
+</body>
+</html>
