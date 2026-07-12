@@ -22,6 +22,9 @@ EXIT_OK, EXIT_USAGE, EXIT_INVALID = 0, 2, 6
 WIRE_PREFIX = "[EVT v2]"
 WIRE_RE = re.compile(r"^\[EVT v[12]\]\s+(?P<type>[a-z_.]+)\s+(?P<json>\{.*\})\s*$")
 
+# spool 귀속 key(--surface): bare surface:N 또는 정식 부서 키 <slug>@surface:N (검증 확장·§4d).
+SURFACE_KEY_RE = re.compile(r"^(?:[a-z0-9_-]{1,32}@)?surface:\d{1,8}$")
+
 # type → 필수 payload 키 (EVENT_CONTRACT.md 표와 1:1)
 SCHEMA = {
     "run.queued": ["agent", "task"],
@@ -157,6 +160,11 @@ def cmd_emit(a):
     if not ok:
         print(f"invalid: {err}", file=sys.stderr)
         return EXIT_INVALID
+    surface = getattr(a, "surface", None)
+    if surface is not None and not SURFACE_KEY_RE.match(surface):
+        print(f"invalid: bad --surface key: {surface} "
+              f"(surface:N 또는 <slug>@surface:N)", file=sys.stderr)
+        return EXIT_INVALID
     print(to_wire(a.type, payload))
     if getattr(a, "spool", False):
         try:  # spool 기록 실패는 wire 방출을 막지 않는다 (best-effort 수송로)
@@ -202,7 +210,8 @@ def main(argv=None):
     c.add_argument("--field", action="append", help="key=value (반복 가능)")
     c.add_argument("--payload", help="JSON 문자열(--field 대신)")
     c.add_argument("--spool", action="store_true", help="wire 방출에 더해 HUD spool에 append")
-    c.add_argument("--surface", help="spool 노드 귀속 key (예: surface:12)")
+    c.add_argument("--surface",
+                   help="spool 노드 귀속 key — surface:12 또는 정식 부서 키 dept-1@surface:12")
     c.set_defaults(fn=cmd_emit)
 
     c = sub.add_parser("parse")

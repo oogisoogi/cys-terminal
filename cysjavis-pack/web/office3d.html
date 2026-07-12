@@ -643,6 +643,7 @@ function applyPose(ent, t, dt){
 
 // ---------- 월드 구축 ----------
 let worldGroup = null;
+let worldSeen = false;      // 최초 world 수신 시 1회만 v2 self-heal 판정
 const nodes = new Map();
 const racks = new Map();
 let lobbyAnchor = new THREE.Vector3(0, 0.3, 0);
@@ -1079,6 +1080,15 @@ function handlePatchTop(f){
 }
 
 function buildWorld(w){
+  if (!worldSeen){          // 월드 계약 v2 self-heal: 서버가 더 높은 버전을 보내면 이 프론트는 stale → 최신 JS 회수
+    worldSeen = true;
+    if ((w.v||0) <= 2){
+      sessionStorage.removeItem('cysWorldReloadGuard');   // 정합 버전 → 가드 해제(향후 정당한 업그레이드가 다시 1회 리로드 가능)
+    } else if (!sessionStorage.getItem('cysWorldReloadGuard')){
+      sessionStorage.setItem('cysWorldReloadGuard', '1');  // 무한 리로드 방지: 1회만
+      location.reload(); return;
+    }
+  }
   if (worldGroup) disposeGroup(worldGroup);
   worldGroup = new THREE.Group();
   nodes.clear(); racks.clear();
@@ -1794,14 +1804,25 @@ function openPanel(key){
 }
 function fillPanel(ent){
   const n = ent.data;
-  document.getElementById('p-title').textContent = `${ent.deptId} · ${n.role} (${n.key})`;
+  const title = document.getElementById('p-title');
+  title.textContent = `${n.dept_label || ent.deptId} · ${n.role}`;   // 표시는 dept_label — raw 키 비노출
+  title.title = n.key;                                                // 키는 불투명 토큰 — tooltip 보조 노출만
   document.getElementById('p-meta').innerHTML =
     `상태 ${PRESENCE_KO[n.presence]||n.presence} (conf ${n.presence_conf}) · ctx ${n.ctx?.pct??'—'}%`
     + ` · agent ${n.agent||'—'}<br>task: ${n.task||'—'}`
     + (n.flags?.length ? `<br>flags: ${n.flags.join(', ')}` : '');
 }
 function closePanel(){ selected = null; panel.style.display = 'none'; pendingCmd = null; hideTaskTip(); }
-if (dbg){ dbg.openPanel = openPanel; }   // 게이트에서 hover/선택 경로(task 전문)를 구동
+if (dbg){
+  dbg.openPanel = openPanel;             // 게이트에서 hover/선택 경로(task 전문)를 구동
+  dbg.peek = peekSelected;               // 게이트에서 /peek URL 인코딩 경로를 구동
+  dbg.panelTitle = ()=> document.getElementById('p-title').textContent;   // 패널 dept_label 표기 단언
+  dbg.nodeState = (key)=>{               // 키별 격리 단언(동번호 충돌·본부 매칭) — 불투명 키로 조회
+    const e = nodes.get(key); if (!e) return null;
+    return { ctx: e.data.ctx?.pct ?? null, presence: e.data.presence,
+             ringVisible: !!(e.set.progRing && e.set.progRing.visible) };
+  };
+}
 document.getElementById('p-close').onclick = closePanel;
 function setPanelStatus(msg, cls){
   const el = document.getElementById('p-status');
@@ -2174,7 +2195,9 @@ document.getElementById('chat-input').addEventListener('keydown', e=>{
 async function peekSelected(){
   if (!selected){ addChat('sy','시스템','대상 없음 — 직원을 클릭'); return; }
   try {
-    const r = await fetch('/peek?key=' + selected, { headers: { 'X-HUD-Token': HUD_TOKEN } });
+    // 키는 불투명 토큰 — URL 삽입점(GET)은 반드시 encodeURIComponent (fragment/구분자 절단 방어·포맷 재변경 대비).
+    // cf. /command(POST)는 JSON body 전송이라 인코딩 불요 — GET(URL) vs POST(body) 인코딩 요구 차이.
+    const r = await fetch('/peek?key=' + encodeURIComponent(selected), { headers: { 'X-HUD-Token': HUD_TOKEN } });
     const j = await r.json();
     if (j.ok && j.lines.length){
       const tail = j.lines.slice(-3).join('  ⏎ ');

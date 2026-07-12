@@ -4901,8 +4901,10 @@ fn request_on(socket: &std::path::Path, method: &str, params: Value) -> Result<V
 fn run_fleet(as_json: bool) -> i32 {
     // RC-7: HOME 미설정(Windows) 함정 회피 — dirs 기반 공용 해소.
     let home = cys::home_dir().to_string_lossy().into_owned();
-    let mut targets: Vec<(std::path::PathBuf, String)> =
-        vec![(socket_path(), "본부 · CEO".to_string())];
+    // v2 부서 한정 키(DESIGN-dept-qualified-keys-v2 §4a): 항목마다 dept(slug=레지스트리 키)·
+    // socket(경로 문자열) additive. 본부는 고정 slug "main"·socket=null(기본 소켓 사용).
+    let mut targets: Vec<(std::path::PathBuf, String, String, Value)> =
+        vec![(socket_path(), "본부 · CEO".to_string(), "main".to_string(), Value::Null)];
     let reg = std::env::var("CYS_DEPTS_JSON")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::path::PathBuf::from(&home).join(".cys/depts.json"));
@@ -4916,16 +4918,20 @@ fn run_fleet(as_json: bool) -> i32 {
                         .map(std::path::PathBuf::from)
                         .unwrap_or_else(|| cys::dept_socket_path(name));
                     let disp = meta["display_name"].as_str().unwrap_or(name).to_string();
-                    targets.push((sock, disp));
+                    // 방출 socket = 실제 도달 소켓과 동일 경로 문자열(브리지가 cys --socket 로 재사용).
+                    let sock_str = sock.to_string_lossy().into_owned();
+                    targets.push((sock, disp, name.clone(), Value::String(sock_str)));
                 }
             }
         }
     }
     let mut out: Vec<Value> = Vec::new();
-    for (sock, disp) in &targets {
+    for (sock, disp, dept, emit_sock) in &targets {
         match request_on(sock, "org.status", json!({})) {
-            Ok(r) => out.push(json!({"department": disp, "surfaces": r["surfaces"].clone()})),
-            Err(e) => out.push(json!({"department": disp, "error": e, "surfaces": []})),
+            Ok(r) => out.push(json!({"department": disp, "dept": dept, "socket": emit_sock,
+                                     "surfaces": r["surfaces"].clone()})),
+            Err(e) => out.push(json!({"department": disp, "dept": dept, "socket": emit_sock,
+                                      "error": e, "surfaces": []})),
         }
     }
     if as_json {

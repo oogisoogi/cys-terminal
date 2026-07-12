@@ -159,7 +159,9 @@ class Coalescer:
 #   ① 대상 surface가 shell 프롬프트 상태면 Return 주입 = 즉시 실행이다. 이는 기능
 #      그 자체이며 신뢰 주체(오너)의 실수 방지를 위해 개행 제거·1줄 강제만 한다.
 #   ② GET / 를 읽을 수 있는 로컬 주체는 토큰을 얻는다 — localhost 바인딩이 경계.
-CMD_KEY_RE = re.compile(r"^surface:\d{1,8}$")
+# v2 부서 한정 키(DESIGN-dept-qualified-keys-v2 §3·C2): 정식 노드 키는 <slug>@surface:N.
+# 구분자 @ (v2.0의 # 교체 — # 은 URL fragment 라 /peek GET 에서 서버에 키가 잘려 도달).
+CMD_KEY_RE = re.compile(r"^[a-z0-9_-]{1,32}@surface:\d{1,8}$")
 CTRL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 
 
@@ -209,6 +211,36 @@ def gate_command(body, token_header, expected_token, origin, origins, known_keys
     return True, None, {"key": key, "text": text}
 
 
+# ---------------------------------------------- v2 부서 한정 키 (§3 · §4b)
+SLUG_RE = re.compile(r"^[a-z0-9_-]{1,32}$")
+
+
+def normalize_slug(raw):
+    """레지스트리 키 → 계약 문자셋(^[a-z0-9_-]{1,32}$) 정규화. fail-open 금지.
+
+    소문자화 → 허용 외 문자 '-' 치환 → 32자 절단. 충돌 해소(-N 서픽스)는 호출자(부서 루프) 몫.
+    빈 결과는 'dept' 로 대체(정식 키 생성 보장).
+    """
+    s = re.sub(r"[^a-z0-9_-]", "-", (raw or "").strip().lower())[:32]
+    return s or "dept"
+
+
+def full_key(slug, surface_ref):
+    """정식 노드 키 <slug>@surface:N. surface_ref 부재 시 None (귀속 불능 노드)."""
+    if not surface_ref:
+        return None
+    return "%s@%s" % (slug, surface_ref)
+
+
+def node_key(s):
+    """노드 정식 키 — merge_fleet 가 주석한 _full_key 우선.
+
+    미주석(부트 전·구 테스트 fixture) 시 bare surface_ref 폴백 — 하위호환 경로(계약 §5).
+    실운영에선 merge_fleet 가 매 스냅샷에서 _full_key 를 부여하므로 항상 정식 키가 반환된다.
+    """
+    return s.get("_full_key") or s.get("surface_ref")
+
+
 # ------------------------------------------------------------------ 월드
 TODO_ROLE = re.compile(r"(?:^|/)(?P<r>[A-Z_]+)_TODO\.md$")
 TODO_ROLE_MAP = {"MASTER": "master", "WORKER": "worker", "CSO": "cso",
@@ -231,6 +263,11 @@ class World:
         self.flags = defaultdict(dict)  # surface_id → {flag: expiry_ts}
         self.server_room = {}          # pid → {cmd, scoped}
         self.prev_nodes = {}           # key → 직전 노드 스냅샷 (diff용)
+        # v2 부서 한정 키(§4b) — 소켓 캐리·지연 히트 마이그레이션
+        self.sockets = {}              # full_key → socket 경로|None(본부) (M1 스냅샷 캐리)
+        self.pending_heat = {}         # 부팅 시 보존한 bare 키 히트 (첫 merge 후 승격·M2)
+        self.heat_migrated = False     # bare→정식 히트 승격 1회 게이트
+        self._dept_fallback_warned = False  # dept 필드 부재 폴백 1회 경고
         # 오피스 디테일 v1.1 — 상단 필드·노드 확장 필드
         self.progress = {}             # node key → {task,stage,pct,detail,ts}  (기능 6)
         self.run = {}                  # node key → {queued,active,done_today,failed_today} (기능 7)
@@ -258,14 +295,47 @@ class World:
         return sorted(k for k, exp in f.items() if exp > now)
 
     def apply_usage(self, surface_id, payload):
-        """usage.updated → 해당 노드 usage 즉시 갱신. 성공 시 노드 key 반환."""
+        """usage.updated → 해당 노드 usage 즉시 갱신. 성공 시 노드 정식 key 반환.
+
+        C3: `cys events` 는 본부 단일 구독이므로 usage 이벤트의 surface_id 는 본부 노드 것이다.
+        전 부서 첫-매칭 순회(구현: departments[0]=본부 순서 의존·무문서)를 본부(slug=="main")
+        한정 조회로 교체 — 동번호 부서 surface 로의 오귀속·순서 의존을 소거한다.
+        """
         with self.lock:
             for d in self.departments:
+                if d.get("_slug") != "main":
+                    continue
                 for s in d.get("surfaces", []):
                     if s.get("surface_id") == surface_id:
                         s["usage"] = payload
-                        return s.get("surface_ref")
+                        return node_key(s)
         return None
+
+    def socket_for(self, full_key):
+        """정식 키 → (found, socket|None). 스냅샷(M1)에 없으면 (False, None) = fail-closed.
+
+        found=True·socket=None 은 본부 노드(기본 소켓 사용) — /command·/peek 가 --socket 을 생략한다.
+        found=False 는 미지 키 → 조작 거부.
+        """
+        with self.lock:
+            if full_key in self.sockets:
+                return True, self.sockets[full_key]
+        return False, None
+
+    def has_full_key(self, full_key):
+        """현재 fleet 스냅샷에 정식 키가 실존하는지 (귀속 사다리 ① 존재 검증)."""
+        with self.lock:
+            return any(node_key(s) == full_key for d in self.departments
+                       for s in d.get("surfaces", []))
+
+    def unique_full_key_for_ref(self, ref):
+        """bare surface_ref 가 fleet 에서 정확히 1개 surface 에만 있으면 그 정식 키 (귀속 사다리 ②)."""
+        if not ref:
+            return None
+        with self.lock:
+            hits = [node_key(s) for d in self.departments for s in d.get("surfaces", [])
+                    if s.get("surface_ref") == ref]
+        return hits[0] if len(hits) == 1 else None
 
     def apply_todo(self, path, done, total):
         with self.lock:
@@ -279,6 +349,56 @@ class World:
         elif name == "ledger.killed":
             self.server_room.pop(payload.get("pid"), None)
 
+    def _annotate_depts(self, new_deps):
+        """부서별 slug 정규화(충돌 -N 서픽스)·정식 키·dept_label·socket 을 surface 에 주석.
+
+        self.sockets 스냅샷(full_key → socket|None) 재구성(M1). (lock 보유 상태 호출 — 재진입 금지.)
+        dept 필드 부재(구 cys 조합) 시 display_name 정규화 폴백 + 1회 경고(계약 §4b·§5).
+        """
+        used = set()
+        sockets = {}
+        for d in new_deps:
+            raw_dept = d.get("dept")
+            if raw_dept is None:   # 구 cys: dept 필드 없음 → display_name 정규화 폴백 + 1회 경고
+                raw_dept = d.get("department")
+                if not self._dept_fallback_warned:
+                    sys.stderr.write(
+                        "[hud-bridge] warn: fleet dept 필드 부재 — display_name 정규화 폴백\n")
+                    self._dept_fallback_warned = True
+            base = normalize_slug(raw_dept)
+            slug = base
+            n = 2
+            while slug in used:   # 충돌 해소: base-2, base-3 … (32자 상한 유지)
+                slug = "%s-%d" % (base[:29], n)
+                n += 1
+            used.add(slug)
+            label = d.get("department") or slug
+            socket = d.get("socket")   # 문자열 경로 또는 None(본부)
+            d["_slug"] = slug
+            d["_dept_label"] = label
+            for s in d.get("surfaces", []):
+                fk = full_key(slug, s.get("surface_ref"))
+                s["_full_key"] = fk
+                s["_dept_label"] = label
+                s["_dept"] = slug
+                if fk is not None:
+                    sockets[fk] = socket
+        self.sockets = sockets
+
+    def _migrate_pending_heat(self):
+        """부팅 시 보존한 bare 키 히트를 첫 fleet 기준 정식 키로 1회 승격 (M2 · lock 보유 호출).
+
+        부팅 순서상 load_heat(main 1333) < 첫 merge_fleet(스레드 기동 후) 이라 즉시 승격 불가 —
+        유일 매칭(bare surface_ref 가 정확히 1개 surface)만 정식 키로 승격, 실패분은 폐기한다.
+        """
+        for bare, v in self.pending_heat.items():
+            hits = [node_key(s) for d in self.departments for s in d.get("surfaces", [])
+                    if s.get("surface_ref") == bare]
+            if len(hits) == 1 and hits[0] and hits[0] not in self.heat_acc:
+                self.heat_acc[hits[0]] = v
+        self.pending_heat = {}
+        self.heat_migrated = True
+
     def merge_fleet(self, fleet, status):
         """스냅샷 병합 → (patch 프레임 목록, 구조변화 여부). 부재 시 이전 유지."""
         with self.lock:
@@ -291,12 +411,14 @@ class World:
             structural = False
             if fleet:
                 new_deps = fleet.get("departments") or []
-                old_keys = {s.get("surface_ref") for d in self.departments
+                self._annotate_depts(new_deps)   # 정식 키·socket 주석 (구조 비교 전 선행)
+                # 정식 키 기준 구조 비교 — 동번호 부서 surface_ref 충돌로 인한 오탐 제거
+                old_keys = {node_key(s) for d in self.departments
                             for s in d.get("surfaces", [])}
-                new_keys = {s.get("surface_ref") for d in new_deps
+                new_keys = {node_key(s) for d in new_deps
                             for s in d.get("surfaces", [])}
-                old_shape = [d.get("department") for d in self.departments]
-                new_shape = [d.get("department") for d in new_deps]
+                old_shape = [d.get("_slug") for d in self.departments]
+                new_shape = [d.get("_slug") for d in new_deps]
                 structural = (old_keys != new_keys) or (old_shape != new_shape)
                 # 출력량 변화율 (line_count 델타)
                 now = time.time()
@@ -309,6 +431,8 @@ class World:
                             self.line_rate[sid] = max(0.0, (lc - prev[0]) / (now - prev[1]))
                         self.line_hist[sid] = (lc, now)
                 self.departments = new_deps
+                if not self.heat_migrated:   # 첫 실 fleet 병합 시점에 히트 지연 승격(M2)
+                    self._migrate_pending_heat()
             patches = self._diff_patches()
             return patches, structural
 
@@ -324,8 +448,10 @@ class World:
         flags = self.live_flags(sid, now)
         if ctx is not None and ctx >= 90:
             flags = flags + ["ctx_critical"]
+        nkey = node_key(s)
         return {
-            "key": s.get("surface_ref"), "surface_id": sid,
+            "key": nkey, "surface_id": sid,
+            "dept_label": s.get("_dept_label"),   # 표시 전용(패널 타이틀) — raw 키 노출 제거(§3)
             "role": s.get("role") or "무소속",
             "agent": s.get("agent") or u.get("agent"),
             "presence": presence, "presence_conf": round(conf, 2),
@@ -340,8 +466,8 @@ class World:
             "activity": compute_activity(len(dq), self.line_rate.get(sid, 0.0)),
             "flags": flags,
             # 오피스 디테일 v1.1 — spool 귀속 노드 상태 (없으면 null)
-            "progress": self.progress.get(s.get("surface_ref")),
-            "run": self.run.get(s.get("surface_ref")),
+            "progress": self.progress.get(nkey),
+            "run": self.run.get(nkey),
         }
 
     def _diff_patches(self):
@@ -360,10 +486,10 @@ class World:
         return patches
 
     def known_keys(self):
-        """현재 fleet에 실존하는 surface_ref 집합 (조작 대상 allowlist)."""
+        """현재 fleet에 실존하는 정식 노드 키 집합 (조작 대상 allowlist)."""
         with self.lock:
-            return {s.get("surface_ref") for d in self.departments
-                    for s in d.get("surfaces", []) if s.get("surface_ref")}
+            return {node_key(s) for d in self.departments
+                    for s in d.get("surfaces", []) if node_key(s)}
 
     # --- 오피스 디테일 v1.1 ---
     def ref_count(self, key):
@@ -378,11 +504,11 @@ class World:
                        if s.get("surface_ref") == key)
 
     def role_key(self, role):
-        """role 문자열이 fleet에서 유일한 surface에 매칭되면 그 key, 아니면 None (귀속 규칙 2순위)."""
+        """role 문자열이 fleet에서 유일한 surface에 매칭되면 그 정식 키, 아니면 None (귀속 사다리 ③)."""
         if not role:
             return None
         with self.lock:
-            hits = [s.get("surface_ref") for d in self.departments
+            hits = [node_key(s) for d in self.departments
                     for s in d.get("surfaces", []) if s.get("role") == role]
         return hits[0] if len(hits) == 1 else None
 
@@ -403,7 +529,7 @@ class World:
             self.heat_hour = hour
             for d in self.departments:
                 for s in d.get("surfaces", []):
-                    key = s.get("surface_ref")
+                    key = node_key(s)
                     if not key:
                         continue
                     sid = s.get("surface_id")
@@ -478,7 +604,7 @@ class World:
                 if m:
                     todo_named[TODO_ROLE_MAP.get(m.group("r"), m.group("r"))] = t
             return {
-                "v": 1, "ts": now, "seq": self.seq,
+                "v": 2, "ts": now, "seq": self.seq,   # v2: 정식 노드 키(<slug>@surface:N)·dept_label
                 "daemon": {"version": self.daemon.get("version"),
                            "paused": bool(self.daemon.get("paused"))},
                 "departments": deps,
@@ -550,7 +676,8 @@ def route_event(ev, world, coal, now=None):
     backlog = (now - ts) > BACKLOG_FX_SECS
     sid = ev.get("surface_id")
     p = ev.get("payload") or {}
-    key = f"surface:{sid}" if sid is not None else None
+    # C3: `cys events` 는 본부 단일 구독 → 이벤트 노드 키는 본부 정식 키(main@surface:N).
+    key = f"main@surface:{sid}" if sid is not None else None
     frames = []
     poke = False
 
@@ -584,8 +711,9 @@ def route_event(ev, world, coal, now=None):
                        "bytes": p.get("bytes")})
     elif name in ("surface.created", "surface.closed", "surface.exited"):
         poke = True
+        # C4: sid 부재 시 payload.surface_ref 에서 번호 재조립 → 본부 정식 키(main@)로 생성.
         frames.append({"t": "fx", "kind": "spawn" if name == "surface.created" else "despawn",
-                       "key": key or f"surface:{(p.get('surface_ref') or '').split(':')[-1]}"})
+                       "key": key or f"main@surface:{(p.get('surface_ref') or '').split(':')[-1]}"})
     elif name == "health.alert":
         rule = p.get("rule") or "alert"
         if sid is not None and rule == "rate_limited":
@@ -616,15 +744,23 @@ def route_event(ev, world, coal, now=None):
 
 # --------------------------------------------------- EVT spool → 프레임 (§2·§3)
 def attribute_spool(entry, world):
-    """spool 항목 노드 귀속 (계약 §3 + EVENT_CONTRACT 전역 유일 게이트).
+    """spool 항목 노드 귀속 — v2 귀속 사다리 (계약 §4b).
 
-    surface_ref는 부서 데몬별 번호라 전역 유일이 아니다 — key가 fleet에서 **정확히 1개** surface에만
-    존재할 때만 귀속하고, 중복(또는 부재)이면 payload.agent==role 유일 일치로 폴백, 그마저 없으면
-    미귀속(None). 틀린 귀속(오정보)보다 미귀속(정직한 공백)이 낫다.
+    ① 정식 키(<slug>@surface:N) 명시 → 스냅샷 존재 검증 후 즉시 귀속.
+    ② bare surface:N → 전역 유일 게이트(하위호환) → 그 surface 의 정식 키로 승격.
+    ③ payload.agent==role 유일 일치 → 그 정식 키.
+    ④ 미귀속(None). 틀린 귀속(오정보)보다 미귀속(정직한 공백)이 낫다.
     """
     key = entry.get("key")
-    if isinstance(key, str) and key and world.ref_count(key) == 1:
-        return key
+    if isinstance(key, str) and key:
+        if "@" in key:                       # ① 정식 키 명시
+            if world.has_full_key(key):
+                return key
+            # 스냅샷에 없는 정식 키 → 신뢰하지 않고 role 폴백으로 강등(③)
+        else:                                # ② bare surface:N (하위호환)
+            fk = world.unique_full_key_for_ref(key)
+            if fk is not None:
+                return fk
     return world.role_key((entry.get("payload") or {}).get("agent"))
 
 
@@ -981,11 +1117,19 @@ def read_history(after_ts, limit=6000):
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07")
 
 
-def peek_surface(key, lines=12):
-    """직원 응답 회수(#2 대화) — read-screen 단발 조회 (상시 폴링 아님·관측 전용)."""
+def peek_surface(key, socket=None, lines=12):
+    """직원 응답 회수(#2 대화) — read-screen 단발 조회 (상시 폴링 아님·관측 전용).
+
+    M1: key 는 정식 키(<slug>@surface:N) — @ 뒤 bare surface:N 만 --surface 로 넘기고,
+    부서 소켓(socket 인자)이 있으면 `cys --socket <path>` 전역 옵션으로 해당 데몬에 라우팅한다.
+    """
+    bare = key.split("@", 1)[1] if "@" in key else key
+    args = [CYS]
+    if socket:
+        args += ["--socket", socket]
+    args += ["read-screen", "--surface", bare, "--lines", "40"]
     try:
-        r = subprocess.run([CYS, "read-screen", "--surface", key, "--lines", "40"],
-                           capture_output=True, text=True, timeout=10, **NOWIN)
+        r = subprocess.run(args, capture_output=True, text=True, timeout=10, **NOWIN)
         if r.returncode != 0:
             return None
         txt = ANSI_RE.sub("", r.stdout)
@@ -1067,7 +1211,12 @@ def _save_offset(path, offset):
 
 
 def load_heat(world):
-    """부팅 시 히트 링 복원 (브리지 재시작 생존 · §2)."""
+    """부팅 시 히트 링 복원 (브리지 재시작 생존 · §2).
+
+    M2: 부팅 직후는 fleet 미수집이라 bare 키(surface:N)를 정식 키로 매핑할 수 없다 —
+    정식 키(@ 포함)는 heat_acc 로 즉시 복원하고, bare 키는 pending_heat 로 **보존만** 한 뒤
+    첫 merge_fleet 완료 시점에 1회 기회적 승격한다(_migrate_pending_heat).
+    """
     try:
         with open(PRESENCE_HEAT_PATH) as f:
             d = json.load(f)
@@ -1078,7 +1227,11 @@ def load_heat(world):
         for k, v in acc.items():
             a = v.get("active"); t = v.get("total")
             if isinstance(a, list) and len(a) == 24 and isinstance(t, list) and len(t) == 24:
-                world.heat_acc[k] = {"active": a, "total": t}
+                entry = {"active": a, "total": t}
+                if isinstance(k, str) and "@" in k:
+                    world.heat_acc[k] = entry          # 정식 키 → 즉시 복원
+                else:
+                    world.pending_heat[k] = entry      # bare 키 → 지연 승격 대기
     if isinstance(d.get("hour"), int):
         world.heat_hour = d["hour"]
 
@@ -1087,7 +1240,7 @@ def persist_heat(world):
     try:
         os.makedirs(STATE_DIR, exist_ok=True)
         with world.lock:
-            payload = {"hour": world.heat_hour,
+            payload = {"v": 2, "hour": world.heat_hour,   # v2: acc 키 = 정식 노드 키
                        "acc": {k: dict(v) for k, v in world.heat_acc.items()}}
         tmp = PRESENCE_HEAT_PATH + ".tmp"
         with open(tmp, "w") as f:
@@ -1217,7 +1370,10 @@ class Handler(BaseHTTPRequestHandler):
             key = (self.path.split("key=")[1].split("&")[0]) if "key=" in self.path else ""
             if not CMD_KEY_RE.match(key) or key not in self.world.known_keys():
                 return self._send(403, "application/json", b'{"ok": false, "error": "bad_key"}')
-            rows = peek_surface(key)
+            found, socket = self.world.socket_for(key)   # M1: 스냅샷 socket 캐리(재독 금지)
+            if not found:                                 # 미지 키 → fail-closed
+                return self._send(403, "application/json", b'{"ok": false, "error": "bad_key"}')
+            rows = peek_surface(key, socket)
             body = json.dumps({"ok": rows is not None, "lines": rows or []},
                               ensure_ascii=False).encode()
             return self._send(200, "application/json; charset=utf-8", body)
@@ -1254,15 +1410,23 @@ class Handler(BaseHTTPRequestHandler):
         if not ok:
             return self._cmd_result(403, False, err, body if isinstance(body, dict) else None)
         key, text = cleaned["key"], cleaned["text"]
+        # M1 소켓 캐리: 정식 키(<slug>@surface:N)에서 스냅샷 socket 을 조회(depts.json 재독 금지).
+        # 미지 키는 fail-closed 거부. @ 뒤 bare surface:N 만 --surface 로, 부서 소켓은 전역 옵션
+        # `cys --socket <path>` 로 해당 데몬에 라우팅 — 본부(socket=None)는 --socket 생략.
+        found, socket = self.world.socket_for(key)
+        if not found:
+            return self._cmd_result(403, False, "unknown_target", cleaned)
+        bare = key.split("@", 1)[1]
+        pre = [CYS] + (["--socket", socket] if socket else [])
         # 동일화 경로: cys send(타이핑) → send-key Return(확정). argv 배열 직접
         # 전달이라 shell 해석 표면 없음. 주입은 surface.input_injected 이벤트로
         # 데몬→브리지→SSE로 되돌아와 화면에 배달 연출로 확인된다(동시성).
-        r1 = subprocess.run([CYS, "send", "--surface", key, "--", text],
+        r1 = subprocess.run(pre + ["send", "--surface", bare, "--", text],
                             capture_output=True, text=True, timeout=10, **NOWIN)
         if r1.returncode != 0:
             return self._cmd_result(502, False,
                                     "send_failed: " + (r1.stderr or "")[:120], cleaned)
-        r2 = subprocess.run([CYS, "send-key", "--surface", key, "Return"],
+        r2 = subprocess.run(pre + ["send-key", "--surface", bare, "Return"],
                             capture_output=True, text=True, timeout=10, **NOWIN)
         if r2.returncode != 0:
             return self._cmd_result(502, False,
