@@ -3266,10 +3266,17 @@ async function manualRotateSkewed(appVer: string, heldMain: boolean, heldDepts: 
   stickyToast("rotate-daemon", "feed", "↻ 데몬 교대", `새 버전 v${appVer}로 교대 중… 저장 후 세션을 복원합니다.`);
   try {
     if (heldMain) await invoke("rotate_daemon", { force: true });
-    for (const d of heldDepts) await invoke("rotate_dept_daemon", { name: d.name, force: true });
+    // 경미2: rotate_dept_daemon이 반환하는 restore_ok=false(교대 후 부서 노드 복원 실패)를 삼키지 않고 승격.
+    let deptRestoreFailed = false;
+    for (const d of heldDepts) {
+      const info = (await invoke("rotate_dept_daemon", { name: d.name, force: true })) as { restore_ok?: boolean };
+      if (info?.restore_ok === false) deptRestoreFailed = true;
+    }
     dismissToast("rotate-daemon");
     clearSkewBadge();
-    toast("watchdog", "✅ 데몬 교대 완료", `데몬이 v${appVer}로 교대됐습니다. 노드 복원이 진행됩니다.`);
+    if (deptRestoreFailed)
+      toast("health", "⚠ 교대 후 부서 복원 실패", `데몬은 v${appVer}로 교대됐으나 일부 부서 노드 복원이 실패했습니다 — 상태를 점검하세요.`);
+    else toast("watchdog", "✅ 데몬 교대 완료", `데몬이 v${appVer}로 교대됐습니다. 노드 복원이 진행됩니다.`);
   } catch (e) {
     dismissToast("rotate-daemon");
     toast("health", "데몬 교대 실패", String(e));
@@ -3348,7 +3355,7 @@ async function promptPackInstall() {
 }
 
 /// Update 버튼 디스패처 — 가용 업데이트 종류에 따라 경로를 고른다.
-/// 바이너리 우선(재시작이 팩 포함) → 무중단 팩 → 미확인/바이너리 필요 시 수동 재확인.
+/// 본체(바이너리)=홈페이지 다운로드 안내(T5·재시작 없음) → 무중단 팩 → 미확인 시 수동 재확인.
 async function onUpdateButton() {
   if (updateAvailable) return promptBinaryHomepage();
   if (packUpdateAvailable && !packUpdateAvailable.binary_too_old) return promptPackInstall();

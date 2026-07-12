@@ -1648,7 +1648,11 @@ async fn rotate_dept_daemon(app: AppHandle, name: String, force: bool) -> Result
     // (T3) rotate는 graceful_kill로 노드 PTY를 동반 종료하고 새 데몬은 surface 0개로 뜬다. 콜드부트
     // auto-restore가 돌지만 실패할 수 있어(2026-07-12 dept-4 실사고: 콜드부트 복원 FAILED·미가시)
     // 사이드카 restore로 명시 복원한다(방금 rotate로 데몬은 살아있음·run_restore 멱등이라 이미 되살렸으면 no-op).
-    let _ = run_sidecar_restore(Some(sock.clone())).await;
+    // restore_ok를 반환 info에 실어 UI(manualRotateSkewed)가 복원 실패를 삼키지 않게 한다(dept-4 계열 가시화).
+    let restore_ok = run_sidecar_restore(Some(sock.clone())).await;
+    if let Some(obj) = info.as_object_mut() {
+        obj.insert("restore_ok".into(), json!(restore_ok));
+    }
     Ok(info)
 }
 
