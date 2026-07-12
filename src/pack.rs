@@ -616,6 +616,33 @@ pub fn remote_is_newer(remote: &str, disk: &str) -> bool {
     }
 }
 
+/// 부트 스윕 조기 반환 게이트 — 디스크 팩이 `binary_version` 이상으로 커밋됐고(.pack-version)
+/// 매니페스트가 실재하면 true(스윕 불요). GUI 온보딩·cysd 부트가 공유한다(SOT 단일).
+/// - 디스크>바이너리(무중단 pack-update 전진)도 true — 스윕해봐야 install의 다운그레이드
+///   차단에 막히므로 스킵이 동치·저렴하다(lame-duck 스큐의 매 부트 차단 로그 소음도 제거).
+/// - ★안전 방향이 remote_is_newer(fail-CLOSED=반영 거부)와 반대다: 마커 부재·파싱 실패·
+///   매니페스트 부재 = false = **스윕(치유) 실행**. 게이트는 "확실히 최신"일 때만 닫힌다.
+/// - 매니페스트는 존재 stat만 검사한다 — 깊은 파싱 검증은 doctor 소관(매 부트 파싱 = 비용 재유입).
+pub fn pack_current_in(dir: &Path, binary_version: &str) -> bool {
+    if !dir.join(INSTALL_MANIFEST).exists() {
+        return false;
+    }
+    let Ok(disk) = std::fs::read_to_string(dir.join(PACK_VERSION_FILE)) else {
+        return false;
+    };
+    match (parse_semver(disk.trim()), parse_semver(binary_version)) {
+        (Some(d), Some(b)) => d >= b,
+        _ => false,
+    }
+}
+
+/// pack_current_in의 실경로 래퍼 — 호출부(GUI setup·cysd main)가 pack_dir 해석에 재결합하지 않게 한다.
+/// ★게이트는 반드시 **부트 호출부**에 두고 install() 내부에 넣지 마라 — 내부에 넣으면 수동
+/// `cys init-pack`·pack-update·pack-downgrade(치유의 정식 경로)까지 게이트되어 치유가 불구가 된다.
+pub fn pack_current_for(binary_version: &str) -> bool {
+    pack_current_in(&pack_dir(), binary_version)
+}
+
 /// 원자적 파일 쓰기(§7-⑤): 같은 디렉터리 temp 파일에 쓰고 fsync → rename으로 원자 교체 →
 /// 디렉터리 fsync(best-effort). 쓰는 도중 crash 시 부분 파일이 최종 경로에 남지 않는다
 /// (std::fs::write는 비원자라 부분 쓰기 노출). cysd governance의 write_json_atomic과 동형.
@@ -1402,6 +1429,39 @@ mod tests {
         // master는 정확 일치만 — 'masterful' 같은 변형은 매핑 없음
         assert_eq!(dir_file("master").as_deref(), Some("MASTER_DIRECTIVE.md"));
         assert_eq!(dir_file("masterful"), None);
+    }
+
+    /// ★부트 스윕 게이트 회귀 핀 — 게이트는 "확실히 최신"일 때만 닫힌다(치유 방향 fail-open).
+    /// 안전 방향이 remote_is_newer(fail-CLOSED)와 반대임을 박제한다: 마커 부재·파싱 실패·
+    /// 매니페스트 부재는 전부 false(=스윕 실행)여야 한다.
+    #[test]
+    fn pack_current_gate_only_closes_when_provably_current() {
+        let td = std::env::temp_dir().join(format!("cys-pack-current-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        std::fs::create_dir_all(&td).unwrap();
+
+        // ① 완전 부재(신선 머신) → 스윕
+        assert!(!pack_current_in(&td, "0.12.51"), "마커·매니페스트 부재 = 스윕");
+        // ② 마커만 있고 매니페스트 부재(부분 손상) → 스윕
+        std::fs::write(td.join(PACK_VERSION_FILE), "0.12.51").unwrap();
+        assert!(!pack_current_in(&td, "0.12.51"), "매니페스트 부재 = 스윕");
+        // ③ 동일 버전 + 매니페스트 실재 → 게이트 닫힘(평시 부트)
+        std::fs::write(td.join(INSTALL_MANIFEST), "{}").unwrap();
+        assert!(pack_current_in(&td, "0.12.51"), "동일 버전 = 스킵");
+        // ④ 개행·공백 trim(python 도구 CRLF 재직렬화 대비 — 7-12 원복 사고 계열)
+        std::fs::write(td.join(PACK_VERSION_FILE), "0.12.51\r\n").unwrap();
+        assert!(pack_current_in(&td, "0.12.51"), "CRLF trim 후 동일 버전 = 스킵");
+        // ⑤ 디스크 구버전(바이너리 업그레이드 직후) → 스윕
+        std::fs::write(td.join(PACK_VERSION_FILE), "0.12.50").unwrap();
+        assert!(!pack_current_in(&td, "0.12.51"), "디스크 구버전 = 스윕");
+        // ⑥ 디스크 전진(pack-update 스큐) → 스킵(스윕해봐야 다운그레이드 차단 = 동치·저렴)
+        std::fs::write(td.join(PACK_VERSION_FILE), "0.12.52").unwrap();
+        assert!(pack_current_in(&td, "0.12.51"), "디스크 전진 = 스킵");
+        // ⑦ 마커 손상(비semver) → 스윕(fail-open 치유)
+        std::fs::write(td.join(PACK_VERSION_FILE), "garbage").unwrap();
+        assert!(!pack_current_in(&td, "0.12.51"), "마커 손상 = 스윕");
+
+        let _ = std::fs::remove_dir_all(&td);
     }
 
     #[test]

@@ -102,15 +102,22 @@ async fn main() {
         Ok(false) => {}
         Err(e) => eprintln!("[cysd] pack journal recovery skipped: {e}"),
     }
-    // 온보딩②: 신규 머신 첫 기동 시 pack 자동 설치 (보존 모드 — 기존 사용자 파일 불가침).
-    // launch-agent·디렉티브·acl이 "init-pack을 아는 사람"에게만 동작하는 것을 없앤다.
-    match cys::pack::install(false) {
-        Ok((written, _)) if written > 0 => eprintln!(
-            "[cysd] CYSJavis Pack: {written} file(s) installed at {}",
-            cys::pack::pack_dir().display()
-        ),
-        Ok(_) => {}
-        Err(e) => eprintln!("[cysd] pack auto-install skipped: {e}"),
+    // 온보딩②: 팩이 이 바이너리 버전으로 미커밋일 때만 자동 설치 — 신규 머신·바이너리 업그레이드·
+    // 팩 소실(.pack-version/매니페스트 부재 = 게이트 개방)이 실행 조건. launch-agent·디렉티브·acl이
+    // "init-pack을 아는 사람"에게만 동작하는 것을 없앤다는 원목적은 유지된다(보존 모드·사용자 파일 불가침).
+    // ★게이트(pack_current_for): 평시 부트는 stat 2회로 조기 반환 — 부서 데몬 N개·RestartOnFailure
+    // 재기동·로그온 자동기동마다 전량 스윕(320파일 read+해시)이 돌던 비용 제거(2026-07-12 Win11 이슈 실측).
+    // 손상+마커 무결 상태의 치유는 cys init-pack/pack-update/doctor --fix 명시 경로가 담당한다
+    // (매 부트 전량 치유는 seed-once 원복 사고(7-12)의 원인 기전 — 의도적 축소).
+    if !cys::pack::pack_current_for(env!("CARGO_PKG_VERSION")) {
+        match cys::pack::install(false) {
+            Ok((written, _)) if written > 0 => eprintln!(
+                "[cysd] CYSJavis Pack: {written} file(s) installed at {}",
+                cys::pack::pack_dir().display()
+            ),
+            Ok(_) => {}
+            Err(e) => eprintln!("[cysd] pack auto-install skipped: {e}"),
+        }
     }
     let socket_path = cys::socket_path();
     let daemon = Daemon::new(socket_path.clone());

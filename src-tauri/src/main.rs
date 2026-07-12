@@ -7,7 +7,7 @@ use base64::Engine;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Mutex;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_updater::UpdaterExt;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
@@ -1202,9 +1202,11 @@ async fn maybe_autoregister_launchd() -> bool {
 }
 
 /// 첫 기동 온보딩 공용 단계 — `cys init-pack`으로 팩 파일 + Claude SessionStart hook 등록.
-/// install은 preserve, hook은 중복 dedup(already→skip·.bak-cys 무변경)이라 **멱등** — 매 기동
-/// 실행해도 안전(팩 삭제 시 자가치유). Windows·macOS 온보딩이 공유한다(autostart는 OS별로 분리:
-/// Windows=schtasks·macOS=launchd). best-effort — 실패해도 세션은 진행.
+/// install은 preserve, hook은 중복 dedup(already→skip·.bak-cys 무변경)이라 **멱등** — 반복 실행해도
+/// 안전하다. 단 호출은 setup의 needs_onboard 게이트(pack_current_for)로 조건화됐다(2026-07-12):
+/// 신선 머신·버전 변경·팩 소실(.pack-version/매니페스트 부재)에만 실행 — 평시 부트 비용 제거.
+/// Windows·macOS 온보딩이 공유한다(autostart는 OS별로 분리: Windows=schtasks·macOS=launchd).
+/// best-effort — 실패해도 세션은 진행(팩 미설치면 .pack-version 부재 = 다음 부트 게이트 개방 = 재시도).
 #[cfg(any(windows, target_os = "macos"))]
 fn onboard_init_pack(cys: &std::path::Path) {
     let mut init = std::process::Command::new(cys);
@@ -1816,6 +1818,9 @@ async fn install_update(app: AppHandle, force: bool) -> Result<(), String> {
     let _ = std::fs::write(pending_restore_path(), "");
     stop_running_daemon().await;
     // 4) 앱 재시작 — setup의 ensure_daemon이 새 cysd를 자동 기동, maybe_restore_after_update가 노드 복원
+    // ★재활성화 경고(현재 이 경로는 휴면 — 본체 업데이트는 홈페이지 전용 T5): single-instance 플러그인이
+    // 등록돼 있어 restart()의 신 프로세스가 구 프로세스의 인스턴스 락과 레이스할 수 있다(신 인스턴스가
+    // 죽어가는 구 인스턴스로 포워딩 후 종료 → 앱 미복귀). 이 경로를 되살릴 때 반드시 실기기 검증하라.
     app.restart();
 }
 
@@ -2017,6 +2022,14 @@ async fn stop_running_daemon() {
 
 fn main() {
     tauri::Builder::default()
+        // ★최선두 등록 필수 — 두 번째 인스턴스는 다른 플러그인·setup이 돌기 전에 기존 창 포커스 후
+        // 스스로 종료된다(Win11 cys-app.exe 프로세스 증식 이슈의 증상 차단 · 2026-07-12). 스폰 소스가
+        // 무엇이든(설치기 재실행·바로가기 이중클릭·OS 재기동 복원) 단일 인스턴스가 보장된다.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_notification::init())
@@ -2077,6 +2090,12 @@ fn main() {
         .setup(|app| {
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
+                // ★온보딩 게이트 캡처 — 반드시 데몬 기동(launchd load·ensure_daemon)보다 먼저 평가한다.
+                // cysd는 부트 시 스스로 팩을 설치하고 .pack-version을 기록하므로(cysd/main.rs 온보딩②),
+                // 캡처가 데몬 기동 뒤면 신선 머신에서 게이트가 '최신'으로 오판해 hook 미설치(T1 회귀).
+                // Directive: 이 순서를 옮기지 마라 — 게이트·온보딩·cysd 스윕의 정합은 이 캡처 시점이 진실이다.
+                #[allow(unused_variables)] // 온보딩 경로가 없는 OS(linux CI 등)에서만 미사용
+                let needs_onboard = !cys::pack::pack_current_for(env!("CARGO_PKG_VERSION"));
                 #[cfg(target_os = "macos")]
                 let launchd_owns = maybe_autoregister_launchd().await;
                 #[cfg(not(target_os = "macos"))]
@@ -2100,11 +2119,18 @@ fn main() {
                 // event-forwarder를 먼저 띄워 init-pack 블로킹이 양방향 이벤트 파이프를 막지 않게 한다(반쪽 부팅 방지).
                 spawn_event_forwarder(handle.clone(), default_socket());
                 // RC-1: Windows 첫 기동 온보딩(팩+hook+autostart schtasks). 멱등.
+                // 게이트(needs_onboard·위 캡처): 신선 머신·버전 변경·팩 소실에만 실행 — 평시 부트의
+                // 사이드카 스폰+전량 스윕+schtasks 재등록 비용 제거(2026-07-12 Win11 이슈 실측).
+                // hook·schtasks만 유실된 상태(팩·마커 무결)의 치유는 doctor --fix·버전 전이가 담당.
                 #[cfg(windows)]
-                maybe_windows_onboard();
-                // RC-17(T5): macOS 첫 기동 온보딩(팩+hook) — Windows 대칭. autostart는 위 launchd. 멱등.
+                if needs_onboard {
+                    maybe_windows_onboard();
+                }
+                // RC-17(T5): macOS 첫 기동 온보딩(팩+hook) — Windows 대칭(동일 게이트). autostart는 위 launchd.
                 #[cfg(target_os = "macos")]
-                maybe_macos_onboard();
+                if needs_onboard {
+                    maybe_macos_onboard();
+                }
                 // 업데이트 재시작 시: 새 팩(새 기능) 반영 + 노드 자동복귀(마커가 있을 때만).
                 maybe_apply_pending_update(&handle);
             });
