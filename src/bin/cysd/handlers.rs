@@ -354,20 +354,65 @@ fn typing_guard_secs() -> u64 {
         .unwrap_or(3)
 }
 
-/// authoritative(타이핑 가드 면제) 권한 가드 — defense-in-depth (agy R1 지적1 · codex R2 강화).
-/// 권위 주입(launch-agent/reinject)만 면제를 받게 한다: 발신 surface role이 master/cso일 때만
-/// 허용하고, 미해소 외부 caller(None — raw RPC)와 worker·reviewer는 거부한다. launch-agent는
-/// 조상 추적으로 master surface(Some)로 해소되므로 정상 허용된다. 비권위 노드가 `authoritative`로
-/// 사람-입력 보호(typing_guard)를 무력화하는 것을 막는다(1차 방어는 cys CLI가 authoritative 미노출).
-fn authoritative_caller_ok(daemon: &Daemon, from_sid: Option<u64>) -> bool {
-    // 미해소 caller(None — 어떤 surface의 자손도 아닌 외부 raw RPC)는 면제하지 않는다
-    // (codex R2: None=>true는 외부 raw RPC가 우회 가능한 신원 모델 구멍). launch-agent/reinject는
-    // master가 실행하므로 resolve_caller_surface의 조상 추적(cys→shell→claude=master surface)으로
-    // Some(master)로 해소되어 정상 허용된다 — None 분기에 기대지 않는다.
-    from_sid
+/// authoritative(타이핑 가드 면제) restore-root 분기 — caller_pid 의 32-hop 조상 중 restore_roots 에
+/// 등록된 pid 가 있고 그 pid 의 현재 start_time 이 등록값과 일치할 때만 true. resolve_caller_surface·
+/// caller_cache 와 완전 독립이다(별도 sysinfo 새로고침·캐시 미사용 — 공유 자료구조 오염 0). start_time
+/// 재조회를 lookup 으로 주입해 관측실패(None) 경로를 결정론 테스트한다. fail-closed: 복원 미진행(빈
+/// 목록)·미등록 조상·start_time 불일치/관측실패 = false. Some(current)==Some(registered) 만 허용한다.
+fn caller_in_restore_root(
+    daemon: &Daemon,
+    caller_pid: u32,
+    start_time_lookup: impl Fn(u32) -> Option<u64>,
+) -> bool {
+    let roots = {
+        let g = daemon.restore_roots.lock().unwrap_or_else(|e| e.into_inner());
+        if g.is_empty() {
+            // 복원 미진행 — 면제 창이 닫혀 있음(빠른 경로: sysinfo 새로고침 회피).
+            return false;
+        }
+        g.clone()
+    };
+    let mut sys = sysinfo::System::new();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    let mut cur = caller_pid;
+    for _ in 0..32 {
+        if let Some(&(_, registered_start)) = roots.iter().find(|(p, _)| *p == cur) {
+            // A5(pid 재사용)·A6(관측실패) fail-closed: 현재 start_time 재조회가 등록값과
+            // Some==Some 로 일치할 때만 허용. None(관측실패)·불일치는 거부한다.
+            return start_time_lookup(cur) == Some(registered_start);
+        }
+        match sys
+            .process(sysinfo::Pid::from_u32(cur))
+            .and_then(|p| p.parent())
+        {
+            Some(parent) if parent.as_u32() != cur && parent.as_u32() > 1 => {
+                cur = parent.as_u32();
+            }
+            _ => break,
+        }
+    }
+    false
+}
+
+/// authoritative(타이핑 가드 면제) 권한 가드 — defense-in-depth (agy R1 지적1 · codex R2 강화 · T6 확장).
+/// 두 경로만 면제한다: (a) 발신 surface role∈{master,cso} — 권위 노드의 직접 주입(불변). (b) auto-restore
+/// 가 스폰한 phoenix restore 프로세스(restore_roots)의 **살아있는 자손**, 복원이 도는 동안만 — 콜드부트
+/// 부서장 fresh-fallback 부활(dept-4)이 typing_guard 에 막히던 결함을 좁게 연다. 미해소 외부 caller
+/// (None — raw RPC)·worker·reviewer·surface.create 임의-cmd 자식·HUD bridge 는 어느 경로에도 안 들어
+/// 거부된다(fail-closed). launch-agent 는 master 실행이면 (a), phoenix 복원 자손이면 (b)로 해소된다.
+fn authoritative_caller_ok(daemon: &Daemon, from_sid: Option<u64>, caller_pid: Option<u32>) -> bool {
+    // (a) 권위 노드(master/cso) — 기존 불변식(role 자체가 권한 메커니즘).
+    if from_sid
         .and_then(|sid| daemon.get_surface(sid))
         .and_then(|s| s.role.lock().unwrap().clone())
         .map_or(false, |r| r == "master" || r == "cso")
+    {
+        return true;
+    }
+    // (b) restore-root 의 살아있는 자손 — 복원 진행 중에만(restore_roots 비면 caller_in_restore_root 즉시 false).
+    caller_pid.map_or(false, |pid| {
+        caller_in_restore_root(daemon, pid, crate::state::peer_start_time)
+    })
 }
 
 /// 컨텍스트 임계(%) — 절대지침의 60% 사이클을 결정론으로 발화하는 기준.
@@ -859,7 +904,8 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             // T3-13 타이핑 가드: 사람이 방금(기본 3초) 입력 중인 pane에 원격 직접 주입 금지.
             // 무음 큐잉 대신 명시 에러 — 후속 send-key Return이 사람의 미완성 입력을
             // 실행해버리는 최악 경로를 차단한다 (--queued는 quiet 대기 배달이라 허용).
-            if !human && !(authoritative && authoritative_caller_ok(daemon, verified_from)) {
+            if !human && !(authoritative && authoritative_caller_ok(daemon, verified_from, caller_pid))
+            {
                 let guard = typing_guard_secs();
                 if guard > 0 {
                     let typing = surface
@@ -1001,7 +1047,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 .get("authoritative")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            if !(authoritative && authoritative_caller_ok(daemon, verified_from)) {
+            if !(authoritative && authoritative_caller_ok(daemon, verified_from, caller_pid)) {
                 let guard = typing_guard_secs();
                 if guard > 0 {
                     let typing = surface
