@@ -12,6 +12,7 @@ import json
 import os
 import secrets
 import tempfile
+import threading
 import time
 import unittest
 
@@ -377,6 +378,213 @@ class EventSurfaceValidation(unittest.TestCase):
 
     def test_garbage_rejected(self):
         self.assertEqual(self._emit("surface:notanumber"), E.EXIT_INVALID)
+
+
+# ============================ Phase 2 (멀티 구독·sid 맵 정식화·emitter auto) ============
+
+class ReconcileTargets(unittest.TestCase):
+    """P2-1 reconcile_targets 순수 로직 — spawn·reap·상한 절단."""
+
+    def test_spawn_all_from_empty(self):
+        to_spawn, to_reap = B.reconcile_targets({"main": None, "dept-1": "s1"}, {})
+        self.assertEqual(to_spawn, {"main": None, "dept-1": "s1"})
+        self.assertEqual(to_reap, set())
+
+    def test_reap_removed_target(self):
+        to_spawn, to_reap = B.reconcile_targets({"main": None}, {"main": None, "dept-1": "s1"})
+        self.assertEqual(to_spawn, {})
+        self.assertEqual(to_reap, {"dept-1"})
+
+    def test_spawn_only_new(self):
+        to_spawn, to_reap = B.reconcile_targets(
+            {"main": None, "dept-1": "s1", "dept-2": "s2"}, {"main": None, "dept-1": "s1"})
+        self.assertEqual(to_spawn, {"dept-2": "s2"})
+        self.assertEqual(to_reap, set())
+
+    def test_cap_enforced_main_priority(self):
+        desired = {"main": None}
+        for i in range(20):
+            desired["dept-%02d" % i] = "s%d" % i
+        to_spawn, _ = B.reconcile_targets(desired, {}, cap=12)
+        self.assertEqual(len(to_spawn), 12)   # 상한 절단
+        self.assertIn("main", to_spawn)       # main 우선 보존
+
+
+class SupervisorReconcile(unittest.TestCase):
+    """P2-1 SubscriptionSupervisor.reconcile_once — 부서 추가/소멸 fixture (프로세스 미기동)."""
+
+    def _fake_sup(self, world):
+        sup = B.SubscriptionSupervisor(world, None, None, threading.Event(), tempfile.mkdtemp())
+        spawned, reaped = [], []
+        sup._spawn = lambda slug, sock: (spawned.append((slug, sock)),
+                                         sup.subs.__setitem__(slug, {"socket": sock}))
+        sup._reap = lambda slug: (reaped.append(slug), sup.subs.pop(slug, None))
+        return sup, spawned, reaped
+
+    def test_initial_spawns_main_and_depts(self):
+        sup, spawned, reaped = self._fake_sup(merged_world(DUP))
+        sup.reconcile_once()
+        self.assertEqual(dict(spawned), {"main": None, "dept-1": "/tmp/d1.sock"})
+        self.assertEqual(reaped, [])
+
+    def test_new_dept_spawned_only(self):
+        w = merged_world(DUP)
+        sup, spawned, reaped = self._fake_sup(w)
+        sup.reconcile_once()
+        spawned.clear()
+        w.merge_fleet(build_fleet(DUP + [("dept-2", "/tmp/d2.sock", "2부서",
+                                          [("worker", "surface:3", 3)])]), None)
+        sup.reconcile_once()
+        self.assertEqual(spawned, [("dept-2", "/tmp/d2.sock")])   # 신규 부서만
+        self.assertEqual(reaped, [])
+
+    def test_removed_dept_reaped(self):
+        w = merged_world(DUP)
+        sup, spawned, reaped = self._fake_sup(w)
+        sup.reconcile_once()
+        w.merge_fleet(build_fleet([("main", None, "본부", [("master", "surface:5", 5)])]), None)
+        sup.reconcile_once()   # dept-1 소멸
+        self.assertEqual(reaped, ["dept-1"])
+
+
+class RouteEventSlugContext(unittest.TestCase):
+    """P2-2 route_event slug 문맥 — 키 f'{slug}@surface:N', 기본 main 하위호환."""
+
+    def _hook(self, w, slug):
+        coal = B.Coalescer()
+        now = time.time()
+        ev = {"name": "agent.hook.PreToolUse", "surface_id": 5, "timestamp": now,
+              "payload": {"tool_name": "Bash"}}
+        frames, _ = B.route_event(ev, w, coal, slug, now=now)
+        return [f for f in frames if f["t"] == "fx"][0]
+
+    def test_dept_slug_key(self):
+        self.assertEqual(self._hook(merged_world(DUP), "dept-1")["key"], "dept-1@surface:5")
+
+    def test_default_slug_is_main(self):
+        w = merged_world(DUP)
+        coal = B.Coalescer()
+        now = time.time()
+        ev = {"name": "agent.hook.PreToolUse", "surface_id": 5, "timestamp": now,
+              "payload": {"tool_name": "Bash"}}
+        frames, _ = B.route_event(ev, w, coal, now=now)   # slug 생략 → main
+        self.assertEqual([f for f in frames if f["t"] == "fx"][0]["key"], "main@surface:5")
+
+
+class HookIsolation(unittest.TestCase):
+    """P2-3 동번호 hook 무충돌 — 두 데몬 sid 5, 본부에만 hook → 본부 노드만 active."""
+
+    def test_same_sid_hook_marks_only_own_dept(self):
+        w = merged_world(DUP)   # main@surface:5 + dept-1@surface:5
+        coal = B.Coalescer()
+        now = time.time()
+        ev = {"name": "agent.hook.PreToolUse", "surface_id": 5, "timestamp": now,
+              "payload": {"tool_name": "Bash"}}
+        B.route_event(ev, w, coal, "main", now=now)   # 본부 구독 경유
+        nodes = {n["key"]: n for dep in w.snapshot()["departments"] for n in dep["nodes"]}
+        self.assertEqual(nodes["main@surface:5"]["presence"], "active")
+        self.assertNotEqual(nodes["dept-1@surface:5"]["presence"], "active")   # 오염 없음
+
+
+class LineRateIsolation(unittest.TestCase):
+    """P2-3 line_rate 격리(잠복 결함 2호) — 동번호 부서가 서로 activity 를 덮지 않는다."""
+
+    def test_same_sid_line_rate_isolated(self):
+        depts = [("main", None, "본부", [("master", "surface:5", 5)]),
+                 ("dept-1", "/tmp/d1.sock", "1부서", [("worker", "surface:5", 5)])]
+        w = B.World()
+        f1 = build_fleet(depts)
+        f1["departments"][0]["surfaces"][0]["line_count"] = 100
+        f1["departments"][1]["surfaces"][0]["line_count"] = 100
+        w.merge_fleet(f1, None)          # baseline (prev 없음 → rate 미산출)
+        time.sleep(0.01)                 # dt>0 보장
+        f2 = build_fleet(depts)
+        f2["departments"][0]["surfaces"][0]["line_count"] = 1000   # 본부만 급증
+        f2["departments"][1]["surfaces"][0]["line_count"] = 100    # 부서는 정지
+        w.merge_fleet(f2, None)
+        self.assertGreater(w.line_rate["main@surface:5"], 0.0)     # 본부 rate 보존
+        self.assertEqual(w.line_rate["dept-1@surface:5"], 0.0)     # 부서에 덮이지 않음
+
+
+class ApplyUsageSlugScope(unittest.TestCase):
+    """P2-2 apply_usage slug 스코프 — 부서 구독 usage 는 그 부서 노드에만 귀속."""
+
+    def test_usage_attributes_to_subscription_slug(self):
+        w = merged_world(DUP)   # main surface:5·8, dept-1 surface:5
+        coal = B.Coalescer()
+        ev = {"name": "usage.updated", "surface_id": 5, "timestamp": time.time(),
+              "payload": {"ctx_pct": 42}}
+        frames, _ = B.route_event(ev, w, coal, "dept-1")
+        fx = [f for f in frames if f["kind"] == "usage"][0]
+        self.assertEqual(fx["key"], "dept-1@surface:5")   # 본부 surface:5 아님
+        main5 = [s for d in w.departments if d["_slug"] == "main"
+                 for s in d["surfaces"] if s["surface_id"] == 5][0]
+        self.assertNotIn("usage", main5)   # 본부 노드 무반영
+
+
+class EventSurfaceAuto(unittest.TestCase):
+    """P2-4 --surface auto 해석 3분기 — main·부서매칭·미귀속(fail-open 금지)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        depts = os.path.join(self.tmp, "depts.json")
+        with open(depts, "w") as f:
+            json.dump({"depts": {"dept-1": {"socket": "/tmp/d1.sock"}}}, f)
+        self._saved = {k: os.environ.get(k)
+                       for k in ("CYS_SOCKET", "CYS_DEPTS_JSON", "HUD_STATE_DIR")}
+        os.environ["CYS_DEPTS_JSON"] = depts
+        os.environ.pop("CYS_SOCKET", None)
+        self._orig_ref = E._resolve_surface_ref
+        E._resolve_surface_ref = lambda: "surface:7"   # cys identify 스텁
+
+    def tearDown(self):
+        E._resolve_surface_ref = self._orig_ref
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_main_when_no_socket(self):
+        self.assertEqual(E.resolve_auto_surface(), "main@surface:7")
+
+    def test_dept_when_socket_matches(self):
+        os.environ["CYS_SOCKET"] = "/tmp/d1.sock"
+        self.assertEqual(E.resolve_auto_surface(), "dept-1@surface:7")
+
+    def test_unmatched_socket_is_none(self):
+        os.environ["CYS_SOCKET"] = "/tmp/unknown.sock"
+        self.assertIsNone(E.resolve_auto_surface())   # 미귀속 폴백
+
+    def test_identify_fail_is_none(self):
+        E._resolve_surface_ref = lambda: None
+        self.assertIsNone(E.resolve_auto_surface())
+
+    def test_emit_auto_spools_resolved_key(self):
+        os.environ["CYS_SOCKET"] = "/tmp/d1.sock"
+        sd = tempfile.mkdtemp()
+        os.environ["HUD_STATE_DIR"] = sd
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = E.main(["emit", "task.unblocked", "--payload", '{"task":"T"}',
+                         "--surface", "auto", "--spool"])
+        self.assertEqual(rc, 0)
+        with open(os.path.join(sd, "evt_spool.jsonl")) as f:
+            e = json.loads(f.readline())
+        self.assertEqual(e["key"], "dept-1@surface:7")
+
+    def test_emit_auto_unresolved_omits_key(self):
+        os.environ["CYS_SOCKET"] = "/tmp/unknown.sock"   # 미매칭 → None
+        sd = tempfile.mkdtemp()
+        os.environ["HUD_STATE_DIR"] = sd
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = E.main(["emit", "task.unblocked", "--payload", '{"task":"T"}',
+                         "--surface", "auto", "--spool"])
+        self.assertEqual(rc, 0)
+        with open(os.path.join(sd, "evt_spool.jsonl")) as f:
+            e = json.loads(f.readline())
+        self.assertNotIn("key", e)   # 미귀속 — bare/오귀속 키 미기록
 
 
 if __name__ == "__main__":

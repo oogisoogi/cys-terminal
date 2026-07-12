@@ -12,6 +12,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 
@@ -24,6 +25,58 @@ WIRE_RE = re.compile(r"^\[EVT v[12]\]\s+(?P<type>[a-z_.]+)\s+(?P<json>\{.*\})\s*
 
 # spool 귀속 key(--surface): bare surface:N 또는 정식 부서 키 <slug>@surface:N (검증 확장·§4d).
 SURFACE_KEY_RE = re.compile(r"^(?:[a-z0-9_-]{1,32}@)?surface:\d{1,8}$")
+CYS_BIN = os.environ.get("CYS_BIN", "cys")
+
+
+def _resolve_slug_from_socket():
+    """CYS_SOCKET env → 부서 slug (P2-4). 부재=본부 main. depts.json socket 매칭.
+
+    매칭 실패 시 None(미귀속 폴백 — fail-open 금지: main 으로 오귀속하지 않는다).
+    """
+    sock = os.environ.get("CYS_SOCKET")
+    if not sock:
+        return "main"   # 본부 기본(CYS_SOCKET 미설정 노드 = 본부)
+    reg = os.environ.get("CYS_DEPTS_JSON") or os.path.expanduser("~/.cys/depts.json")
+    try:
+        with open(reg) as f:
+            depts = (json.load(f) or {}).get("depts") or {}
+    except (OSError, ValueError):
+        return None
+    for name, meta in depts.items():
+        if isinstance(meta, dict) and meta.get("socket") == sock:
+            return name
+    return None   # 매칭 실패 → 미귀속
+
+
+def _resolve_surface_ref():
+    """`cys identify` → caller.surface_ref (P2-4). 실패·surface 밖이면 None."""
+    try:
+        out = subprocess.run([CYS_BIN, "identify"], capture_output=True, text=True, timeout=5)
+    except Exception:
+        return None
+    if out.returncode != 0:
+        return None
+    try:
+        d = json.loads(out.stdout)
+    except (ValueError, TypeError):
+        return None
+    ref = ((d or {}).get("caller") or {}).get("surface_ref")
+    return ref if isinstance(ref, str) and ref else None
+
+
+def resolve_auto_surface():
+    """--surface auto → 방출 노드의 정식 키 <slug>@surface:N (P2-4).
+
+    slug(CYS_SOCKET→depts.json)·surface_ref(cys identify) 중 하나라도 해석 실패 시 None
+    (미귀속 폴백 — fail-open 금지). 순수 조립부만 분리해 테스트에서 두 해석기를 주입한다.
+    """
+    slug = _resolve_slug_from_socket()
+    if slug is None:
+        return None
+    ref = _resolve_surface_ref()
+    if ref is None:
+        return None
+    return f"{slug}@{ref}"
 
 # type → 필수 payload 키 (EVENT_CONTRACT.md 표와 1:1)
 SCHEMA = {
@@ -161,14 +214,16 @@ def cmd_emit(a):
         print(f"invalid: {err}", file=sys.stderr)
         return EXIT_INVALID
     surface = getattr(a, "surface", None)
-    if surface is not None and not SURFACE_KEY_RE.match(surface):
+    if surface == "auto":   # P2-4: 방출 노드 정식 키 자동 해석(실패=미귀속 폴백·fail-open 금지)
+        surface = resolve_auto_surface()
+    elif surface is not None and not SURFACE_KEY_RE.match(surface):
         print(f"invalid: bad --surface key: {surface} "
-              f"(surface:N 또는 <slug>@surface:N)", file=sys.stderr)
+              f"(surface:N · <slug>@surface:N · auto)", file=sys.stderr)
         return EXIT_INVALID
     print(to_wire(a.type, payload))
     if getattr(a, "spool", False):
         try:  # spool 기록 실패는 wire 방출을 막지 않는다 (best-effort 수송로)
-            _spool_append(a.type, payload, getattr(a, "surface", None))
+            _spool_append(a.type, payload, surface)   # auto 해석·검증 통과한 key(또는 None)
         except OSError:
             pass
     return EXIT_OK
@@ -211,7 +266,7 @@ def main(argv=None):
     c.add_argument("--payload", help="JSON 문자열(--field 대신)")
     c.add_argument("--spool", action="store_true", help="wire 방출에 더해 HUD spool에 append")
     c.add_argument("--surface",
-                   help="spool 노드 귀속 key — surface:12 또는 정식 부서 키 dept-1@surface:12")
+                   help="spool 노드 귀속 key — auto(표준·자동 정식 키 해석) · dept-1@surface:12 · surface:12")
     c.set_defaults(fn=cmd_emit)
 
     c = sub.add_parser("parse")

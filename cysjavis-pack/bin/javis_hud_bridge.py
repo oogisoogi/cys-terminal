@@ -32,6 +32,10 @@ BIND = "127.0.0.1"
 PORT = int(os.environ.get("HUD_PORT", "8642"))  # 8765는 이 장비에서 선점 실측 → 회피
 FLEET_POLL_SECS = float(os.environ.get("HUD_POLL", "2.0"))
 CYS = os.environ.get("HUD_CYS_BIN", "cys")
+# P2-1 부서 이벤트 멀티 구독 슈퍼바이저
+SUB_CAP = int(os.environ.get("HUD_SUB_CAP", "12"))     # 동시 구독 상한(런어웨이 방지)
+SUB_BACKOFF_SECS = 2.0                                   # 구독 재수립 백오프
+SUB_RECONCILE_SECS = 2.0                                 # 타깃 reconcile 주기
 # Windows: 이 브리지는 콘솔 없는 cysd가 NO_WINDOW로 띄운다 — 콘솔 자식(cys.exe)을 그냥
 # 스폰하면 새 콘솔 창이 할당된다(상주 events 자식 = AppData 경로 제목의 검은 WT 탭 실사고
 # 2026-07-11). 이 파일의 모든 subprocess 호출에 **NOWIN 을 전개해 숨긴다. 타 OS 무동작.
@@ -257,10 +261,12 @@ class World:
         self.daemon = {}
         self.todo = {}                 # path → {done,total,age_secs}
         self.seq = 0
-        self.hooks = defaultdict(deque)      # surface_id → 최근 hook ts deque
-        self.line_hist = {}            # surface_id → (line_count, ts)
-        self.line_rate = {}            # surface_id → lines/s
-        self.flags = defaultdict(dict)  # surface_id → {flag: expiry_ts}
+        # P2-3(잠복 결함 2호): 4맵을 sid 단독 키 → 정식 노드 키(<slug>@surface:N)로 전환.
+        # sid 는 부서 데몬별이라 비유일 — sid 키 유지 시 동번호 부서가 hook·activity·flag 상호 오염.
+        self.hooks = defaultdict(deque)      # node_key → 최근 hook ts deque
+        self.line_hist = {}            # node_key → (line_count, ts)
+        self.line_rate = {}            # node_key → lines/s
+        self.flags = defaultdict(dict)  # node_key → {flag: expiry_ts}
         self.server_room = {}          # pid → {cmd, scoped}
         self.prev_nodes = {}           # key → 직전 노드 스냅샷 (diff용)
         # v2 부서 한정 키(§4b) — 소켓 캐리·지연 히트 마이그레이션
@@ -281,29 +287,29 @@ class World:
         self.prev_top = {}             # patch_top 직전값 비교 (field → value)
 
     # --- 수집 반영 ---
-    def note_hook(self, surface_id, ts):
-        dq = self.hooks[surface_id]
+    def note_hook(self, key, ts):
+        dq = self.hooks[key]
         dq.append(ts)
         while dq and ts - dq[0] > 60.0:
             dq.popleft()
 
-    def set_flag(self, surface_id, flag, ttl):
-        self.flags[surface_id][flag] = time.time() + ttl
+    def set_flag(self, key, flag, ttl):
+        self.flags[key][flag] = time.time() + ttl
 
-    def live_flags(self, surface_id, now):
-        f = self.flags.get(surface_id) or {}
+    def live_flags(self, key, now):
+        f = self.flags.get(key) or {}
         return sorted(k for k, exp in f.items() if exp > now)
 
-    def apply_usage(self, surface_id, payload):
+    def apply_usage(self, surface_id, payload, slug="main"):
         """usage.updated → 해당 노드 usage 즉시 갱신. 성공 시 노드 정식 key 반환.
 
-        C3: `cys events` 는 본부 단일 구독이므로 usage 이벤트의 surface_id 는 본부 노드 것이다.
-        전 부서 첫-매칭 순회(구현: departments[0]=본부 순서 의존·무문서)를 본부(slug=="main")
-        한정 조회로 교체 — 동번호 부서 surface 로의 오귀속·순서 의존을 소거한다.
+        P2-2: 이벤트가 도착한 구독의 slug 스코프로 조회한다(C3 본부 한정을 일반화 — 각 부서
+        구독은 자기 데몬 surface_id 만 발급하므로 slug 로 스코프해 동번호 부서 오귀속·순서 의존 소거).
+        기본값 "main" 은 단일 구독(P1) 하위호환.
         """
         with self.lock:
             for d in self.departments:
-                if d.get("_slug") != "main":
+                if d.get("_slug") != slug:
                     continue
                 for s in d.get("surfaces", []):
                     if s.get("surface_id") == surface_id:
@@ -336,6 +342,19 @@ class World:
             hits = [node_key(s) for d in self.departments for s in d.get("surfaces", [])
                     if s.get("surface_ref") == ref]
         return hits[0] if len(hits) == 1 else None
+
+    def dept_targets(self):
+        """현재 fleet 의 구독 타깃 {slug: socket|None} (P2-1 슈퍼바이저 reconcile 입력).
+
+        각 부서의 socket 은 merge_fleet 가 주석한 dept["socket"](본부=None). 첫 등장 slug 만 채택.
+        """
+        with self.lock:
+            out = {}
+            for d in self.departments:
+                slug = d.get("_slug")
+                if slug and slug not in out:
+                    out[slug] = d.get("socket")
+            return out
 
     def apply_todo(self, path, done, total):
         with self.lock:
@@ -424,12 +443,13 @@ class World:
                 now = time.time()
                 for d in new_deps:
                     for s in d.get("surfaces", []):
-                        sid = s.get("surface_id")
+                        # P2-3: 정식 키로 line 이력 추적 — 동번호 부서 간 activity 오염 제거
+                        nk = node_key(s)
                         lc = s.get("line_count") or 0
-                        prev = self.line_hist.get(sid)
+                        prev = self.line_hist.get(nk)
                         if prev and now > prev[1]:
-                            self.line_rate[sid] = max(0.0, (lc - prev[0]) / (now - prev[1]))
-                        self.line_hist[sid] = (lc, now)
+                            self.line_rate[nk] = max(0.0, (lc - prev[0]) / (now - prev[1]))
+                        self.line_hist[nk] = (lc, now)
                 self.departments = new_deps
                 if not self.heat_migrated:   # 첫 실 fleet 병합 시점에 히트 지연 승격(M2)
                     self._migrate_pending_heat()
@@ -437,18 +457,18 @@ class World:
             return patches, structural
 
     def _node_view(self, s, now):
-        """fleet surface → 계약 v1 노드 뷰."""
+        """fleet surface → 계약 노드 뷰."""
         sid = s.get("surface_id")
-        dq = self.hooks.get(sid) or ()
+        nkey = node_key(s)   # P2-3: hook·activity·flag 조회를 정식 키로 (sid 비유일 오염 제거)
+        dq = self.hooks.get(nkey) or ()
         last_hook = dq[-1] if dq else None
         presence, conf = judge_presence(s, now, last_hook)
         st = s.get("status") or {}
         ctx = pick_ctx(s)
         u = s.get("usage") or {}
-        flags = self.live_flags(sid, now)
+        flags = self.live_flags(nkey, now)
         if ctx is not None and ctx >= 90:
             flags = flags + ["ctx_critical"]
-        nkey = node_key(s)
         return {
             "key": nkey, "surface_id": sid,
             "dept_label": s.get("_dept_label"),   # 표시 전용(패널 타이틀) — raw 키 노출 제거(§3)
@@ -463,7 +483,7 @@ class World:
             "rate": [{"label": r.get("label"), "used_pct": r.get("used_pct"),
                       "resets_at": r.get("resets_at")}
                      for r in (u.get("rate") or [])],
-            "activity": compute_activity(len(dq), self.line_rate.get(sid, 0.0)),
+            "activity": compute_activity(len(dq), self.line_rate.get(nkey, 0.0)),
             "flags": flags,
             # 오피스 디테일 v1.1 — spool 귀속 노드 상태 (없으면 null)
             "progress": self.progress.get(nkey),
@@ -532,8 +552,7 @@ class World:
                     key = node_key(s)
                     if not key:
                         continue
-                    sid = s.get("surface_id")
-                    dq = self.hooks.get(sid) or ()
+                    dq = self.hooks.get(key) or ()   # P2-3: 정식 키로 hook 조회
                     presence, _ = judge_presence(s, now, dq[-1] if dq else None)
                     acc = self.heat_acc.setdefault(
                         key, {"active": [0] * 24, "total": [0] * 24})
@@ -661,9 +680,12 @@ TOOL_HOOKS = {"agent.hook.PreToolUse": "pre", "agent.hook.PostToolUse": "post",
               "agent.hook.PermissionRequest": "perm"}
 
 
-def route_event(ev, world, coal, now=None):
+def route_event(ev, world, coal, slug="main", now=None):
     """데몬 이벤트 1건 → 방출 프레임 목록 (+월드 반영). 순수 로직 (테스트 대상).
 
+    P2-2: slug = 이 이벤트가 도착한 구독의 부서 slug. 노드 키·apply_usage·hook·flag·coalesce
+    를 전부 f"{slug}@surface:{sid}" 정식 키로 스코프한다(main@ 고정 일반화). 기본값 "main" 은
+    단일 구독(P1) 하위호환. coalesce·hook·flag 키를 정식 키로 둬 동번호 부서 상호 억제/오염 차단.
     반환: (frames, poke_fleet) — poke_fleet=True면 즉시 스냅샷 재폴링 필요.
     백로그 게이트(§7): 이벤트가 BACKLOG_FX_SECS보다 과거면 상태 반영만 하고
     fx 프레임은 억제한다 — "켜는 순간"의 과거 연출 폭주 방지, 상태는 손실 0.
@@ -676,24 +698,24 @@ def route_event(ev, world, coal, now=None):
     backlog = (now - ts) > BACKLOG_FX_SECS
     sid = ev.get("surface_id")
     p = ev.get("payload") or {}
-    # C3: `cys events` 는 본부 단일 구독 → 이벤트 노드 키는 본부 정식 키(main@surface:N).
-    key = f"main@surface:{sid}" if sid is not None else None
+    # P2-2: 구독 부서 slug 로 정식 노드 키 조립.
+    key = f"{slug}@surface:{sid}" if sid is not None else None
     frames = []
     poke = False
 
     if name in TOOL_HOOKS:
         now = ev.get("timestamp") or time.time()
-        if sid is not None:
-            world.note_hook(sid, now)
+        if key is not None:
+            world.note_hook(key, now)
         phase = TOOL_HOOKS[name]
         if phase == "perm" and not p.get("is_actionable"):
             phase = "pre"  # 비실행성 권한훅은 도구 연출로 강등
-        if coal.allow(name, sid):
+        if coal.allow(name, key):
             frames.append({"t": "fx", "kind": "tool", "key": key, "phase": phase,
                            "tool": p.get("tool_name"), "role": p.get("role"),
                            "ok": (p.get("exit_code") in (0, None))})
     elif name == "usage.updated":
-        k = world.apply_usage(sid, p)
+        k = world.apply_usage(sid, p, slug)
         if k:
             frames.append({"t": "fx", "kind": "usage", "key": k, "pct": p.get("ctx_pct")})
     elif name == "todo.updated":
@@ -701,8 +723,10 @@ def route_event(ev, world, coal, now=None):
         frames.append({"t": "fx", "kind": "todo", "path": p.get("path"),
                        "done": p.get("done"), "total": p.get("total")})
     elif name == "surface.input_injected":
+        # from 은 동일 데몬 내 소스 surface → 같은 slug 로 정식화.
         frames.append({"t": "fx", "kind": "doc", "to": key,
-                       "from": f"surface:{p.get('from')}" if p.get("from") is not None else None,
+                       "from": f"{slug}@surface:{p.get('from')}" if p.get("from") is not None
+                               else None,
                        "bytes": p.get("bytes")})
     elif name == "queue.enqueued":
         frames.append({"t": "fx", "kind": "queue", "to": key, "depth": p.get("depth")})
@@ -711,18 +735,18 @@ def route_event(ev, world, coal, now=None):
                        "bytes": p.get("bytes")})
     elif name in ("surface.created", "surface.closed", "surface.exited"):
         poke = True
-        # C4: sid 부재 시 payload.surface_ref 에서 번호 재조립 → 본부 정식 키(main@)로 생성.
+        # C4: sid 부재 시 payload.surface_ref 에서 번호 재조립 → 구독 slug 정식 키로 생성.
         frames.append({"t": "fx", "kind": "spawn" if name == "surface.created" else "despawn",
-                       "key": key or f"main@surface:{(p.get('surface_ref') or '').split(':')[-1]}"})
+                       "key": key or f"{slug}@surface:{(p.get('surface_ref') or '').split(':')[-1]}"})
     elif name == "health.alert":
         rule = p.get("rule") or "alert"
-        if sid is not None and rule == "rate_limited":
-            world.set_flag(sid, "rate_limited", 90)
-        if coal.allow(name, sid):
+        if key is not None and rule == "rate_limited":
+            world.set_flag(key, "rate_limited", 90)
+        if coal.allow(name, key):
             frames.append({"t": "fx", "kind": "alert", "key": key, "rule": rule,
                            "line": (p.get("line") or "")[:120]})
     elif name == "master.deadman":
-        if coal.allow(name, sid):
+        if coal.allow(name, key):
             frames.append({"t": "fx", "kind": "deadman", "key": key,
                            "idle_secs": p.get("idle_secs")})
     elif name in ("schedule.fired", "schedule.error"):
@@ -734,7 +758,7 @@ def route_event(ev, world, coal, now=None):
         frames.append({"t": "fx", "kind": "rack", "on": name == "ledger.registered",
                        "pid": p.get("pid")})
     elif name == "pane.idle":
-        if coal.allow(name, sid):
+        if coal.allow(name, key):
             frames.append({"t": "fx", "kind": "idle", "key": key,
                            "idle_secs": p.get("idle_seconds")})
     if backlog:  # 과거 이벤트: 상태 반영은 위에서 완료, 연출만 억제
@@ -1164,32 +1188,108 @@ def fleet_loop(world, hub, poke):
         poke.clear()
 
 
-def events_loop(world, hub, poke, coal):
-    os.makedirs(STATE_DIR, exist_ok=True)
-    cursor = os.path.join(STATE_DIR, "cursor.seq")
-    while True:
-        proc = subprocess.Popen(
-            [CYS, "events", "--reconnect", "--cursor-file", cursor],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1, **NOWIN)
-        try:
-            for line in proc.stdout:
+def reconcile_targets(desired, active, cap=SUB_CAP):
+    """구독 타깃 조정 (P2-1 · 순수 로직 — 테스트 대상).
+
+    desired: {slug: socket|None} (main 포함). active: 현재 구독 slug 집합/딕셔너리.
+    반환 (to_spawn:{slug:socket}, to_reap:set) — 상한 cap 은 main 우선 + slug 정렬로 결정론적
+    절단(런어웨이 방지). desired 에서 사라진 slug 은 reap, 신규 slug 은 spawn.
+    """
+    ordered = (["main"] if "main" in desired else []) + \
+              sorted(s for s in desired if s != "main")
+    capped = {s: desired[s] for s in ordered[:cap]}
+    to_spawn = {s: sock for s, sock in capped.items() if s not in active}
+    to_reap = set(active) - set(capped)
+    return to_spawn, to_reap
+
+
+class SubscriptionSupervisor:
+    """부서별 (slug,socket) 이벤트 구독 fan-out 슈퍼바이저 (P2-1).
+
+    fleet 폴 주기마다 타깃({main:None} ∪ fleet dept/socket)과 실구독을 reconcile —
+    신규 부서 spawn·소멸 부서 reap(proc terminate). 공유 Hub·공유 Coalescer 경유,
+    cursor 는 slug 별 cursor-<slug>.seq. 각 구독은 독립 리더 스레드 + `cys [--socket S] events`.
+    """
+
+    def __init__(self, world, hub, coal, poke, state_dir):
+        self.world = world
+        self.hub = hub
+        self.coal = coal
+        self.poke = poke
+        self.state_dir = state_dir
+        self.subs = {}   # slug → {"stop":Event, "proc":[Popen|None], "thread":Thread, "socket":..}
+
+    def _reader(self, slug, socket, stop, holder):
+        cursor = os.path.join(self.state_dir, f"cursor-{slug}.seq")
+        args_base = [CYS] + (["--socket", socket] if socket else []) + \
+                    ["events", "--reconnect", "--cursor-file", cursor]
+        while not stop.is_set():
+            proc = subprocess.Popen(args_base, stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL, text=True, bufsize=1, **NOWIN)
+            holder[0] = proc
+            try:
+                for line in proc.stdout:
+                    if stop.is_set():
+                        break
+                    try:
+                        ev = json.loads(line)
+                    except ValueError:
+                        continue
+                    if ev.get("type") != "event":
+                        continue
+                    self.world.seq = max(self.world.seq, ev.get("seq") or 0)
+                    frames, want_poke = route_event(ev, self.world, self.coal, slug)
+                    for fr in frames:
+                        self.hub.publish(fr)
+                        if fr.get("t") == "fx":
+                            archive_fx(ev.get("timestamp"), fr)
+                    if want_poke:
+                        self.poke.set()
+            finally:
                 try:
-                    ev = json.loads(line)
-                except ValueError:
-                    continue
-                if ev.get("type") != "event":
-                    continue
-                world.seq = max(world.seq, ev.get("seq") or 0)
-                frames, want_poke = route_event(ev, world, coal)
-                for fr in frames:
-                    hub.publish(fr)
-                    if fr.get("t") == "fx":
-                        archive_fx(ev.get("timestamp"), fr)
-                if want_poke:
-                    poke.set()
-        finally:
-            proc.terminate()
-        time.sleep(2.0)  # 구독 재수립 백오프
+                    proc.terminate()
+                except Exception:
+                    pass
+            if stop.is_set():
+                break
+            time.sleep(SUB_BACKOFF_SECS)   # 구독 재수립 백오프
+
+    def _spawn(self, slug, socket):
+        stop = threading.Event()
+        holder = [None]
+        t = threading.Thread(target=self._reader, args=(slug, socket, stop, holder), daemon=True)
+        self.subs[slug] = {"stop": stop, "proc": holder, "thread": t, "socket": socket}
+        t.start()
+
+    def _reap(self, slug):
+        sub = self.subs.pop(slug, None)
+        if not sub:
+            return
+        sub["stop"].set()
+        proc = sub["proc"][0]
+        if proc is not None:   # stdout 블로킹 리더를 깨우려면 proc 을 외부에서 종료해야 한다
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
+    def reconcile_once(self):
+        desired = {"main": None}
+        desired.update(self.world.dept_targets())
+        to_spawn, to_reap = reconcile_targets(desired, self.subs)
+        for slug in to_reap:
+            self._reap(slug)
+        for slug, sock in to_spawn.items():
+            self._spawn(slug, sock)
+
+    def run(self):
+        os.makedirs(self.state_dir, exist_ok=True)
+        while True:
+            try:
+                self.reconcile_once()
+            except Exception:
+                pass   # reconcile 실패가 슈퍼바이저를 죽이지 않게(다음 주기 재시도)
+            time.sleep(SUB_RECONCILE_SECS)
 
 
 # --------------------------------------------- 오피스 디테일 v1.1 수집 루프
@@ -1498,7 +1598,9 @@ def main():
     world.cost_cache = {"ts": time.time(), "value": read_cost_today(TRANSCRIPTS_DB)}
     coal = Coalescer()                     # fx 전역 초당 예산 = 단일 인스턴스 (events·spool 공유)
     threading.Thread(target=fleet_loop, args=(world, hub, poke), daemon=True).start()
-    threading.Thread(target=events_loop, args=(world, hub, poke, coal), daemon=True).start()
+    # P2-1: 단일 events_loop → 부서별 멀티 구독 슈퍼바이저(공유 hub·coal·poke)
+    sup = SubscriptionSupervisor(world, hub, coal, poke, STATE_DIR)
+    threading.Thread(target=sup.run, daemon=True).start()
     threading.Thread(target=spool_loop, args=(world, hub, coal), daemon=True).start()
     threading.Thread(target=kanban_loop, args=(world, hub), daemon=True).start()
     threading.Thread(target=verdict_loop, args=(world, hub), daemon=True).start()
