@@ -3105,13 +3105,13 @@ async function checkForUpdate(silent: boolean) {
     else
       toast("feed", "↻ 무중단 팩 업데이트", `팩 ${packUpdateAvailable.pack_version} — 상단 Update(재시작 없음)`);
   } else if (packUpdateAvailable && packUpdateAvailable.binary_too_old) {
-    // 팩은 있으나 min_binary_version > 설치 바이너리 → 무중단 불가, 바이너리 업데이트 필요.
+    // 팩은 있으나 min_binary_version > 설치 바이너리 → 무중단 불가, 본체 업데이트(홈페이지) 필요(T5 정책).
     badge.hidden = false;
     badge.textContent = "!";
     badge.classList.remove("ok");
-    badge.title = `팩 ${packUpdateAvailable.pack_version}: 바이너리 업데이트 필요`;
-    const msg = `새 팩 ${packUpdateAvailable.pack_version}은 더 새로운 바이너리를 요구합니다 — 바이너리 업데이트(재시작) 후 적용됩니다.`;
-    if (!silent) toast("health", "바이너리 업데이트 필요", msg);
+    badge.title = `팩 ${packUpdateAvailable.pack_version}: 본체 업데이트 필요 (홈페이지에서 다운로드)`;
+    const msg = `새 팩 ${packUpdateAvailable.pack_version}은 더 새로운 본체를 요구합니다 — 홈페이지(www.cysinsight.com)에서 본체 업데이트 후 적용됩니다.`;
+    if (!silent) toast("health", "본체 업데이트 필요", msg);
     else toast("feed", "⚠ 업데이트 있음", msg);
   } else {
     // ★fail-safe: 양쪽 체크가 모두 성공적으로 '없음'을 확인했을 때만 상태를 갱신한다. 장애(체크 실패)
