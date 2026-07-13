@@ -642,8 +642,10 @@ class Preflight:
             if f == "MASTER_DIRECTIVE.md" and os.path.isfile(marker):
                 tpl_path = os.path.join(pack_dir(), "directives", "CEO_TEMPLATE.md")
                 try:
-                    live = open(p, encoding="utf-8", errors="replace").read()
-                    tpl = (open(tpl_path, encoding="utf-8", errors="replace").read()
+                    # 승격 무결은 바이트 대조 — errors="replace" 텍스트 비교는 서로 다른 손상
+                    # 바이트열이 같은 대체문자로 정규화돼 false-PASS할 수 있다(CRLF 함정 계열).
+                    live = open(p, "rb").read()
+                    tpl = (open(tpl_path, "rb").read()
                            if os.path.isfile(tpl_path) else None)
                     text = open(marker, encoding="utf-8", errors="replace").read()
                 except OSError as e:
@@ -3651,29 +3653,21 @@ class Preflight:
             self.add(cid, WARN, "javis_directive_bench.py 부재 — 회귀 트립와이어 비활성")
             return
         baseline = os.path.join(pack_dir(), "bench", "directive-bench-baseline.json")
+        # 재핀 의례와 비교가 같은 --stage-pre-ceo 플래그를 쓴다(bench가 스테이징 단일 구현:
+        # 승격 상태면 MASTER를 보존 헌법(.pre-ceo)으로 채점·마커 부재 시 no-op) — 라이브(CEO
+        # 규약)로 baseline을 핀하면 트립와이어가 낮게 눌려 헌법 회귀에 무뎌지는 비대칭을
+        # 구조적으로 차단한다.
         if not os.path.isfile(baseline):
             self.add(cid, WARN,
                      "baseline 미핀(%s) — 트립와이어 비활성. 재핀은 오너/master 의례: 디렉티브 "
-                     "검토 후 `python3 %s score --save-baseline %s`" % (baseline, tool, baseline))
+                     "검토 후 `python3 %s score --stage-pre-ceo --save-baseline %s`"
+                     % (baseline, tool, baseline))
             return
         ddir = os.path.join(pack_dir(), "directives")
-        tmp = None
         try:
-            pre_ceo = os.path.join(ddir, "MASTER_DIRECTIVE.md.pre-ceo")
-            if os.path.isfile(pre_ceo):
-                # CEO 승격 상태: 채점 대상 헌법은 보존본(.pre-ceo)이다 — 라이브(CEO 규약)를
-                # 그대로 채점하면 승격 자체가 영구 회귀로 잡혀 신호가 무뎌진다(C03 A안과 동일
-                # 이관). 관찰 전용 임시 스테이징 — 팩은 절대 쓰지 않는다.
-                tmp = tempfile.mkdtemp(prefix="javis-c64-")
-                for name in DIRECTIVES:
-                    src = os.path.join(ddir, name)
-                    if os.path.isfile(src):
-                        shutil.copy(src, os.path.join(tmp, name))
-                shutil.copy(pre_ceo, os.path.join(tmp, "MASTER_DIRECTIVE.md"))
-                ddir = tmp
             p = subprocess.run(
                 [sys.executable, tool, "score", "--directive-dir", ddir,
-                 "--compare", baseline],
+                 "--stage-pre-ceo", "--compare", baseline],
                 capture_output=True, text=True, timeout=60)
             if p.returncode == 0:
                 self.add(cid, PASS, "디렉티브 회귀 없음 (baseline 대비 composite 유지)")
@@ -3681,15 +3675,12 @@ class Preflight:
                 detail = re.sub(r"\s+", " ", (p.stdout or p.stderr or "").strip())[:400]
                 self.add(cid, WARN,
                          "★디렉티브 회귀/baseline 문제 검출 — 의도된 진화면 오너/master 재핀 "
-                         "의례, 아니면 소실 조항 복원: %s" % detail)
+                         "의례(`--stage-pre-ceo --save-baseline`), 아니면 소실 조항 복원: %s" % detail)
             else:
                 self.add(cid, WARN, "bench 실행 이상(rc=%d) — 수동 확인: %s"
                          % (p.returncode, (p.stderr or "")[:200]))
         except Exception as e:
             self.add(cid, WARN, "bench 호출 실패(%s) — 트립와이어 미작동, 수동 확인" % e)
-        finally:
-            if tmp:
-                shutil.rmtree(tmp, ignore_errors=True)
 
     def run(self):
         # 의도된 호출 순서(불변식). C25를 C18보다 먼저: C25의 --fix(파일 설치·색인 등재)가

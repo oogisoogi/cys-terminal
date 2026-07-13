@@ -66,12 +66,24 @@ def load_fixtures(fixtures_dir):
     return fixtures
 
 
-def load_directive_texts(directive_dir):
+def resolve_directive_path(directive_dir, fname, stage_pre_ceo):
+    """채점 대상 경로 해석. --stage-pre-ceo 시 MASTER는 승격 보존본(.pre-ceo)이 정본이다 —
+    CEO 승격 상태(cys-dept가 라이브를 CEO 규약으로 교체)에서 라이브를 채점하면 승격 자체가
+    영구 회귀로 잡힌다. save-baseline과 compare(preflight C64)가 같은 플래그를 쓰면 재핀
+    의례와 비교가 구조적으로 비대칭일 수 없다. 마커 부재면 no-op(비승격에서 같은 명령 유효)."""
+    if stage_pre_ceo and fname == "MASTER_DIRECTIVE.md":
+        marker = os.path.join(directive_dir, fname + ".pre-ceo")
+        if os.path.isfile(marker):
+            return marker
+    return os.path.join(directive_dir, fname)
+
+
+def load_directive_texts(directive_dir, stage_pre_ceo=False):
     """역할 → 정규화된 디렉티브 텍스트. 파일 부재 시 빈 문자열(해당 fixture 전건 미커버)."""
     texts = {}
     missing = []
     for role, fname in DIRECTIVE_FILES.items():
-        path = os.path.join(directive_dir, fname)
+        path = resolve_directive_path(directive_dir, fname, stage_pre_ceo)
         if os.path.isfile(path):
             with open(path, encoding="utf-8") as fh:
                 texts[role] = normalize(fh.read())
@@ -81,11 +93,11 @@ def load_directive_texts(directive_dir):
     return texts, missing
 
 
-def sha256_map(directive_dir):
+def sha256_map(directive_dir, stage_pre_ceo=False):
     """디렉티브 4종의 SHA-256(원본 바이트). 파일 부재 시 값은 null."""
     result = {}
     for role, fname in DIRECTIVE_FILES.items():
-        path = os.path.join(directive_dir, fname)
+        path = resolve_directive_path(directive_dir, fname, stage_pre_ceo)
         if os.path.isfile(path):
             with open(path, "rb") as fh:
                 result[fname] = hashlib.sha256(fh.read()).hexdigest()
@@ -145,7 +157,7 @@ def _dump(obj):
 def cmd_score(args):
     """score 서브커맨드 — 채점하고 필요 시 baseline 저장/비교."""
     fixtures = load_fixtures(args.fixtures_dir)
-    texts, missing = load_directive_texts(args.directive_dir)
+    texts, missing = load_directive_texts(args.directive_dir, args.stage_pre_ceo)
     result = score(fixtures, texts)
     if missing:
         result["missing_directives"] = missing
@@ -189,7 +201,7 @@ def cmd_score(args):
             "miss_rate": result["miss_rate"],
             "hit_rate": result["hit_rate"],
             "per_fixture": result["per_fixture"],
-            "directive_sha256": sha256_map(args.directive_dir),
+            "directive_sha256": sha256_map(args.directive_dir, args.stage_pre_ceo),
         }
         with open(args.save_baseline, "w", encoding="utf-8") as fh:
             fh.write(_dump(baseline))
@@ -214,6 +226,9 @@ def build_parser():
                     help="현행 점수+디렉티브 SHA-256 저장")
     sc.add_argument("--compare", metavar="FILE", default=None,
                     help="baseline 대비 회귀 판정(하락>0.01=exit 1·부재=exit 1)")
+    sc.add_argument("--stage-pre-ceo", action="store_true",
+                    help="CEO 승격 상태면 MASTER를 보존본(.pre-ceo)으로 채점(마커 부재 시 no-op) — "
+                         "save-baseline·compare 양쪽에 같이 써서 재핀/비교 대칭을 보장")
     sc.set_defaults(func=cmd_score)
     return p
 
