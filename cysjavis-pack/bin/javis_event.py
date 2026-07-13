@@ -19,6 +19,7 @@ import time
 import javis_scrub  # ★G2: 기록·전파 직전 비밀 마스킹(같은 폴더 형제 모듈 — 부재 시 즉시 실패=fail-closed)
 
 EXIT_OK, EXIT_USAGE, EXIT_INVALID = 0, 2, 6
+EXIT_DEGRADED = 4  # 해법④(2026-07-14 오너 승인): 미지 타입=부패 아닌 '방출자가 더 새로움' — 무음 드롭 금지
 
 WIRE_PREFIX = "[EVT v2]"
 WIRE_RE = re.compile(r"^\[EVT v[12]\]\s+(?P<type>[a-z_.]+)\s+(?P<json>\{.*\})\s*$")
@@ -139,8 +140,8 @@ def to_wire(evt_type, payload):
     return f"{WIRE_PREFIX} {evt_type} {json.dumps(payload, ensure_ascii=False)}"
 
 
-def parse_wire(line):
-    """(evt_type, payload) 또는 ValueError."""
+def parse_wire(line, lenient_unknown=False):
+    """(evt_type, payload) 또는 ValueError. lenient_unknown=미지 타입만 통과(해법④)."""
     m = WIRE_RE.match(line.strip())
     if not m:
         raise ValueError("not an EVT v1/v2 line")
@@ -151,6 +152,11 @@ def parse_wire(line):
         raise ValueError(f"bad payload json: {e}") from e
     ok, err = validate(evt_type, payload)
     if not ok:
+        # 해법④: lenient_unknown 시 '미지 타입'만 통과시켜 호출부가 강등 표시(EXIT_DEGRADED)로
+        # 처리하게 한다 — 신형 방출자의 이벤트가 구형 소비자에서 부패(invalid)로 오분류되어
+        # 무음 소실되는 경로 차단. 형식·JSON·필수키 오류는 종전대로 거부(계약 불변).
+        if lenient_unknown and evt_type not in SCHEMA:
+            return evt_type, payload
         raise ValueError(err)
     return evt_type, payload
 
@@ -232,10 +238,16 @@ def cmd_emit(a):
 def cmd_parse(a):
     line = a.line if a.line else sys.stdin.readline()
     try:
-        evt_type, payload = parse_wire(line)
+        evt_type, payload = parse_wire(line, lenient_unknown=True)
     except ValueError as e:
         print(f"invalid: {e}", file=sys.stderr)
         return EXIT_INVALID
+    if evt_type not in SCHEMA:
+        print(json.dumps({"type": evt_type, "payload": payload, "degraded": "unknown-type",
+                          "hint": "소비자 스키마보다 새 이벤트 — 스키마 갱신 전까지 강등 표시(무음 드롭 금지)"},
+                         ensure_ascii=False))
+        print(f"degraded: unknown type {evt_type} — 소비자 스키마 갱신 필요(EVENT_CONTRACT)", file=sys.stderr)
+        return EXIT_DEGRADED
     print(json.dumps({"type": evt_type, "payload": payload}, ensure_ascii=False))
     return EXIT_OK
 
@@ -243,10 +255,13 @@ def cmd_parse(a):
 def cmd_speak(a):
     line = a.line if a.line else sys.stdin.readline()
     try:
-        evt_type, payload = parse_wire(line)
+        evt_type, payload = parse_wire(line, lenient_unknown=True)
     except ValueError as e:
         print(f"invalid: {e}", file=sys.stderr)
         return EXIT_INVALID
+    if evt_type not in SCHEMA:
+        print(f"새 유형의 이벤트({evt_type})를 수신했습니다 — 소비자 스키마 갱신 필요.")
+        return EXIT_DEGRADED
     print(speak(evt_type, payload))
     return EXIT_OK
 

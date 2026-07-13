@@ -41,6 +41,7 @@ if [ -z "$NONPACK" ]; then
   echo "        ② git tag pack-vX.Y.Z && git push origin pack-vX.Y.Z"
   echo "        ③ CI(pack-release.yml)가 서명 팩 3종+latest.json 캐리포워드 발행"
   echo "  버전: pack-vX.Y.Z 는 현재 pack_version(최신 릴리스 manifest)보다 커야 한다"
+  echo "  min_binary(정책 파생 — 해법③⑤): $(bash scripts/min-binary-policy.sh 2>&1 | tr '\n' ' ')"
   echo "  ⚠ 예외(사람 판단): 팩이 새 바이너리 기능을 요구하면 본체 레인 또는 PACK_MIN_BINARY 상향"
 else
   N_NP=$(echo "$NONPACK" | wc -l | tr -d ' ')

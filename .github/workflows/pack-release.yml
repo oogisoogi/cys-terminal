@@ -30,9 +30,10 @@ jobs:
     env:
       KEY_ID: '39E60A702949D6C3'    # 임베드 키링(cysjavis-pack/trusted-keys.json) key_id
       EXPIRES_DAYS: '90'            # 서명 신선도 유효창(release.yml과 동일)
-      # ★무중단 팩 채널 안전 하한(release.yml과 동일 값 유지 — seed-once 상태 보호는 0.12.48+).
-      # 새 팩이 더 새로운 바이너리 RPC에 의존할 때만 상향(상향하면 그 이하 사용자는 본체 안내).
-      PACK_MIN_BINARY: '0.12.48'
+      # ★min_binary는 정책 파생(해법③⑤ · 2026-07-14): scripts/min-binary-policy.sh가
+      # max(security-floor.txt, 지원창 하한)을 계산 — 손설정 하한의 '잊음' 실패 계급 제거.
+      # 비상시에만 오버라이드(값 지정 시 정책 무시·근거를 커밋에 남길 것).
+      PACK_MIN_BINARY_OVERRIDE: ''
     steps:
       - uses: actions/checkout@v4
 
@@ -43,6 +44,20 @@ jobs:
           echo "$PV" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "::error::태그가 pack-vX.Y.Z 형식이 아님: $GITHUB_REF_NAME"; exit 1; }
           echo "PACK_VERSION=$PV" >> "$GITHUB_ENV"
           echo "pack_version=$PV (tag $GITHUB_REF_NAME)"
+
+      # ★해법③⑤: min_binary = max(security_floor, 지원창 하한) — 정책 공식(가시화 로그 포함).
+      - name: Compute min_binary (policy)
+        run: |
+          set -euo pipefail
+          git fetch --tags --quiet
+          if [ -n "$PACK_MIN_BINARY_OVERRIDE" ]; then
+            MB="$PACK_MIN_BINARY_OVERRIDE"
+            echo "::warning::min_binary 정책 오버라이드 사용: $MB"
+          else
+            MB="$(bash scripts/min-binary-policy.sh)"
+          fi
+          echo "MIN_BINARY=$MB" >> "$GITHUB_ENV"
+          echo "min_binary=$MB"
 
       # ★시크릿/개인정보 발행 hard-gate (release.yml과 동일 2중 스캔).
       - name: Secret/PII scan (pre-build hard-gate)
@@ -80,7 +95,7 @@ jobs:
             --key-id "$KEY_ID" \
             --signed-at "$SIGNED_AT" \
             --expires-at "$EXPIRES_AT" \
-            --min-binary-version "$PACK_MIN_BINARY" \
+            --min-binary-version "$MIN_BINARY" \
             --pack-version "$PACK_VERSION" \
             > pack-manifest.json
           python3 -c "import json; m=json.load(open('pack-manifest.json')); assert m['pack_version']=='$PACK_VERSION', m['pack_version']; print('pack_version =', m['pack_version'], '· files =', len(m['files']))"
@@ -194,7 +209,30 @@ jobs:
         run: |
           set -euo pipefail
           ./target/release/cys pack-update --from . --dry-run
-          echo "✅ 실서명 아티팩트 실검증 통과"
+          echo "✅ 실서명 아티팩트 실검증 통과(최신 검증기)"
+
+      # ★해법②: '하한 호환' 선언을 매 릴리스 기계 증명 — min_binary '실물' 검증기로도 통과해야
+      # 발행. 하한 태그 소스를 빌드(최초 1회 비용)하고 이후는 바이너리 캐시로 즉시.
+      - name: Cache min_binary verifier
+        uses: actions/cache@v4
+        with:
+          path: .minbin-cache
+          key: minbin-${{ env.MIN_BINARY }}-${{ runner.os }}
+
+      - name: Verify with min_binary verifier (해법②)
+        run: |
+          set -euo pipefail
+          BIN=".minbin-cache/cys-v$MIN_BINARY"
+          if [ ! -x "$BIN" ]; then
+            echo "하한 검증기 캐시 미스 — v$MIN_BINARY 소스 빌드(최초 1회)"
+            git fetch --depth 1 origin tag "v$MIN_BINARY"
+            git worktree add /tmp/minbin "v$MIN_BINARY"
+            (cd /tmp/minbin && cargo build --release --bin cys)
+            mkdir -p .minbin-cache && cp /tmp/minbin/target/release/cys "$BIN"
+            git worktree remove --force /tmp/minbin
+          fi
+          "$BIN" pack-update --from . --dry-run
+          echo "✅ 하한(v$MIN_BINARY) 검증기로도 통과 — min_binary 호환이 선언이 아니라 증명됨"
 
       # 직전 latest 릴리스의 latest.json 캐리포워드 — binary updater endpoint(releases/latest/
       # download/latest.json)가 이 릴리스를 latest로 봐도 본체 버전 감지가 유지되게 한다.
@@ -217,7 +255,7 @@ jobs:
           set -euo pipefail
           gh release create "$GITHUB_REF_NAME" -R "$SRC_REPO" \
             --title "pack $PACK_VERSION (팩-only 무중단)" \
-            --notes "팩-only 릴리스 — 본체 버전 불변(min_binary $PACK_MIN_BINARY+ 무중단 적용). latest.json은 직전 본체 릴리스 캐리포워드." \
+            --notes "팩-only 릴리스 — 본체 버전 불변(min_binary $MIN_BINARY+ 무중단 적용). latest.json은 직전 본체 릴리스 캐리포워드." \
             pack.tar.gz pack-manifest.json pack-manifest.json.minisig latest.json
           gh release edit "$GITHUB_REF_NAME" -R "$SRC_REPO" --latest --draft=false
           echo "✅ pack-only 릴리스 발행: $GITHUB_REF_NAME (pack_version=$PACK_VERSION)"
