@@ -426,6 +426,10 @@ enum Command {
         /// 이 팩이 요구하는 최소 바이너리 버전(기본 빈 문자열=제약 없음)
         #[arg(long, default_value = "")]
         min_binary_version: String,
+        /// pack_version 오버라이드(팩-only 릴리스 레인 — 미지정 시 CARGO_PKG_VERSION).
+        /// 바이너리 범프 없이 팩만 전진시킬 때 CI(pack-release.yml)가 pack-v* 태그에서 주입한다.
+        #[arg(long)]
+        pack_version: Option<String>,
     },
     /// 시스템 자기진단·수리(§3.4) — pack 스큐·stale lock·고아 소켓·hook·채널 DB 무결 진단.
     /// --fix: stale lock·고아 소켓·staging 잔재 제거 + hook 재등록(사용자 데이터·pack 본체·DB 미삭제).
@@ -1811,8 +1815,8 @@ fn run(command: Command) -> i32 {
             return run_pack_merge(file, take_new, keep_mine, ai, to_local, yes);
         }
 
-        Command::PackManifest { key_id, signed_at, expires_at, min_binary_version } => {
-            return run_pack_manifest(key_id, signed_at, expires_at, &min_binary_version);
+        Command::PackManifest { key_id, signed_at, expires_at, min_binary_version, pack_version } => {
+            return run_pack_manifest(key_id, signed_at, expires_at, &min_binary_version, pack_version);
         }
 
         Command::Doctor { fix, json } => return run_doctor(fix, json),
@@ -5768,13 +5772,19 @@ fn build_pack_manifest_value(
     signed_at: Option<i64>,
     expires_at: Option<i64>,
     min_binary_version: &str,
+    pack_version: Option<&str>,
 ) -> serde_json::Value {
     let mut files: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
     for (rel, content) in cys::pack::PACK.iter().chain(cys::pack::PACK_SKILLS.iter()) {
         files.insert((*rel).to_string(), sha256_hex(content));
     }
     let mut obj = serde_json::Map::new();
-    obj.insert("pack_version".into(), json!(env!("CARGO_PKG_VERSION")));
+    // 팩-only 릴리스 레인(2026-07-13 오너 승인): pack_version을 바이너리 버전과 분리 지정 가능.
+    // 미지정=기존과 바이트 동일(CARGO_PKG_VERSION) — 본체 릴리스 경로 회귀 0.
+    obj.insert(
+        "pack_version".into(),
+        json!(pack_version.unwrap_or(env!("CARGO_PKG_VERSION"))),
+    );
     obj.insert("min_binary_version".into(), json!(min_binary_version));
     if let Some(k) = key_id {
         obj.insert("key_id".into(), json!(k));
@@ -5796,8 +5806,18 @@ fn run_pack_manifest(
     signed_at: Option<i64>,
     expires_at: Option<i64>,
     min_binary_version: &str,
+    pack_version: Option<String>,
 ) -> i32 {
-    let v = build_pack_manifest_value(key_id, signed_at, expires_at, min_binary_version);
+    // 오버라이드는 semver 파싱 가능해야 한다(fail-loud) — 비교 게이트(check_pack_update·
+    // version_gates)가 파싱 불가 버전을 만나 무음 오동작하는 경로를 방출 시점에 차단.
+    if let Some(ref pv) = pack_version {
+        if cys::pack::parse_semver(pv).is_none() {
+            eprintln!("[pack-manifest] --pack-version 파싱 불가(semver 아님): {pv:?}");
+            return 2;
+        }
+    }
+    let v = build_pack_manifest_value(key_id, signed_at, expires_at, min_binary_version,
+                                      pack_version.as_deref());
     match serde_json::to_string_pretty(&v) {
         Ok(s) => {
             println!("{s}");
@@ -7409,8 +7429,11 @@ mod tests {
     #[test]
     fn pack_manifest_emits_embedded_files_with_content_hash() {
         // 플래그 전건 주입.
-        let v = build_pack_manifest_value(Some("39E60A702949D6C3".into()), Some(100), Some(200), "0.4.1");
+        let v = build_pack_manifest_value(Some("39E60A702949D6C3".into()), Some(100), Some(200), "0.4.1", None);
         assert_eq!(v["pack_version"], json!(env!("CARGO_PKG_VERSION")));
+        // 팩-only 레인: pack_version 오버라이드가 그대로 방출되고, 미지정은 기존과 동일(회귀 0).
+        let vo = build_pack_manifest_value(None, None, None, "", Some("9.9.9"));
+        assert_eq!(vo["pack_version"], json!("9.9.9"), "pack_version 오버라이드 미반영");
         assert_eq!(v["min_binary_version"], json!("0.4.1"));
         assert_eq!(v["key_id"], json!("39E60A702949D6C3"));
         assert_eq!(v["signed_at"], json!(100));
@@ -7432,7 +7455,7 @@ mod tests {
             .collect();
         assert_eq!(files.len(), embedded.len(), "manifest files에 임베드 외 항목 존재");
         // 미지정 플래그는 생략(fail-closed: 미서명 manifest는 무중단 검증에서 거부됨).
-        let v2 = build_pack_manifest_value(None, None, None, "");
+        let v2 = build_pack_manifest_value(None, None, None, "", None);
         assert!(v2.get("key_id").is_none(), "미지정 key_id가 방출됨");
         assert!(v2.get("signed_at").is_none(), "미지정 signed_at가 방출됨");
         assert!(v2.get("expires_at").is_none(), "미지정 expires_at가 방출됨");

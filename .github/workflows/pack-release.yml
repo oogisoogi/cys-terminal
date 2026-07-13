@@ -1,0 +1,223 @@
+# ── 팩-only 릴리스 레인 (2026-07-13 오너 승인 — "인테리어만 교체") ──
+# 본체(바이너리) 버전 범프 없이 팩 콘텐츠만 전진시킨다. 사용자 GUI는 본체 알림 없이
+# 팩 무중단(↻·세션/데몬 생존) 경로만 보게 된다.
+#
+# 사용법: 팩만 변경됐는지 scripts/release-lane-check.sh로 판별 후
+#   git tag pack-vX.Y.Z && git push origin pack-vX.Y.Z
+# 버전 규칙(충돌 함정): pack-vX.Y.Z 는 직전 pack_version(본체 결합값 포함)보다 커야 하고,
+#   이후 '본체' 릴리스의 다음 버전은 반드시 최신 pack-v 버전보다 커야 한다(동일 pack_version
+#   재사용 시 갱신 감지 무음 실패 — lane-check가 기계 검사).
+#
+# 게이트·산출물은 release.yml pack-artifacts 잡과 동형(시크릿 2중 스캔·역커버리지·동일성 3자
+# 폐포·실서명→실검증). 차이는 ①pack_version을 태그에서 주입(--pack-version, 바이너리 버전과
+# 분리) ②본체 자산 없이 팩 3종 + 직전 릴리스의 latest.json 캐리포워드(binary updater endpoint가
+# releases/latest를 보므로, latest 마킹 후에도 본체 버전 감지가 끊기지 않게 유지).
+name: pack-release
+
+on:
+  push:
+    tags:
+      - "pack-v*"
+
+env:
+  SRC_REPO: idoforgod/cys-terminal
+
+jobs:
+  pack-only:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      KEY_ID: '39E60A702949D6C3'    # 임베드 키링(cysjavis-pack/trusted-keys.json) key_id
+      EXPIRES_DAYS: '90'            # 서명 신선도 유효창(release.yml과 동일)
+      # ★무중단 팩 채널 안전 하한(release.yml과 동일 값 유지 — seed-once 상태 보호는 0.12.48+).
+      # 새 팩이 더 새로운 바이너리 RPC에 의존할 때만 상향(상향하면 그 이하 사용자는 본체 안내).
+      PACK_MIN_BINARY: '0.12.48'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Derive pack version from tag
+        run: |
+          set -euo pipefail
+          PV="${GITHUB_REF_NAME#pack-v}"
+          echo "$PV" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "::error::태그가 pack-vX.Y.Z 형식이 아님: $GITHUB_REF_NAME"; exit 1; }
+          echo "PACK_VERSION=$PV" >> "$GITHUB_ENV"
+          echo "pack_version=$PV (tag $GITHUB_REF_NAME)"
+
+      # ★시크릿/개인정보 발행 hard-gate (release.yml과 동일 2중 스캔).
+      - name: Secret/PII scan (pre-build hard-gate)
+        run: bash scripts/secret-scan.sh --all
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          key: pack-release
+
+      - name: Scan pack content (pre-build hard-gate)
+        run: bash scripts/scan-pack-secrets.sh
+
+      # ★cargo clean — 스테일 OUT_DIR/pack_all.rs(이전 트리 임베드 테이블) 재사용이 manifest SOT를
+      # 오염시키는 회귀 차단(release.yml과 동일).
+      - name: cargo clean (스테일 생성표 무효화)
+        run: cargo clean
+
+      - name: Build cys
+        run: cargo build --release --bin cys
+
+      # 권위 manifest — pack_version은 태그 주입(팩-only 레인 핵심), 나머지는 release.yml과 동일.
+      - name: Emit authoritative pack-manifest.json (pack_version = tag)
+        run: |
+          set -euo pipefail
+          SIGNED_AT="$(date -u +%s)"
+          EXPIRES_AT="$(( SIGNED_AT + EXPIRES_DAYS * 86400 ))"
+          ./target/release/cys pack-manifest \
+            --key-id "$KEY_ID" \
+            --signed-at "$SIGNED_AT" \
+            --expires-at "$EXPIRES_AT" \
+            --min-binary-version "$PACK_MIN_BINARY" \
+            --pack-version "$PACK_VERSION" \
+            > pack-manifest.json
+          python3 -c "import json; m=json.load(open('pack-manifest.json')); assert m['pack_version']=='$PACK_VERSION', m['pack_version']; print('pack_version =', m['pack_version'], '· files =', len(m['files']))"
+
+      # ★역방향 커버리지 게이트(release.yml과 동형 — SOT=manifest, 잔차만 분류).
+      - name: Reverse coverage gate (disk orphan detection)
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, subprocess, sys
+          man = json.load(open("pack-manifest.json"))
+          embedded = set(man["files"])
+          if not embedded:
+              print("::error::manifest.files 비어있음 — 역커버리지 불가", file=sys.stderr); sys.exit(1)
+          out = subprocess.run(["git", "ls-files", "cysjavis-pack"],
+                               capture_output=True, text=True, check=True).stdout
+          tracked = set()
+          for line in out.splitlines():
+              line = line.strip()
+              if line.startswith("cysjavis-pack/"):
+                  tracked.add(line[len("cysjavis-pack/"):])
+          if not tracked:
+              print("::error::git ls-files cysjavis-pack 비어있음 — 인덱스 부재?", file=sys.stderr); sys.exit(1)
+          def is_excluded(rel):
+              return any(c.startswith(".") or c == "tests" or c == "__pycache__"
+                         for c in rel.split("/"))
+          gap = tracked - embedded
+          orphans = sorted(g for g in gap if not is_excluded(g))
+          if orphans:
+              print("::error::디스크 고아(git-추적이나 임베드 누락):", file=sys.stderr)
+              for o in orphans:
+                  print(f"::error::  {o}", file=sys.stderr)
+              sys.exit(1)
+          print(f"[역커버리지] tracked={len(tracked)} embedded={len(embedded)} "
+                f"gap={len(gap)}(전부 제외규칙) orphan=0 — 통과")
+          PY
+
+      # ★embed-vs-standalone 동일성 게이트 + 결정론 pack.tar.gz (release.yml과 동형 3자 폐포).
+      - name: Identity gate + build pack.tar.gz
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os, subprocess, sys, tempfile
+          ROOT = "cysjavis-pack"
+          man = json.load(open("pack-manifest.json"))
+          files = man["files"]
+          if not files:
+              print("::error::manifest.files 비어있음", file=sys.stderr); sys.exit(1)
+          def sha256_file(p):
+              h = hashlib.sha256()
+              with open(p, "rb") as f:
+                  for chunk in iter(lambda: f.read(1 << 16), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+          for rel, want in files.items():
+              src = os.path.join(ROOT, rel)
+              if not os.path.isfile(src):
+                  print(f"::error::manifest 등재 파일이 트리에 없음: {rel}", file=sys.stderr); sys.exit(1)
+              got = sha256_file(src)
+              if got != want:
+                  print(f"::error::동일성 불일치 {rel}: embed {want} != tree {got}", file=sys.stderr); sys.exit(1)
+          print(f"[gate①] embed-vs-tree {len(files)}개 sha256 전수 일치")
+          with open("pack-files.txt", "w") as f:
+              for rel in sorted(files):
+                  f.write(rel + "\n")
+          subprocess.run([
+              "tar", "--sort=name", "--owner=0", "--group=0", "--numeric-owner",
+              "--mtime=UTC 2020-01-01", "-czf", "pack.tar.gz",
+              "-C", ROOT, "-T", "pack-files.txt",
+          ], check=True)
+          with tempfile.TemporaryDirectory() as td:
+              subprocess.run(["tar", "-xzf", "pack.tar.gz", "-C", td], check=True)
+              extracted = {}
+              for dirpath, _dirs, names in os.walk(td):
+                  for n in names:
+                      p = os.path.join(dirpath, n)
+                      extracted[os.path.relpath(p, td)] = sha256_file(p)
+              if set(extracted) != set(files):
+                  miss = set(files) - set(extracted)
+                  extra = set(extracted) - set(files)
+                  print(f"::error::tar⇔manifest 집합 불일치 missing={sorted(miss)} extra={sorted(extra)}", file=sys.stderr)
+                  sys.exit(1)
+              for rel, want in files.items():
+                  if extracted[rel] != want:
+                      print(f"::error::tar sha256 불일치 {rel}", file=sys.stderr); sys.exit(1)
+          print(f"[gate③] tar⇔manifest⇔embed 3자 폐포 {len(files)}개 일치")
+          man["digest"] = sha256_file("pack.tar.gz")
+          with open("pack-manifest.json", "w") as mf:
+              json.dump(man, mf, ensure_ascii=False, indent=2)
+              mf.write("\n")
+          print(f"[gate④] digest 주입 → {man['digest'][:16]}…")
+          PY
+
+      - name: Scan pack content (pre-publish hard-gate)
+        run: bash scripts/scan-pack-secrets.sh
+
+      - name: Sign pack-manifest.json (minisign)
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "${TAURI_SIGNING_PRIVATE_KEY:-}" || { echo "::error::TAURI_SIGNING_PRIVATE_KEY 미설정"; exit 1; }
+          bunx @tauri-apps/cli@2 signer sign \
+            --private-key "$TAURI_SIGNING_PRIVATE_KEY" \
+            --password "" \
+            pack-manifest.json
+          base64 --decode pack-manifest.json.sig > pack-manifest.json.minisig
+
+      # ★실서명→실검증 폐포(release.yml과 동일 — 배포 형식이 실검증기를 통과해야 발행).
+      - name: Verify signed pack end-to-end
+        run: |
+          set -euo pipefail
+          ./target/release/cys pack-update --from . --dry-run
+          echo "✅ 실서명 아티팩트 실검증 통과"
+
+      # 직전 latest 릴리스의 latest.json 캐리포워드 — binary updater endpoint(releases/latest/
+      # download/latest.json)가 이 릴리스를 latest로 봐도 본체 버전 감지가 유지되게 한다.
+      # (latest.json 내 다운로드 URL은 절대경로라 원 릴리스 자산을 계속 가리킨다 — 유효.)
+      - name: Carry forward latest.json from previous release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          PREV=$(gh release list -R "$SRC_REPO" --exclude-drafts --exclude-pre-releases --limit 20 \
+            --json tagName --jq '[.[] | select(.tagName | startswith("pack-v") | not)][0].tagName')
+          test -n "$PREV" || { echo "::error::직전 본체 릴리스를 찾지 못함 — latest.json 캐리포워드 불가"; exit 1; }
+          gh release download "$PREV" -R "$SRC_REPO" --pattern latest.json
+          python3 -c "import json; d=json.load(open('latest.json')); print('carry-forward latest.json: binary', d.get('version'), 'from', '$PREV')"
+
+      - name: Create pack release + upload assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" -R "$SRC_REPO" \
+            --title "pack $PACK_VERSION (팩-only 무중단)" \
+            --notes "팩-only 릴리스 — 본체 버전 불변(min_binary $PACK_MIN_BINARY+ 무중단 적용). latest.json은 직전 본체 릴리스 캐리포워드." \
+            pack.tar.gz pack-manifest.json pack-manifest.json.minisig latest.json
+          gh release edit "$GITHUB_REF_NAME" -R "$SRC_REPO" --latest --draft=false
+          echo "✅ pack-only 릴리스 발행: $GITHUB_REF_NAME (pack_version=$PACK_VERSION)"
