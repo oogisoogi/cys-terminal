@@ -6,6 +6,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import { imeStep, initialImeState, isHangulText, type ImeEvent } from "./ime";
 import { shellQuote, shellQuoteJoin } from "./shellquote";
+import { updatePlan } from "./updateplan";
 import { DEFAULT_BG, readableForeground } from "./theme";
 import { reorderWorkspace, reorderGroup } from "./reorder";
 import { deptPlaceholderLabel } from "./deptlabel";
@@ -3145,45 +3146,54 @@ async function checkForUpdate(silent: boolean) {
   }
 
   const badge = document.getElementById("update-badge")!;
-  if (updateAvailable) {
-    // (T5) 본체(바이너리) 업데이트는 홈페이지 다운로드 전용 — 인앱 재시작 설치 폐지(오너 정책).
+  // 분기 판정은 순수 함수(updateplan.ts — 옵션 2·오너 승인 2026-07-14)로 일원화.
+  // 기존 4분기 배지·문구는 updateplan.test.ts가 문자열 단위로 핀(회귀 0) — 신설은
+  // pack-and-binary(본체+팩 동시·호환 시 팩 무중단을 가리지 않음·T5 불변) 하나뿐이다.
+  const plan = updatePlan({
+    binVersion: updateAvailable ? updateAvailable.version : null,
+    packVersion: packUpdateAvailable ? packUpdateAvailable.pack_version : null,
+    binaryTooOld: packUpdateAvailable ? packUpdateAvailable.binary_too_old : false,
+    binCheckFailed,
+    packCheckFailed,
+  });
+  if (plan.kind !== "unknown") {
+    // unknown = 체크 실패·보존 상태 없음 → 배지 유지('최신' 오단정 금지, 종전 fail-safe).
     badge.hidden = false;
-    badge.textContent = "!";
-    badge.classList.remove("ok");
-    badge.title = `새 본체 버전 ${updateAvailable.version} (홈페이지에서 다운로드)`;
-    if (!silent) promptBinaryHomepage();
-    else toast("feed", "🔄 새 본체 버전", `새 본체 ${updateAvailable.version} — 홈페이지(www.cysinsight.com)에서 다운로드`);
-  } else if (packUpdateAvailable && !packUpdateAvailable.binary_too_old) {
-    // 팩만 변경 + 바이너리 호환 → 무중단 가능(세션·데몬 생존).
-    badge.hidden = false;
-    badge.textContent = "↻";
-    badge.classList.remove("ok");
-    badge.title = `팩 ${packUpdateAvailable.pack_version} (무중단·세션 유지)`;
-    if (!silent) promptPackInstall();
-    else
-      toast("feed", "↻ 무중단 팩 업데이트", `팩 ${packUpdateAvailable.pack_version} — 상단 Update(재시작 없음)`);
-  } else if (packUpdateAvailable && packUpdateAvailable.binary_too_old) {
-    // 팩은 있으나 min_binary_version > 설치 바이너리 → 무중단 불가, 본체 업데이트(홈페이지) 필요(T5 정책).
-    badge.hidden = false;
-    badge.textContent = "!";
-    badge.classList.remove("ok");
-    badge.title = `팩 ${packUpdateAvailable.pack_version}: 본체 업데이트 필요 (홈페이지에서 다운로드)`;
-    const msg = `새 팩 ${packUpdateAvailable.pack_version}은 더 새로운 본체를 요구합니다 — 홈페이지(www.cysinsight.com)에서 본체 업데이트 후 적용됩니다.`;
-    if (!silent) toast("health", "본체 업데이트 필요", msg);
-    else toast("feed", "⚠ 업데이트 있음", msg);
-  } else {
-    // ★fail-safe: 양쪽 체크가 모두 성공적으로 '없음'을 확인했을 때만 상태를 갱신한다. 장애(체크 실패)
-    // 시엔 마지막 검증 상태(배지)를 유지한다 — 일시 장애로 "최신" 오단정하지 않게.
-    if (!binCheckFailed && !packCheckFailed) {
-      // 오너 지시(2026-07-03): 최신 확인 시 숨김 대신 "0" 표시 — "확인이 끝났고 대기 업데이트
-      // 0건"을 명시(숨김은 '아직 확인 전'과 구별 불가였다). 중립 스타일(.ok)로 경고색 회피.
-      badge.hidden = false;
-      badge.textContent = "0";
-      badge.classList.add("ok");
-      badge.title = "최신 버전 — 대기 중인 업데이트 없음";
-    }
-    // 어느 한쪽이라도 체크 실패면 상태 불명 — '이미 최신' 단정 금지(바이너리·팩 둘 다 성공 확인 시에만).
-    if (!silent && !binCheckFailed && !packCheckFailed) toast("watchdog", "✅ 최신 버전", "최신 버전입니다. 추가 업데이트가 없습니다.");
+    badge.textContent = plan.badge;
+    if (plan.ok) badge.classList.add("ok");
+    else badge.classList.remove("ok");
+    badge.title = plan.title;
+  }
+  switch (plan.kind) {
+    case "pack-and-binary":
+      // ★옵션 2: 팩 무중단이 실행 가능한 액션 — 모달은 팩 하나만(silent 불변식: 모달 금지는
+      // silent 경로에만 해당·비silent도 모달 1개 상한), 본체는 토스트로 병행 안내(T5 경로 유지).
+      if (!silent) {
+        promptPackInstall();
+        toast("feed", "🔄 새 본체도 있음", `새 본체 ${updateAvailable!.version} — 홈페이지(www.cysinsight.com)에서 다운로드`);
+      } else toast("feed", "↻ 무중단 팩 + 새 본체", plan.toastMsg);
+      break;
+    case "binary":
+      // (T5) 본체(바이너리) 업데이트는 홈페이지 다운로드 전용 — 인앱 재시작 설치 폐지(오너 정책).
+      if (!silent) promptBinaryHomepage();
+      else toast("feed", "🔄 새 본체 버전", plan.toastMsg);
+      break;
+    case "pack":
+      // 팩만 변경 + 바이너리 호환 → 무중단 가능(세션·데몬 생존).
+      if (!silent) promptPackInstall();
+      else toast("feed", "↻ 무중단 팩 업데이트", plan.toastMsg);
+      break;
+    case "binary-required":
+      // 팩은 있으나 min_binary_version > 설치 바이너리 → 무중단 불가, 본체 업데이트(홈페이지) 필요(T5 정책).
+      if (!silent) toast("health", "본체 업데이트 필요", plan.toastMsg);
+      else toast("feed", "⚠ 업데이트 있음", plan.toastMsg);
+      break;
+    case "none":
+      // 오너 지시(2026-07-03): 최신 확인 시 숨김 대신 "0" 표시. 중립 스타일(.ok)로 경고색 회피.
+      if (!silent) toast("watchdog", "✅ 최신 버전", "최신 버전입니다. 추가 업데이트가 없습니다.");
+      break;
+    case "unknown":
+      break;
   }
 }
 
