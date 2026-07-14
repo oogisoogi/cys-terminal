@@ -7,7 +7,7 @@
 // 앞에 둔다. 아니면 Menlo/SF Mono 부재 시 xterm가 셀 폭을 CJK 전각폰트(Noto Sans KR)로 측정해
 // Latin 글자가 넓게 벌어진다(자간 이상).
 export const DEFAULT_FONT_STACK =
-  "Menlo, 'SF Mono', 'Cascadia Mono', Consolas, 'Apple SD Gothic Neo', 'Malgun Gothic', 'Noto Sans KR', monospace";
+  "'JetBrains Mono', Menlo, 'SF Mono', 'Cascadia Mono', Consolas, 'Apple SD Gothic Neo', 'Malgun Gothic', 'Noto Sans KR', monospace";
 
 // 선택 폰트를 기본 스택 '앞'에 합성 — 미설치 폰트는 브라우저가 체인 아래로 폴백하고
 // CJK 폴백(한글)은 항상 보존된다. null·공백 = 기본 스택 그대로.
