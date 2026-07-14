@@ -1714,6 +1714,31 @@ async fn promote_pending_ceo() -> Result<String, String> {
     }
 }
 
+/// ★조직 모델(오너 2026-07-15): 부서 탭의 "▶부서장" — 해당 부서 데몬에 master(부서장) 노드 기동.
+/// start_master(base=CEO 자리)와 대칭·동일 메커니즘(launch-agent). CYS_SOCKET=부서 소켓으로
+/// 그 부서 데몬이 pane을 spawn하므로 부서 팩 디렉티브(MASTER_DIRECTIVE)가 자동 주입되고,
+/// claim도 그 부서 레지스트리 대상(데몬당 살아있는 마스터 1명 규칙은 부서별 독립 적용).
+#[tauri::command]
+async fn start_dept_master(socket: String) -> Result<(), String> {
+    let cys = resolve_sidecar("cys");
+    let out = tokio::task::spawn_blocking(move || {
+        let mut cmd = std::process::Command::new(&cys);
+        inject_runtime_path(&mut cmd);
+        cmd.env("CYS_SOCKET", &socket);
+        cmd.arg("launch-agent").arg("--role").arg("master").arg("--agent").arg("claude");
+        no_console(&mut cmd);
+        cmd.output()
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
 /// 부서 데몬 teardown(socket 기준) — ws 이름 변경(rename)으로 name→socket 매핑이 끊겨도 정확히 종료.
 /// cys-dept down-sock에 일임(레지스트리 역인덱스로 부서명 해석 후 teardown).
 #[tauri::command]
@@ -2208,6 +2233,7 @@ fn main() {
             dept_tombstone_by_socket,
             dept_tombstones,
             start_master,
+            start_dept_master,
             ceo_pending,
             promote_pending_ceo,
             daemon_status,

@@ -4339,12 +4339,34 @@ document.getElementById("btn-ws-new")!.addEventListener("click", () => addWorksp
 // surface에서 마법 문구 입력"이라는 취약한 산문 계약에서 해방. 명령 자체가 base 데몬 고정
 // (CYS_SOCKET 제거 — start_master)이라 어느 탭에서 눌러도 부서 오염 불가. 생성 surface는 자동입양.
 // 중복 클릭은 데몬 claim_denied가 비파괴 방어(두 번째 master 거부 — 위 btn-ws-new 주석과 동일 축).
+// ★조직 모델(오너 2026-07-15): 본부=▶CEO(마스터 오브 마스터 자리) · 부서 탭=▶부서장(부서 데몬별
+// 독립 마스터). "데몬당 살아있는 마스터 1명" 규칙은 조직 단위별 적용 — 부서 10개면 마스터 10명.
+// claim_denied 원문은 초보에게 불친절 → 조직 모델 언어로 번역.
+function masterDeniedMsg(e: unknown, where: string): string {
+  const s = String(e);
+  if (/claim_denied|privileged role/i.test(s))
+    return `이미 ${where}에 마스터가 실행 중입니다 — 기존 마스터 탭(pane)을 사용하세요. (조직 단위당 마스터 1명 — 부서장은 각 부서 탭에서 세웁니다)`;
+  return s;
+}
 document.getElementById("btn-master-start")?.addEventListener("click", async () => {
   try {
     await invoke("start_master");
-    toast("feed", "▶ 마스터 시작", "base 본부에 master 노드를 기동했습니다 — 잠시 후 pane이 자동으로 나타납니다.");
+    toast("feed", "▶ CEO 시작", "본부(base)에 마스터 오브 마스터 노드를 기동했습니다 — 잠시 후 pane이 자동으로 나타납니다. 부서가 있으면 승인 후 CEO 규약으로 승격됩니다.");
   } catch (e) {
-    toast("health", "마스터 시작 실패", String(e));
+    toast("health", "CEO 시작 실패", masterDeniedMsg(e, "본부(base)"));
+  }
+});
+document.getElementById("btn-dept-master")?.addEventListener("click", async () => {
+  const ws = workspaces[activeWs];
+  if (!ws?.socket) {
+    toast("health", "▶부서장은 부서 탭에서", "지금 보고 있는 탭이 본부입니다 — 부서 탭을 연 상태에서 누르세요(본부 마스터는 ▶CEO).");
+    return;
+  }
+  try {
+    await invoke("start_dept_master", { socket: ws.socket });
+    toast("feed", "▶ 부서장 시작", `${ws.name ?? "부서"}에 마스터(부서장) 노드를 기동했습니다 — 잠시 후 pane이 자동으로 나타납니다.`);
+  } catch (e) {
+    toast("health", "부서장 시작 실패", masterDeniedMsg(e, `이 부서(${ws.name ?? ws.socket})`));
   }
 });
 
