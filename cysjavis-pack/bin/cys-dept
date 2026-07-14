@@ -332,11 +332,27 @@ sys.exit(3)' 2>/dev/null) || true
 # CEO 승격: 부서가 1개 이상이면 기본 데몬을 CEO로(디렉티브 교체, 가역 백업). 부서 0이면 표준 master 보존(하위호환).
 # ★첫 승격은 자동이 아니다(오너 2026-07-14): 최소 1개 마스터(부서)가 존재한 뒤 오너가 승인(feed)
 # 하거나 지명(promote-ceo)해야 한다. 마커(.pre-ceo)=기승인 상태라 조정(무결 유지)은 묻지 않는다.
+# ★부트 게이트(BOOTSTRAP_HARDENING WP-2): base master가 한 번도 부트되지 않은 기계
+#   (.master-bootstrapped 부재 — writer=javis_bootstrap.py 성공 경로 유일)에서는 승격을 PENDING으로
+#   보류한다. 부트 전 승격은 "부트 시퀀스 0개인 CEO"를 낳는다(윈도우 초보 실사고 근본원인 R2).
+#   stale 정책(설계 §4.1): 이 게이트는 마커 '존재만' 본다(버전 무관 — 승격은 조직 사실).
+BOOT_MARKER="$HOME/.cys/.master-bootstrapped"
+CEO_PENDING="$HOME/.cys/state/ceo-pending"
 ceo_promote(){  # $1: "consented"면 동의 게이트 생략(오너 지명 promote-ceo 경로)
   local md="$PACK_DEFAULT/directives/MASTER_DIRECTIVE.md"
   local ceo="$PACK_DEFAULT/directives/CEO_TEMPLATE.md"
   [ -f "$ceo" ] || { echo "[cys-dept] CEO 템플릿 없음 — 승격 생략(cys init-pack 필요)"; return 0; }
-  cmp -s "$md" "$ceo" 2>/dev/null && return 0
+  cmp -s "$md" "$ceo" 2>/dev/null && { rm -f "$CEO_PENDING" 2>/dev/null || true; return 0; }
+  if [ ! -f "$md.pre-ceo" ] && [ ! -f "$BOOT_MARKER" ]; then
+    # PENDING: 부서 생성 자체는 성공 유지(return 0). 침묵 금지 — feed(비대기·보조)+stderr 고지,
+    # GUI 상시 배지는 ceo-pending 파일 존재로 렌더(WP-2/T6). 해소=부트 ⑦ one-shot 또는 차기 lifecycle.
+    mkdir -p "$(dirname "$CEO_PENDING")"
+    printf 'pending since %s\n' "$(date +%Y-%m-%dT%H:%M:%S 2>/dev/null || echo unknown)" > "$CEO_PENDING"
+    env -u CYS_SOCKET "$CYS" feed push --title "CEO 승격 보류(부트 필요)" \
+      --body "부서가 생성되었으나 base master가 아직 부트되지 않았습니다. base에서 '너는 마스터다' 또는 '마스터 시작' 버튼으로 부트를 완료하면 승격 승인을 요청합니다." >/dev/null 2>&1 || true
+    echo "[cys-dept] CEO 승격 보류(PENDING) — base master 미부트(.master-bootstrapped 부재)" >&2
+    return 0
+  fi
   if [ ! -f "$md.pre-ceo" ] && [ "${1:-}" != "consented" ]; then
     # deny/timeout/feed불가 = 승격 보류(표준 master 유지·다음 부서 이벤트에 재질의) — fail-safe는 '승격 안 함'.
     # env -u CYS_SOCKET: 승격 대상은 기본 데몬이므로 승인 요청도 기본 데몬 feed로(ceo_reinject_master와 동형).
@@ -350,18 +366,20 @@ ceo_promote(){  # $1: "consented"면 동의 게이트 생략(오너 지명 promo
   fi
   [ -f "$md.pre-ceo" ] || cp "$md" "$md.pre-ceo"
   cp "$ceo" "$md"
+  rm -f "$CEO_PENDING" 2>/dev/null || true   # 승격 완료 = PENDING 해소
   echo "[cys-dept] 기본 데몬 CEO 승격(directives 교체·백업 .pre-ceo)"
   ceo_reinject_master "CEO 승격"
 }
 ceo_demote(){
   local md="$PACK_DEFAULT/directives/MASTER_DIRECTIVE.md"
+  rm -f "$CEO_PENDING" 2>/dev/null || true   # 부서 0 = 승격 사유 소멸 — PENDING 청소(승격 이력 무관)
   [ -f "$md.pre-ceo" ] || return 0
   cp "$md.pre-ceo" "$md"; rm -f "$md.pre-ceo"
   echo "[cys-dept] CEO 강등(표준 master 원복)"
   ceo_reinject_master "표준 master 복귀"
 }
 
-cmd="${1:?usage: cys-dept launch|allocate|create|down|down-sock|rotate|reap|promote-ceo|list|sock <name> | <name> -- <cmd>}"
+cmd="${1:?usage: cys-dept launch|allocate|create|down|down-sock|rotate|reap|promote-ceo|promote-if-pending [--request-only]|list|sock <name> | <name> -- <cmd>}"
 # ★단일소유 기술 강제(CEO 2026-06-22): 부서 lifecycle mutation은 CSO(CYS_ROLE=cso)·GUI(role 없음·오너
 # 직접)만 허용한다. roled 비-CSO 노드(부서장 master·워커·리뷰어·CEO)의 cys-dept create/down 직접 호출을
 # 차단해 다중주체 churn(빈 dept-N·중복·레이스)을 기술적으로 방지. (defense-in-depth — 의도적 unset 우회는
@@ -370,6 +388,13 @@ case "$cmd" in
   launch|allocate|create|down|down-sock|rotate|reap|promote-ceo)
     if [ -n "${CYS_ROLE:-}" ] && [ "${CYS_ROLE}" != "cso" ]; then
       echo "[cys-dept] ★단일소유 강제: 부서 lifecycle mutation은 CSO/GUI 전용(CYS_ROLE=$CYS_ROLE 차단·다중 churn 방지). CSO에 요청하라." >&2
+      exit 7
+    fi ;;
+  promote-if-pending)
+    # --request-only는 무변조(조건 확인+알림 재발행뿐)라 가드 면제 — 부트 스크립트 ⑦(master 세션)이
+    # 호출한다. 대기형(실제 승격)은 여타 mutation과 동일하게 CSO/GUI 전용.
+    if [ "${2:-}" != "--request-only" ] && [ -n "${CYS_ROLE:-}" ] && [ "${CYS_ROLE}" != "cso" ]; then
+      echo "[cys-dept] ★단일소유 강제: promote-if-pending(대기형)은 CSO/GUI 전용 — master 세션은 --request-only만 허용." >&2
       exit 7
     fi ;;
 esac
@@ -774,6 +799,29 @@ EOF
     n=$(reg_count)
     [ "$n" -ge 1 ] || { echo "[cys-dept] 부서 0개 — CEO는 최소 1개 마스터(부서) 존재 후 단계다(승격 안 함)"; exit 4; }
     ceo_promote consented
+    ;;
+  promote-if-pending)
+    # BOOTSTRAP_HARDENING WP-2: 부트 게이트로 보류된 승격의 해소 경로.
+    # 조건 = PENDING 존재 + .master-bootstrapped 존재 + 부서≥1. 미충족=no-op(exit 0·멱등).
+    # --request-only(부트 ⑦ 전용·비대기): 알림 재발행만 — 실제 승격·동의 대기는 하지 않는다
+    #   (부트와 승격 동의의 분리 — 설계 v1.1 결함⑤). 대기형: ceo_promote(자체 동의 게이트 --wait) 경유.
+    _pend_ok=0
+    [ -f "$CEO_PENDING" ] && [ -f "$BOOT_MARKER" ] && [ "$(reg_count)" -ge 1 ] && _pend_ok=1
+    if [ "${2:-}" = "--request-only" ]; then
+      if [ "$_pend_ok" -eq 1 ]; then
+        env -u CYS_SOCKET "$CYS" feed push --title "CEO 승격 대기" \
+          --body "부트 완료 — 부서가 존재하여 CEO 승격이 대기 중입니다. GUI 배지 또는 다음 부서 이벤트에서 승인을 진행하세요." >/dev/null 2>&1 || true
+        echo "[cys-dept] CEO 승격 대기 알림 발행(request-only)"
+      else
+        echo "[cys-dept] promote-if-pending(request-only): 조건 미충족 — no-op (pending=$([ -f "$CEO_PENDING" ] && echo y || echo n) 마커=$([ -f "$BOOT_MARKER" ] && echo y || echo n) 부서=$(reg_count))"
+      fi
+      exit 0
+    fi
+    if [ "$_pend_ok" -eq 1 ]; then
+      ceo_promote   # 동의 게이트(feed --wait) 경유 — 성공 시 PENDING 해소는 ceo_promote 내부
+    else
+      echo "[cys-dept] promote-if-pending: 조건 미충족 — no-op"
+    fi
     ;;
   list) reg_names ;;
   sock) dept_sock "${2:?usage: cys-dept sock <name>}" ;;
