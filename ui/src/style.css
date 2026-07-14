@@ -9,11 +9,13 @@
   --warn: #d29922;
   --error: #f85149;
   --ok: #3fb950;
+  --ui-chrome-scale: 1.25; /* UI 크롬(툴바·사이드바 헤더·버튼) 글자 배율 — 조절 가능(오너 요청 2026-07-14) */
 }
 * { box-sizing: border-box; }
 html, body {
   margin: 0; height: 100%;
   background: var(--bg); color: var(--canvas-text);
+  -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; /* 얇고 선명 — cmux(Ghostty) 렌더에 근접(오너 요청 2026-07-14) */
   font: 13px/1.4 -apple-system, "SF Pro", "Segoe UI", sans-serif;
   overflow: hidden;
 }
@@ -24,7 +26,7 @@ html, body {
   -webkit-user-select: none; user-select: none;
 }
 #brand { font-weight: 700; color: var(--accent); }
-#daemon-info { color: #8b949e; font-size: 11px; }
+#daemon-info { color: #8b949e; font-size: calc(11px * var(--ui-chrome-scale)); }
 /* P2 버전 스큐 배지 — lame-duck 데몬(세션 보존) 안내. 경고색이되 위협적이지 않게(불안 방지가 목적).
    클릭 = 데몬 교대(manualRotateSkewed — 메인+부서 순차). */
 .ver-skew-badge {
@@ -36,7 +38,7 @@ html, body {
 #topbar button {
   background: #21262d; color: var(--text);
   border: 1px solid var(--border); border-radius: 6px;
-  padding: 3px 10px; cursor: pointer; font-size: 12px;
+  padding: 4px 12px; cursor: pointer; font-size: calc(12px * var(--ui-chrome-scale));
 }
 #topbar button:hover { border-color: var(--accent); }
 .badge {
@@ -62,13 +64,13 @@ html, body {
 #wsbar-drag:hover, body.wsbar-resizing #wsbar-drag { background: rgba(88,166,255,.35); }
 body.wsbar-resizing { cursor: col-resize; -webkit-user-select: none; user-select: none; }
 #btn-ws-font-minus, #btn-ws-font-plus {
-  background: none; border: none; color: #8b949e; cursor: pointer; font-size: 11px; padding: 0 2px;
+  background: none; border: none; color: #8b949e; cursor: pointer; font-size: calc(13px * var(--ui-chrome-scale)); padding: 0 2px;
 }
 #btn-ws-font-minus:hover, #btn-ws-font-plus:hover { color: var(--text, #e2e8f0); }
 #wsbar-head {
   display: flex; align-items: center; justify-content: space-between;
   padding: 10px 12px 6px;
-  font-size: 11px; font-weight: 700; letter-spacing: .04em;
+  font-size: calc(11px * var(--ui-chrome-scale)); font-weight: 700; letter-spacing: .04em;
   color: #6e7681; text-transform: uppercase;
 }
 /* 제목이 축소를 흡수(ellipsis) — 좁은 폭에서 헤더가 2단으로 랩되지 않게(폭 불변식: 헤더는 항상 1줄) */
@@ -233,12 +235,12 @@ body.ws-reordering { cursor: grabbing; -webkit-user-select: none; user-select: n
   border-radius: 0 0 6px 0;
   white-space: nowrap;
 }
-.pane .pane-title-text { overflow: hidden; text-overflow: ellipsis; }
+.pane .pane-title-text { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 /* 역할 신호 점(제목 앞): Control Center cc-dot의 깜박임(cc-blink) 재사용 — 역할색은 JS(setRoleDot)가 채운다 */
 .pane .pane-role-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
 .pane .pane-role-dot.working { animation: cc-blink 1.4s infinite; }
 /* T5 사용량 관측 배지: CTX(컨텍스트%)·rate limit 윈도우 — 데몬 관측치(usage.rs) 표시 */
-.pane .pane-usage { display: flex; gap: 4px; color: #6e7681; font-variant-numeric: tabular-nums; }
+.pane .pane-usage { display: none; } /* 제목탭 usage(CTX·rate) 제거 — 프롬프트 입력창 아래에 있으니 제목엔 불필요(오너 요청 2026-07-14) */
 .pane .pane-usage .warn { color: #d29922; }
 .pane .pane-usage .crit { color: #f85149; font-weight: 600; }
 .pane .pane-usage.stale { opacity: .45; }
