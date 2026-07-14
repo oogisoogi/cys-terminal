@@ -117,6 +117,13 @@ check("W5 D8 파생 로직", "cys-dept-[^/]*" in src)
 # "삭제→재생성→재시작 시 새 부서 살해"(데몬 묘비 잔존) 또는 부활 구멍(데몬 묘비 미기록).
 check("W6 데몬 묘비 set 병행", '"$CYS" tombstone "$1" --dept' in src)
 check("W7 데몬 묘비 remove 병행", '"$CYS" tombstone "$1" --dept --remove' in src)
+# ★R7(적대검증 W1): down/down-sock 모두 묘비가 reg_remove보다 선행(set -e abort 시 등재+미묘비 창 봉쇄)
+_down = src.split("  down)", 1)[1].split(";;", 1)[0]
+check("W8 down: 묘비 선기록", _down.index('dept_tombstone "$name"') < _down.index('reg_remove "$name"'))
+_ds = src.split("  down-sock)", 1)[1].split(";;", 1)[0]
+check("W9 down-sock: 묘비 선기록(실행문 정박 — 주석 오매치 방지)",
+      _ds.index('dept_tombstone "$name"') < _ds.index('reg_remove "$name"'))
+check("W10 ★R11 해소 실패 WARN 가시화", "데몬 묘비 해소 미확정" in src)
 
 print("\n%d FAIL" % len(fails) if fails else "\nALL PASS")
 sys.exit(1 if fails else 0)

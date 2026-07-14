@@ -81,6 +81,15 @@ case "$CYS_ROLE" in
 esac
 echo "■ CYSJavis 역할 각성 (CYS_ROLE=$CYS_ROLE)"
 cat "$D"
+# ★R13 부트 브리지(T2b 전 임시 — hook=system층이라 디렉티브(user-owned) 미개정 기계에도 전파):
+# 구 산문 §0만 아는 master는 부트 스크립트를 몰라 완료 마커가 안 생기고 CEO 승격이 영구
+# PENDING(promote-if-pending은 마커 필수)이 된다. 디렉티브 §0의 정식 개정은 T2b(재핀 의례).
+if [ "$CYS_ROLE" = "master" ] && [ -f "$JARVIS_DIR/bin/javis_bootstrap.py" ]; then
+  echo
+  echo "■ 부트 브리지: 부트 시퀀스(§0)는 산문 수행 대신 다음 명령 실행+최종 JSON 인용으로 수행하라 —"
+  echo "  ${CYS_PY:-python3} $JARVIS_DIR/bin/javis_bootstrap.py"
+  echo "  (exit 7=이 surface는 master 아님·인계 / 그 외 비0=단계·원인 그대로 보고 / 완료 선언은 JSON 인용 시에만)"
+fi
 # ── 사용자 로컬 디렉티브 오버레이(~/.cys/local/directives/<ROLE>_DIRECTIVE.local.md) ──
 # 업데이트·치유 불가침 사용자 확장점(팩 파일 직접 수정 대체 채널). 안전핵 키워드 줄은 주입에서
 # 제외(compose_directive sanitize 필터와 동일 취지) + 캡 24576B. 재선언 한 줄이 항상 뒤따른다.

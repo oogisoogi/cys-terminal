@@ -1292,7 +1292,8 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     dt.insert(name.clone());
                 }
             }
-            governance::persist_topology(daemon);
+            // ★R9: 전용 사이드카 영속(topology 재작성 불요·구 바이너리 다운그레이드 면역)
+            governance::persist_dept_tombstones(daemon);
             let mut dv: Vec<String> =
                 daemon.dept_tombstones.lock().unwrap().iter().cloned().collect();
             dv.sort();

@@ -76,6 +76,21 @@ env = setup(tmp, "ok")
 code, out, _ = run_hook(env, role="master")
 check("2a ⓐ성공: 디렉티브 주입", "DIRECTIVE-BODY-MASTER" in out)
 check("2b ⓐ성공: self-demote 없음", "역할 주소 상실" not in out)
+# ★R13 부트 브리지: 구 산문 §0만 아는 디렉티브 기계에도(hook=system층 전파) 스크립트 경로 고지
+check("2c ★R13 부트 브리지 주입(javis_bootstrap 부재 시 생략)",
+      "부트 브리지" not in out)  # 가짜 팩엔 bin/javis_bootstrap.py 없음 → 브리지 미주입(조건부 확인)
+
+shutil.rmtree(tmp)
+
+# ── 2x. ★R13 브리지 존재 케이스: 팩에 javis_bootstrap.py 있으면 master 주입에 브리지 동봉 ──
+tmp = tempfile.mkdtemp(prefix="hook-t2x-")
+env = setup(tmp, "ok")
+_bs = os.path.join(env["CYS_PACK_DIR"], "bin")
+os.makedirs(_bs, exist_ok=True)
+open(os.path.join(_bs, "javis_bootstrap.py"), "w", encoding="utf-8").write("# stub\n")
+code, out, _ = run_hook(env, role="master")
+check("2x1 ★R13 브리지 주입", "부트 브리지" in out and "javis_bootstrap.py" in out)
+check("2x2 브리지는 worker엔 미주입", "부트 브리지" not in run_hook(env, role="worker")[1])
 shutil.rmtree(tmp)
 
 # ── 3. ⓑ 명시적 거부 → self-demote·디렉티브 미주입 ──

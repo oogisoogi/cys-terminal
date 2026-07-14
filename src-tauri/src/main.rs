@@ -1677,6 +1677,43 @@ async fn start_master() -> Result<(), String> {
     }
 }
 
+/// ★R8(WP-2·적대검증 W2): CEO 승격 대기(PENDING) 여부 — cys-dept가 기록한 상태 파일 존재 검사.
+/// 프론트가 시작 시 1회+팔레트 온디맨드로 읽는다(신규 타이머 금지 — WINAUDIT 타이머 증식 방지).
+#[tauri::command]
+fn ceo_pending() -> bool {
+    cys::home_dir().join(".cys/state/ceo-pending").exists()
+}
+
+/// ★R8: PENDING 해소 실행 — cys-dept promote-if-pending(대기형·자체 동의 게이트 feed --wait 경유).
+/// GUI는 role-less(CYS_ROLE 제거 명시)라 단일소유 가드를 통과한다. async라 UI 무블록,
+/// feed --wait의 timeout(deny/timeout=보류) 규약이 상한을 보장한다.
+#[tauri::command]
+async fn promote_pending_ceo() -> Result<String, String> {
+    let tool = dept_tool();
+    let out = tokio::task::spawn_blocking(move || {
+        let mut cmd = std::process::Command::new("bash");
+        inject_runtime_path(&mut cmd);
+        cmd.env_remove("CYS_SOCKET");
+        cmd.env_remove("CYS_ROLE");
+        cmd.arg(&tool).arg("promote-if-pending");
+        no_console(&mut cmd);
+        cmd.output()
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+    let txt = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    if out.status.success() {
+        Ok(txt.trim().to_string())
+    } else {
+        Err(txt.trim().to_string())
+    }
+}
+
 /// 부서 데몬 teardown(socket 기준) — ws 이름 변경(rename)으로 name→socket 매핑이 끊겨도 정확히 종료.
 /// cys-dept down-sock에 일임(레지스트리 역인덱스로 부서명 해석 후 teardown).
 #[tauri::command]
@@ -2171,6 +2208,8 @@ fn main() {
             dept_tombstone_by_socket,
             dept_tombstones,
             start_master,
+            ceo_pending,
+            promote_pending_ceo,
             daemon_status,
             list_surfaces,
             org_status,

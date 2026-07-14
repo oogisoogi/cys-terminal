@@ -71,6 +71,17 @@ def _read_json(path):
         return None
 
 
+def _progress(msg):
+    """★R12: 단계 시작 신호(stderr 1줄) — 진행 중 무출력이면 최악 수 분의 침묵 창이 생겨
+    관찰자(초보·master)가 '멈춤'으로 오인한다(실사고 증상②의 형태적 재생산 방지).
+    기계 계약(exit code·⑧ JSON)과 별개의 인간 관찰자용 인터페이스."""
+    sys.stderr.write("[bootstrap] %s\n" % msg)
+    try:
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
 def _run(cmd, timeout=120):
     """서브프로세스 실행 — (exit, stdout+stderr 병합 텍스트). shell 미사용(경로 quoting 안전)."""
     try:
@@ -139,6 +150,7 @@ def cmd_run():
     # ① preflight --fix — READY 판정은 preflight exit code가 사실(자연어 재추론 금지)
     preflight = os.path.join(PACK, "bin", "javis_preflight.py")
     if os.path.isfile(preflight):
+        _progress("① preflight --fix 실행 중(최대 300s)…")
         code, out = _run([py, preflight, "--fix"], timeout=300)
         log.step("①preflight", code, out)
         if code != 0:
@@ -147,12 +159,14 @@ def cmd_run():
         log.step("①preflight", 0, "preflight 부재 — 생략(팩 불완전 가능·계속)")
 
     # ② 데몬 생존 — 이후 ③의 비정상 exit를 '거부'로 해석하는 전제(데몬 생존 보증)
+    _progress("② 데몬 생존 확인…")
     code, out = _run(["cys", "ping"], timeout=15)
     log.step("②ping", code, out)
     if code != 0:
         return log.fail("②ping", code, out, 3)
 
     # ③ claim-role master — 거부=exit 7(유령 master 차단: 이 surface는 master가 아니다)
+    _progress("③ master 역할 등록…")
     code, out = _run(["cys", "claim-role", "master"], timeout=15)
     log.step("③claim-role", code, out)
     if code != 0:
@@ -161,6 +175,7 @@ def cmd_run():
         return log.fail("③claim-role", code, msg, 7)
 
     # ④ 4종 의무 노드 기동
+    _progress("④ 4종 의무 노드 기동 중(최대 300s)…")
     code, out = _run(["cys", "boot"], timeout=300)
     log.step("④boot", code, out)
     if code != 0:
@@ -171,10 +186,12 @@ def cmd_run():
     # ④-b 리뷰어 감지·무구독 폴백(R1·D-IMPL-1 — 산문 §0 ④-b의 코드 전사): cys boot는 미설치
     # CLI를 건너뛰므로 agy/codex 부재 기계(초보 전원)에서 대체 리뷰어(reviewer-claude-*)를 기동할
     # 주체가 없으면 ⑤ check가 영영 실패한다. 실패=기록만(best-effort) — 최종 게이트는 ⑤ check.
-    code, out = _run([py, orchestra, "boot-reviewers"], timeout=180)
+    _progress("④-b 리뷰어 감지·폴백 기동 중(최대 320s — 대체 리뷰어 2슬롯 순차)…")
+    code, out = _run([py, orchestra, "boot-reviewers"], timeout=320)
     log.step("④b-boot-reviewers", code, out)
 
     # ⑤ orchestra check — bounded retry(노드 ready는 비동기·check는 스냅샷)
+    _progress("⑤ 노드 생존 결정론 확인(check · 최대 %d회×%.0fs 재시도)…" % (CHECK_RETRIES, CHECK_INTERVAL_S))
     code, out = 1, "orchestra 부재"
     for attempt in range(1, CHECK_RETRIES + 1):
         code, out = _run([py, orchestra, "check"], timeout=60)

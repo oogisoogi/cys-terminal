@@ -3622,6 +3622,26 @@ async function buildPaletteItems(): Promise<PaletteItem[]> {
     });
   }
 
+  // ── (4-b) ★R8(WP-2): CEO 승격 대기 해소 — cys-dept PENDING(부트 게이트 보류)의 즉시 경로.
+  // 온디맨드 조회(팔레트 열 때만 — 신규 타이머 0). 대기형은 오너 동의 게이트(feed --wait) 경유.
+  if (await invoke("ceo_pending").catch(() => false)) {
+    items.push({
+      id: "act:ceo-promote",
+      title: "CEO 승격 진행 (대기 중)",
+      subtitle: "부서가 존재·base 부트 완료 — 동의 게이트(feed)를 거쳐 승격합니다",
+      keywords: "ceo promote 승격 pending 대기",
+      confirm: { title: "CEO 승격", body: "기본 데몬 master를 CEO로 승격합니다(동의 요청이 feed에 뜹니다 · .pre-ceo 백업으로 가역)." },
+      action: async () => {
+        try {
+          const r = (await invoke("promote_pending_ceo")) as string;
+          toast("feed", "CEO 승격 처리", r || "완료");
+        } catch (e) {
+          toast("health", "CEO 승격 실패", String(e));
+        }
+      },
+    });
+  }
+
   // ── (5) 빌트인 webview 액션(정적) ──
   items.push(
     { id: "act:new-tab", title: "새 탭", keywords: "new tab 탭", action: () => actionNew() },
@@ -4103,6 +4123,18 @@ async function start() {
   // 부서 데몬 확보를 list 대조보다 선행 — 미가동이면 cys-dept launch. 실패해도(등록된) ws는 보존.
   const ghosts = new Set<number>();
   for (const ws of workspaces.filter((w) => w.socket)) {
+    // ★WP-3+R10: 묘비 검사를 생존 검사보다 **선행** — spawn_org_restore는 업데이트 후에만
+    // 실행되므로(적대검증 보조 관찰), teardown 실패로 살아남은 묘비 데몬의 수렴 주체는 매 시작
+    // 도는 이 루프다. 묘비+생존이면 탭 드롭+정리 시도(묘비가 부활을 차단하므로 best-effort).
+    // 재생성 레이스 안전: 재생성 경로(allocate/create/launch)가 묘비를 선해소하므로 오드롭 없음.
+    {
+      const dn = deptNameFromSocket(ws.socket);
+      if (deptTombs && dn && deptTombs.has(dn)) {
+        ghosts.add(ws.id);
+        invoke("stop_dept_daemon_by_socket", { socket: ws.socket }).catch(() => {});
+        continue;
+      }
+    }
     let alive = false;
     try {
       await invoke("daemon_status", { socket: ws.socket });
@@ -4111,15 +4143,6 @@ async function start() {
       alive = false;
     }
     if (alive) continue;
-    // ★WP-3: 삭제-의도 묘비 부서 → 등재 여부와 무관하게 드롭(재-launch 금지). 생존(alive) 탭은
-    // 이 검사 이전에 continue — spawn_org_restore reaper가 정지시키면 다음 시작에서 드롭된다.
-    {
-      const dn = deptNameFromSocket(ws.socket);
-      if (deptTombs && dn && deptTombs.has(dn)) {
-        ghosts.add(ws.id);
-        continue;
-      }
-    }
     // 죽은 socket + 레지스트리 미등록 → 유령 → 드롭(재-launch로 부활시키지 않음)
     if (registered && ws.socket && !registered.has(ws.socket)) {
       ghosts.add(ws.id);
@@ -4324,6 +4347,18 @@ document.getElementById("btn-master-start")?.addEventListener("click", async () 
     toast("health", "마스터 시작 실패", String(e));
   }
 });
+
+// ★R8(WP-2): 시작 시 1회 CEO PENDING 고지 — cys-dept 알림이 가리키는 실존 컨트롤(팔레트
+// "CEO 승격 진행")로 안내. 폴링 없음(시작 1회+팔레트 온디맨드 — WINAUDIT 타이머 증식 방지).
+(async () => {
+  try {
+    if (await invoke("ceo_pending")) {
+      toast("feed", "CEO 승격 대기 중", "부서가 존재합니다 — base 부트 완료 후 명령 팔레트의 'CEO 승격 진행'으로 승인할 수 있습니다.");
+    }
+  } catch {
+    /* 데몬 미가동 등 — 침묵(다음 시작·팔레트에서 재확인) */
+  }
+})();
 
 // ---------- 사이드바 폭 드래그 + 글자 배율 (오너 요청 2026-07-12) ----------
 // 폭·배율은 CSS 변수(--wsbar-w/--wsbar-font)가 진실원, localStorage 영속. 클램프 산식=wsbar.ts.

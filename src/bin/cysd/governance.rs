@@ -951,13 +951,6 @@ pub fn persist_topology(daemon: &Arc<Daemon>) {
         }
     }
     let rev = daemon.tombstones_rev.load(std::sync::atomic::Ordering::SeqCst);
-    // ★WP-3: 부서 묘비 — role 묘비와 별도 키(질문이 다름: role=세션 부활, dept=부서 데몬 부활).
-    // rev 카운터는 role 묘비 전용 유지(phoenix 조건부 replace 계약 불변 — dept는 소비자가 단순 대조).
-    let dept_tombstones: Vec<String> = {
-        let mut v: Vec<String> = daemon.dept_tombstones.lock().unwrap().iter().cloned().collect();
-        v.sort();
-        v
-    };
     let dir = crate::state::state_dir(&daemon.socket_path);
     let content = serde_json::to_string_pretty(&json!({
         "schema_version": 1,          // ★A-S1 스키마 마커 — 이 키 부재=legacy topology(phoenix 는 경고+진행)
@@ -965,7 +958,6 @@ pub fn persist_topology(daemon: &Arc<Daemon>) {
         "updated_at": now_epoch(),
         "entries": entries,
         "tombstones": tombstones,
-        "dept_tombstones": dept_tombstones,
     }))
     .unwrap_or_default();
     // ★원자 쓰기 — SIGTERM/크래시가 쓰기 도중 끼어도 topology.json은 옛 완본 또는 새 완본만
@@ -1046,21 +1038,61 @@ fn tombstones_from_latest_generation() -> std::collections::HashSet<String> {
 /// **부재=빈 집합(fresh 정상)**. **손상(파싱 실패)=조용한 빈집합 금지** — `.corrupt-<ts>` isolate(파일 보존)
 /// + 세대 스냅샷 tombstones 폴백. 손상을 빈집합으로 흘리면 폐역 역할이 부활(P0-3)하므로, 스냅샷으로 복구를
 /// 시도하고 원본은 isolate 해 소실을 디스크에 확정하지 않는다(.corrupt prune 상한은 W3).
-/// ★WP-3: 부서 묘비 로더 — topology.json "dept_tombstones" 키. 부재/손상=빈 집합(하위호환·
-/// 손상 격리는 role 로더가 담당 — 이중 isolate 방지). 구 데몬은 이 키를 무시(serde 관용).
+/// ★WP-3·R9(적대검증 W3): 부서 묘비의 영속은 **전용 사이드카**(dept_tombstones.json — writer는
+/// 이 데몬 유일)로 한다. topology.json 공유 키였다면 구(pre-WP-3) 바이너리가 topology를
+/// 재작성하는 순간 키가 소실돼(버전 스큐 = 이 시스템의 1급 조건) 삭제 부서가 부활한다 —
+/// 구 바이너리가 절대 건드리지 않는 신규 파일이 다운그레이드 면역의 정공법(단일-writer 마커 원칙).
+fn dept_tombstones_path(socket_path: &std::path::Path) -> std::path::PathBuf {
+    crate::state::state_dir(socket_path).join("dept_tombstones.json")
+}
+
+pub fn persist_dept_tombstones(daemon: &Arc<Daemon>) {
+    let mut v: Vec<String> = daemon.dept_tombstones.lock().unwrap().iter().cloned().collect();
+    v.sort();
+    let dir = crate::state::state_dir(&daemon.socket_path);
+    let content = serde_json::to_string_pretty(&json!({"dept_tombstones": v})).unwrap_or_default();
+    let _ = write_json_atomic(&dir, "dept_tombstones.json", &content);
+}
+
+/// 부서 묘비 로더 — 사이드카 우선. 손상=.corrupt-ts 격리+WARN+빈 집합(dept 묘비는 role과 달리
+/// 사용자 재삭제로 재기록 가능하라 세대 스냅샷까지는 두지 않는다 — 정직한 한계).
+/// 사이드카 부재 시 legacy topology.json "dept_tombstones" 키 폴백(초기 빌드 흔적 흡수) → 빈 집합.
 pub fn load_dept_tombstones_from_disk(
     socket_path: &std::path::Path,
 ) -> std::collections::HashSet<String> {
-    let p = crate::state::state_dir(socket_path).join("topology.json");
-    std::fs::read_to_string(&p)
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        .and_then(|v| {
-            v.get("dept_tombstones").and_then(|t| t.as_array()).map(|arr| {
-                arr.iter().filter_map(|x| x.as_str().map(String::from)).collect()
-            })
-        })
-        .unwrap_or_default()
+    let p = dept_tombstones_path(socket_path);
+    match std::fs::read_to_string(&p) {
+        Ok(s) => match serde_json::from_str::<serde_json::Value>(&s) {
+            Ok(v) => v
+                .get("dept_tombstones")
+                .and_then(|t| t.as_array())
+                .map(|arr| arr.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                .unwrap_or_default(),
+            Err(e) => {
+                let ts = now_epoch() as u64;
+                let corrupt = p.with_file_name(format!("dept_tombstones.json.corrupt-{ts}"));
+                let _ = std::fs::rename(&p, &corrupt);
+                eprintln!(
+                    "[cysd] dept_tombstones.json 손상({e}) — {} isolate·빈 집합 폴백(부활 게이트 일시 해제 주의)",
+                    corrupt.display()
+                );
+                std::collections::HashSet::new()
+            }
+        },
+        Err(_) => {
+            // legacy 폴백: 초기 빌드가 topology.json 키에 기록했을 수 있다(배포 0·dev 흔적 흡수).
+            let tp = crate::state::state_dir(socket_path).join("topology.json");
+            std::fs::read_to_string(&tp)
+                .ok()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .and_then(|v| {
+                    v.get("dept_tombstones").and_then(|t| t.as_array()).map(|arr| {
+                        arr.iter().filter_map(|x| x.as_str().map(String::from)).collect()
+                    })
+                })
+                .unwrap_or_default()
+        }
+    }
 }
 
 pub fn load_tombstones_from_disk(socket_path: &std::path::Path) -> std::collections::HashSet<String> {

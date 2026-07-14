@@ -124,6 +124,11 @@ check("1e ⓓ ⑦ 비대기 인자", "promote-if-pending --request-only" in call
 check("1f boot-last 단계 누적",
       bool((json.load(open(os.path.join(home, ".cys", "state", "boot-last.json"),
                            encoding="utf-8")) or {}).get("steps")))
+check("1g ★R12 진행 신호(침묵 창 방지 — 단계 시작 stderr)",
+      "[bootstrap] ①" in err and "[bootstrap] ⑤" in err, err[:200])
+src_boot = open(SCRIPT, encoding="utf-8").read()
+check("1h ★R6 ④-b timeout≥320(2슬롯×130s 순차 — 스텁은 즉시 반환이라 정적 핀·실기 미검증 정직 표기)",
+      "timeout=320" in src_boot)
 shutil.rmtree(tmp)
 
 # ── 2. ⓐ 부서 소켓 컨텍스트: 성공해도 base 마커 미생성·⑦ 생략 ──
