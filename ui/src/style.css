@@ -225,15 +225,18 @@ body.ws-reordering { cursor: grabbing; -webkit-user-select: none; user-select: n
 .pane .pane-title {
   display: flex; align-items: center; gap: 6px;
   width: fit-content; max-width: 100%;
-  height: 22px; line-height: 22px; padding: 0 8px;
-  font-size: 11px; color: #8b949e; background: var(--bar);
+  height: 26px; line-height: 26px; padding: 0 10px;
+  font-size: 15px; color: #8b949e; background: var(--bar);
+  font-family: var(--ui-title-font, "JetBrains Mono", Menlo, ui-monospace, monospace);
+  font-weight: 400;
   border: 1px solid var(--hairline); border-top: none; border-left: none;
   border-radius: 0 0 6px 0;
   white-space: nowrap;
 }
 .pane .pane-title-text { overflow: hidden; text-overflow: ellipsis; }
 /* 역할 신호 점(제목 앞): Control Center cc-dot의 깜박임(cc-blink) 재사용 — 역할색은 JS(setRoleDot)가 채운다 */
-.pane .pane-role-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; animation: cc-blink 1.4s infinite; }
+.pane .pane-role-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+.pane .pane-role-dot.working { animation: cc-blink 1.4s infinite; }
 /* T5 사용량 관측 배지: CTX(컨텍스트%)·rate limit 윈도우 — 데몬 관측치(usage.rs) 표시 */
 .pane .pane-usage { display: flex; gap: 4px; color: #6e7681; font-variant-numeric: tabular-nums; }
 .pane .pane-usage .warn { color: #d29922; }

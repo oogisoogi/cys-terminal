@@ -1250,8 +1250,10 @@ function applyFontFace(face: string | null) {
   fontFace = face && face.trim() ? face : null;
   if (fontFace === null) localStorage.removeItem("cys-font-face");
   else localStorage.setItem("cys-font-face", fontFace);
+  const fam = composeFontFamily(fontFace);
+  document.documentElement.style.setProperty("--ui-title-font", fam); // 제목·본문 폰트 통일(오너 요청 2026-07-14): pane-title이 이 변수를 따라 터미널 폰트와 동일
   for (const rt of panes.values()) {
-    rt.term.options.fontFamily = composeFontFamily(fontFace);
+    rt.term.options.fontFamily = fam;
     fitPane(rt);
   }
 }
@@ -1427,12 +1429,24 @@ const paneTitle = (title: string | null | undefined, liveCwd?: string | null) =>
   isAutoTitle(title) ? liveCwd || "…" : (title as string);
 
 // pane 헤더 역할 점 — CC 깜박이 점(cc-blink)을 역할색으로 제목 앞에 표시(무역할 셸·종료 pane은 숨김).
-function setRoleDot(el: HTMLElement, role: string | null) {
+// org_fleet(lastFleet) 스냅샷에서 surface의 작동 여부 — 역할 점 깜빡을 '작업중'에만 적용(오너 요청 2026-07-14).
+function surfaceWorking(sid: number): boolean {
+  for (const d of ((lastFleet as any)?.departments ?? [])) {
+    for (const s of (d.surfaces ?? [])) {
+      if (s.surface_id === sid) {
+        return s.status?.state === "working" || (!s.status && !s.exited && (s.idle_secs ?? 999) <= 60);
+      }
+    }
+  }
+  return false; // fleet 미등록 = 비작동(안 깜빡·안전 기본)
+}
+function setRoleDot(el: HTMLElement, role: string | null, working = false) {
   const color = roleDotColor(role);
   el.style.display = color ? "" : "none";
+  el.classList.toggle("working", !!color && working); // 작동 중일 때만 cc-blink(오너 요청 2026-07-14: 대기 시 정적)
   if (color) {
     el.style.background = color;
-    el.title = `역할: ${role}`;
+    el.title = `역할: ${role}${working ? " · 작업중" : ""}`;
   }
 }
 
@@ -1463,7 +1477,7 @@ async function refreshPaneTitles() {
         const rt = panes.get(paneKey(s.surface_id, sk));
         if (!rt) continue;
         renderUsage(rt.usageEl, s.exited ? null : s.usage); // 종료 pane은 배지 제거 (혼동 방지)
-        setRoleDot(rt.roleEl, s.exited ? null : s.role); // 역할 점도 동일 주기 갱신
+        setRoleDot(rt.roleEl, s.exited ? null : s.role, !s.exited && surfaceWorking(s.surface_id)); // 역할 점 + 작동중일 때만 깜빡, 동일 주기 갱신
         if (rt.titleEl.isContentEditable) continue; // 이름 편집 중에는 덮어쓰지 않음
         rt.titleEl.textContent = paneTitle(s.title, s.live_cwd) + (s.exited ? " [exited]" : "");
       }
@@ -1477,7 +1491,7 @@ async function refreshPaneTitles() {
         // !w.pending — 런칭 중 placeholder(socket 미정)에는 입양 금지(타 데몬 surface 오입양 차단).
         const ws = workspaces.find((w) => !w.pending && (w.socket ?? undefined) === (sk ?? undefined));
         if (!ws || collectSids(ws.tree).includes(s.surface_id)) continue;
-        setRoleDot((await makePane(s.surface_id, s.title, sk)).roleEl, s.role); // 입양 즉시 역할 점 채색(다음 틱 대기 없이)
+        setRoleDot((await makePane(s.surface_id, s.title, sk)).roleEl, s.role, surfaceWorking(s.surface_id)); // 입양 즉시 역할 점 채색 + 작동중 판정
         ws.tree = ws.tree
           ? { type: "split", dir: "row", a: ws.tree, b: { type: "pane", sid: s.surface_id } }
           : { type: "pane", sid: s.surface_id };
