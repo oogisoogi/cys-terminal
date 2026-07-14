@@ -951,6 +951,13 @@ pub fn persist_topology(daemon: &Arc<Daemon>) {
         }
     }
     let rev = daemon.tombstones_rev.load(std::sync::atomic::Ordering::SeqCst);
+    // ★WP-3: 부서 묘비 — role 묘비와 별도 키(질문이 다름: role=세션 부활, dept=부서 데몬 부활).
+    // rev 카운터는 role 묘비 전용 유지(phoenix 조건부 replace 계약 불변 — dept는 소비자가 단순 대조).
+    let dept_tombstones: Vec<String> = {
+        let mut v: Vec<String> = daemon.dept_tombstones.lock().unwrap().iter().cloned().collect();
+        v.sort();
+        v
+    };
     let dir = crate::state::state_dir(&daemon.socket_path);
     let content = serde_json::to_string_pretty(&json!({
         "schema_version": 1,          // ★A-S1 스키마 마커 — 이 키 부재=legacy topology(phoenix 는 경고+진행)
@@ -958,6 +965,7 @@ pub fn persist_topology(daemon: &Arc<Daemon>) {
         "updated_at": now_epoch(),
         "entries": entries,
         "tombstones": tombstones,
+        "dept_tombstones": dept_tombstones,
     }))
     .unwrap_or_default();
     // ★원자 쓰기 — SIGTERM/크래시가 쓰기 도중 끼어도 topology.json은 옛 완본 또는 새 완본만
@@ -1038,6 +1046,23 @@ fn tombstones_from_latest_generation() -> std::collections::HashSet<String> {
 /// **부재=빈 집합(fresh 정상)**. **손상(파싱 실패)=조용한 빈집합 금지** — `.corrupt-<ts>` isolate(파일 보존)
 /// + 세대 스냅샷 tombstones 폴백. 손상을 빈집합으로 흘리면 폐역 역할이 부활(P0-3)하므로, 스냅샷으로 복구를
 /// 시도하고 원본은 isolate 해 소실을 디스크에 확정하지 않는다(.corrupt prune 상한은 W3).
+/// ★WP-3: 부서 묘비 로더 — topology.json "dept_tombstones" 키. 부재/손상=빈 집합(하위호환·
+/// 손상 격리는 role 로더가 담당 — 이중 isolate 방지). 구 데몬은 이 키를 무시(serde 관용).
+pub fn load_dept_tombstones_from_disk(
+    socket_path: &std::path::Path,
+) -> std::collections::HashSet<String> {
+    let p = crate::state::state_dir(socket_path).join("topology.json");
+    std::fs::read_to_string(&p)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| {
+            v.get("dept_tombstones").and_then(|t| t.as_array()).map(|arr| {
+                arr.iter().filter_map(|x| x.as_str().map(String::from)).collect()
+            })
+        })
+        .unwrap_or_default()
+}
+
 pub fn load_tombstones_from_disk(socket_path: &std::path::Path) -> std::collections::HashSet<String> {
     let dir = crate::state::state_dir(socket_path);
     let p = dir.join("topology.json");
@@ -1560,6 +1585,11 @@ pub fn close_surface(daemon: &Arc<Daemon>, id: u64, cause: CloseCause) -> Result
         }
         surface
     };
+    // ★D7(BOOTSTRAP_HARDENING WP-3): 묘비를 kill 루프 **이전**에 선영속 — 아래 kill 구간에서
+    // 데몬이 SIGKILL/크래시로 죽으면 in-memory 묘비가 디스크에 없어 다음 콜드부트 phoenix가
+    // "의도 삭제된 역할"을 부활시켰다. surfaces 락 해제 직후라 persist_topology 재진입 안전
+    // (말미 persist는 role-map 후속 정리 반영용으로 유지 — 이중 persist 비용 수용).
+    persist_topology(daemon);
     // health 디바운스·조치 게이트 맵에서 이 surface의 (surface_id, rule) 키 회수 —
     // surface가 맵에서 사라지는 유일 지점에서 함께 비워 누수를 차단한다(별도 락).
     prune_surface_health_keys(

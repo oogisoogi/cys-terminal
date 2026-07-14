@@ -1275,6 +1275,39 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             ))
         }
 
+        // ★BOOTSTRAP_HARDENING WP-3: 부서 의도-삭제 묘비 — GUI 삭제 클릭 시점의 견고 선기록
+        // (단일 writer=base 데몬·영속=topology.json). 리바이버(spawn_org_restore·프론트 복원)가
+        // 이 집합을 게이트로 읽어, 취약한 teardown 체인(reg_remove)이 무음 실패해도 삭제 부서를
+        // 부활시키지 않는다. remove=true는 부서 재생성 경로의 해소(재편입).
+        "dept_tombstone.set" => {
+            let Some(name) = param_str(&params, "name") else {
+                return Reply::Single(err_response(&id, "invalid_params", "missing name"));
+            };
+            let remove = params.get("remove").and_then(|v| v.as_bool()).unwrap_or(false);
+            {
+                let mut dt = daemon.dept_tombstones.lock().unwrap();
+                if remove {
+                    dt.remove(&name);
+                } else {
+                    dt.insert(name.clone());
+                }
+            }
+            governance::persist_topology(daemon);
+            let mut dv: Vec<String> =
+                daemon.dept_tombstones.lock().unwrap().iter().cloned().collect();
+            dv.sort();
+            Reply::Single(ok_response(
+                &id,
+                json!({"name": name, "removed": remove, "dept_tombstones": dv}),
+            ))
+        }
+        "dept_tombstone.list" => {
+            let mut dv: Vec<String> =
+                daemon.dept_tombstones.lock().unwrap().iter().cloned().collect();
+            dv.sort();
+            Reply::Single(ok_response(&id, json!({"dept_tombstones": dv})))
+        }
+
         // 사후 역할 등록: 이미 떠 있는 세션이 자기 surface를 역할 주소로 등록 ("너는 마스터이다" 경로)
         "system.claim_role" => {
             let Some(role) = param_str(&params, "role") else {

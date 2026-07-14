@@ -734,6 +734,12 @@ pub struct Daemon {
     /// 역할을 절대 재스폰하지 않는다(사고사만 부활, 의도삭제는 좀비 차단). 데몬 기동 시
     /// topology.json에서 로드한다(구 topology=필드 부재→빈 집합=기존 동작 하위호환).
     pub tombstones: Mutex<std::collections::HashSet<String>>,
+    /// ★BOOTSTRAP_HARDENING WP-3: 부서(dept) 의도-삭제 묘비 — GUI 삭제 클릭 시점에 base 데몬이
+    /// 선기록하는 견고 의도 기록(dept_tombstone.set RPC · 단일 writer=이 데몬). 취약한
+    /// bash→python teardown 체인(reg_remove)이 무음 실패해도 리바이버(spawn_org_restore·프론트
+    /// 복원)가 이 집합을 게이트로 읽어 삭제 부서를 부활시키지 않는다. 부서 재생성(dept_tombstone.set
+    /// remove=true)이 유일 해소 경로. topology.json "dept_tombstones" 키로 영속(부재=빈 집합 하위호환).
+    pub dept_tombstones: Mutex<std::collections::HashSet<String>>,
     /// ★W2/A-S1: 묘비 변경 단조 카운터(topology.json 의 tombstones_rev). persist_topology 가 묘비 집합이
     /// 직전 영속본과 달라질 때만 +1 한다. phoenix 는 "rev ≥ 마지막으로 본 rev"일 때만 topology 묘비를 desired 에
     /// 그대로 대입(조건부 replace)해, 부분절단·조작으로 묘비만 빈 파일(rev 부재/역행)을 걸러낸다. 기동 시
@@ -1208,6 +1214,9 @@ impl Daemon {
             roles: Mutex::new(HashMap::new()),
             // ★W2a 콜드부트 생존: topology.json에 영속된 묘비를 기동 시 로드(구 topology=빈 집합).
             tombstones: Mutex::new(crate::governance::load_tombstones_from_disk(&socket_path)),
+            dept_tombstones: Mutex::new(crate::governance::load_dept_tombstones_from_disk(
+                &socket_path,
+            )),
             // ★W2/A-S1: rev 를 disk topology 에서 시드(재시작 넘어 단조성 유지)·직전 영속본=시드 묘비.
             tombstones_rev: std::sync::atomic::AtomicU64::new(
                 crate::governance::load_tombstones_rev_from_disk(&socket_path),

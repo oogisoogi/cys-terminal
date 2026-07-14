@@ -905,6 +905,18 @@ fn spawn_org_restore(app: AppHandle) {
         let _ = app.emit("restore-progress", json!({"phase": "start"}));
         // 본부(기본 소켓) — setup의 ensure_daemon으로 이미 가동 확정.
         let hq_ok = run_sidecar_restore(None).await;
+        // ★WP-3 리바이버 게이트: base 데몬 dept 묘비 — 삭제-의도 부서는 재기동에서 제외(+생존 시 reap).
+        // RPC 실패=빈 집합(보수적 fail-open: 묘비 부재=현행 거동 — 롤백 불변식 "부재=제약 없음").
+        let tombs: std::collections::HashSet<String> =
+            rpc_oneshot(&cys::socket_path(), "dept_tombstone.list", json!({}))
+                .await
+                .ok()
+                .and_then(|v| {
+                    v.get("dept_tombstones").and_then(|a| a.as_array()).map(|a| {
+                        a.iter().filter_map(|x| x.as_str().map(String::from)).collect()
+                    })
+                })
+                .unwrap_or_default();
         // 부서 순회 — 등록 부서(depts.json)만 대상(유령 부서 재-launch 차단).
         let mut ok = 0usize;
         let mut fail = 0usize;
@@ -924,6 +936,22 @@ fn spawn_org_restore(app: AppHandle) {
                     .await
                     .map(|r| r.is_ok())
                     .unwrap_or(false);
+                    // ★WP-3: 묘비 부서 — 재기동 금지. 생존이면 reap(정리 대기 프로세스 — 묘비가
+                    // 부활을 이미 차단하므로 좀비 아님. teardown 실패=WARN·차회 부팅 재평가로 수렴).
+                    if tombs.contains(name.as_str()) {
+                        if alive {
+                            let _ = stop_dept_daemon_by_socket(
+                                sock.to_string_lossy().to_string(),
+                            )
+                            .await;
+                        }
+                        let _ = app.emit(
+                            "restore-progress",
+                            json!({"phase": "skip", "dept": name,
+                                   "detail": "삭제-의도 묘비 — 재기동 제외"}),
+                        );
+                        continue;
+                    }
                     let dept_ok = if alive {
                         run_sidecar_restore(Some(sock.clone())).await
                     } else {
@@ -1582,6 +1610,59 @@ fn read_dept_catalog() -> Result<Value, String> {
     }
 }
 
+/// ★WP-3(BOOTSTRAP_HARDENING): 소켓 문자열에서 부서명 파생 — cys-dept-<name> 슬러그
+/// (unix `.../cys-dept-<n>/cys.sock` · pipe `\\.\pipe\cys-dept-<n>` 공통 · cys-dept D8 파생과 동일 규약).
+fn dept_name_from_socket(sock: &str) -> Option<String> {
+    let norm = sock.replace('\\', "/");
+    norm.split('/')
+        .find_map(|seg| seg.strip_prefix("cys-dept-").map(str::to_string))
+        .filter(|n| !n.is_empty())
+}
+
+/// ★WP-3 의도 선기록: 부서 삭제 클릭의 **제1행위** — base 데몬에 dept 묘비를 기록한다(견고
+/// writer=데몬 RPC·topology.json 영속). 이후의 teardown(bash→python 체인·reg_remove)이 무음
+/// 실패해도 리바이버(spawn_org_restore·프론트 복원)가 이 묘비를 게이트로 읽어 부활을 차단한다.
+#[tauri::command]
+async fn dept_tombstone_by_socket(socket: String) -> Result<Value, String> {
+    let name = dept_name_from_socket(&socket)
+        .ok_or_else(|| format!("부서명 파생 실패(비표준 소켓): {socket}"))?;
+    rpc_oneshot(&cys::socket_path(), "dept_tombstone.set", json!({"name": name})).await
+}
+
+/// ★WP-3 리바이버 게이트 소스: base 데몬의 dept 묘비 목록(프론트 복원이 유령 판정에 사용).
+#[tauri::command]
+async fn dept_tombstones() -> Result<Vec<String>, String> {
+    let v = rpc_oneshot(&cys::socket_path(), "dept_tombstone.list", json!({})).await?;
+    Ok(v.get("dept_tombstones")
+        .and_then(|a| a.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .unwrap_or_default())
+}
+
+/// ★WP-1 결정 e(설계 v1.1): "마스터 시작" — cys launch-agent --role master 배선. worker/cso와
+/// 동일 메커니즘(앵커 준수: 시스템은 노드만 띄우고 지휘하지 않는다). CYS_SOCKET 제거로 항상
+/// base 데몬 대상(부서 오염 불가 — 소켓 격리와 동일 축). 생성된 surface는 GUI 자동입양이 수용.
+#[tauri::command]
+async fn start_master() -> Result<(), String> {
+    let cys = resolve_sidecar("cys");
+    let out = tokio::task::spawn_blocking(move || {
+        let mut cmd = std::process::Command::new(&cys);
+        inject_runtime_path(&mut cmd);
+        cmd.env_remove("CYS_SOCKET");
+        cmd.arg("launch-agent").arg("--role").arg("master").arg("--agent").arg("claude");
+        no_console(&mut cmd);
+        cmd.output()
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
 /// 부서 데몬 teardown(socket 기준) — ws 이름 변경(rename)으로 name→socket 매핑이 끊겨도 정확히 종료.
 /// cys-dept down-sock에 일임(레지스트리 역인덱스로 부서명 해석 후 teardown).
 #[tauri::command]
@@ -2073,6 +2154,9 @@ fn main() {
         .plugin(tauri_plugin_notification::init())
         .manage(Attachments(Mutex::new(HashMap::new())))
         .invoke_handler(tauri::generate_handler![
+            dept_tombstone_by_socket,
+            dept_tombstones,
+            start_master,
             daemon_status,
             list_surfaces,
             org_status,

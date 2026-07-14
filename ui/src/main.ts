@@ -2441,7 +2441,17 @@ function buildTab(ws: Workspace): HTMLElement {
       }, 2500);
       return;
     }
+    // ★WP-3 의도 선기록(제1행위): teardown 이전에 base 데몬에 dept 묘비 기록 — 이후 체인이
+    // 무음 실패해도 재시작 부활을 차단한다. 실패=가시화(같은 탭 재삭제가 재시도 — 무음 삼킴 금지).
+    if (ws.socket) {
+      try {
+        await invoke("dept_tombstone_by_socket", { socket: ws.socket });
+      } catch (e) {
+        toast("watchdog", "부서 삭제 의도 기록 실패", `${e} — 삭제는 계속 진행되나 재시작 시 부활할 수 있습니다. 같은 탭을 다시 삭제하면 재시도됩니다.`);
+      }
+    }
     for (const sid of collectSids(ws.tree)) {
+      // pane 개별 close 실패는 관용(묘비가 이미 부활 차단 — per-pane 토스트는 스팸).
       await invoke("close_surface", { socket: ws.socket, surfaceId: sid }).catch(() => {});
       destroyPaneRuntime(sid, ws.socket);
     }
@@ -2451,7 +2461,12 @@ function buildTab(ws: Workspace): HTMLElement {
     // 부서 데몬 teardown은 '그 socket을 쓰는 마지막 탭'일 때만(중복 탭 잔존 시 다른 탭 보호)
     const stillUsed = ws.socket && workspaces.some((w) => w.socket === ws.socket);
     // socket 기준 teardown(order 8) — ws rename으로 name↔socket이 끊겨도 정확히 종료.
-    if (ws.socket && !stillUsed) await invoke("stop_dept_daemon_by_socket", { socket: ws.socket }).catch(() => {});
+    // ★WP-3: 실패 가시화(.catch 삼킴 제거) — 묘비가 부활을 차단하므로 잔존 데몬은 '정리 대기'일 뿐이며
+    // 차회 부팅 reaper가 수렴하지만, 사용자에게는 알린다.
+    if (ws.socket && !stillUsed)
+      await invoke("stop_dept_daemon_by_socket", { socket: ws.socket }).catch((e) =>
+        toast("watchdog", "부서 데몬 종료 실패", `${e} — 부활은 차단됨(삭제 의도 기록됨)·다음 앱 시작 시 자동 정리를 재시도합니다.`),
+      );
     if (workspaces.length === 0) {
       await addWorkspace(); // addWorkspace가 activeWs를 설정
     } else {
@@ -4076,6 +4091,14 @@ async function start() {
   } catch {
     registered = null;
   }
+  // ★WP-3 리바이버 게이트: base 데몬 dept 묘비 — 삭제-의도 부서 탭은 등재 여부와 무관하게 드롭
+  // (reg_remove 무음 실패로 등재가 잔존해도 부활 차단). 조회 실패=null(보수적 보존 — 현행 거동).
+  let deptTombs: Set<string> | null = null;
+  try {
+    deptTombs = new Set((await invoke("dept_tombstones")) as string[]);
+  } catch {
+    deptTombs = null;
+  }
 
   // 부서 데몬 확보를 list 대조보다 선행 — 미가동이면 cys-dept launch. 실패해도(등록된) ws는 보존.
   const ghosts = new Set<number>();
@@ -4088,6 +4111,15 @@ async function start() {
       alive = false;
     }
     if (alive) continue;
+    // ★WP-3: 삭제-의도 묘비 부서 → 등재 여부와 무관하게 드롭(재-launch 금지). 생존(alive) 탭은
+    // 이 검사 이전에 continue — spawn_org_restore reaper가 정지시키면 다음 시작에서 드롭된다.
+    {
+      const dn = deptNameFromSocket(ws.socket);
+      if (deptTombs && dn && deptTombs.has(dn)) {
+        ghosts.add(ws.id);
+        continue;
+      }
+    }
     // 죽은 socket + 레지스트리 미등록 → 유령 → 드롭(재-launch로 부활시키지 않음)
     if (registered && ws.socket && !registered.has(ws.socket)) {
       ghosts.add(ws.id);
@@ -4278,6 +4310,20 @@ document.getElementById("btn-theme")!.addEventListener("click", (e) =>
 // 새 ws를 master로 선언 시 공유 데몬 claim 충돌은 데몬 레벨 claim_denied(cysd handlers.rs·kill 없음)가
 // 비파괴 방어한다(생태계 죽지 않음·거부만). guard-master-claim(Fix2') 부트 자동발동 배선은 별건(헌법 토큰).
 document.getElementById("btn-ws-new")!.addEventListener("click", () => addWorkspace());
+
+// ★WP-1 결정 e(BOOTSTRAP_HARDENING v1.1): "마스터 시작" — cys launch-agent --role master 배선.
+// worker/cso 기동과 동일 메커니즘(앵커: 시스템은 노드만 띄우고 지휘하지 않는다). 초보를 "올바른
+// surface에서 마법 문구 입력"이라는 취약한 산문 계약에서 해방. 명령 자체가 base 데몬 고정
+// (CYS_SOCKET 제거 — start_master)이라 어느 탭에서 눌러도 부서 오염 불가. 생성 surface는 자동입양.
+// 중복 클릭은 데몬 claim_denied가 비파괴 방어(두 번째 master 거부 — 위 btn-ws-new 주석과 동일 축).
+document.getElementById("btn-master-start")?.addEventListener("click", async () => {
+  try {
+    await invoke("start_master");
+    toast("feed", "▶ 마스터 시작", "base 본부에 master 노드를 기동했습니다 — 잠시 후 pane이 자동으로 나타납니다.");
+  } catch (e) {
+    toast("health", "마스터 시작 실패", String(e));
+  }
+});
 
 // ---------- 사이드바 폭 드래그 + 글자 배율 (오너 요청 2026-07-12) ----------
 // 폭·배율은 CSS 변수(--wsbar-w/--wsbar-font)가 진실원, localStorage 영속. 클램프 산식=wsbar.ts.
