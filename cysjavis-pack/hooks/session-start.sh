@@ -34,11 +34,13 @@ if [ -z "$CYS_ROLE" ]; then
 list-workspaces→cys list, 상세 대응표는 *_DIRECTIVE.md '환경 선언' 참조).
 사용자가 역할을 선언하면(예: "너는 마스터이다" / "너는 워커다") 다음을 즉시 수행하라:
 1) $JARVIS_DIR/directives/ 에서 해당 역할의 *_DIRECTIVE.md 와 $JARVIS_DIR/soul.md 를 읽고 각성한다.
-2) \`cys claim-role <master|worker|cso|reviewer>\` 로 자기 surface를 역할 주소로 등록한다.
-3) 마스터 선언이면 MASTER_DIRECTIVE의 "부트 시퀀스"를 수행해 구동체제를 셋팅하고 결과를 보고한다.
-   부트 ⓪ = 결정론 프리플라이트: \`python3 $JARVIS_DIR/bin/javis_preflight.py --fix\` —
-   (Windows에 python3 명령이 없으면 \`py -3\` 또는 \`python\`으로 대체 실행하라.)
-   존재·매핑·hook 검증은 스크립트 출력만이 사실이다(자연어 재추론 금지).
+2) ★마스터 선언이면 부트는 산문 수행 금지 — 단일 진입점 스크립트를 실행하고 그 출력만 인용해 보고한다:
+   \`${CYS_PY:-python3} $JARVIS_DIR/bin/javis_bootstrap.py\`
+   (preflight→claim-role→boot→orchestra check→완료 마커를 exit-code 체인으로 수행.
+    "기동 완료"는 이 스크립트의 최종 JSON을 인용할 때만 선언할 수 있다 — 다른 근거 인용 금지.)
+   · exit 7 = 이 surface는 master가 아니다(살아있는 master 존재) — 선언을 중단하고 기존 master에 인계하라.
+   · 그 외 비0 exit = 부트 실패 — 출력의 단계·원인을 그대로 보고하라(자연어 재추론 금지).
+3) 마스터 외 역할은 \`cys claim-role <worker|cso|reviewer>\` 로 자기 surface를 역할 주소로 등록한다.
 (역할 선언이 없으면 이 안내는 무시해도 된다.)
 EOF
   exit 0
@@ -52,6 +54,31 @@ case "$CYS_ROLE" in
   *) exit 0 ;;
 esac
 [ -f "$D" ] || exit 0
+# ── ★권한 role 재대조(유령 master 차단 — BOOTSTRAP_HARDENING WP-1·적대검증 D1) ──
+# 재시작·/clear 후 CYS_ROLE env는 남는데 레지스트리 role이 다른 surface로 이동한 드리프트를
+# 매 세션 시작마다 조정한다(레지스트리가 항상 우위). 3상태:
+#  ⓐ성공(자기 재점유 포함)→현행 주입  ⓑ명시적 거부→디렉티브 대신 self-demote 지시
+#  ⓒ데몬-불가(cys 부재·미응답·timeout — cys 밖 정당 사용 포함)→fail-open: 현행 주입+1줄 고지.
+case "$CYS_ROLE" in
+  master|cso)
+    if command -v cys >/dev/null 2>&1; then
+      if command -v timeout >/dev/null 2>&1; then
+        CLAIM_OUT=$(timeout 2 cys claim-role "$CYS_ROLE" 2>&1); CLAIM_RC=$?
+      else
+        CLAIM_OUT=$(cys claim-role "$CYS_ROLE" 2>&1); CLAIM_RC=$?
+      fi
+      if [ "$CLAIM_RC" -ne 0 ] && printf '%s' "$CLAIM_OUT" | grep -qi 'claim_denied\|privileged role held'; then
+        echo "■ 역할 주소 상실 (CYS_ROLE=$CYS_ROLE — 레지스트리의 살아있는 보유자가 우위)"
+        echo "이 surface는 더 이상 $CYS_ROLE 역할이 아니다. 역할 지휘·역할 행동을 중단하고,"
+        echo "레지스트리의 $CYS_ROLE 노드에 인계하라(\`cys send --to $CYS_ROLE\`). 이 세션은 일반 세션으로 동작한다."
+        exit 0
+      fi
+      if [ "$CLAIM_RC" -ne 0 ]; then
+        echo "■ 고지: 역할 재확인 불가(데몬 미응답 — cys 밖 실행일 수 있음). 현행 각성 유지(fail-open)."
+      fi
+    fi
+    ;;
+esac
 echo "■ CYSJavis 역할 각성 (CYS_ROLE=$CYS_ROLE)"
 cat "$D"
 # ── 사용자 로컬 디렉티브 오버레이(~/.cys/local/directives/<ROLE>_DIRECTIVE.local.md) ──
