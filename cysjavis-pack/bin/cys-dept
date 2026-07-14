@@ -52,6 +52,17 @@ dept_tombstone(){
   [ -f "$ph" ] || return 0
   python3 "$ph" tombstone "$1" --dept >/dev/null 2>&1 || true
 }
+# ★재생성 묘비 해소(BOOTSTRAP_HARDENING WP-3·R6ⓒ): 삭제된 동명 부서를 다시 만들면 묘비를 해제해야
+# 새 부서가 피닉스 보호집합에 재편입된다(미해소=삭제→재생성 부서가 보호 영구 제외되는 역전 결함).
+# 성공 경로 말미에서만 호출(예약 직후 해소는 생성 실패 시 유령 보호 재편입 위험). rotate는 호출 금지
+# (rotate=묘비 불변 계약 — CYS_DEPT_ROTATE 가드). best-effort(|| true — 생성 흐름 불파괴).
+dept_tombstone_remove(){
+  [ -n "${1:-}" ] || return 0
+  [ "${CYS_DEPT_ROTATE:-}" = "1" ] && return 0
+  ph="${CYS_PACK_DIR:-$PACK_DEFAULT}/bin/javis_phoenix.py"
+  [ -f "$ph" ] || return 0
+  python3 "$ph" tombstone "$1" --dept --remove >/dev/null 2>&1 || true
+}
 
 # RC-15(D7): 부서 로그·상태 디렉토리 — Windows named pipe 소켓(\\.\pipe\...)은 dirname/디렉토리 개념이
 # 없어(RC-4 파생) mkdir·로그 경로가 깨진다. 실 디렉토리로 분리:
@@ -415,6 +426,7 @@ case "$cmd" in
     fi
     seed_schedule "$pack"   # owner-progress-report 제거(부서는 최상위 보고 안 함) — 데몬 30초 핫리로드로 반영
     ceo_promote
+    dept_tombstone_remove "$name"   # WP-3·R6ⓒ: 재기동 성공 = 재생성 의도 확정 → 묘비 해소(rotate는 내부 가드로 no-op)
     echo "[cys-dept] $name 가동 완료 (sock=$sock pack=$pack). 부서 수=$(reg_count)"
     ;;
   allocate)
@@ -514,6 +526,7 @@ PY
     else
       echo "[cys-dept] WARN: $name 셸 생성 실패 — read-screen 점검(데몬·격리는 정상)" >&2
     fi
+    dept_tombstone_remove "$name"   # WP-3·R6ⓒ: 번호 재사용으로 묘비명과 충돌 시 보호 재편입
     echo "[cys-dept] $name allocate 완료 (sock=$sock acct=$acctdir)" >&2
     echo "$name"   # ★stdout 마지막 줄 = 확정 name (Tauri 파싱). 진단은 전부 >&2
     ;;
@@ -652,6 +665,7 @@ PY
     else
       echo "[cys-dept] WARN: $name 셸 생성 실패 — read-screen 점검(데몬·격리는 정상)" >&2
     fi
+    dept_tombstone_remove "$name"   # WP-3·R6ⓒ: 삭제→동명 재생성 시 보호 재편입
     echo "[cys-dept] create '$disp'($name) 완료 (account=$acctkey sock=$sock)" >&2
     echo "$name"   # stdout 마지막 = 확정 name(Tauri 파싱)
     ;;
@@ -682,6 +696,14 @@ for n,e in d.items():
     if e.get('socket')==s: print(n); break
 PY
 )
+    if [ -z "$name" ]; then
+      # ★D8 봉쇄(BOOTSTRAP_HARDENING WP-3): 역인덱스 실패(rename 레이스·레지스트리 손상) 시
+      # 소켓 슬러그(cys-dept-<name>[.sock 부모] · unix/named pipe 공통)에서 name을 파생 —
+      # 종전엔 reg_remove·dept_tombstone이 통째로 스킵돼 '등재+미묘비' 부활 구멍이 남았다.
+      # 파생 실패(비표준 소켓)면 종전과 동일(skip — 보수적).
+      name=$(printf '%s' "$sock" | tr '\\' '/' | grep -o 'cys-dept-[^/]*' | head -1 | sed 's/^cys-dept-//') || true
+      [ -n "$name" ] && echo "[cys-dept] down-sock: 역인덱스 실패 — 소켓 슬러그에서 name 파생($name)" >&2
+    fi
     pid=$(CYS_NO_AUTOSTART=1 CYS_SOCKET="$sock" "$CYS" identify 2>/dev/null | python3 -c "import json,sys;print(json.load(sys.stdin).get('daemon_pid',''))" 2>/dev/null || true)
     if [ -n "${pid:-}" ]; then
       graceful_kill "$pid"
@@ -734,7 +756,8 @@ PY
     fi
     # launch 재귀 호출: 소켓이 죽었으니 새 바이너리로 재spawn. CYS_ROLE 그대로 상속(게이트 통과 주체 동일).
     # launch stdout은 로그로 흘리고, 아래서 새 버전을 확정 출력한다.
-    bash "$0" launch "$name" || { echo "[cys-dept] ERROR: $name rotate 재기동 실패" >&2; exit 1; }
+    # CYS_DEPT_ROTATE=1: launch의 dept_tombstone_remove를 no-op으로 — rotate=묘비 불변 계약(WP-3).
+    CYS_DEPT_ROTATE=1 bash "$0" launch "$name" || { echo "[cys-dept] ERROR: $name rotate 재기동 실패" >&2; exit 1; }
     newver="$(CYS_NO_AUTOSTART=1 CYS_SOCKET="$sock" "$CYS" identify 2>/dev/null | python3 -c "import json,sys;print(json.load(sys.stdin).get('version',''))" 2>/dev/null || true)"
     # ★검증 게이트(지시3): Rust/UI 성공 판정·사람 로그 확인용 — 마지막 줄에 확정 출력.
     echo "rotated $name: v${oldver:-?}→v${newver:-?}"
