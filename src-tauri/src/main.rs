@@ -939,16 +939,30 @@ fn spawn_org_restore(app: AppHandle) {
                     // ★WP-3: 묘비 부서 — 재기동 금지. 생존이면 reap(정리 대기 프로세스 — 묘비가
                     // 부활을 이미 차단하므로 좀비 아님. teardown 실패=WARN·차회 부팅 재평가로 수렴).
                     if tombs.contains(name.as_str()) {
+                        let mut detail = "삭제-의도 묘비 — 재기동 제외".to_string();
                         if alive {
                             let _ = stop_dept_daemon_by_socket(
                                 sock.to_string_lossy().to_string(),
                             )
                             .await;
+                            // ★R4(D-IMPL-4): teardown 함수는 실패를 삼키므로(무조건 Ok) 재프로브로
+                            // 결과를 가시화 — 여전히 생존이면 WARN 라벨(차회 부팅 재시도가 수렴 경로).
+                            let still = tokio::time::timeout(
+                                std::time::Duration::from_secs(2),
+                                rpc_oneshot(&sock, "system.identify", json!({})),
+                            )
+                            .await
+                            .map(|r| r.is_ok())
+                            .unwrap_or(false);
+                            detail = if still {
+                                "삭제-의도 묘비 — teardown 미확정(WARN·차회 시작 시 재시도)".into()
+                            } else {
+                                "삭제-의도 묘비 — 잔존 데몬 정리 완료".into()
+                            };
                         }
                         let _ = app.emit(
                             "restore-progress",
-                            json!({"phase": "skip", "dept": name,
-                                   "detail": "삭제-의도 묘비 — 재기동 제외"}),
+                            json!({"phase": "skip", "dept": name, "detail": detail}),
                         );
                         continue;
                     }

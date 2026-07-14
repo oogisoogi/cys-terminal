@@ -27,6 +27,14 @@ import sys
 import tempfile
 import time
 
+# ★R3(D-IMPL-3): Windows 파이프 환경(cp949/cp1252)에서 한글 출력 UnicodeEncodeError 크래시 방어 —
+# PYTHONUTF8 export는 cys-dept 경로에만 있어 이 스크립트의 직접 실행을 보호하지 못한다.
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 HOME = os.path.expanduser("~")
 CYS_DIR = os.path.join(HOME, ".cys")
 PACK = os.environ.get("CYS_PACK_DIR") or os.path.join(CYS_DIR, "pack")
@@ -158,8 +166,15 @@ def cmd_run():
     if code != 0:
         return log.fail("④boot", code, out, 4)
 
-    # ⑤ orchestra check — bounded retry(노드 ready는 비동기·check는 스냅샷)
     orchestra = os.path.join(PACK, "bin", "javis_orchestra.py")
+
+    # ④-b 리뷰어 감지·무구독 폴백(R1·D-IMPL-1 — 산문 §0 ④-b의 코드 전사): cys boot는 미설치
+    # CLI를 건너뛰므로 agy/codex 부재 기계(초보 전원)에서 대체 리뷰어(reviewer-claude-*)를 기동할
+    # 주체가 없으면 ⑤ check가 영영 실패한다. 실패=기록만(best-effort) — 최종 게이트는 ⑤ check.
+    code, out = _run([py, orchestra, "boot-reviewers"], timeout=180)
+    log.step("④b-boot-reviewers", code, out)
+
+    # ⑤ orchestra check — bounded retry(노드 ready는 비동기·check는 스냅샷)
     code, out = 1, "orchestra 부재"
     for attempt in range(1, CHECK_RETRIES + 1):
         code, out = _run([py, orchestra, "check"], timeout=60)

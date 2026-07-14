@@ -262,6 +262,11 @@ enum Command {
         /// 폐역 해제(재편입 가능).
         #[arg(long)]
         remove: bool,
+        /// 부서(dept) 묘비 대상 — role 세션이 아니라 부서 데몬의 부활을 차단/해소한다
+        /// (BOOTSTRAP_HARDENING WP-3 · dept_tombstone.set RPC). cys-dept가 삭제/재생성 시
+        /// phoenix 묘비와 쌍으로 호출한다(한쪽만 있으면 재생성 부서 살해 또는 부활 구멍).
+        #[arg(long)]
+        dept: bool,
     },
     /// Subscribe to the daemon event stream (push; no polling)
     Events {
@@ -1892,15 +1897,26 @@ fn run(command: Command) -> i32 {
                 })
             }),
 
-        Command::Tombstone { role, remove } => {
-            request("tombstone.set", json!({"role": role, "remove": remove})).map(|r| {
-                let rev = r["tombstones_rev"].as_u64().unwrap_or(0);
-                println!(
-                    "tombstone {} {} (rev={rev})",
-                    role,
-                    if remove { "removed" } else { "set" }
-                );
-            })
+        Command::Tombstone { role, remove, dept } => {
+            if dept {
+                request("dept_tombstone.set", json!({"name": role, "remove": remove})).map(|r| {
+                    let n = r["dept_tombstones"].as_array().map(|a| a.len()).unwrap_or(0);
+                    println!(
+                        "dept tombstone {} {} (총 {n}개)",
+                        role,
+                        if remove { "removed" } else { "set" }
+                    );
+                })
+            } else {
+                request("tombstone.set", json!({"role": role, "remove": remove})).map(|r| {
+                    let rev = r["tombstones_rev"].as_u64().unwrap_or(0);
+                    println!(
+                        "tombstone {} {} (rev={rev})",
+                        role,
+                        if remove { "removed" } else { "set" }
+                    );
+                })
+            }
         }
 
         Command::Events { after_seq, names, categories, filter, reconnect, cursor_file } => {

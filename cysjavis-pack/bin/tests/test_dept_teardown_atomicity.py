@@ -38,9 +38,10 @@ def setup(tmp, reg_depts):
     os.makedirs(os.path.dirname(reg), exist_ok=True)
     with open(reg, "w", encoding="utf-8") as f:
         json.dump({"depts": reg_depts}, f)
-    # 스텁 cys: identify 실패(pid 빈값 → kill 생략)·기타 성공
+    # 스텁 cys: identify 실패(pid 빈값 → kill 생략)·기타 성공·전 호출 기록(A4 데몬 묘비 핀용)
     with open(os.path.join(bindir, "cys"), "w", encoding="utf-8", newline="\n") as f:
-        f.write("#!/bin/sh\ncase \"$1\" in identify) exit 1;; esac\nexit 0\n")
+        f.write("#!/bin/sh\necho \"cys $@\" >> \"%s/calls.log\"\n"
+                "case \"$1\" in identify) exit 1;; esac\nexit 0\n" % tmp)
     os.chmod(os.path.join(bindir, "cys"), 0o755)
     # 스텁 phoenix: 인자 기록만
     with open(os.path.join(fakepack, "javis_phoenix.py"), "w", encoding="utf-8", newline="\n") as f:
@@ -75,6 +76,9 @@ check("A1 down-sock exit 0", code == 0, out[-150:])
 check("A2 reg_remove(레지스트리 비움)",
       json.load(open(reg, encoding="utf-8"))["depts"] == {})
 check("A3 묘비 기록(tombstone dept-3 --dept)", "tombstone dept-3 --dept" in phoenix_log(tmp))
+calls_a = open(os.path.join(tmp, "calls.log"), encoding="utf-8").read() if \
+    os.path.exists(os.path.join(tmp, "calls.log")) else ""
+check("A4 데몬 묘비 병행 기록(D-IMPL-2)", "tombstone dept-3 --dept" in calls_a, calls_a[-120:])
 shutil.rmtree(tmp)
 
 # ── B. D8: 역인덱스 실패여도 슬러그 파생 → 묘비 기록 ──
@@ -109,6 +113,10 @@ check("W2 rotate 가드(export)", "CYS_DEPT_ROTATE=1 bash \"$0\" launch" in src)
 check("W3 helper rotate 가드", '[ "${CYS_DEPT_ROTATE:-}" = "1" ] && return 0' in src)
 check("W4 helper --remove", "--dept --remove" in src)
 check("W5 D8 파생 로직", "cys-dept-[^/]*" in src)
+# ★D-IMPL-2 대칭 핀: phoenix 묘비와 데몬 묘비는 set/remove가 항상 쌍으로 — 한쪽만 있으면
+# "삭제→재생성→재시작 시 새 부서 살해"(데몬 묘비 잔존) 또는 부활 구멍(데몬 묘비 미기록).
+check("W6 데몬 묘비 set 병행", '"$CYS" tombstone "$1" --dept' in src)
+check("W7 데몬 묘비 remove 병행", '"$CYS" tombstone "$1" --dept --remove' in src)
 
 print("\n%d FAIL" % len(fails) if fails else "\nALL PASS")
 sys.exit(1 if fails else 0)

@@ -48,6 +48,10 @@ dept_pack(){ echo "$HOME/.cys/pack-dept-$1"; }
 # 오보하지 않게 한다. best-effort — phoenix 부재·실패가 teardown을 절대 깨지 않는다(|| true·무출력).
 dept_tombstone(){
   [ -n "${1:-}" ] || return 0
+  # ★D-IMPL-2 대칭 계약: phoenix 묘비와 데몬 묘비(base cysd topology)는 항상 쌍으로 set/remove —
+  # 데몬 묘비는 리바이버(spawn_org_restore·프론트 복원)의 게이트, phoenix 묘비는 보호집합의 게이트.
+  # GUI 삭제의 의도-선기록(Tauri dept_tombstone_by_socket)과는 멱등 중복(무해). best-effort.
+  env -u CYS_SOCKET "$CYS" tombstone "$1" --dept >/dev/null 2>&1 || true
   ph="${CYS_PACK_DIR:-$PACK_DEFAULT}/bin/javis_phoenix.py"
   [ -f "$ph" ] || return 0
   python3 "$ph" tombstone "$1" --dept >/dev/null 2>&1 || true
@@ -59,6 +63,9 @@ dept_tombstone(){
 dept_tombstone_remove(){
   [ -n "${1:-}" ] || return 0
   [ "${CYS_DEPT_ROTATE:-}" = "1" ] && return 0
+  # ★D-IMPL-2: 데몬 묘비도 함께 해소 — 이게 없으면 삭제→동명/동번호 재생성 부서를
+  # spawn_org_restore가 묘비로 오판해 reap(재생성-살해). phoenix와 쌍 유지.
+  env -u CYS_SOCKET "$CYS" tombstone "$1" --dept --remove >/dev/null 2>&1 || true
   ph="${CYS_PACK_DIR:-$PACK_DEFAULT}/bin/javis_phoenix.py"
   [ -f "$ph" ] || return 0
   python3 "$ph" tombstone "$1" --dept --remove >/dev/null 2>&1 || true
