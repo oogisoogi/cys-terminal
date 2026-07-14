@@ -1258,6 +1258,28 @@ function applyFontFace(face: string | null) {
   }
 }
 
+// ── 영역별 폰트 커스터마이징(오너 요청 2026-07-14): 제목/본문/메뉴 크기·굵기 + 제목=역할색. localStorage 영속.
+function setDocVar(cssVar: string, lsKey: string, value: string | null) {
+  if (!value) { localStorage.removeItem(lsKey); document.documentElement.style.removeProperty(cssVar); }
+  else { localStorage.setItem(lsKey, value); document.documentElement.style.setProperty(cssVar, value); }
+}
+function applyTitleSize(px: string | null) { setDocVar("--pane-title-size", "cys-title-size", px ? px + "px" : null); }
+function applyTitleWeight(w: string | null) { setDocVar("--pane-title-weight", "cys-title-weight", w); }
+function applyMenuWeight(w: string | null) { setDocVar("--menu-weight", "cys-menu-weight", w); }
+let titleColorRole = localStorage.getItem("cys-title-color-role") !== "0"; // 기본 ON(제목 글자=역할 점색)
+function applyTitleColorRole(on: boolean) { titleColorRole = on; localStorage.setItem("cys-title-color-role", on ? "1" : "0"); }
+function applyTermWeight(w: string | null) {
+  if (!w) localStorage.removeItem("cys-term-weight"); else localStorage.setItem("cys-term-weight", w);
+  const val = w || "400";
+  for (const rt of panes.values()) (rt.term.options as any).fontWeight = val;
+}
+// 마운트 시 저장값 복원(초기 1회)
+(function restoreFontCustomizations() {
+  const ts = localStorage.getItem("cys-title-size"); if (ts) document.documentElement.style.setProperty("--pane-title-size", ts + "px");
+  const tw = localStorage.getItem("cys-title-weight"); if (tw) document.documentElement.style.setProperty("--pane-title-weight", tw);
+  const mw = localStorage.getItem("cys-menu-weight"); if (mw) document.documentElement.style.setProperty("--menu-weight", mw);
+})();
+
 // Control Center 본문 전용 zoom — 터미널 fontSize와 분리(배율 단위).
 // WebKit `zoom`을 #cc-body에만 적용(host #cc-panel은 fixed라 zoom 시 위치/스크롤 회귀 → 본문만 확대,
 // sticky 헤더·탭은 1.0x 유지). 사이드바(ft/feed)는 터미널 작업공간 폭이라 zoom 비대상(터미널 fit 회귀 방지).
@@ -1478,6 +1500,7 @@ async function refreshPaneTitles() {
         if (!rt) continue;
         renderUsage(rt.usageEl, s.exited ? null : s.usage); // 종료 pane은 배지 제거 (혼동 방지)
         setRoleDot(rt.roleEl, s.exited ? null : s.role, !s.exited && surfaceWorking(s.surface_id)); // 역할 점 + 작동중일 때만 깜빡, 동일 주기 갱신
+        rt.titleEl.style.color = (titleColorRole && !s.exited && roleDotColor(s.role)) ? (roleDotColor(s.role) as string) : ""; // 제목 글자색 = 역할 점색(오너 요청 2026-07-14·토글 시)
         if (rt.titleEl.isContentEditable) continue; // 이름 편집 중에는 덮어쓰지 않음
         rt.titleEl.textContent = paneTitle(s.title, s.live_cwd) + (s.exited ? " [exited]" : "");
       }
@@ -1614,6 +1637,7 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
     // 폰트: 기본 스택(Latin 등폭을 CJK보다 앞에 — 셀 폭 측정 왜곡 방지)·선택 폰트 합성 = appearance.ts.
     fontFamily: composeFontFamily(fontFace),
     fontSize,
+    fontWeight: (localStorage.getItem("cys-term-weight") || "normal") as any, // 본문 굵기 재시작 유지(오너 요청 2026-07-14)
     // 배경 테마: 하드코딩 리터럴 대신 현재 색 상태 참조 — 새 pane도 커스텀 색으로 생성된다.
     theme: { background: currentBg(), foreground: readableForeground(currentBg()) },
     scrollback: 5000,
@@ -2765,6 +2789,26 @@ function openThemePopover(anchor: HTMLElement) {
   fontSel.addEventListener("change", () => applyFontFace(fontSel.value || null));
   fontRow.appendChild(fontSel);
 
+  // 영역별 폰트 컨트롤(오너 요청 2026-07-14): 제목 크기·굵기·색 + 본문/메뉴 굵기.
+  const WEIGHTS: [string, string][] = [["가늘게", "300"], ["보통", "400"], ["굵게", "600"], ["매우 굵게", "700"]];
+  const mkWeightRow = (txt: string, lsKey: string, def: string, on: (v: string) => void) => {
+    const r = document.createElement("label"); r.className = "theme-pop-row"; r.textContent = txt;
+    const sel = document.createElement("select");
+    for (const [l, w] of WEIGHTS) { const o = document.createElement("option"); o.value = w; o.textContent = l; sel.appendChild(o); }
+    sel.value = localStorage.getItem(lsKey) || def; sel.addEventListener("change", () => on(sel.value));
+    r.appendChild(sel); return r;
+  };
+  const titleSizeRow = document.createElement("label"); titleSizeRow.className = "theme-pop-row"; titleSizeRow.textContent = "제목 크기";
+  const tsInp = document.createElement("input"); tsInp.type = "number"; tsInp.min = "8"; tsInp.max = "40"; tsInp.style.width = "56px";
+  tsInp.value = localStorage.getItem("cys-title-size") || "20";
+  tsInp.addEventListener("input", () => applyTitleSize(tsInp.value)); titleSizeRow.appendChild(tsInp);
+  const titleWeightRow = mkWeightRow("제목 굵기", "cys-title-weight", "400", applyTitleWeight);
+  const titleColorRow = document.createElement("label"); titleColorRow.className = "theme-pop-row"; titleColorRow.textContent = "제목=역할색";
+  const tcCb = document.createElement("input"); tcCb.type = "checkbox"; tcCb.checked = titleColorRole;
+  tcCb.addEventListener("change", () => applyTitleColorRole(tcCb.checked)); titleColorRow.appendChild(tcCb);
+  const termWeightRow = mkWeightRow("본문 굵기", "cys-term-weight", "400", applyTermWeight);
+  const menuWeightRow = mkWeightRow("메뉴 굵기", "cys-menu-weight", "600", applyMenuWeight);
+
   const reset = document.createElement("button");
   reset.className = "theme-pop-reset";
   reset.textContent = "기본값 복원";
@@ -2773,9 +2817,14 @@ function openThemePopover(anchor: HTMLElement) {
     picker.value = DEFAULT_BG;
     applyFontFace(null);
     fontSel.value = "";
+    applyTitleSize(null); tsInp.value = "20";
+    applyTitleWeight(null); (titleWeightRow.querySelector("select") as HTMLSelectElement).value = "400";
+    applyTitleColorRole(true); tcCb.checked = true;
+    applyTermWeight(null); (termWeightRow.querySelector("select") as HTMLSelectElement).value = "400";
+    applyMenuWeight(null); (menuWeightRow.querySelector("select") as HTMLSelectElement).value = "600";
   });
 
-  pop.append(row, fontRow, reset);
+  pop.append(row, fontRow, titleSizeRow, titleWeightRow, titleColorRow, termWeightRow, menuWeightRow, reset);
 
   // 앵커(테마 버튼) 하단에 배치 후 화면 밖으로 나가면 안쪽으로 보정.
   const r = anchor.getBoundingClientRect();

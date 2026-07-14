@@ -92,7 +92,7 @@ body.wsbar-resizing { cursor: col-resize; -webkit-user-select: none; user-select
 /* 사이드바 글자 배율(--wsbar-font·A−/A＋ 버튼·영속) — 고정 2배 하드코딩을 배율로 대체(오너 가독성 요청의 상위 호환 2026-07-12) */
 .ws-tab .ws-name {
   flex: 1; min-width: 0;
-  font-size: calc(13px * var(--wsbar-font, 1)); font-weight: 600;
+  font-size: calc(13px * var(--wsbar-font, 1)); font-weight: var(--menu-weight, 600);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .ws-tab .ws-sub {
@@ -225,10 +225,10 @@ body.ws-reordering { cursor: grabbing; -webkit-user-select: none; user-select: n
 .pane .pane-title {
   display: flex; align-items: center; gap: 6px;
   width: fit-content; max-width: 100%;
-  height: 26px; line-height: 26px; padding: 0 10px;
-  font-size: 15px; color: #8b949e; background: var(--bar);
+  height: calc(var(--pane-title-size, 20px) + 12px); line-height: calc(var(--pane-title-size, 20px) + 12px); padding: 0 10px;
+  font-size: var(--pane-title-size, 20px); color: var(--pane-title-color, #8b949e); background: var(--bar);
   font-family: var(--ui-title-font, "JetBrains Mono", Menlo, ui-monospace, monospace);
-  font-weight: 400;
+  font-weight: var(--pane-title-weight, 400);
   border: 1px solid var(--hairline); border-top: none; border-left: none;
   border-radius: 0 0 6px 0;
   white-space: nowrap;
