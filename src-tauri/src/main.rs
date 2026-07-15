@@ -2359,19 +2359,45 @@ fn main() {
                 let launchd_owns = maybe_autoregister_launchd().await;
                 #[cfg(not(target_os = "macos"))]
                 let launchd_owns = false;
-                let result = if launchd_owns {
-                    // launchd가 cysd를 소유·기동한다 — 수동 spawn 금지(중복 spawn·flock 경합 방지,
-                    // codex BLOCKER). launchctl load는 비동기라 socket-ready를 최대 5초 폴링.
+                // ★신선 머신 부트 수리(오너 2026-07-15 — "daemon: connecting…" 영구 고착 실사고):
+                // 종전에는 launchd 소유 시 5초 무응답이면 부트 시퀀스 전체를 영구 포기했다(재시도·
+                // 폴백 전무 — 온보딩·이벤트 파이프까지 미실행). 최신 macOS는 앱이 등록한 LaunchAgent를
+                // '백그라운드 항목' 사용자 승인까지 보류할 수 있고, 첫 실행 Gatekeeper 검증은 5초를
+                // 훌쩍 넘긴다. 수리: ①launchd 5초 무응답 → 형제 spawn 폴백(CLI cys와 대칭 — 중복
+                // spawn은 cysd 시동 잠금(healthy-holder 거부)이 단일 인스턴스 보장) ②그래도 실패면
+                // 15초 간격 백그라운드 재시도(최대 20회 ≈ 5분 — 승인 지연·느린 첫 기동 흡수)
+                // ③4회째부터 로그인 항목 안내 이벤트(daemon-retry-hint) — 생초보 가이드.
+                let mut result = if launchd_owns {
                     if wait_for_connect(50).await {
                         Ok(())
                     } else {
-                        Err("launchd-owned cysd did not become ready within 5s".to_string())
+                        eprintln!("[cys-app] launchd-owned cysd not ready in 5s — 형제 spawn 폴백");
+                        ensure_daemon().await
                     }
                 } else {
                     ensure_daemon().await
                 };
+                if result.is_err() {
+                    for attempt in 1..=20u32 {
+                        let _ = handle.emit(
+                            "daemon-error",
+                            format!("데몬 대기 중 — 재시도 {attempt}/20 (15초 간격)"),
+                        );
+                        if attempt == 4 {
+                            let _ = handle.emit("daemon-retry-hint", ());
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                        if ensure_daemon().await.is_ok() {
+                            result = Ok(());
+                            break;
+                        }
+                    }
+                }
                 if let Err(e) = result {
-                    let _ = handle.emit("daemon-error", e);
+                    let _ = handle.emit(
+                        "daemon-error",
+                        format!("{e} — 데몬을 시작하지 못했습니다. 시스템 설정 → 일반 → 로그인 항목에서 cys 백그라운드 항목을 허용한 뒤 앱을 다시 여세요."),
+                    );
                     return;
                 }
                 let _ = handle.emit("daemon-ready", ());

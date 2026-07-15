@@ -3995,6 +3995,17 @@ async function start() {
     listen("daemon-error", (e) => {
       info.textContent = `daemon error: ${e.payload}`;
     });
+    // ★신선 머신 부트 수리 짝(오너 2026-07-15): 백엔드 재시도 4회째 발화 — 상단바 텍스트는
+    // 초보자가 놓치므로 sticky 토스트로 로그인 항목 승인 안내(데몬이 뜨면 daemon-ready가 진행).
+    listen("daemon-retry-hint", () => {
+      stickyToast(
+        "daemon-hint",
+        "health",
+        "데몬 시작 대기 중",
+        "백그라운드 서비스(cysd) 시작을 기다리고 있습니다. 계속 이 상태면: 시스템 설정 → 일반 → 로그인 항목에서 cys 관련 항목을 허용해 주세요. 허용 즉시 자동으로 연결됩니다.",
+      );
+    });
+    listen("daemon-ready", () => dismissToast("daemon-hint"));
     const probe = setInterval(async () => {
       try {
         await invoke("daemon_status");
