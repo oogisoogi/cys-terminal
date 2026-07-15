@@ -1,9 +1,10 @@
 // 업데이트 분기 판정 — 순수 함수 (옵션 2 · 오너 승인 2026-07-14).
 // 목적: "본체+팩 동시 존재 & 바이너리 호환"일 때 팩 무중단 경로가 본체 알림에
-// 가려지던 간극을 닫는다(pack-and-binary 분기 신설). T5 정책(본체=홈페이지 전용)
-// 불변 — 본체 인앱 설치를 되살리지 않는다.
-// 계약: ①기존 4분기(binary/pack/binary-required/none)의 배지·문구는 종전과 동일
-// (회귀 0 — updateplan.test.ts가 문자열 단위로 핀) ②silent 경로는 토스트만
+// 가려지던 간극을 닫는다(pack-and-binary 분기 신설).
+// ★T5 개정(오너 2026-07-15 실험): 본체 인앱 패치 설치(install_update) 재배선 —
+// binary·pack-and-binary 문구가 "홈페이지 다운로드"에서 "Update 버튼 패치 설치"로
+// 바뀌었고 updateplan.test.ts 핀도 함께 갱신됐다(의도적 계약 변경).
+// 계약: ①분기 구조(5분기)는 불변 ②silent 경로는 토스트만
 // (모달 금지 — 시작 시 자동 체크가 온보딩 화면에 끼어들지 않게, 성찰 불변식).
 
 export type UpdateInputs = {
@@ -24,25 +25,25 @@ export type UpdatePlan = {
 
 export function updatePlan(i: UpdateInputs): UpdatePlan {
   if (i.binVersion && i.packVersion && !i.binaryTooOld) {
-    // ★옵션 2 신설: 팩 무중단을 가리지 않는다 — 팩은 지금(↻·재시작 없음), 본체는 홈페이지.
+    // ★옵션 2: 팩 무중단을 가리지 않는다 — 팩은 지금(↻·재시작 없음), 본체는 패치 설치(T5 개정).
     return {
       kind: "pack-and-binary",
       badge: "↻",
       ok: false,
-      title: `팩 ${i.packVersion} 무중단 적용 가능 (새 본체 ${i.binVersion}은 홈페이지)`,
+      title: `팩 ${i.packVersion} 무중단 적용 가능 (새 본체 ${i.binVersion}은 패치 설치)`,
       toastMsg:
         `팩 ${i.packVersion}은 상단 Update로 무중단 적용(재시작 없음) · ` +
-        `새 본체 ${i.binVersion}은 홈페이지(www.cysinsight.com)에서 다운로드`,
+        `새 본체 ${i.binVersion}은 Update 버튼으로 패치 설치(재시작·자동 복원)`,
     };
   }
   if (i.binVersion) {
-    // (T5) 본체는 홈페이지 다운로드 전용 — 종전 문구 그대로(회귀 0).
+    // 본체 패치 설치(T5 개정 — 오너 2026-07-15): Update 버튼 클릭 시 인앱 패치 설치.
     return {
       kind: "binary",
       badge: "!",
       ok: false,
-      title: `새 본체 버전 ${i.binVersion} (홈페이지에서 다운로드)`,
-      toastMsg: `새 본체 ${i.binVersion} — 홈페이지(www.cysinsight.com)에서 다운로드`,
+      title: `새 본체 버전 ${i.binVersion} (Update 버튼으로 패치 설치)`,
+      toastMsg: `새 본체 ${i.binVersion} — 상단 Update 버튼으로 패치 설치(재시작·자동 복원)`,
     };
   }
   if (i.packVersion && !i.binaryTooOld) {

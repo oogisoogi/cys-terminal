@@ -8,9 +8,9 @@ describe("updatePlan — 옵션 2 분기 판정(문자열 핀 = 회귀 0 증명)
     const p = updatePlan({ ...base, binVersion: "0.12.57", packVersion: "0.12.58" });
     expect(p.kind).toBe("pack-and-binary");
     expect(p.badge).toBe("↻");
-    expect(p.title).toBe("팩 0.12.58 무중단 적용 가능 (새 본체 0.12.57은 홈페이지)");
+    expect(p.title).toBe("팩 0.12.58 무중단 적용 가능 (새 본체 0.12.57은 패치 설치)");
     expect(p.toastMsg).toContain("무중단 적용(재시작 없음)");
-    expect(p.toastMsg).toContain("www.cysinsight.com"); // T5 본체 안내 보존
+    expect(p.toastMsg).toContain("패치 설치"); // T5 개정(오너 2026-07-15) — 본체 인앱 패치 안내
   });
 
   test("본체+팩 동시 + 비호환 → 종전대로 본체 필요(가림이 정당한 케이스)", () => {
@@ -19,12 +19,12 @@ describe("updatePlan — 옵션 2 분기 판정(문자열 핀 = 회귀 0 증명)
     expect(p.kind).toBe("binary");
   });
 
-  test("본체만 → 종전 문구 그대로(T5·회귀 0)", () => {
+  test("본체만 → 패치 설치 문구(T5 개정 — 오너 2026-07-15)", () => {
     const p = updatePlan({ ...base, binVersion: "0.12.57", packVersion: null });
     expect(p.kind).toBe("binary");
     expect(p.badge).toBe("!");
-    expect(p.title).toBe("새 본체 버전 0.12.57 (홈페이지에서 다운로드)");
-    expect(p.toastMsg).toBe("새 본체 0.12.57 — 홈페이지(www.cysinsight.com)에서 다운로드");
+    expect(p.title).toBe("새 본체 버전 0.12.57 (Update 버튼으로 패치 설치)");
+    expect(p.toastMsg).toBe("새 본체 0.12.57 — 상단 Update 버튼으로 패치 설치(재시작·자동 복원)");
   });
 
   test("팩만 + 호환 → 종전 무중단 문구 그대로(회귀 0)", () => {

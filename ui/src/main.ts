@@ -3185,12 +3185,12 @@ async function checkForUpdate(silent: boolean) {
       // silent 경로에만 해당·비silent도 모달 1개 상한), 본체는 토스트로 병행 안내(T5 경로 유지).
       if (!silent) {
         promptPackInstall();
-        toast("feed", "🔄 새 본체도 있음", `새 본체 ${updateAvailable!.version} — 홈페이지(www.cysinsight.com)에서 다운로드`);
+        toast("feed", "🔄 새 본체도 있음", `새 본체 ${updateAvailable!.version} — 상단 Update 버튼으로 패치 설치(재시작·자동 복원)`);
       } else toast("feed", "↻ 무중단 팩 + 새 본체", plan.toastMsg);
       break;
     case "binary":
-      // (T5) 본체(바이너리) 업데이트는 홈페이지 다운로드 전용 — 인앱 재시작 설치 폐지(오너 정책).
-      if (!silent) promptBinaryHomepage();
+      // 본체(바이너리) 패치 설치 — 오너 지시(2026-07-15) 재배선(구 T5 홈페이지 전용의 실험적 개정).
+      if (!silent) promptBinaryPatch();
       else toast("feed", "🔄 새 본체 버전", plan.toastMsg);
       break;
     case "pack":
@@ -3212,25 +3212,29 @@ async function checkForUpdate(silent: boolean) {
   }
 }
 
-/// (T5) 본체(바이너리) 업데이트 안내 — 인앱 install_update 폐지, 홈페이지 다운로드 전용(오너 정책).
-/// 새 본체 버전을 알리고 확인 시 다운로드 페이지를 시스템 브라우저로 연다(open_url = Rust HARD
-/// 화이트리스트 게이트). 데몬·세션은 건드리지 않는다(재시작 없음 — 팩 경로 promptPackInstall과 별개).
-async function promptBinaryHomepage() {
+/// 본체(바이너리) 패치 설치 — 오너 지시(2026-07-15)로 인앱 install_update 재배선(구 T5 홈페이지
+/// 전용 정책의 실험적 개정). install_update = drain 저장 신호 → 다운로드·서명검증 → .app 교체 →
+/// 데몬 핸드오프 → 앱 재시작(부서·노드는 피닉스·resume으로 자동 복원). 진행 표시는
+/// update-progress 리스너("upd-bin" sticky)가 전담한다.
+async function promptBinaryPatch() {
   if (!updateAvailable) {
     await checkForUpdate(false);
     return;
   }
   const v = updateAvailable.version;
   const ok = await confirmModal(
-    `새 본체 버전 ${v}`,
-    `새 본체(앱) 버전 ${v}이 있습니다. 본체 업데이트는 홈페이지에서 내려받아 설치합니다.\n\n` +
-      `확인을 누르면 다운로드 페이지(www.cysinsight.com)를 엽니다.`,
+    `새 본체 버전 ${v} — 패치 설치`,
+    `새 본체(앱) ${v}을 패치 방식으로 설치합니다: 저장(drain) 신호 후 다운로드·서명 검증·교체하고 앱을 ` +
+      `재시작합니다. 부서·노드는 재시작 후 자동 복원됩니다(대화 기억 포함). 마지막 미저장분은 손실될 수 ` +
+      `있습니다.\n\n지금 설치하시겠습니까? (수동 설치는 홈페이지 www.cysinsight.com)`,
   );
   if (!ok) return;
   try {
-    await invoke("open_url", { url: "https://www.cysinsight.com" });
+    await invoke("install_update", { force: true });
+    // 성공 시 백엔드가 app.restart()까지 수행 — 후속 UI 처리 없음(진행은 update-progress 리스너).
   } catch (e) {
-    toast("health", "홈페이지 열기 실패", String(e));
+    dismissToast("upd-bin");
+    toast("health", "패치 설치 실패", String(e));
   }
 }
 
@@ -3368,6 +3372,60 @@ async function manualRotateSkewed(appVer: string, heldMain: boolean, heldDepts: 
   }
 }
 
+// ── 상시 "↻ 재시작" 버튼(초보자용) — 수동 "데몬 kill + 앱 재실행" 루틴의 원클릭 대체 ──
+// 스큐 여부와 무관하게 메인→살아있는 부서 데몬을 force 순차 교대한다(drain 저장 → 종료 → 새 데몬 기동 →
+// 피닉스·resume 복원). manualRotateSkewed와 동일 백엔드(rotate_daemon/rotate_dept_daemon force=true) 재사용.
+// 앱 재시작 없음 — install_update의 app.restart()는 single-instance 레이스 경고 경로(휴면)라 배제,
+// GUI는 새 데몬에 자동 재연결된다. 죽은 부서 소켓은 skip(detectSkew 동형 — 부서 부활은 CSO·피닉스 소유).
+async function manualRestartAllDaemons() {
+  if (rotatingDaemon) {
+    toast("feed", "재시작 진행 중", "데몬 교대·재검이 진행 중입니다 — 잠시 후 다시 시도하세요.");
+    return;
+  }
+  const ok = await confirmModal(
+    "데몬 재시작",
+    "데몬(메인+부서)을 다시 시작합니다. 진행 중인 노드에 저장(drain) 신호를 보낸 뒤 데몬을 새로 켜고, " +
+      "부서·노드는 대화 기억까지 자동 복원됩니다. 마지막 미저장분은 손실될 수 있습니다.\n\n지금 재시작하시겠습니까?",
+  );
+  if (!ok) return;
+  rotatingDaemon = true;
+  stickyToast("restart-daemon", "feed", "↻ 데몬 재시작", "저장 후 데몬을 다시 시작하는 중… 부서·노드를 자동 복원합니다.");
+  try {
+    await invoke("rotate_daemon", { force: true });
+    // 부서 열거=list_depts(레지스트리 SOT) + daemon_status 생존 확인 — detectSkew 동형(죽은 등재 skip).
+    const reg = (await invoke("list_depts").catch(() => ({ depts: {} }))) as {
+      depts?: Record<string, { socket?: string }>;
+    };
+    let deptRestoreFailed = false;
+    const failedDepts: string[] = [];
+    for (const [name, meta] of Object.entries(reg.depts ?? {})) {
+      if (!meta.socket) continue;
+      try {
+        await invoke("daemon_status", { socket: meta.socket });
+      } catch {
+        continue; // 죽은/전이 중 부서 소켓 skip(무해)
+      }
+      try {
+        const info = (await invoke("rotate_dept_daemon", { name, force: true })) as { restore_ok?: boolean };
+        if (info?.restore_ok === false) deptRestoreFailed = true;
+      } catch {
+        failedDepts.push(name);
+      }
+    }
+    dismissToast("restart-daemon");
+    if (failedDepts.length)
+      toast("health", "⚠ 일부 부서 재시작 실패", `메인 데몬은 재시작됐으나 부서 교대가 실패했습니다: ${failedDepts.join(", ")} — 상태를 점검하세요.`);
+    else if (deptRestoreFailed)
+      toast("health", "⚠ 재시작 후 부서 복원 실패", "데몬은 재시작됐으나 일부 부서 노드 복원이 실패했습니다 — 상태를 점검하세요.");
+    else toast("watchdog", "✅ 데몬 재시작 완료", "데몬이 다시 시작됐습니다. 부서·노드 복원이 진행됩니다.");
+  } catch (e) {
+    dismissToast("restart-daemon");
+    toast("health", "데몬 재시작 실패", String(e));
+  } finally {
+    rotatingDaemon = false;
+  }
+}
+
 // 시작 시 1회 + 5분 주기(B) — 스큐 재검·배지 멱등 갱신·무손실 자동 교대·1회 능동 안내(C).
 async function checkVersionSkew() {
   if (rotatingDaemon) return; // 교대 진행 중 중복 발동 방지(주기 타이머·수동 클릭)
@@ -3438,9 +3496,9 @@ async function promptPackInstall() {
 }
 
 /// Update 버튼 디스패처 — 가용 업데이트 종류에 따라 경로를 고른다.
-/// 본체(바이너리)=홈페이지 다운로드 안내(T5·재시작 없음) → 무중단 팩 → 미확인 시 수동 재확인.
+/// 본체(바이너리)=패치 설치(오너 2026-07-15 재배선·재시작+자동복원) → 무중단 팩 → 미확인 시 수동 재확인.
 async function onUpdateButton() {
-  if (updateAvailable) return promptBinaryHomepage();
+  if (updateAvailable) return promptBinaryPatch();
   if (packUpdateAvailable && !packUpdateAvailable.binary_too_old) return promptPackInstall();
   return checkForUpdate(false);
 }
@@ -3976,8 +4034,8 @@ async function start() {
   });
 
   // 바이너리 업데이트 진행률(install_update가 emit). chunk=이번 청크 바이트(누적 아님), total=전체(Option→null 가능).
-  // ★v0.12.51+ 휴면: 본체 업데이트가 홈페이지 다운로드로 전환돼(T5) install_update가 UI에서 호출되지 않으므로
-  //   이 리스너는 발화하지 않는다 — 백엔드 재활성화 여지를 위해 유지(backend install_update 주석과 짝).
+  // ★재활성(오너 2026-07-15): promptBinaryPatch가 install_update를 다시 호출한다 — 이 리스너가
+  //   "upd-bin" sticky 진행 토스트를 전담(backend install_update 주석과 짝).
   let updDownloaded = 0;
   await listen("update-progress", (e) => {
     const p = (e.payload ?? {}) as { phase?: string; chunk?: number; total?: number };
@@ -4078,6 +4136,21 @@ async function start() {
   // 시작 시 + 6시간마다 백그라운드 업데이트 확인 (조용히 — 있으면 badge·toast)
   checkForUpdate(true);
   setInterval(() => checkForUpdate(true), 6 * 3600 * 1000);
+
+  // 테스트 전용(패치 채널 E2E — 오너 2026-07-15): CYS_AUTOTEST_PATCH_INSTALL=1 env 기동이면 기동
+  // 직후 패치 설치를 무클릭 자동 발화(Finder 런칭엔 env 부재 → 프로덕션 무영향). install_update가
+  // 자체적으로 업데이트를 재확인하므로 updateAvailable 상태에 의존하지 않는다.
+  (async () => {
+    try {
+      if ((await invoke("autotest_patch_install")) === true) {
+        stickyToast("upd-bin", "feed", "⬇ 패치 설치(자동 테스트)", "패치 업데이트 확인·설치 중…");
+        await invoke("install_update", { force: true });
+      }
+    } catch (e) {
+      dismissToast("upd-bin");
+      toast("health", "자동 테스트 패치 실패", String(e));
+    }
+  })();
 
   // Session restore (멀티마스터 F4): 저장본 먼저 로드(ws.socket 포함) → 부서 데몬 확보를 list 대조보다
   // 선행 → 소켓별 대조. 데몬 일시 미가동 ws는 보존(영구 삭제 방지, 검증 mustFix).
@@ -4337,6 +4410,7 @@ document.getElementById("cc-sessions-redact")!.addEventListener("click", (e) => 
   refreshSessions();
 });
 document.getElementById("btn-update")!.addEventListener("click", () => onUpdateButton());
+document.getElementById("btn-restart-daemon")!.addEventListener("click", () => void manualRestartAllDaemons());
 document.getElementById("btn-theme")!.addEventListener("click", (e) =>
   openThemePopover(e.currentTarget as HTMLElement),
 );

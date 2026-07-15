@@ -1879,10 +1879,37 @@ async fn rotate_dept_daemon(app: AppHandle, name: String, force: bool) -> Result
     Ok(info)
 }
 
+/// 업데이트 체크·설치 공용 updater 핸들. CYS_UPDATE_MANIFEST_URL(테스트 전용 env)이 있으면 그
+/// 엔드포인트로 오버라이드한다 — 패치 채널 E2E 실기기 검증용(Finder 런칭엔 env가 없어 프로덕션
+/// 경로는 tauri.conf 기본 엔드포인트 그대로). ★서명 검증 불변: 설치는 baked pubkey로 .sig를
+/// 검증하므로 엔드포인트 교체가 위조 패키지 설치를 허용하지 않는다.
+fn build_updater(app: &AppHandle) -> Result<tauri_plugin_updater::Updater, String> {
+    if let Some(u) = cys::env_compat("CYS_UPDATE_MANIFEST_URL") {
+        let url: tauri::Url = u
+            .parse()
+            .map_err(|e| format!("CYS_UPDATE_MANIFEST_URL 파싱 실패: {e}"))?;
+        return app
+            .updater_builder()
+            .endpoints(vec![url])
+            .map_err(|e| e.to_string())?
+            .build()
+            .map_err(|e| e.to_string());
+    }
+    app.updater().map_err(|e| e.to_string())
+}
+
+/// 테스트 전용(패치 채널 E2E — 오너 2026-07-15): CYS_AUTOTEST_PATCH_INSTALL=1 env로 기동된
+/// 경우에만 true — UI가 기동 직후 패치 설치를 무클릭 자동 발화한다(Finder 런칭엔 env 부재 →
+/// 프로덕션 무영향).
+#[tauri::command]
+fn autotest_patch_install() -> bool {
+    cys::env_compat("CYS_AUTOTEST_PATCH_INSTALL").as_deref() == Some("1")
+}
+
 /// 업데이트 확인: 새 버전이 있으면 (version, notes)를 반환, 없으면 null.
 #[tauri::command]
 async fn check_update(app: AppHandle) -> Result<Option<Value>, String> {
-    let updater = app.updater().map_err(|e| e.to_string())?;
+    let updater = build_updater(&app)?;
     match updater.check().await.map_err(|e| e.to_string())? {
         Some(update) => Ok(Some(json!({
             "version": update.version,
@@ -1991,8 +2018,8 @@ async fn live_session_count() -> Result<u64, String> {
 
 /// 업데이트 다운로드·설치 후 데몬 핸드오프 + 재시작.
 /// force=false: 살아있는 세션이 있으면 설치 전에 거부(UI가 확인 후 force=true로 재호출).
-/// ★v0.12.51+ UI 미사용(후속 제거 예정) — 본체 업데이트는 홈페이지 다운로드로 전환됨(T5). 이 커맨드와
-///   update-progress emit은 미래 재활성화 여지를 위해 유지하나 UI에서 호출되지 않는다(promptBinaryHomepage 대체).
+/// ★재배선(오너 2026-07-15): 본체 패치(인앱) 설치 경로 재활성화 — UI promptBinaryPatch가 호출한다
+///   (구 T5 홈페이지 전용 정책의 실험적 개정 · 실기기 검증 대상). 아래 app.restart() 레이스 경고 참조.
 #[tauri::command]
 async fn install_update(app: AppHandle, force: bool) -> Result<(), String> {
     // 1) 세션 가드 (오너 정책: 없으면 자동·있으면 확인)
@@ -2001,7 +2028,7 @@ async fn install_update(app: AppHandle, force: bool) -> Result<(), String> {
         return Err(format!("live_sessions:{sessions}"));
     }
     // 2) 업데이트 받아 설치 (.app 번들 교체 — 새 cysd/cys 동봉)
-    let updater = app.updater().map_err(|e| e.to_string())?;
+    let updater = build_updater(&app)?;
     let update = updater
         .check()
         .await
@@ -2302,6 +2329,7 @@ fn main() {
             check_pack_update,
             live_session_count,
             install_update,
+            autotest_patch_install,
             rotate_daemon,
             install_pack_update,
             launch_dept_daemon,
