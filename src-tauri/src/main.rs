@@ -895,6 +895,32 @@ async fn run_sidecar_restore(socket: Option<std::path::PathBuf>) -> bool {
     .unwrap_or(false)
 }
 
+/// ★TCC 처방(오너 2026-07-15 — EPERM 실사고 구조 수리): 서명이 바뀌는 업그레이드마다 macOS가
+/// 폴더 접근 권한(TCC)을 리셋해 pane 자식(claude 등)이 작업 폴더 읽기에서 EPERM으로 죽는다.
+/// ①GUI(UI 프로세스)가 기동 시 데스크톱/문서를 read_dir — 미결정 상태면 macOS 권한 팝업이 떠
+///   선제 해결된다(UI 프로세스만 팝업 표시 가능 · CLI 자식은 팝업 없이 조용히 거부됨).
+/// ②이미 거부된 상태(팝업 재유도 불가)면 perm-warning 이벤트 → 프론트 sticky 토스트로 설정
+///   경로 안내. 매 기동 실행 — 저비용·멱등(허용 상태면 무음).
+#[cfg(target_os = "macos")]
+fn nudge_folder_permissions(app: &AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let home = cys::home_dir();
+        for folder in ["Desktop", "Documents"] {
+            let p = home.join(folder);
+            let denied = tokio::task::spawn_blocking(move || {
+                matches!(std::fs::read_dir(&p),
+                         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied)
+            })
+            .await
+            .unwrap_or(false);
+            if denied {
+                let _ = app.emit("perm-warning", json!({"folder": folder}));
+            }
+        }
+    });
+}
+
 /// (T2) 업데이트 후 조직 전체 복원 — setup 완료를 막지 않도록 백그라운드 태스크로 순차 실행하며
 /// restore-progress를 emit한다(update-progress emit 스타일 동형). 본부=기본 소켓 사이드카 restore →
 /// list_depts() 순회: 부서 데몬이 살아있으면 사이드카 restore(부서 소켓), 죽었으면 기존 launch 경로
@@ -2343,6 +2369,9 @@ fn main() {
                 }
                 // 업데이트 재시작 시: 새 팩(새 기능) 반영 + 노드 자동복귀(마커가 있을 때만).
                 maybe_apply_pending_update(&handle);
+                // ★TCC 처방(오너 2026-07-15): 폴더 권한 선제 트리거·거부 감지 안내.
+                #[cfg(target_os = "macos")]
+                nudge_folder_permissions(&handle);
             });
             Ok(())
         })

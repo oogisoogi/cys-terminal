@@ -147,6 +147,17 @@ def cmd_run():
     log = _Log()
     py = sys.executable or "python3"
 
+    # ★TCC 보조 경고(오너 2026-07-15): macOS 폴더 권한 리셋(서명 변경 업그레이드) 시 pane 자식이
+    # EPERM으로 죽는 실사고 — 부트가 살아있는 세션에서라도 조기 경고(주 안내는 GUI perm-warning).
+    if sys.platform == "darwin":
+        try:
+            os.listdir(os.path.join(HOME, "Desktop"))
+        except PermissionError:
+            _progress("⚠ macOS 데스크탑 폴더 접근 거부 — 시스템 설정→개인정보 보호 및 보안→"
+                      "파일 및 폴더에서 cys 허용 후 앱 재시작(미허용 시 pane의 claude가 EPERM으로 꺼짐)")
+        except OSError:
+            pass
+
     # ① preflight --fix — READY 판정은 preflight exit code가 사실(자연어 재추론 금지)
     preflight = os.path.join(PACK, "bin", "javis_preflight.py")
     if os.path.isfile(preflight):

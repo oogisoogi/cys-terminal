@@ -4039,6 +4039,18 @@ async function start() {
   });
 
   // (T4) 업데이트 후 조직 복원 진행(restore-progress·spawn_org_restore emit) — '직원 복귀 중' 가시화.
+  // ★TCC 처방(오너 2026-07-15): macOS 폴더 권한 거부 감지 → 안내(EPERM 실사고 — CLI 자식은
+  // 팝업 없이 조용히 거부되므로 GUI가 유일한 안내 주체다).
+  await listen("perm-warning", (e) => {
+    const p = (e.payload ?? {}) as { folder?: string };
+    const f = p.folder === "Documents" ? "문서" : "데스크탑";
+    stickyToast(
+      `perm-${p.folder ?? "folder"}`,
+      "health",
+      `⚠ macOS ${f} 폴더 접근 차단`,
+      `pane 안의 claude 등이 EPERM으로 꺼질 수 있습니다 — 시스템 설정 → 개인정보 보호 및 보안 → 파일 및 폴더(또는 전체 디스크 접근 권한)에서 cys를 허용한 뒤 앱을 재시작하세요.`,
+    );
+  });
   await listen("restore-progress", (e) => {
     const p = (e.payload ?? {}) as { phase?: string; hq_ok?: boolean; ok?: number; fail?: number; detail?: string };
     if (p.phase === "start") {
