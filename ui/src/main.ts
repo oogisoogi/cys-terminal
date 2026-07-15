@@ -2334,7 +2334,7 @@ function buildTab(ws: Workspace): HTMLElement {
   const close = document.createElement("span");
   close.className = "ws-close";
   close.textContent = "×";
-  close.title = "워크스페이스 닫기 (surface 전부 종료)";
+  close.title = "완전 삭제 — 클릭하면 확인 창이 열립니다 (부서면 데몬 종료·부활 차단 포함)";
   titleRow.append(label, close);
   // WP-10: 부서 준비 중 탭엔 스피너 글리프를 라벨 앞에 붙이고 aria-busy 로 진행을 알린다(CSS가 회전·정지 담당).
   if (ws.pending) {
@@ -2427,20 +2427,19 @@ function buildTab(ws: Workspace): HTMLElement {
     ]);
   });
   close.addEventListener("click", async () => {
-    // WKWebView에서 confirm()은 무동작 — 2-click 확인 패턴 사용
-    if (close.dataset.arm !== "1") {
-      close.dataset.arm = "1";
-      close.innerHTML = TRASH_SVG;
-      close.classList.add("close-armed");
-      close.title = "한 번 더 누르면 삭제";
-      setTimeout(() => {
-        close.dataset.arm = "";
-        close.textContent = "×";
-        close.classList.remove("close-armed");
-        close.title = "워크스페이스 닫기 (surface 전부 종료)";
-      }, 2500);
-      return;
-    }
+    // ★완전 삭제 확인(오너 2026-07-15 — 발견 불가 UX 수리): 숨은 2-click 무장 패턴을 설명형
+    // 확인 다이얼로그로 교체(WKWebView confirm() 무동작 → 기존 confirmModal 재사용). 초보자가
+    // "무엇이 어떻게 삭제되는지" 읽고 결정한다. pane 개별 ×(저위험)는 종전 2-click 유지.
+    const wsName = ws.name || UNTITLED;
+    const ok = await confirmModal(
+      ws.socket ? `부서 "${wsName}" 완전 삭제` : `워크스페이스 "${wsName}" 완전 삭제`,
+      (ws.socket
+        ? "이 부서의 pane(에이전트 세션)이 전부 종료되고 부서 데몬도 종료됩니다. 삭제 의도가 기록되어 " +
+          "앱을 재시작해도 부활하지 않습니다."
+        : "이 워크스페이스의 pane(에이전트 세션)이 전부 종료되고 탭이 제거됩니다.") +
+        "\n\n완전히 삭제하시겠습니까?",
+    );
+    if (!ok) return;
     // ★WP-3 의도 선기록(제1행위): teardown 이전에 base 데몬에 dept 묘비 기록 — 이후 체인이
     // 무음 실패해도 재시작 부활을 차단한다. 실패=가시화(같은 탭 재삭제가 재시도 — 무음 삼킴 금지).
     if (ws.socket) {
