@@ -237,7 +237,7 @@ body.ws-reordering { cursor: grabbing; -webkit-user-select: none; user-select: n
 }
 .pane .pane-title-text { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 /* 역할 신호 점(제목 앞): Control Center cc-dot의 깜박임(cc-blink) 재사용 — 역할색은 JS(setRoleDot)가 채운다 */
-.pane .pane-role-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+.pane .pane-role-dot { width: 10px; height: 10px; border-radius: 50%; flex: none; }
 .pane .pane-role-dot.working { animation: cc-blink 1.4s infinite; }
 /* T5 사용량 관측 배지: CTX(컨텍스트%)·rate limit 윈도우 — 데몬 관측치(usage.rs) 표시 */
 .pane .pane-usage { display: none; } /* 제목탭 usage(CTX·rate) 제거 — 프롬프트 입력창 아래에 있으니 제목엔 불필요(오너 요청 2026-07-14) */
