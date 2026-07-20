@@ -1,15 +1,18 @@
-# 설계 v2: 레이아웃 커스텀 영구화 + 명명 템플릿 (cys UI)
+# 설계 v3: 레이아웃 커스텀 영구화 (cys UI)
 
 > 작성 2026-07-20 · cys-dev(node227) · 박사 07-20 확정 과제1 재설계
-> **v2 개정(2026-07-20): codex(surface:228) BLOCK/NO-GO 적대검토 9지적 전면 반영.**
-> 상태: **개정 초안 — codex 재검토(re-verdict) 대기 · 빌드 미착수**
-> 방침: 빌드·설치·재시작 미실행(검증만) · 전달=소스 커밋(format-patch)
+> **v2: codex(surface:228) BLOCK/NO-GO 9지적 전면 반영.**
+> **v3(master 07-20 수정지시): codex 재호출 금지(228 폐쇄·구독소진). 재검증=master 경검토
+>   (정식 hetero 재검증은 구독 리셋 Jul25 이후 이연). G3 명명템플릿=박사 '옵션'→이연.
+>   phase1(G1+G2)만 승인. ★구현은 '설계 개정→master 확인' 후에만 착수.**
+> 상태: **master 경검토 대기 · 빌드 미착수 · phase1 구현은 master 확인 후**
+> 방침: 빌드·설치·재시작 미실행(검증만) · 전달=소스 커밋(format-patch) · 과제1+2 함께 전달
 
 ## 0. 한 줄 요약
 
 박사가 드래그로 만든 페인 배치·비율을 **cys/데몬 재시작에도 복원**하고, 저장을 `~/.cys`
-사용자 데이터로 옮기며, 화면구성 1/2/3 명명 템플릿(2단계)을 추가한다. 자동 4열
-타일링(4bf8aa3)은 **폐기가 아니라 "저장본 없을 때의 초기 폴백"으로 강등**한다.
+사용자 데이터로 옮긴다. 자동 4열 타일링(4bf8aa3)은 **폐기가 아니라 "저장본 없을 때의
+초기 폴백"으로 강등**한다. (명명 템플릿 G3 = 박사 옵션 → phase2로 이연.)
 
 ## 0-1. v1 대비 변경 요지 (codex BLOCK 해소)
 
@@ -24,6 +27,11 @@
 | 7 | flush 순서 역전 | **직렬 write 큐 + monotonic revision** + mouseup·close·visibility flush |
 | 8 | 손상파일 자동덮어쓰기 | NotFound/corrupt/permission **구분**, corrupt는 백업·비덮어쓰기·에러 UI |
 | 9 | 과제2 전역 lsregister 과도 | **targeted unregister** + dev wrapper의 bundle-id assertion |
+
+**master 07-20 요구수정 7 ↔ 위 표 매핑(전부 반영 확인)**: ①stable instance_key=행1(§3-1 A1
+권고) · ②placeholder+점진 reconciliation=행2 · ③~/.cys 단일 SOT+마이그레이션/tombstone=행3 ·
+④revision CAS/lock 또는 daemon 단일writer=행4(§7-D) · ⑤staged prod→dev migration=행5 ·
+⑥직렬 flush·손상보존·적대테스트=행6·7·8+§6 매트릭스 · ⑦localStorage vs file authority 확정=행3(§7-E).
 
 ---
 
@@ -62,11 +70,11 @@
 
 ## 3. 데이터 모델
 
-### 3-1. 안정키 (codex#1 반영 — `ord` identity 폐기)
+### 3-1. instance_key (codex#1·master① — `role+ord` identity 폐기)
 ```jsonc
 { "type": "pane",
-  "key": { "socket": "…/cys.sock", "role": "worker-eduscan",
-           "cwd": "/…/eduscan", "agent": "claude" },
+  "instance_key": { "socket": "…/cys.sock", "role": "worker-eduscan",
+                    "cwd": "/…/eduscan", "agent": "claude" },
   "ord": 0 }                 // ord = 표시순서 힌트 전용 · 매칭 identity 아님
 ```
 - **1차 매칭**: `(socket, role, cwd, agent)` 완전일치(라벨 role은 dept/agent 접미로 사실상
@@ -75,6 +83,17 @@
   위치순(ord) 근사매칭**을 하되 `binding:"weak"`로 표기 → 사용자가 리바인드 가능. **절대
   자동 셸 생성·자동 재배치 안 함.**
 - 근거·한계를 스키마 주석에 박제(관측순 ord는 identity 아님 — codex#1).
+
+#### ★master 검토 결정점 A — instance_key를 어디서 얻나 (2택)
+| 안 | 내용 | 장 | 단 |
+|---|---|---|---|
+| **A1 (권고·phase1 채택)** 파생 튜플 | UI가 `(socket,role,cwd,agent)`를 launch identity에서 파생 | **데몬 무변경**·즉시 구현·표준 4열 편성(박사 실사용)엔 유일 | generic 중복·role:null은 약결속(위치근사)로만 |
+| A2 데몬 네이티브 stable_key | 데몬이 노드 생성 시 durable instance_key 발급·재기동 재부여 | 약결속 케이스도 강결속 | **데몬 코드·프로토콜 변경 = 범위 확대**·boot 재부여 계약 신설 필요 |
+
+> **권고**: phase1은 **A1**. 박사 핵심 요구(4열 fleet 배치의 재시작 복원)는 라벨 role이
+> 유일해 A1로 충족된다. A2는 약결속이 실무에서 부족할 때의 phase1.5 경화로 남긴다.
+> recall.rs:382(sid 재발급 확증)로 A2 없이는 sid 복원이 불가함은 이미 규명 — A1이 그 공백을
+> 데몬 무변경으로 메운다. **최종 채택은 master 경검토에서 확정.**
 
 ### 3-2. Settle-window reconciliation (codex#2·missing 반영)
 복원을 **상태기계**로: 비동기로 3/5→5/5 도착해도 topology 불변.
@@ -129,27 +148,36 @@ RESOLVE settle 후:
 ## 5. UI 상호작용
 - **5-1 자동 4열 강등**: `actionEqualize`(정렬 버튼)는 명시적 사용자 액션으로 유지. 변경은
   **초기 폴백만** — 저장·마이그레이션 산출이 모두 없을 때만 자동 4열.
-- **5-2 명명 템플릿(G3·2단계)**: 상단바 "화면구성 ▾" = [현재]·[슬롯 명명]·[+새 구성].
-  전환 = 슬롯 layout으로 tree 교체. **template은 항상 topology 보존**(placeholder 포함).
+- **5-2 명명 템플릿 (G3 · phase2 이연)**: 박사 '옵션' → phase1에서 제외. 참고 방향만:
+  상단바 "화면구성 ▾"로 슬롯 명명·전환, template은 항상 topology 보존(placeholder 포함).
 
 ---
 
-## 6. 단계·게이트 (codex#5 staged 반영 · 전부 소스 커밋)
+## 6. 단계·게이트 (master 07-20 phasing · 전부 소스 커밋)
+
+**★phase1(G1+G2)만 승인. 구현은 이 설계의 master 경검토 확인 후 착수(개정 전 구현 금지).**
 
 | 단계 | 내용 | 게이트 |
 |---|---|---|
-| **1a** | 안정키 slot + settle reconciliation(순수함수·상태기계 단위테스트) | 복원 회귀 테스트 매트릭스(아래) 통과 |
-| **1b** | `~/.cys/ui-layouts.json` persist(command 2 + CAS/flock + 마이그레이션) | **prod identifier에서 먼저** localStorage→파일 승격 검증 |
-| — 게이트 — | 1b 검증 완료 후에만 과제2 dev identifier 분리 활성(codex#5) | |
+| **1a** | instance_key slot(A1 파생) + settle reconciliation(순수함수·상태기계 단위테스트) | 복원 회귀 테스트 매트릭스 통과 |
+| **1b** | `~/.cys/ui-layouts.json` persist(command 2 + CAS/flock + 1회 마이그레이션·tombstone) | **prod identifier에서 먼저** localStorage→파일 승격 검증 |
+| — 게이트(master⑤) — | 1b 검증 완료 후에만 과제2 dev identifier 분리 활성 | |
 | **1c** | 자동 4열 = 초기 폴백 강등 | (1a 포함 가능) |
-| **2** | 명명 템플릿 1/2/3 | 박사 승인 후 |
+| **2 (이연)** | G3 명명 템플릿 | 박사 옵션 승인 후 별도 |
 
-**테스트 매트릭스(codex missing)**: daemon restart · reordered launch · partial arrival(3/5→5/5)
+**테스트 매트릭스(master⑥ 적대테스트)**: daemon restart · reordered launch · partial arrival(3/5→5/5)
 · stale async write · concurrent prod/dev writer · corrupt JSON · legacy sid-only 승격 · role:null/generic 중복 약결속.
 
 ---
 
-## 7. 남은 결정(박사/codex 확인)
-1. 약결속(generic 중복) 발생 시 UX — 자동 근사 후 "리바인드?" 배지 vs 첫 등장부터 수동 바인드?
-2. settle 타임아웃 4s 적정성(boot 편성 도착 실측 필요) — 너무 짧으면 정상 노드가 orphan行.
-3. 단일 writer를 daemon으로 승격할지(가장 견고) vs flock+CAS(프로토콜 무변경·이번 채택안).
+## 7. master 경검토 결정점 (codex 재호출 없이 master가 판정)
+> codex(228) 폐쇄로 재호출 금지. 아래는 master 경검토에서 확정할 항목(정식 hetero
+> 재검증은 Jul25 구독 리셋 후 이연). 확정되면 phase1 구현 착수.
+
+- **A. instance_key 출처**(§3-1): A1 파생 튜플(권고·데몬 무변경) vs A2 데몬 네이티브
+  stable_key(범위 확대). → 권고 A1, master 확정 요망.
+- **B. 약결속 UX**: generic 중복/role:null 근사매칭 후 "리바인드?" 배지 vs 첫 등장부터 수동.
+- **C. settle 타임아웃**: 기본 4s의 boot 편성 도착 실측 필요(짧으면 정상 노드가 orphan화).
+- **D. 동시쓰기 방식**: flock+CAS(채택안·프로토콜 무변경) vs daemon 단일 writer(최견고·범위 확대).
+- **E. authority 확정(master⑦)**: 본 설계는 **파일 단일 SOT + localStorage 1회 마이그레이션
+  후 tombstone**으로 이미 확정. master 승인만 남음.
