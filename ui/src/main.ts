@@ -3184,10 +3184,9 @@ function startGroupDrag(e0: MouseEvent, srcId: number) {
 }
 
 // ---------- 정렬: 역할(role) 기반 고정 배치 ----------
-// 현재 워크스페이스의 살아있는 surface를 역할별 표준 자리로 재배치한다:
-//   · 왼쪽 끝 컬럼  = master(위) / cso(아래), 세로 3:1
-//   · 가운데        = worker·미분류 surface를 같은 폭 컬럼으로 균등 분배(좌→우 순서 보존)
-//   · 오른쪽 끝 컬럼 = reviewer-gemini(agy, 위) / reviewer-codex(codex, 아래), 세로 1:1
+// 현재 워크스페이스의 살아있는 surface를 역할별 표준 자리로 재배치한다(오너 확정 레이아웃 2026-07-15):
+//   4열 가로 균등 — ① master ② cso ③ 워커·미분류(세로 균등 스택) ④ 리뷰어(세로 균등 스택,
+//   agy→codex→기타 고정 순). 역할 열이 비면 그 열은 생략되고 나머지가 폭을 균등 분할한다.
 // 트리 위상만 새로 짜고 attachDividerDrag는 건드리지 않으므로 수동 크기 조절은 그대로 보존된다
 // (정렬 후에도 divider를 다시 끌 수 있다 — 현재 크기만 표준 배치로 리셋될 뿐이다).
 // divider 1px·pane 헤더 등으로 컬럼 폭엔 셀 1칸 이내 잔차가 있을 수 있다.
@@ -3199,33 +3198,28 @@ function evenComb(nodes: Node[], dir: "row" | "col"): Node {
   return acc;
 }
 
-function firstWithRole(sids: number[], roleOf: Map<number, string | null>, role: string): number | null {
-  for (const sid of sids) if (roleOf.get(sid) === role) return sid;
-  return null;
-}
-
 function roleLayout(sids: number[], roleOf: Map<number, string | null>): Node {
-  const master = firstWithRole(sids, roleOf, "master");
-  const cso = firstWithRole(sids, roleOf, "cso");
-  const agy = firstWithRole(sids, roleOf, "reviewer-gemini"); // 안티그래피티
-  const codex = firstWithRole(sids, roleOf, "reviewer-codex");
-  const corners = new Set([master, cso, agy, codex].filter((x): x is number => x != null));
-  const middle = sids.filter((sid) => !corners.has(sid)); // worker·미분류 전부 가운데
+  // 4열 버킷: master | cso | 워커·미분류 | 리뷰어 — 역할 변형(worker-2 등)은 접두 매칭(roleDotColor와 동일 관례).
+  const bucket = (sid: number): number => {
+    const r = roleOf.get(sid);
+    if (r?.startsWith("master")) return 0;
+    if (r?.startsWith("cso")) return 1;
+    if (r?.startsWith("reviewer")) return 3;
+    return 2; // worker·미분류 전부 워커 열
+  };
+  const cols: number[][] = [[], [], [], []];
+  for (const sid of sids) cols[bucket(sid)].push(sid); // 열 안 순서 = 기존 좌→우 순서 보존
+  // 리뷰어 열만 고정 순: agy(gemini, 위) → codex → 기타(stable sort라 기타끼리는 기존 순서 유지)
+  const revPri = (sid: number): number => {
+    const r = roleOf.get(sid) ?? "";
+    return r === "reviewer-gemini" ? 0 : r === "reviewer-codex" ? 1 : 2;
+  };
+  cols[3].sort((a, b) => revPri(a) - revPri(b));
+
   const pane = (sid: number): Node => ({ type: "pane", sid });
-
-  const columns: Node[] = [];
-  // 왼쪽 끝: master(위) / cso(아래) = 3:1 (누락 시 있는 쪽이 컬럼 전체)
-  if (master != null && cso != null) columns.push({ type: "split", dir: "col", ratio: 3 / 4, a: pane(master), b: pane(cso) });
-  else if (master != null) columns.push(pane(master));
-  else if (cso != null) columns.push(pane(cso));
-  // 가운데: worker·미분류 균등 컬럼
-  for (const sid of middle) columns.push(pane(sid));
-  // 오른쪽 끝: agy(위) / codex(아래) = 1:1 (누락 시 있는 쪽이 컬럼 전체)
-  if (agy != null && codex != null) columns.push({ type: "split", dir: "col", ratio: 1 / 2, a: pane(agy), b: pane(codex) });
-  else if (agy != null) columns.push(pane(agy));
-  else if (codex != null) columns.push(pane(codex));
-
-  return evenComb(columns, "row"); // 컬럼들을 같은 폭으로 가로 배치
+  // 각 열은 세로 균등 스택, 열들은 가로 균등 — 빈 열은 생략(evenComb 균등 분배가 자동 흡수).
+  const columns = cols.filter((c) => c.length).map((c) => evenComb(c.map(pane), "col"));
+  return evenComb(columns, "row");
 }
 
 async function actionEqualize() {
