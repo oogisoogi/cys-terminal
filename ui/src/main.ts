@@ -3762,7 +3762,13 @@ function openThemePopover(anchor: HTMLElement) {
   fontRow.appendChild(fontSel);
 
   // 영역별 폰트 컨트롤(오너 요청 2026-07-14): 제목 크기·굵기·색 + 본문/메뉴 굵기.
-  const WEIGHTS: [string, string][] = [["가늘게", "300"], ["보통", "400"], ["굵게", "600"], ["매우 굵게", "700"]];
+  // 굵기 세밀화(오너 요청 2026-07-15): JetBrains Mono variable/전 정적 굵기(100~800) 전 구간.
+  // 2단계(Regular/Bold)만 설치된 환경에선 브라우저가 근접 굵기로 폴백하므로 무해.
+  const WEIGHTS: [string, string][] = [
+    ["가장 가늘게 (100)", "100"], ["아주 가늘게 (200)", "200"], ["가늘게 (300)", "300"],
+    ["보통 (400)", "400"], ["중간 (500)", "500"], ["약간 굵게 (600)", "600"],
+    ["굵게 (700)", "700"], ["아주 굵게 (800)", "800"],
+  ];
   const mkWeightRow = (txt: string, lsKey: string, def: string, on: (v: string) => void) => {
     const r = document.createElement("label"); r.className = "theme-pop-row"; r.textContent = txt;
     const sel = document.createElement("select");
