@@ -1,152 +1,155 @@
-# 설계: 레이아웃 커스텀 영구화 + 명명 템플릿 (cys UI)
+# 설계 v2: 레이아웃 커스텀 영구화 + 명명 템플릿 (cys UI)
 
 > 작성 2026-07-20 · cys-dev(node227) · 박사 07-20 확정 과제1 재설계
-> 상태: **설계 초안 — codex(surface:228) 적대검토 대기 · 빌드 미착수**
+> **v2 개정(2026-07-20): codex(surface:228) BLOCK/NO-GO 적대검토 9지적 전면 반영.**
+> 상태: **개정 초안 — codex 재검토(re-verdict) 대기 · 빌드 미착수**
 > 방침: 빌드·설치·재시작 미실행(검증만) · 전달=소스 커밋(format-patch)
 
 ## 0. 한 줄 요약
 
-박사가 드래그로 만든 페인 배치·비율을 **cys/데몬 재시작에도 복원**되도록 하고(현재는
-데몬 재시작 시 붕괴), 저장 위치를 `~/.cys` 사용자 데이터로 옮기며, 화면구성 1/2/3
-명명 템플릿(2단계 옵션)을 추가한다. **자동 4열 타일링(4bf8aa3)은 폐기가 아니라
-"저장된 레이아웃이 없을 때의 초기 기본값"으로 강등한다.**
+박사가 드래그로 만든 페인 배치·비율을 **cys/데몬 재시작에도 복원**하고, 저장을 `~/.cys`
+사용자 데이터로 옮기며, 화면구성 1/2/3 명명 템플릿(2단계)을 추가한다. 자동 4열
+타일링(4bf8aa3)은 **폐기가 아니라 "저장본 없을 때의 초기 폴백"으로 강등**한다.
+
+## 0-1. v1 대비 변경 요지 (codex BLOCK 해소)
+
+| # | codex 지적 | v2 결정 |
+|---|---|---|
+| 1 | `role+ord`는 identity 아님 | **폐기**. 안정키 = `(socket, role, cwd, agent)`. `ord`는 표시순서 전용 |
+| 2 | 접기+고아 append로 topology 비가역 손실 | **settle-window reconciliation** — 미매칭 리프를 placeholder로 보존, 자동 셸 생성·일렬 append 금지 |
+| 3 | 이중 진실원 미확정 | **`~/.cys/ui-layouts.json` 단일 authority**, localStorage=1회 마이그레이션 후 tombstone |
+| 4 | atomic rename은 torn write만 방지 | **revision CAS + flock**(prod/dev 동시쓰기 대비) |
+| 5 | 과도기 UX 미규정 | **staged gate** — 1b를 prod identifier로 먼저 검증 후 dev 분리 활성 |
+| 6 | legacy leaf 재붕괴 | 첫 매칭 시 **즉시 안정키 승격·flush** |
+| 7 | flush 순서 역전 | **직렬 write 큐 + monotonic revision** + mouseup·close·visibility flush |
+| 8 | 손상파일 자동덮어쓰기 | NotFound/corrupt/permission **구분**, corrupt는 백업·비덮어쓰기·에러 UI |
+| 9 | 과제2 전역 lsregister 과도 | **targeted unregister** + dev wrapper의 bundle-id assertion |
 
 ---
 
-## 1. 현재 실측 (추정 아님 · 파일·라인)
+## 1. 현재 실측 (파일·라인 근거)
 
 | 기능 | 상태 | 근거 |
 |---|---|---|
-| 드래그로 분할 비율 조정 UI | **이미 존재** | `ui/src/main.ts:2055` `attachDividerDrag` — divider mousedown→ratio 계산→`node.ratio` 갱신→`saveLayout()` |
-| 드래그로 페인 배치(split/이동) | **부분 존재** | Split→/↓ 버튼(`actionSplit`)·정렬(`actionEqualize`)로 위상 생성. 페인 자체를 드래그로 재배치하는 UI는 **없음**(divider는 크기만) |
-| 레이아웃 저장 | **이미 존재** | `main.ts:1384` `saveLayout` — `workspaces`(트리 위상+ratio)를 localStorage `cys-layout-v2`에 직렬화 |
-| 레이아웃 복원 | **이미 존재하나 sid 종속** | `main.ts:4095~` 시작 시 저장본 로드 → 살아있는 surface **sid 정확매칭** 대조 |
-| persist 물리 위치 | localStorage = `~/Library/WebKit/com.cysjavis.terminal` | identifier 기반 WKWebView 저장소. pack-update와는 무관하게 보존되나 **identifier 종속** |
-| 앱↔`~/.cys` 파일 R/W | **검증된 Tauri command 패턴 존재** | `src-tauri/src/main.rs:967` `read_board_catalog`, `:976` `read_profile_audience`(`~/.cys/profile.json`), `:446` `std::fs::write`. `cys::home_dir().join(".cys/...")` 관례 확립 |
+| 드래그로 분할 비율 조정 UI | **이미 존재** | `ui/src/main.ts:2055` `attachDividerDrag`→`node.ratio`→`saveLayout()` |
+| 페인 자체를 드래그로 재배치 | **없음**(divider는 크기만) | Split→/↓·정렬로만 위상 생성 |
+| 레이아웃 저장 | **이미 존재** | `main.ts:1384` `saveLayout`→localStorage `cys-layout-v2` |
+| 레이아웃 복원 | **존재하나 sid 종속** | `main.ts:4095~`·죽은 sid 제거 `:4189`·고아 일렬 append `:4227-4231` |
+| **surface_id 는 데몬 재시작마다 1부터 재발급** | **코드 확증** | `src/bin/cysd/recall.rs:382` 주석("재시작마다 1부터 재발급하면 무관 세션이 같은 id로 recall에 합쳐진다") |
+| 데몬 측 surface-layout 영속·복원 | **없음** | recall.rs = 트랜스크립트 **검색** DB(FTS5)일 뿐. 재기동은 `cys boot`가 재생 |
+| `boot` 표준 편성 재생 | 고정 (role,agent) 세트 | `src/bin/cys.rs:3719` — CSO·worker(claude)·reviewer agy·codex 4종 의무 + grok |
+| surface durable 속성 | role·cwd·agent | `src/bin/cysd/state.rs:101` Surface{role, cwd, agent_meta(name)} |
+| 앱↔`~/.cys` 파일 R/W | **검증된 command 패턴** | `src-tauri/src/main.rs:976` `read_profile_audience`·`:446` `std::fs::write` |
 
-**결론: 수동 드래그 크기조정 UI와 저장/복원 골격은 이미 있다. 신규 UI를 처음부터
-만들 필요 없음.** 남은 것은 아래 3개 gap이다.
+**핵심 확증**: 데몬 재시작 시 sid는 무의미(1부터 재발급). 안정 identity의 **유일한
+출처는 launch identity** — `boot`이 동일 (role, agent, cwd)로 표준 편성을 재생하므로
+`(socket, role, cwd, agent)` 튜플이 재시작을 넘어 재현된다.
+
+**단, 정직한 한계(codex 지적 1·missing)**: 이 재현은 *표준 편성*에 한하며 코드가
+보장하는 계약은 아니다. **generic 중복**(같은 socket·role·cwd의 plain worker 2개)과
+**role:null 일반 셸**은 안정키가 없다 → 아래 3-1에서 명시적 폴백·약결속으로 처리.
 
 ---
 
-## 2. 진짜 Gap (재설계 대상)
-
-### G1 — 데몬 재시작 시 배치·비율 붕괴 (★핵심)
-복원(`main.ts:4188-4190`)은 저장 tree의 sid가 **살아있는 surface sid와 정확히 일치**할
-때만 그 노드를 살린다. 불일치 sid는 `replaceNode(...,()=>null)`로 트리에서 제거되고,
-레이아웃에 없는 surface는 `main.ts:4227-4231`에서 **무조건 `dir:"row"` 단순 일렬**로
-append된다(ratio 기본 0.5).
-
-- surface sid는 **데몬 생애 내에서만 안정**하다(데몬은 앱과 별개 상주 프로세스 —
-  `cys list`로 surface:213/214/227/228 유지 확인). **앱만 재시작 → sid 유지 → 복원 OK.**
-- 그러나 **데몬까지 재시작(`cys boot`·재부팅)하면 sid가 새로 발급** → 저장 tree의
-  sid 전부 dead 판정 → **박사가 만든 배치·비율이 통째로 일렬로 붕괴**한다.
-- 이것이 박사가 겪는 "재시작에도 복원" 실패의 근본이다.
-
-### G2 — persist가 identifier 종속 localStorage
-박사 요구 = `~/.cys` 사용자 데이터에 저장(pack-update 보존 대상). 현재는 WKWebView
-localStorage(identifier `com.cysjavis.terminal` 종속). **과제2와 직접 충돌**: dev
-오버레이가 identifier를 `.dev`로 바꾸면 dev/prod localStorage가 **다른 경로로 분리** →
-박사가 한쪽에서 저장한 레이아웃이 다른 쪽에서 안 보인다. → **`~/.cys` 파일 persist가
-이 분리를 원천 해소**한다(두 과제가 연결됨).
-
-### G3 — 명명 템플릿 슬롯 1/2/3 없음 (2단계 옵션)
-현재 저장 슬롯은 단일(현재 상태만). 명명된 화면구성 여러 개 저장·전환 불가.
+## 2. 진짜 Gap
+- **G1(핵심)** 데몬 재시작 시 sid 재발급(recall.rs:382 확증)으로 저장 tree가 전부 dead
+  판정 → `dir:"row"` 일렬로 붕괴. = 박사가 겪는 "재시작 복원 실패"의 근본.
+- **G2** persist가 identifier 종속 localStorage(`~/Library/WebKit/com.cysjavis.terminal`).
+  과제2가 identifier를 `.dev`로 분리하면 dev/prod 레이아웃이 갈라짐.
+- **G3** 명명 템플릿 1/2/3 없음(2단계 옵션).
 
 ---
 
 ## 3. 데이터 모델
 
-### 3-1. 안정 재매핑 키 (G1 해결의 핵심)
-트리 리프를 `sid`(휘발성) 대신 **역할 기반 안정 슬롯**으로 저장한다. 복원 시
-살아있는 surface를 이 키로 재매핑한다.
-
+### 3-1. 안정키 (codex#1 반영 — `ord` identity 폐기)
 ```jsonc
-// 저장 리프 (기존 {type:"pane", sid} 확장)
 { "type": "pane",
-  "slot": { "role": "master", "ord": 0 } }   // role + 같은 role 내 순번
+  "key": { "socket": "…/cys.sock", "role": "worker-eduscan",
+           "cwd": "/…/eduscan", "agent": "claude" },
+  "ord": 0 }                 // ord = 표시순서 힌트 전용 · 매칭 identity 아님
 ```
+- **1차 매칭**: `(socket, role, cwd, agent)` 완전일치(라벨 role은 dept/agent 접미로 사실상
+  유일 — worker-eduscan·reviewer-codex).
+- **동률·약결속(generic 중복·role:null)**: 1차로 유일 확정 안 되면 **settle 윈도우 내
+  위치순(ord) 근사매칭**을 하되 `binding:"weak"`로 표기 → 사용자가 리바인드 가능. **절대
+  자동 셸 생성·자동 재배치 안 함.**
+- 근거·한계를 스키마 주석에 박제(관측순 ord는 identity 아님 — codex#1).
 
-- 복원 매핑: 살아있는 surface들을 `(role, 등장순서 ord)`로 인덱싱 → 저장 슬롯과
-  대조해 sid 부여. role 불명(일반 셸)은 `role:null, ord:n`로 순서만 매칭.
-- 매칭 실패한 저장 슬롯 = 그 페인은 이번에 없음 → 트리에서 접기(기존 replaceNode 재사용).
-- 매칭 안 된 살아있는 surface = 고아 → 기존 append 경로(G1의 일렬 붙이기)로 폴백.
-- **하위호환**: 옛 저장본(`sid`만 있는 리프)은 그대로 sid 매칭(마이그레이션 불요).
-
-> 대안 검토: sid 대신 title 매칭 = title은 사용자 rename·cwd로 흔들려 불안정 → 기각.
-> role+ord가 데몬 재시작에도 가장 안정(역할은 launch-agent가 재부여).
-
-### 3-2. `~/.cys` persist 파일
+### 3-2. Settle-window reconciliation (codex#2·missing 반영)
+복원을 **상태기계**로: 비동기로 3/5→5/5 도착해도 topology 불변.
 ```
-~/.cys/ui-layouts.json     # 신규 · pack tar가 푸는 경로와 무충돌(박사 경고 반영: agents.json/soul 회피)
+LOAD    저장 topology 그대로 구성 — 모든 리프를 placeholder(대기)로 표시
+BIND    surface 도착마다 안정키로 placeholder에 결속(1차→약결속 순)
+SETTLE  타임아웃(예 4s·boot 편성 도착 여유)까지 위 반복. 이 동안:
+        · 미결속 placeholder = 접지 않음(자리 보존·흐리게 "대기 중")
+        · 미매칭 live surface = 일렬 append 안 함(보류 목록)
+RESOLVE settle 후:
+        · 남은 placeholder = "없음 — [시작] [제거]"(명시 조작 전까지 자리 유지)
+        · 남은 orphan = "새 페인 — [여기 바인드] [무시]"
+```
+→ v1의 "접기+고아 일렬 append"(main.ts:4189/4227) 폐기. 지연도착이 자리를 안 뺏는다.
+
+### 3-3. `~/.cys` persist (codex#3 단일 진실원)
+```
+~/.cys/ui-layouts.json    # 신규 · pack tar 경로와 무충돌(agents.json/soul 회피)
 ```
 ```jsonc
-{
-  "version": 1,
-  "current": { /* 현재 활성 레이아웃 스냅샷(기존 cys-layout-v2 페이로드 + slot 리프) */ },
-  "templates": [                                  // G3 · 2단계
-    { "id": 1, "name": "개발", "layout": { /* … */ } },
-    { "id": 2, "name": "리뷰", "layout": { /* … */ } }
-  ]
-}
+{ "schema": 1,
+  "revision": 42,                         // monotonic · CAS 기준(codex#4·#7)
+  "current": { /* slot 리프 topology */ },
+  "templates": [ {"id":1,"name":"개발","layout":{}}, … ] }   // G3
 ```
-
-- **마이그레이션**: 최초 1회 localStorage `cys-layout-v2` → `ui-layouts.json.current` 승격.
-  이후 localStorage는 캐시로만(또는 완전 이전). 손상·부재 시 자동 4열(4bf8aa3)로 폴백.
-- **쓰기 시점**: `saveLayout()` 말미에 디바운스(예 500ms)로 파일 flush — 드래그 연속
-  이벤트마다 디스크 쓰기 폭주 방지.
+- **단일 authority = 이 파일.** localStorage `cys-layout-v2`는 **1회 마이그레이션
+  소스로만** 사용 → 성공 원자쓰기 후 tombstone(`{migrated:true}`로 치환+키 clear)로
+  stale resurrection 차단(codex#3·#6).
 
 ---
 
-## 4. Persist 배선 (앱↔파일)
+## 4. Persist 배선 (codex#4·#7·#8)
 
-기존 검증 패턴(`read_profile_audience`) 그대로 Tauri command 2개 신설:
-
+기존 검증 패턴(`read_profile_audience`) 위에 command 2개 신설:
 ```rust
-#[tauri::command] fn read_ui_layouts() -> Result<Value,String>            // ~/.cys/ui-layouts.json 읽기(없으면 null)
-#[tauri::command] fn write_ui_layouts(data: Value) -> Result<(),String>   // 원자적 쓰기(temp→rename)
+#[tauri::command] fn read_ui_layouts() -> Result<Value,String>          // NotFound→null · corrupt→Err(구분)
+#[tauri::command] fn write_ui_layouts(data, base_revision) -> Result<u64,String>  // CAS
 ```
-- `cys::home_dir().join(".cys/ui-layouts.json")` · `std::fs::write`는 이미 쓰는 API.
-- 원자적 쓰기(temp+rename)로 flush 중 크래시에도 파일 반쪽 손상 방지.
-- `invoke_handler`(main.rs:2075) 목록에 2개 등록.
+- **CAS + flock(codex#4)**: prod/dev 동시 실행 대비. `write`는 flock 취득 → 디스크
+  revision이 `base_revision`과 같을 때만 rename 커밋(revision+1 반환). 다르면
+  `Err("stale")` → 호출측 reload 후 재적용. atomic rename만으로는 lost update 못 막음.
+- **직렬 write 큐 + monotonic revision(codex#7)**: UI는 write invoke를 직렬화(coalescing).
+  완료 역전된 async가 최신 revision을 덮지 않게 revision 가드. flush 트리거 = 드래그
+  mouseup·window close·`visibilitychange(hidden)`. **선행 작업: `saveLayout` 호출부 전수
+  감사**(연속 쓰기 지점 식별).
+- **내구 쓰기(codex#8)**: 같은 디렉터리 유니크 temp → fsync(file)+fsync(parent dir) →
+  rename. 읽기는 **NotFound(→기본 생성)·corrupt JSON(→`.corrupt`로 백업·기본 로드·에러
+  UI·자동덮어쓰기 금지)·permission(→사용자 표면화)** 3분기. accept 전 schema·크기 검증.
 
 ---
 
 ## 5. UI 상호작용
-
-### 5-1. 자동 4열 강등 (즉효·저위험)
-`actionEqualize`(정렬 버튼)는 **명시적 사용자 액션으로 유지**(그대로 둠). 변경점은
-**초기 부팅 폴백**뿐: 저장 레이아웃이 없을 때만 자동 4열 적용(현재는 append 일렬).
-
-### 5-2. 명명 템플릿 (G3 · 2단계 옵션)
-- 최소 UI: 상단바 "화면구성 ▾" 드롭다운 = [현재 저장] · [슬롯1 개발] · [슬롯2 리뷰] · [+ 새 구성].
-- 전환 = 그 슬롯 layout으로 `ws.tree` 교체 후 render(기존 정렬과 동일 경로).
-- 저장 = 현재 tree를 slot 리프로 직렬화해 templates에 upsert.
-- **범위 게이트**: 1단계(G1+G2 복원 견고화)를 먼저 독립 커밋. 2단계(템플릿)는 박사
-  승인 후 별도 커밋 — 1단계만으로도 박사 핵심 요구("재시작 복원")가 충족되므로.
+- **5-1 자동 4열 강등**: `actionEqualize`(정렬 버튼)는 명시적 사용자 액션으로 유지. 변경은
+  **초기 폴백만** — 저장·마이그레이션 산출이 모두 없을 때만 자동 4열.
+- **5-2 명명 템플릿(G3·2단계)**: 상단바 "화면구성 ▾" = [현재]·[슬롯 명명]·[+새 구성].
+  전환 = 슬롯 layout으로 tree 교체. **template은 항상 topology 보존**(placeholder 포함).
 
 ---
 
-## 6. 단계·커밋 계획 (전부 소스 커밋 · 빌드 미실행)
+## 6. 단계·게이트 (codex#5 staged 반영 · 전부 소스 커밋)
 
-| 단계 | 내용 | 위험 | 커밋 |
-|---|---|---|---|
-| 1a | slot 리프 데이터모델 + 복원 재매핑(순수함수·reorder.ts 스타일 단위테스트) | 중(복원 회귀 위험 — 테스트로 방어) | fix(ui): 데몬 재시작에도 레이아웃 복원 |
-| 1b | `~/.cys/ui-layouts.json` persist(Rust command 2 + 마이그레이션) | 중 | feat: 레이아웃 ~/.cys 영구화 |
-| 1c | 자동 4열 = 초기 폴백으로 강등 | 저 | (1a에 포함 가능) |
-| 2 | 명명 템플릿 슬롯 1/2/3 UI | 저 | feat: 화면구성 명명 템플릿(박사 승인 후) |
+| 단계 | 내용 | 게이트 |
+|---|---|---|
+| **1a** | 안정키 slot + settle reconciliation(순수함수·상태기계 단위테스트) | 복원 회귀 테스트 매트릭스(아래) 통과 |
+| **1b** | `~/.cys/ui-layouts.json` persist(command 2 + CAS/flock + 마이그레이션) | **prod identifier에서 먼저** localStorage→파일 승격 검증 |
+| — 게이트 — | 1b 검증 완료 후에만 과제2 dev identifier 분리 활성(codex#5) | |
+| **1c** | 자동 4열 = 초기 폴백 강등 | (1a 포함 가능) |
+| **2** | 명명 템플릿 1/2/3 | 박사 승인 후 |
+
+**테스트 매트릭스(codex missing)**: daemon restart · reordered launch · partial arrival(3/5→5/5)
+· stale async write · concurrent prod/dev writer · corrupt JSON · legacy sid-only 승격 · role:null/generic 중복 약결속.
 
 ---
 
-## 7. 미해결·검토 요청 포인트 (codex에게)
-
-1. **G1 재매핑 키**: role+ord가 데몬 재시작 후 안정적인가? launch-agent 재기동이 역할을
-   같은 순서로 재부여하는 보장이 있나, 아니면 순서가 흔들려 페인이 뒤섞일 위험은?
-2. **부분 매칭 정책**: 저장 슬롯 5개 중 3개만 살아 돌아올 때 — 나머지 2칸을 접고 3개로
-   재배치할지, 빈 셸을 생성해 슬롯 보존할지. 박사 UX 기대치와 정합?
-3. **디바운스 flush vs 즉시**: 드래그 종료(mouseup)에서만 파일 쓰면 디바운스 불요.
-   연속 쓰기 지점이 실제로 있나(현 saveLayout 호출부 감사 필요)?
-4. **localStorage↔파일 이중 진실원**: 마이그레이션 후 localStorage를 버릴지 캐시로 둘지.
-   이중화 시 동기화 버그 위험 대비 단일화 이득?
-5. **과제2 상호작용**: identifier 분리 시 기존 localStorage 레이아웃이 dev에서 안 보이는데,
-   ~/.cys 이전 전 과도기 UX(첫 dev 실행이 빈 화면)를 어떻게 매끄럽게?
+## 7. 남은 결정(박사/codex 확인)
+1. 약결속(generic 중복) 발생 시 UX — 자동 근사 후 "리바인드?" 배지 vs 첫 등장부터 수동 바인드?
+2. settle 타임아웃 4s 적정성(boot 편성 도착 실측 필요) — 너무 짧으면 정상 노드가 orphan行.
+3. 단일 writer를 daemon으로 승격할지(가장 견고) vs flock+CAS(프로토콜 무변경·이번 채택안).
