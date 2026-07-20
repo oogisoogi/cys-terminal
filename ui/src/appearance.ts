@@ -36,6 +36,23 @@ export const ROLE_COLOR: Record<string, string> = {
   "reviewer-gemini": "#ffa726",
 };
 
+// 노드 '작동중' 판정 — pane 역할 점 깜빡(main.ts surfaceWorking)·CC 작업중 카운트의 단일 출처.
+// 자기보고(set-status)는 신선할 때만 신뢰한다: 워커가 working 보고 후 완료 시 idle을 안 보내면
+// status가 working에 박제(stale)돼 점이 영구 깜빡인다. stale·부재 시엔 출력 활동(idle_secs)으로
+// 파생 판정한다 — 신선 임계 120s는 CC의 stale 배지(.cc-task-row.stale)와 동일 기준.
+export const STATUS_FRESH_SECS = 120;
+export const OUTPUT_IDLE_SECS = 60;
+export type AgentStatus = { state?: string; age_secs?: number } | null | undefined;
+export function nodeWorking(
+  status: AgentStatus,
+  idleSecs: number | null | undefined,
+  exited = false,
+): boolean {
+  if (exited) return false;
+  if (status && (status.age_secs ?? 0) <= STATUS_FRESH_SECS) return status.state === "working";
+  return (idleSecs ?? Infinity) <= OUTPUT_IDLE_SECS;
+}
+
 // pane 제목 앞 역할 점 색 — 정확 일치 우선, 변형은 접두 매칭(master-2·cso-1·worker-2·reviewer-* —
 // overrides.rs·pack.rs의 역할 접두 매칭 관례와 동일), 미지 역할은 회색, 무역할(일반 셸)은 null(점 숨김).
 export function roleDotColor(role: string | null | undefined): string | null {
