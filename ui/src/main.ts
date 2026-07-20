@@ -34,7 +34,7 @@ import {
 } from "./resetconfirm";
 import { ccEffectiveZoom } from "./ccscale";
 import { clampWsbarWidth, clampWsbarFont, WSBAR_W_DEFAULT, WSBAR_FONT_STEP } from "./wsbar";
-import { composeFontFamily, FONT_CHOICES, ROLE_COLOR, roleDotColor } from "./appearance";
+import { composeFontFamily, FONT_CHOICES, nodeWorking, ROLE_COLOR, roleDotColor } from "./appearance";
 import { routeOnData } from "./mousefilter";
 import { MouseTrackingFilter, MOUSE_ALL_OFF } from "./trackfilter";
 import {
@@ -892,11 +892,7 @@ function renderTasks(fleet: any) {
       const deptKey = String(d.socket_slug ?? d.name ?? "");
       const surfaces: any[] = (d.surfaces ?? []).slice();
       surfaces.sort((a, b) => (a.surface_id ?? 0) - (b.surface_id ?? 0));
-      const working = surfaces.filter(
-        (s) =>
-          s.status?.state === "working" ||
-          (!s.status && !s.exited && (s.idle_secs ?? 999) <= 60),
-      ).length;
+      const working = surfaces.filter((s) => nodeWorking(s.status, s.idle_secs, s.exited)).length; // stale 자기보고 불신 — 판정=appearance.ts 단일 출처
       const deadBadge = d.error
         ? `<span class="cc-fail-badge crit">⚠ ${d.error === "timeout" ? "응답없음" : "도달불가"}</span>`
         : "";
@@ -1767,7 +1763,7 @@ const panes = new Map<string, PaneRuntime>(); // 키 = paneKey(sid, socket)
 // 부서 데몬 socket_slug(F3 백엔드 단일진실) → socket 경로. launch_dept_daemon 반환·daemon-event로 채운다.
 const socketForSlug = new Map<string, string>();
 // 사이드바 노드 신호 캐시(B3) — org.status 응답을 워크스페이스 행 집계용으로 보관.
-type NodeSig = { role: string | null; state: string; ctx_pct: number | null; idle_secs: number; agent_alive: boolean | null };
+type NodeSig = { role: string | null; state: string; ctx_pct: number | null; idle_secs: number; agent_alive: boolean | null; working: boolean };
 const nodeSig = new Map<string, NodeSig>(); // 키 = `${socket}#${surface_id}`
 let pendingApprovals = 0; // org.status feed.pending 전 소켓 합산(배지 구동 — 이 값만 배지가 쓴다)
 // 같은 순회의 **소켓별** 대기 수. 배너("다른 워크스페이스에 N건")가 이 맵을 직접 읽는다.
@@ -1941,16 +1937,12 @@ const paneTitle = (title: string | null | undefined, liveCwd?: string | null) =>
   isAutoTitle(title) ? liveCwd || "…" : (title as string);
 
 // pane 헤더 역할 점 — CC 깜박이 점(cc-blink)을 역할색으로 제목 앞에 표시(무역할 셸·종료 pane은 숨김).
-// org_fleet(lastFleet) 스냅샷에서 surface의 작동 여부 — 역할 점 깜빡을 '작업중'에만 적용(오너 요청 2026-07-14).
-function surfaceWorking(sid: number): boolean {
-  for (const d of ((lastFleet as any)?.departments ?? [])) {
-    for (const s of (d.surfaces ?? [])) {
-      if (s.surface_id === sid) {
-        return s.status?.state === "working" || (!s.status && !s.exited && (s.idle_secs ?? 999) <= 60);
-      }
-    }
-  }
-  return false; // fleet 미등록 = 비작동(안 깜빡·안전 기본)
+// 작동 여부는 nodeSig(org.status 폴링 10s + status.changed 이벤트 즉시 갱신)에서 읽는다 —
+// 구 데이터원 lastFleet(org_fleet)는 CC 패널이 열려 있어야만 갱신돼 status가 스냅샷에 박제됐고,
+// 완료 후 idle 미보고 워커가 영구 깜빡였다(stale status). 판정 자체는 appearance.ts nodeWorking
+// (신선한 자기보고만 신뢰·stale 시 출력 활동 폴백)이 단일 출처다.
+function surfaceWorking(sid: number, socket: string | null | undefined): boolean {
+  return nodeSig.get(`${socket}#${sid}`)?.working ?? false; // 미등록 = 비작동(안 깜빡·안전 기본)
 }
 function setRoleDot(el: HTMLElement, role: string | null, working = false) {
   const color = roleDotColor(role);
@@ -1989,7 +1981,7 @@ async function refreshPaneTitles() {
         const rt = panes.get(paneKey(s.surface_id, sk));
         if (!rt) continue;
         renderUsage(rt.usageEl, s.exited ? null : s.usage); // 종료 pane은 배지 제거 (혼동 방지)
-        setRoleDot(rt.roleEl, s.exited ? null : s.role, !s.exited && surfaceWorking(s.surface_id)); // 역할 점 + 작동중일 때만 깜빡, 동일 주기 갱신
+        setRoleDot(rt.roleEl, s.exited ? null : s.role, !s.exited && surfaceWorking(s.surface_id, sk)); // 역할 점 + 작동중일 때만 깜빡, 동일 주기 갱신
         rt.titleEl.style.color = (titleColorRole && !s.exited && roleDotColor(s.role)) ? (roleDotColor(s.role) as string) : ""; // 제목 글자색 = 역할 점색(오너 요청 2026-07-14·토글 시)
         if (rt.titleEl.isContentEditable) continue; // 이름 편집 중에는 덮어쓰지 않음
         rt.titleEl.textContent = paneTitle(s.title, s.live_cwd) + (s.exited ? " [exited]" : "");
@@ -2004,7 +1996,7 @@ async function refreshPaneTitles() {
         // !w.pending — 런칭 중 placeholder(socket 미정)에는 입양 금지(타 데몬 surface 오입양 차단).
         const ws = workspaces.find((w) => !w.pending && (w.socket ?? undefined) === (sk ?? undefined));
         if (!ws || collectSids(ws.tree).includes(s.surface_id)) continue;
-        setRoleDot((await makePane(s.surface_id, s.title, sk)).roleEl, s.role, surfaceWorking(s.surface_id)); // 입양 즉시 역할 점 채색 + 작동중 판정
+        setRoleDot((await makePane(s.surface_id, s.title, sk)).roleEl, s.role, surfaceWorking(s.surface_id, sk)); // 입양 즉시 역할 점 채색 + 작동중 판정
         ws.tree = ws.tree
           ? { type: "split", dir: "row", a: ws.tree, b: { type: "pane", sid: s.surface_id } }
           : { type: "pane", sid: s.surface_id };
@@ -3282,6 +3274,8 @@ async function refreshSidebarStatus() {
           ctx_pct: n.status?.context_pct ?? n.usage?.ctx_pct ?? null,
           idle_secs: n.idle_secs,
           agent_alive: n.agent_alive,
+          // 작동중 판정(appearance.ts 단일 출처) — org.status의 age_secs는 응답 시점 계산이라 신선.
+          working: nodeWorking(n.status, n.idle_secs, n.exited),
         });
     } catch {
       /* 부서 데몬 일시 부재 */
