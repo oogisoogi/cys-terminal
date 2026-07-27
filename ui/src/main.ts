@@ -2717,10 +2717,15 @@ function startGroupDrag(e0: MouseEvent, srcId: number) {
   window.addEventListener("mouseup", up, true);
 }
 
-// ---------- 정렬: 역할(role) 기반 고정 배치 ----------
-// 현재 워크스페이스의 살아있는 surface를 역할별 표준 자리로 재배치한다(오너 확정 레이아웃 2026-07-15):
-//   4열 가로 균등 — ① master ② cso ③ 워커·미분류(세로 균등 스택) ④ 리뷰어(세로 균등 스택,
-//   agy→codex→기타 고정 순). 역할 열이 비면 그 열은 생략되고 나머지가 폭을 균등 분할한다.
+// ---------- 정렬: 개수 무관 1행 가로 균등 배치 ----------
+// 살아있는 surface를 개수와 무관하게 좌우로 나란히, 같은 폭으로 배치한다(오너 확정 2026-07-27).
+// ★2026-07-15의 역할별 4열 안(master | cso | 워커 세로스택 | 리뷰어 세로스택)은 폐기됐다 —
+//   그때는 master·CSO가 cys 노드였지만 지금 둘은 cmux 페인이라 cys에는 역할로 열을 묶을 전제가 없다.
+//   전제가 달라졌으므로 설계도 달라진다. 되돌리지 마라.
+// ★폐기를 부른 실사고(2026-07-27 · 전원 워커 7기): 정렬이 화면 전체를 세로로 만들었다. 기전은 두 겹 —
+//   ⑴역할 버킷 4개 중 3개가 비어 워커 열만 남고 ⑵evenComb은 노드가 1개면 루프가 돌지 않아
+//   nodes[0]을 그대로 반환하므로 요청한 "row" 래퍼 자체가 소멸한다. 열이 하나라도 래퍼가
+//   남았다면 세로로 보이지 않았다. ⇒ 역할로 열을 묶는 한 이 붕괴는 어떤 함대 구성에서든 재발한다.
 // 트리 위상만 새로 짜고 attachDividerDrag는 건드리지 않으므로 수동 크기 조절은 그대로 보존된다
 // (정렬 후에도 divider를 다시 끌 수 있다 — 현재 크기만 표준 배치로 리셋될 뿐이다).
 // divider 1px·pane 헤더 등으로 컬럼 폭엔 셀 1칸 이내 잔차가 있을 수 있다.
@@ -2732,28 +2737,9 @@ function evenComb(nodes: Node[], dir: "row" | "col"): Node {
   return acc;
 }
 
-function roleLayout(sids: number[], roleOf: Map<number, string | null>): Node {
-  // 4열 버킷: master | cso | 워커·미분류 | 리뷰어 — 역할 변형(worker-2 등)은 접두 매칭(roleDotColor와 동일 관례).
-  const bucket = (sid: number): number => {
-    const r = roleOf.get(sid);
-    if (r?.startsWith("master")) return 0;
-    if (r?.startsWith("cso")) return 1;
-    if (r?.startsWith("reviewer")) return 3;
-    return 2; // worker·미분류 전부 워커 열
-  };
-  const cols: number[][] = [[], [], [], []];
-  for (const sid of sids) cols[bucket(sid)].push(sid); // 열 안 순서 = 기존 좌→우 순서 보존
-  // 리뷰어 열만 고정 순: agy(gemini, 위) → codex → 기타(stable sort라 기타끼리는 기존 순서 유지)
-  const revPri = (sid: number): number => {
-    const r = roleOf.get(sid) ?? "";
-    return r === "reviewer-gemini" ? 0 : r === "reviewer-codex" ? 1 : 2;
-  };
-  cols[3].sort((a, b) => revPri(a) - revPri(b));
-
-  const pane = (sid: number): Node => ({ type: "pane", sid });
-  // 각 열은 세로 균등 스택, 열들은 가로 균등 — 빈 열은 생략(evenComb 균등 분배가 자동 흡수).
-  const columns = cols.filter((c) => c.length).map((c) => evenComb(c.map(pane), "col"));
-  return evenComb(columns, "row");
+// 좌→우 순서는 기존 트리 순회 순서를 그대로 보존한다(collectSids 결과 순).
+function roleLayout(sids: number[]): Node {
+  return evenComb(sids.map((sid): Node => ({ type: "pane", sid })), "row");
 }
 
 async function actionEqualize() {
@@ -2761,15 +2747,8 @@ async function actionEqualize() {
   if (!ws?.tree) return;
   const live = collectSids(ws.tree).filter((sid) => panes.has(paneKey(sid, ws.socket))); // 죽은/placeholder 노드 제외 (F4 복합키)
   if (live.length < 2) return; // 0~1개는 정렬할 대상이 없음
-  // 역할은 데몬 surface.list에서 조회 (UI 생성 pane은 role=null → 가운데로)
-  const roleOf = new Map<number, string | null>();
-  try {
-    const r = (await invoke("list_surfaces", { socket: ws.socket })) as { surfaces: { surface_id: number; role: string | null }[] };
-    for (const s of r.surfaces) roleOf.set(s.surface_id, s.role);
-  } catch {
-    /* 데몬 일시 미응답: role 없이 진행 → 전부 가운데 균등 */
-  }
-  ws.tree = roleLayout(live, roleOf);
+  // 역할 조회(list_surfaces)는 제거됐다 — 배치가 역할을 보지 않으므로 결과를 버리는 데몬 왕복만 남는다.
+  ws.tree = roleLayout(live);
   render(); // 새 트리로 DOM 재구성 + fitPane→resize_surface + saveLayout
 }
 
