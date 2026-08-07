@@ -112,6 +112,11 @@ body.wsbar-resizing { cursor: col-resize; -webkit-user-select: none; user-select
    ★그 행만 넓히면 안 된다 — 열 너비가 행마다 달라지면 게이지 바의 시작 x가 어긋나 표가 계단이 된다.
    넓이는 열 전체의 속성이지 한 칸의 속성이 아니다. */
 #ws-usage.has-named .wsu-ctx-sid { width: 4.2em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 모델 스코프 게이지(「7d·Fable」)가 표에 있으면 rate 라벨 열을 **모든 행** 함께 넓힌다.
+   ★2.2em은 "5h"·"7d"에 맞춘 폭이라, 넓히지 않으면 긴 라벨이 게이지 트랙 위로 넘쳐 흐른다
+   (flex:none + 고정 width + overflow 미지정 = 잘리지도 않고 밀지도 않고 그냥 겹친다).
+   위 has-named와 **같은 이유·같은 방식**이다: 넓이는 열 전체의 속성이지 한 칸의 속성이 아니다. */
+#ws-usage.has-scoped .wsu-rate-name { width: 6em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .wsu-ctx-sid.named { color: var(--text, #c9d1d9); }
 .wsu-rate-pct, .wsu-ctx-pct { flex: none; width: 2.6em; text-align: right; color: var(--text, #c9d1d9); }
 .wsu-rate-pct.warn, .wsu-ctx-pct.warn { color: var(--warn); }

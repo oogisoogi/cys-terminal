@@ -33,10 +33,22 @@ export interface SurfaceLike {
 
 // 표시 순서 — 여기 없는 라벨은 이 뒤에 데이터 등장 순으로 붙는다.
 //
-// ★fable5 확장점: 모델별 주간 게이지가 statusline JSON에 확인되어 파서에 추가되는 날,
-// 이 배열에 라벨 한 줄만 넣으면 패널에 나타난다. 없는 값을 미리 0%로 그려 두지 않는 이유:
-// 빈 게이지는 「안 썼다」로 읽히지 「데이터가 없다」로 읽히지 않는다.
+// ★모델 스코프 게이지(「7d·Fable」)는 **여기에 넣지 않는다**(티켓⑤ 2026-08-07). 초판 주석은
+// 「fable5 확장점 = 이 배열에 라벨 한 줄 추가」였는데, 실제 API를 열어 보니 라벨의 모델 이름이
+// 응답(`scope.model.display_name`)에서 온다 — 상수로 박으면 스코프가 다른 모델로 옮겨 간 날
+// 남의 게이지에 옛 이름이 붙는다. 미등재 라벨은 labelRank가 5h·7d 뒤로 보내므로 순서도 맞다.
+// 없는 값을 미리 0%로 그려 두지 않는 이유는 그대로다: 빈 게이지는 「안 썼다」로 읽히지
+// 「데이터가 없다」로 읽히지 않는다.
 export const RATE_LABEL_ORDER = ["5h", "7d"];
+
+// 사용량 절에서 **표시하지 않는** 에이전트 (오너 판정 2026-08-07 · master#05bec9).
+//
+// ★왜 지우는가: codex rate의 원천은 rollout 파일 관측치뿐이라 **codex가 도는 동안에만** 갱신된다.
+// 오너 실측에서 화면값(52%)이 ChatGPT 설정의 실물(55%)과 어긋났고, 실시간 조회 API가 없어
+// 좁힐 방법이 없다. ⇒ 낡은 게이지는 없느니만 못하다(사용자는 그것을 현재값으로 읽는다).
+// ★수집은 끊지 않는다 — note_rate·스냅샷·소진 경보는 그대로 돈다(내부 운영용). 여기서 자르는 것은
+//   **화면에 내보내는 마지막 한 걸음**뿐이다. 실시간 원천이 생기면 이 집합에서 빼면 된다.
+export const RATE_HIDDEN_AGENTS = new Set(["codex"]);
 
 export interface RateRow {
   socket: string;
@@ -142,6 +154,18 @@ function sortRates(rows: RateRow[]): RateRow[] {
 // `accounts::note_rate`로 계정에 귀속시킨다(usage.rs:328 codex rollout · usage.rs:1169 gemini ·
 // handlers.rs:3400 statusline). 즉 계정 저장소는 같은 관측을 받아 **페인이 죽어도 들고 있는** 곳이다.
 // 그러므로 계정 유래 행은 surface 유래 행을 대체할 수 있다(정보 손실 없음).
+// 모델 스코프 주간 게이지 — 데몬 OAuth 프로브 유래(accounts.rs ScopedGauge).
+// ★계정의 updated_at과 **별개의 자기 시각**을 들고 온다: 이 게이지의 생산자는 프로브 하나뿐이고
+//   statusline이 rate를 갱신해도 이 값은 그때 관측된 게 아니다. 계정 시각을 물려 쓰면 낡은
+//   게이지가 매번 「방금 관측」으로 둔갑한다.
+export interface ScopedGaugeLike {
+  model: string; // API가 준 표시 이름("Fable") — 우리가 짓지 않는다
+  used_pct: number;
+  resets_at: number | null;
+  updated_at: number;
+  source: string;
+}
+
 export interface AccountLike {
   provider: string;
   account_id: string;
@@ -149,6 +173,7 @@ export interface AccountLike {
   rate: RateWindowLike[];
   // 관측이 한 번도 없으면 null이다(계정은 등록됐으나 아직 못 봤다).
   updated_at: number | null;
+  scoped?: ScopedGaugeLike[] | null;
 }
 
 export function accountRates(accounts: AccountLike[] | null | undefined, nowSecs: number): RateRow[] {
@@ -182,6 +207,52 @@ export function accountRates(accounts: AccountLike[] | null | undefined, nowSecs
     }
   }
   return sortRates(rows);
+}
+
+// 모델 스코프 게이지 → rate 행 (티켓⑤ · 오너 승인 2026-08-07).
+//
+// ★이것은 「자체 집계」 줄과 **다른 종류의 수**다. 자체 집계는 우리가 트랜스크립트를 세어 만든
+// 관측 절대치라 한도를 모르지만, 이 값은 서버가 준 **한도 대비 소진율**이다 — 그래서 게이지로
+// 그린다. 두 줄은 대체 관계가 아니라 보완 관계라 **함께 남긴다**(절대치는 게이지가 못 준다).
+//
+// 라벨 `7d·<모델>`: 기간이 주간이라 7d와 같은 축이고, 뒤에 모델 이름을 붙여 「전체 주간」과 구별한다.
+// ★모델 이름은 응답이 준 것을 그대로 쓴다(RATE_LABEL_ORDER 주석 참조 — 상수 금지).
+export function scopedRates(accounts: AccountLike[] | null | undefined, nowSecs: number): RateRow[] {
+  const rows: RateRow[] = [];
+  for (const a of accounts ?? []) {
+    if (!a) continue;
+    for (const g of a.scoped ?? []) {
+      if (!g || typeof g.model !== "string" || !g.model) continue; // 이름 없는 게이지는 만들지 않는다
+      const used = Number(g.used_pct);
+      const updatedAt = Number(g.updated_at);
+      if (!Number.isFinite(used)) continue;
+      // accountRates와 **같은 규율**: 관측 시각이 없으면 그리지 않는다(나이 0 = 거짓 신선).
+      if (!g.updated_at || !Number.isFinite(updatedAt) || updatedAt <= 0) continue;
+      const age = Math.max(0, Math.round(nowSecs - updatedAt));
+      rows.push({
+        socket: "",
+        agent: a.provider || "?",
+        accountId: a.account_id || "",
+        accountLabel: a.label || "",
+        label: `7d·${g.model}`,
+        usedPct: used,
+        resetsAt: g.resets_at ?? null,
+        ageSecs: age,
+        updatedAt,
+        stale: age > USAGE_STALE_SECS,
+      });
+    }
+  }
+  return sortRates(rows);
+}
+
+// 화면에 내보내기 직전 걸러내기 — 실시간 원천이 없는 에이전트의 행을 뺀다(RATE_HIDDEN_AGENTS 주석).
+//
+// ★**병합이 끝난 뒤에** 걸어야 한다. 계정 유래 행만 지우면 같은 codex의 surface 관측 행이
+// mergeRates의 중복 방지를 빠져나와 그대로 올라온다(덮개가 사라지면 밑에 있던 것이 드러난다).
+// 그래서 이 함수의 입력은 언제나 「최종 목록」이다.
+export function filterDisplayRates(rows: RateRow[]): RateRow[] {
+  return rows.filter((r) => !RATE_HIDDEN_AGENTS.has(r.agent));
 }
 
 // 계정 유래 + surface 유래 병합 — **계정이 이긴다.**

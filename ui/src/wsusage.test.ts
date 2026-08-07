@@ -16,6 +16,7 @@ import {
   compactTokens,
   fableFromAnalytics,
   fableObserved,
+  filterDisplayRates,
   hasMultipleSockets,
   mergeCtxRows,
   mergeRates,
@@ -23,6 +24,7 @@ import {
   paneCtxRows,
   RATE_LABEL_ORDER,
   renderSignature,
+  scopedRates,
   sevClassFor,
   shortSocketTag,
   sourceGrade,
@@ -410,6 +412,119 @@ describe("mergeRates — 계정이 이긴다(중복 줄 = 가짜 계정)", () =>
 
   test("양쪽 다 비면 빈 배열 — 패널이 숨는 조건이 그대로 유지된다", () => {
     expect(mergeRates(accountRates([], ANOW), aggregateRates([], ANOW))).toEqual([]);
+  });
+});
+
+// ── 모델 스코프 주간 게이지 + codex 비표시 (티켓⑤ · 오너 승인 2026-08-07)
+//
+// 픽스처는 데몬 local_json이 실제로 내보내는 모양 그대로다(accounts.rs ScopedGauge 직렬화):
+// scoped[]는 계정 안에 들어 있고 **자기 updated_at**을 들고 있다.
+describe("scopedRates — 「7d·Fable」 실게이지", () => {
+  const ACCT_WITH_SCOPED: AccountLike = {
+    ...ACCT_CLAUDE,
+    scoped: [
+      { model: "Fable", used_pct: 6, resets_at: 1786654800, updated_at: 1786062874, source: "oauth" },
+    ],
+  };
+
+  test("★계정 소속으로 「7d·Fable」 행이 나온다 — 게이지에 필요한 값이 전부 실려야 한다", () => {
+    const rows = scopedRates([ACCT_WITH_SCOPED], ANOW);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].label).toBe("7d·Fable");
+    expect(rows[0].usedPct).toBe(6);
+    expect(rows[0].agent).toBe("claude");
+    // 계정 신원 — 이 값이 비면 범위 머리표가 갈리지 않아 「누구의 한도인지」를 잃는다.
+    expect(rows[0].accountId).toBe("66e877cb-727f-4fb1-8ec9-8f2e8fa68f18");
+    expect(rows[0].accountLabel).toBe("oogisoogi@gmail.com");
+    // 리셋 시각은 게이지가 준 값과 짝을 유지한다(다른 창 것을 끌어오지 않는다).
+    expect(rows[0].resetsAt).toBe(1786654800);
+  });
+
+  test("★★나이는 게이지 자신의 시각으로 잰다 — 계정 시각을 물려 쓰면 낡은 게이지가 방금 관측으로 둔갑한다", () => {
+    // 계정(rate 슬롯)은 방금 갱신됐지만 게이지는 10분 전 관측인 상황 —
+    // statusline이 rate만 갱신하고 지나갈 때 실제로 생기는 모양이다.
+    const drifted: AccountLike = {
+      ...ACCT_CLAUDE,
+      updated_at: ANOW, // 계정 rate는 지금
+      scoped: [{ model: "Fable", used_pct: 6, resets_at: null, updated_at: ANOW - 600, source: "oauth" }],
+    };
+    const rows = scopedRates([drifted], ANOW);
+    expect(rows[0].ageSecs).toBe(600);
+    expect(rows[0].stale).toBe(true);
+    // 대조군: 같은 계정의 rate 행은 신선하다 — 두 축이 따로 늙는 것이 정상이다.
+    expect(accountRates([drifted], ANOW)[0].stale).toBe(false);
+  });
+
+  test("stale 문턱은 rate 행과 같은 값을 쓴다 — 한 표에서 판정이 갈리면 같은 색이 두 뜻을 갖는다", () => {
+    const at = (age: number): AccountLike => ({
+      ...ACCT_CLAUDE,
+      scoped: [{ model: "Fable", used_pct: 6, resets_at: null, updated_at: ANOW - age, source: "oauth" }],
+    });
+    expect(scopedRates([at(USAGE_STALE_SECS)], ANOW)[0].stale).toBe(false); // 경계는 아직 아니다
+    expect(scopedRates([at(USAGE_STALE_SECS + 1)], ANOW)[0].stale).toBe(true);
+  });
+
+  test("이름 없는 모델·관측 시각 없는 게이지는 그리지 않는다 — 없는 사실을 만들지 않는다", () => {
+    const bad: AccountLike = {
+      ...ACCT_CLAUDE,
+      scoped: [
+        { model: "", used_pct: 5, resets_at: null, updated_at: ANOW, source: "oauth" },
+        { model: "Fable", used_pct: 5, resets_at: null, updated_at: 0, source: "oauth" },
+        { model: "Fable", used_pct: NaN as unknown as number, resets_at: null, updated_at: ANOW, source: "oauth" },
+      ],
+    };
+    expect(scopedRates([bad], ANOW)).toEqual([]);
+    // scoped 자체가 없는 계정(실물의 codex·agy)도 조용히 0행이다.
+    expect(scopedRates([ACCT_CODEX, ACCT_UNOBSERVED], ANOW)).toEqual([]);
+  });
+
+  test("정렬 — 5h · 7d 다음에 온다(미등재 라벨이 뒤로 가는 규칙 그대로)", () => {
+    const rows = mergeRates(
+      [...accountRates([ACCT_WITH_SCOPED], ANOW), ...scopedRates([ACCT_WITH_SCOPED], ANOW)],
+      aggregateRates([], ANOW),
+    );
+    expect(rows.map((r) => r.label)).toEqual(["5h", "7d", "7d·Fable"]);
+  });
+
+  test("★게이지 행과 「자체 집계」 줄은 함께 산다 — 종류가 다른 두 수라 하나가 다른 하나를 대체하지 않는다", () => {
+    const rates = mergeRates(
+      [...accountRates([ACCT_WITH_SCOPED], ANOW), ...scopedRates([ACCT_WITH_SCOPED], ANOW)],
+      aggregateRates([], ANOW),
+    );
+    const observed = fableObserved([{ model: "claude-fable-5", tokens: 400 }], 1000);
+    const sig = renderSignature(rates, [], observed, false, false);
+    expect(sig).toContain("7d·Fable|6"); // 한도 대비 게이지(서버 진실)
+    expect(sig).toContain("400|40"); // 자체 집계(관측 절대치 + 비중)
+  });
+});
+
+describe("filterDisplayRates — codex 행 비표시 (오너 판정 2026-08-07)", () => {
+  test("★계정 유래 codex 행이 화면에서 사라진다 — 수집은 그대로 두고 표시만 끊는다", () => {
+    const merged = mergeRates(accountRates([ACCT_CLAUDE, ACCT_CODEX], ANOW), aggregateRates([], ANOW));
+    expect(merged.some((r) => r.agent === "codex")).toBe(true); // 병합 단계엔 아직 있다(수집 무영향)
+    const shown = filterDisplayRates(merged);
+    expect(shown.some((r) => r.agent === "codex")).toBe(false);
+    expect(shown.map((r) => `${r.agent}/${r.label}`)).toEqual(["claude/5h", "claude/7d"]);
+  });
+
+  test("★★surface 관측 유래 codex 행도 막힌다 — 계정 행만 지우면 덮개가 사라져 밑에 있던 것이 드러난다", () => {
+    // 계정 저장소에 codex가 없으면 mergeRates의 중복 방지가 걸리지 않아 surface 행이 그대로 올라온다.
+    const surface = aggregateRates(
+      [sf(1, { usage: mkUsage({ agent: "codex", updated_at: ANOW, rate: [{ label: "7d", used_pct: 52, resets_at: null }] }) })],
+      ANOW,
+    );
+    const merged = mergeRates(accountRates([ACCT_CLAUDE], ANOW), surface);
+    expect(merged.some((r) => r.agent === "codex")).toBe(true);
+    expect(filterDisplayRates(merged).some((r) => r.agent === "codex")).toBe(false);
+  });
+
+  test("다른 에이전트는 건드리지 않는다 — 필터가 넓어지면 살아 있는 원천까지 지운다", () => {
+    const surface = aggregateRates(
+      [sf(1, { usage: mkUsage({ agent: "gemini", updated_at: ANOW, rate: [{ label: "5h", used_pct: 7, resets_at: null }] }) })],
+      ANOW,
+    );
+    const shown = filterDisplayRates(mergeRates(accountRates([ACCT_CLAUDE], ANOW), surface));
+    expect(shown.map((r) => r.agent)).toEqual(["claude", "claude", "gemini"]);
   });
 });
 
