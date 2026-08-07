@@ -13,6 +13,7 @@ import {
   ageText,
   ageAt,
   aggregateRates,
+  CTX_NAME_ORDER,
   filterDisplayRates,
   hasMultipleSockets,
   mergeCtxRows,
@@ -560,13 +561,46 @@ describe("namedCtxRows / mergeCtxRows — 번호 대신 이름", () => {
     expect(rows[0].surfaceId).toBe(0);
   });
 
-  test("★이름 행이 번호 행보다 먼저 온다 (오너 지정 순서) — 그 다음은 번호 오름차순", () => {
+  // ★티켓⑥-b(오너 2026-08-07): 서열은 master → cso → 그 밖의 이름 → 번호 페인이다.
+  //   초판은 「이름 먼저 + 사전순」이라 c < m 때문에 cso가 master 위로 왔다 — 화면의 서열이
+  //   조직의 서열과 거꾸로였다. 아래 기대값의 첫 두 자리가 그 수리의 전부다.
+  test("★페인 CTX 서열 = master → cso → 번호 오름차순 (오너 지정 순서)", () => {
     const panes = paneCtxRows(
       [sf(7, { usage: fresh({ ctx_pct: 30 }) }), sf(3, { usage: fresh({ ctx_pct: 20 }) })],
       NOW,
     );
     const rows = mergeCtxRows(namedCtxRows([NR({ name: "master" }), NR({ name: "cso", ctx_pct: 7 })], NOW), panes);
-    expect(rows.map((r) => r.name || r.surfaceId)).toEqual(["cso", "master", 3, 7]);
+    expect(rows.map((r) => r.name || r.surfaceId)).toEqual(["master", "cso", 3, 7]);
+  });
+
+  test("★입력 순서가 어떻든 결과 서열은 같다 — 정렬이지 도착 순서가 아니다", () => {
+    const panes = paneCtxRows([sf(3, { usage: fresh({ ctx_pct: 20 }) })], NOW);
+    const named = namedCtxRows([NR({ name: "cso", ctx_pct: 7 }), NR({ name: "master" })], NOW);
+    expect(mergeCtxRows(named, panes).map((r) => r.name || r.surfaceId)).toEqual(["master", "cso", 3]);
+    // 병합 인자를 뒤집어도(번호 행이 먼저 들어와도) 같다.
+    expect(mergeCtxRows([], [...panes, ...named]).map((r) => r.name || r.surfaceId)).toEqual(["master", "cso", 3]);
+  });
+
+  test("★등재되지 않은 이름 보고자는 master·cso 뒤 · 번호 페인 앞 — 사이 자리가 정해져 있다", () => {
+    const panes = paneCtxRows([sf(2, { usage: fresh({ ctx_pct: 5 }) })], NOW);
+    const named = namedCtxRows(
+      [NR({ name: "worker-a" }), NR({ name: "cso" }), NR({ name: "alpha" }), NR({ name: "master" })],
+      NOW,
+    );
+    // 미등재끼리는 사전순(alpha < worker-a) — 서열이 없으면 값에 안 흔들리는 순서를 쓴다.
+    expect(mergeCtxRows(named, panes).map((r) => r.name || r.surfaceId)).toEqual([
+      "master",
+      "cso",
+      "alpha",
+      "worker-a",
+      2,
+    ]);
+  });
+
+  test("대소문자가 달라도 서열은 유지된다 — env 재정의로 「Master」가 올 수 있다", () => {
+    const rows = mergeCtxRows(namedCtxRows([NR({ name: "CSO" }), NR({ name: "Master" })], NOW), []);
+    expect(rows.map((r) => r.name)).toEqual(["Master", "CSO"]);
+    expect(CTX_NAME_ORDER).toEqual(["master", "cso"]);
   });
 
   test("이름 없는 보고자는 행을 만들지 않는다 — 지어낸 라벨 금지", () => {

@@ -327,13 +327,34 @@ export function paneCtxRows(surfaces: SurfaceLike[], nowSecs: number): CtxRow[] 
   return sortCtxRows(rows);
 }
 
-// 정렬: **이름 있는 보고자 먼저**, 그 다음 소켓 → 페인 번호 오름차순(오너 지정 순서).
+// 이름 있는 보고자의 **역할 서열** — 이 배열의 자리가 곧 랭크다(티켓⑥-b · 오너 2026-08-07).
+//
+// ★왜 사전순으로는 안 되는가: 초판은 「이름 행 먼저 + 이름 사전순」이었는데, 사전순에서는
+//   c < m 이라 **cso가 master보다 위로 온다**. 화면의 서열이 조직의 서열과 거꾸로 보였다.
+//   순서가 뜻을 갖는 목록에서 정렬 키를 글자에 맡기면, 이름을 바꾸는 순간 뜻이 뒤집힌다.
+// ★상수로 박아도 되는 이유(RATE_LABEL_ORDER와 반대인 판단): rate 라벨의 모델 이름은 **응답이**
+//   정하므로 상수로 박으면 안 됐다. 이 이름들은 우리가 정한다(named.rs DEFAULT_MAP) — 서열도
+//   우리 조직의 사실이므로 코드가 지는 것이 맞다. 미등재 이름은 이 뒤·번호 페인 앞에 온다.
+export const CTX_NAME_ORDER = ["master", "cso"];
+
+// 행 → 정렬 랭크. master=0 · cso=1 · 그 밖의 이름 보고자=2 · 번호 페인=3.
+// ★대소문자를 무시한다: 이름은 env(CYS_NAMED_REPORTERS)로 재정의될 수 있어 「Master」가 올 수
+//   있고, 그때 서열이 조용히 무너지면 원인을 찾기 어렵다(정렬은 틀려도 에러가 나지 않는다).
+const ctxNameRank = (row: CtxRow): number => {
+  if (!row.name) return CTX_NAME_ORDER.length + 1; // 번호 페인은 언제나 맨 뒤
+  const i = CTX_NAME_ORDER.indexOf(row.name.toLowerCase());
+  return i < 0 ? CTX_NAME_ORDER.length : i;
+};
+
+// 정렬: **역할 서열(master → cso → 그 밖의 이름) 먼저**, 그 다음 소켓 → 페인 번호 오름차순.
 // ★이름 행을 위에 두는 이유: master·cso는 상시 존재하는 고정 항목이고 번호 페인은 오가는 것이다.
 //   고정 항목이 변동 항목 사이에 끼면 볼 때마다 자리가 달라져 눈이 못 따라간다.
+// ★같은 랭크 안에서는 종전 규칙 그대로다(이름 사전순 → 소켓 → 번호 오름차순) — 랭크가 같다는 것은
+//   서열이 정해지지 않았다는 뜻이고, 그때는 값에 흔들리지 않는 순서(글자·번호)가 맞다.
 function sortCtxRows(rows: CtxRow[]): CtxRow[] {
   rows.sort(
     (a, b) =>
-      Number(!a.name) - Number(!b.name) || // 이름 있는 행이 먼저
+      ctxNameRank(a) - ctxNameRank(b) ||
       a.name.localeCompare(b.name) ||
       a.socket.localeCompare(b.socket) ||
       a.surfaceId - b.surfaceId,
