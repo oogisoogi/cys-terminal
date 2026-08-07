@@ -417,6 +417,16 @@ pub struct Surface {
     pub last_human_input: Mutex<Option<Instant>>,
     /// T3-14 단조 라인 커서: scrollback FIFO와 무관하게 증가하는 누적 완성 라인 수
     pub line_count: AtomicU64,
+    /// ★scrollback 이 마지막으로 **전진한** 시각(완성 라인 push). None=아직 한 줄도 없음.
+    /// `last_output`(PTY 바이트 도착)과 짝을 이뤄 "출력은 오는데 줄은 안 는다"= 제자리
+    /// 재그리기(TUI) 를 판정한다 — read_text 의 scrollback 경로가 낡은 채로 조용히 응답하던
+    /// 결함(⑴)의 유일한 근거다. 단일 writer = `ingest_output`(완성 라인이 있을 때만).
+    pub last_line_at: Mutex<Option<Instant>>,
+    /// ★(⑶ role 회수) 에이전트 자식이 **연속으로 사라져 있는** 최초 관측 시각(epoch초).
+    /// watchdog `check_agent_death` 가 유일 writer다 — 살아 있으면 None 으로 되돌린다.
+    /// 자가 업데이트류 「잠깐 죽음」을 role 회수로 오판하지 않으려면 이 시각과 유예가 필요하다
+    /// (죽음 관측 1회 = 회수 근거가 아니다).
+    pub agent_dead_since: Mutex<Option<f64>>,
     /// T4-17 헬스 조치: 이 시각까지 queued 배달 일시정지 (직접 send는 통과)
     pub queue_paused_until: Mutex<Option<Instant>>,
     /// T4-17 에코 제외: 마지막 원격 주입 시각 (주입 직후 에코 라인은 룰 매칭 제외)
@@ -1163,6 +1173,93 @@ fn process_chunk_isolated(
             *parser = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
             (None, true)
         }
+    }
+}
+
+/// ★(⑴) scrollback 정지 판정의 유예초 — 이보다 오래 "출력은 오는데 줄은 안 느는" 상태면
+/// 그 pane 은 제자리 재그리기(TUI)다. 3초인 이유: 개행 없는 셸 프롬프트(`$ `)나 진행 표시가
+/// 만드는 순간적 역전(수백 ms)을 TUI 로 오판하지 않으면서, 사람이 화면을 다시 읽기 전에
+/// 판정이 서기 때문이다.
+pub const SCROLLBACK_STALE_GRACE_SECS: f64 = 3.0;
+
+/// ★(⑴) scrollback 이 화면의 진실에서 뒤처졌는가 — **순수 판정부**(결정론 테스트 대상).
+///
+/// 배경(2026-08-07 실측): Claude Code 같은 전체화면 TUI 는 `\n` 을 내지 않고 커서 주소지정으로
+/// 제자리 재그리기만 한다. `ingest_output` 은 **완성 라인(개행)에서만** scrollback 을 전진시키므로
+/// 그런 pane 의 scrollback 은 **TUI 가 화면을 넘겨받기 직전 마지막 줄**에서 영구 정지한다
+/// (실측: surface:386 `line_count=2` — 기동 명령 에코 2줄이 전부). 그런데
+/// `read_text` 의 `lines`/`since_line` 경로는 그 정지한 버퍼를 **아무 표시 없이** 돌려줬다 —
+/// 호출자는 "기동 직후 프레임에 동결된 화면"을 현재 화면으로 읽는다. 같은 시각 데몬 승인
+/// 감지기(`governance::check_approvals`)는 vt100 그리드를 보므로 신선했다: **PTY 는 신선하고
+/// read 경로만 낡는** 비대칭의 정체가 이것이다.
+///
+/// 인자는 둘 다 **경과초**다(작을수록 최근):
+/// - `out_age_secs`: 마지막 PTY 출력 이후 경과초. `None`=출력 이력 없음(신생 pane).
+/// - `line_age_secs`: 마지막 완성 라인 이후 경과초. `None`=완성 라인이 한 줄도 없음(=+∞).
+///
+/// 판정: `line_age - out_age >= grace` — "출력은 계속 오는데 줄은 유예만큼 멈춰 있다".
+/// 출력 자체가 없으면(=아무 일도 안 일어남) 정지가 아니다(false) — 조용한 pane 을 TUI 로
+/// 오판해 grid 로 갈아타면 `--lines 200` 같은 이력 요청이 35줄로 잘려 **손실**이 된다.
+pub fn scrollback_is_stale(
+    out_age_secs: Option<f64>,
+    line_age_secs: Option<f64>,
+    grace_secs: f64,
+) -> bool {
+    let Some(out) = out_age_secs else {
+        return false; // 출력 이력이 없다 = 비교할 사실이 없다(추정 금지)
+    };
+    let line = line_age_secs.unwrap_or(f64::INFINITY);
+    line - out >= grace_secs
+}
+
+#[cfg(test)]
+mod scrollback_freshness_tests {
+    use super::{scrollback_is_stale, SCROLLBACK_STALE_GRACE_SECS};
+
+    const G: f64 = SCROLLBACK_STALE_GRACE_SECS;
+
+    /// ⑴ 재현 핀: TUI(제자리 재그리기) — 출력은 방금 왔는데 줄은 기동 이후 안 늘었다.
+    /// 실측 대응: surface:386(Claude Code) line_count=2·기동 명령 에코에서 정지.
+    #[test]
+    fn tui_redraw_pane_is_stale() {
+        assert!(
+            scrollback_is_stale(Some(0.2), Some(1200.0), G),
+            "출력 0.2초 전·마지막 줄 20분 전이면 scrollback 정지다"
+        );
+    }
+
+    /// 완성 라인이 **한 줄도 없는** pane(첫 바이트부터 TUI 가 화면을 잡은 경우)도 정지다.
+    #[test]
+    fn pane_that_never_completed_a_line_is_stale() {
+        assert!(scrollback_is_stale(Some(0.5), None, G));
+    }
+
+    /// 개행 없는 셸 프롬프트(`$ `)는 정지가 아니다 — 순간적 역전을 TUI 로 오판하면
+    /// `--lines N` 이력 요청이 화면 높이로 잘려 정보가 손실된다.
+    #[test]
+    fn shell_prompt_without_newline_is_not_stale() {
+        assert!(!scrollback_is_stale(Some(0.0), Some(0.05), G));
+    }
+
+    /// 조용한 pane(출력도 줄도 오래 전) — 정지 아님. 둘 다 같이 늙는 것은 정상이다.
+    #[test]
+    fn idle_pane_is_not_stale() {
+        assert!(!scrollback_is_stale(Some(3600.0), Some(3600.0), G));
+        assert!(!scrollback_is_stale(Some(3600.0), Some(3601.5), G));
+    }
+
+    /// 출력 이력이 없으면 판정하지 않는다(fail-safe: 기존 동작 유지).
+    #[test]
+    fn no_output_history_is_never_stale() {
+        assert!(!scrollback_is_stale(None, None, G));
+        assert!(!scrollback_is_stale(None, Some(999.0), G));
+    }
+
+    /// 경계: 정확히 유예만큼 벌어지면 정지(>=). 유예 직전은 아니다.
+    #[test]
+    fn grace_boundary_is_inclusive() {
+        assert!(scrollback_is_stale(Some(1.0), Some(1.0 + G), G));
+        assert!(!scrollback_is_stale(Some(1.0), Some(1.0 + G - 0.01), G));
     }
 }
 
@@ -2971,6 +3068,8 @@ impl Daemon {
             last_cmd_ack: Mutex::new(None),
             last_human_input: Mutex::new(None),
             line_count: AtomicU64::new(0),
+            last_line_at: Mutex::new(None),
+            agent_dead_since: Mutex::new(None),
             queue_paused_until: Mutex::new(None),
             last_injected: Mutex::new(None),
             observed_usage: Mutex::new(None),
@@ -3320,6 +3419,9 @@ impl Daemon {
             surface
                 .line_count
                 .fetch_add(completed.len() as u64, Ordering::Relaxed);
+            // ★scrollback 전진 시각 — read_text 의 신선도 판정 근거(§Surface::last_line_at).
+            // scrollback 락 안에서 찍어 (sb, line_count, last_line_at) 셋이 한 관측점을 가리키게 한다.
+            *surface.last_line_at.lock().unwrap() = Some(Instant::now());
             drop(sb);
             self.persist_for_recall(surface, &completed);
             self.run_health_rules(surface, &completed);

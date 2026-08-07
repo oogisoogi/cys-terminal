@@ -114,6 +114,39 @@ fn param_dim(params: &Value, key: &str, fallback: u16, max: u64) -> Result<u16, 
 static FEED_REQ_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// PTY 쓰기 채널 send 결과 → RPC 응답 (성공 시 None)
+/// ★(⑵) 주입 **거부의 가시화** — 거부는 조용하면 안 된다.
+///
+/// 배경(2026-08-07 실측): master 발신 원장에 `send_rc=1` 실패가 3건 남았는데
+/// (`.master-send-ledger.jsonl` 09:31·13:02·13:23), **어디에도 사유가 없었다** — 데몬은
+/// 거부를 로그·이벤트로 남기지 않고, 배달 원장(`delivery.rs`)은 거부가 그보다 앞이라
+/// 아무 줄도 만들지 않는다. 그래서 사후에 "왜 실패했는가"를 판정할 방법이 **원리적으로**
+/// 없었고, 관측자는 그 침묵을 다른 원인(낡은 화면 판독)으로 오귀속했다.
+/// ⇒ 모든 거부는 **사유·대상·발신자와 함께** 버스 이벤트 + 데몬 로그 한 줄을 남긴다.
+/// 이 함수는 응답을 만들 뿐 정책을 바꾸지 않는다(거부 판정 자체는 호출부 그대로).
+fn reject_send(
+    daemon: &Daemon,
+    sid: u64,
+    method: &str,
+    code: &str,
+    msg: &str,
+    caller_pid: Option<u32>,
+    id: &Value,
+) -> Value {
+    daemon.bus.publish(
+        "send.rejected",
+        "surface",
+        Some(sid),
+        json!({"surface_ref": surface_ref(sid), "method": method, "code": code,
+               "message": msg, "caller_pid": caller_pid}),
+    );
+    eprintln!(
+        "[cysd] {} 주입 거부 — method={method} code={code} caller_pid={} · {msg}",
+        surface_ref(sid),
+        caller_pid.map(|p| p.to_string()).unwrap_or_else(|| "?".into())
+    );
+    err_response(id, code, msg)
+}
+
 fn try_write(
     surface: &crate::state::Surface,
     req: crate::state::WriteReq,
@@ -2831,10 +2864,14 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 ));
             };
             if surface.exited.load(Ordering::Relaxed) {
-                return Reply::Single(err_response(
-                    &id,
+                return Reply::Single(reject_send(
+                    daemon,
+                    sid,
+                    "surface.send_text",
                     "process_exited",
                     "surface process has exited",
+                    caller_pid,
+                    &id,
                 ));
             }
             // T3-13: 사람(UI) 키 입력 **자기신고** — 타이핑 가드 시각만 기록하고 즉시 통과.
@@ -2859,7 +2896,17 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             // 가드를 오염·교착시키지 못하게 한다.
             let verified_from = match check_send_acl(daemon, caller_pid, &surface, &params) {
                 Ok(v) => v,
-                Err(e) => return Reply::Single(err_response(&id, "acl_denied", &e)),
+                Err(e) => {
+                    return Reply::Single(reject_send(
+                        daemon,
+                        sid,
+                        "surface.send_text",
+                        "acl_denied",
+                        &e,
+                        caller_pid,
+                        &id,
+                    ))
+                }
             };
             // ★A9(v4 수리 · D4 DoD "데몬측 예외 1건"): GUI 는 mac 에서 비-휠 마우스 보고를
             // 앱에 forward 하는데 그 경로가 send_input(human=true)라 보고가 사람 타이핑으로
@@ -2976,10 +3023,14 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     if typing {
                         // ★T-0147-6: 코드·문구는 lib 단일 소스다 — 소비자(cys 주입 경로)가 이
                         //   메시지로 `--queued` 1회 전환을 판정한다(문구 사본 금지).
-                        return Reply::Single(err_response(
-                            &id,
+                        return Reply::Single(reject_send(
+                            daemon,
+                            sid,
+                            "surface.send_text",
                             cys::ERR_TYPING_GUARD,
                             cys::MSG_TYPING_GUARD,
+                            caller_pid,
+                            &id,
                         ));
                     }
                 }
@@ -3197,10 +3248,14 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     if typing {
                         // ★T-0147-6: 코드·문구는 lib 단일 소스다 — 소비자(cys 주입 경로)가 이
                         //   메시지로 `--queued` 1회 전환을 판정한다(문구 사본 금지).
-                        return Reply::Single(err_response(
-                            &id,
+                        return Reply::Single(reject_send(
+                            daemon,
+                            sid,
+                            "surface.send_key",
                             cys::ERR_TYPING_GUARD,
                             cys::MSG_TYPING_GUARD,
+                            caller_pid,
+                            &id,
                         ));
                     }
                 }
@@ -3236,6 +3291,21 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     &format!("surface {sid} not found"),
                 ));
             };
+            // ★(⑴) scrollback 정지 판정 — 두 경로(lines·since_line)가 같은 사실을 쓴다.
+            // 판정부는 state::scrollback_is_stale(순수 함수)이고 여기서는 관측만 한다.
+            let stale = {
+                let out_age = Some(surface.last_output.lock().unwrap().elapsed().as_secs_f64());
+                let line_age = surface
+                    .last_line_at
+                    .lock()
+                    .unwrap()
+                    .map(|t| t.elapsed().as_secs_f64());
+                crate::state::scrollback_is_stale(
+                    out_age,
+                    line_age,
+                    crate::state::SCROLLBACK_STALE_GRACE_SECS,
+                )
+            };
             // T3-14 델타 읽기: 단조 라인 커서 이후의 새 라인만 반환 (토큰 절약 모니터링)
             if let Some(since) = param_u64(&params, "since_line") {
                 let max_lines = param_u64(&params, "max_lines").unwrap_or(2000).min(10_000) as usize;
@@ -3250,37 +3320,66 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 let skip = (start - oldest) as usize;
                 let lines: Vec<String> = sb.iter().skip(skip).take(max_lines).cloned().collect();
                 let next_cursor = start + lines.len() as u64;
+                // ★(⑴) 델타 경로는 **의미가 라인 커서**라 grid 로 갈아탈 수 없다(그리드 행은
+                // 단조 라인이 아니다 — 갈아타면 모니터가 같은 화면을 새 라인으로 무한 재수신한다).
+                // 대신 정지 사실을 **응답에 실어** 조용한 0건이 "아무 일 없음"으로 읽히지 않게 한다.
                 return Reply::Single(ok_response(
                     &id,
                     json!({"surface_id": sid, "surface_ref": surface_ref(sid),
                            "text": lines.join("\n"), "line_count": lines.len(),
                            "since": start, "next_cursor": next_cursor,
-                           "latest_cursor": total, "truncated": truncated}),
+                           "latest_cursor": total, "truncated": truncated,
+                           "source": "scrollback", "scrollback_stale": stale}),
                 ));
             }
-            let text = if let Some(lines) = param_u64(&params, "lines") {
-                // Tail of the stripped scrollback line buffer.
-                let sb = surface.scrollback.lock().unwrap_or_else(|e| e.into_inner());
-                let n = sb.len();
-                let start = n.saturating_sub(lines as usize);
-                sb.iter()
-                    .skip(start)
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            } else {
-                // Accurate visible screen, reconstructed by the vt100 grid.
-                surface
+            // grid = vt100 그리드에서 재구성한 **정확한 현재 화면**(데몬 승인 감지기와 동일 소스).
+            let grid = |tail: Option<u64>| -> String {
+                let full = surface
                     .parser
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .screen()
-                    .contents()
+                    .contents();
+                match tail {
+                    // 요청한 N줄만 — 그리드 하단(가장 최근 행)에서 자른다.
+                    Some(n) => {
+                        let rows: Vec<&str> = full.lines().collect();
+                        rows[rows.len().saturating_sub(n as usize)..].join("\n")
+                    }
+                    None => full,
+                }
+            };
+            let (text, source) = if let Some(lines) = param_u64(&params, "lines") {
+                if stale {
+                    // ★(⑴ 수리) scrollback 이 정지한 pane 에서 그 버퍼를 돌려주면 **기동 직후
+                    // 프레임**을 현재 화면이라고 답하는 것이 된다. 호출자가 요구한 것은
+                    // "이 pane 의 마지막 N줄"이므로 **화면 그리드의 마지막 N줄**로 응답한다 —
+                    // 이 경로만이 데몬 승인 감지기와 같은 사실을 본다. 갈아탄 사실은
+                    // `source`/`scrollback_stale` 로 명시한다(무음 대체 금지).
+                    (grid(Some(lines)), "grid")
+                } else {
+                    // Tail of the stripped scrollback line buffer.
+                    let sb = surface.scrollback.lock().unwrap_or_else(|e| e.into_inner());
+                    let n = sb.len();
+                    let start = n.saturating_sub(lines as usize);
+                    (
+                        sb.iter()
+                            .skip(start)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                        "scrollback",
+                    )
+                }
+            } else {
+                // Accurate visible screen, reconstructed by the vt100 grid.
+                (grid(None), "grid")
             };
             Reply::Single(ok_response(
                 &id,
                 json!({"surface_id": sid, "surface_ref": surface_ref(sid), "text": text,
-                       "latest_cursor": surface.line_count.load(Ordering::Relaxed)}),
+                       "latest_cursor": surface.line_count.load(Ordering::Relaxed),
+                       "source": source, "scrollback_stale": stale}),
             ))
         }
 
@@ -9999,6 +10098,209 @@ mod tests {
             assert_eq!(it["claim"]["rc"], json!(0));
             assert_eq!(it["action"], json!("ensure-team"), "닫힌 enum 토큰 이탈: {it}");
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // ⑴ read-screen 낡은 스냅샷 — 재현 + 수리 핀 (2026-08-07 실측 티켓⑦)
+    //
+    // 실측 재현(수리 전): launch-agent 로 띄운 Claude Code pane(surface:386)의
+    //   `cys read-screen --surface 386 --lines 30` → **기동 명령 에코만** 반환
+    //   (`cys status --json` 의 `line_count=2` 로 교차확인). 같은 시각 무옵션 read 는 신선.
+    //   원인은 데몬이 낡은 것이 아니라 **경로가 다른 저장소를 본다**는 것: scrollback 은
+    //   개행에서만 전진하는데 TUI 는 개행을 내지 않는다.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// TUI pane 을 만든다: scrollback 은 「기동 직후 프레임」에서 멈춰 있고(오래 전),
+    /// vt100 그리드에는 최신 화면이 있으며 PTY 출력은 방금 도착했다.
+    fn make_frozen_scrollback_pane(daemon: &Arc<Daemon>) -> (u64, Arc<crate::state::Surface>) {
+        let sid = make_surface(daemon, None);
+        let s = daemon.get_surface(sid).unwrap();
+        {
+            let mut sb = s.scrollback.lock().unwrap();
+            sb.push_back("BOOT-ECHO-claude --model opus".into());
+            sb.push_back("BOOT-ECHO-2".into());
+        }
+        s.line_count.store(2, Ordering::Relaxed);
+        *s.last_line_at.lock().unwrap() =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(600));
+        s.parser
+            .lock()
+            .unwrap()
+            .process(b"LIVE-TUI-FRAME approval prompt");
+        *s.last_output.lock().unwrap() = std::time::Instant::now();
+        (sid, s)
+    }
+
+    fn read_text(daemon: &Arc<Daemon>, params: Value) -> Value {
+        let req = Request {
+            id: json!(1),
+            method: "surface.read_text".into(),
+            params,
+        };
+        let Reply::Single(resp) = dispatch(daemon, req, None) else {
+            panic!("expected single reply");
+        };
+        resp
+    }
+
+    /// ★⑴ 수리 핀: scrollback 이 정지한 pane 에서 `--lines` 는 **화면 그리드**로 답한다.
+    /// 정지한 버퍼를 그대로 주면 「기동 직후 프레임」이 현재 화면으로 읽힌다(재현된 결함).
+    #[test]
+    fn read_text_lines_serves_grid_when_scrollback_frozen() {
+        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let (daemon, dir) = daemon_with_acl("readtext-frozen", r#"{"default":"allow","rules":[]}"#);
+        let (sid, _s) = make_frozen_scrollback_pane(&daemon);
+
+        let resp = read_text(&daemon, json!({"surface_id": sid, "lines": 30}));
+        let text = resp["result"]["text"].as_str().unwrap_or("");
+        assert!(
+            text.contains("LIVE-TUI-FRAME"),
+            "정지 판정 후에도 현재 화면을 못 냈다: {text:?}"
+        );
+        assert!(
+            !text.contains("BOOT-ECHO"),
+            "기동 직후 프레임(정지한 scrollback)을 현재 화면으로 답했다 — ⑴ 재현: {text:?}"
+        );
+        assert_eq!(resp["result"]["source"], json!("grid"), "소스 표기 누락");
+        assert_eq!(resp["result"]["scrollback_stale"], json!(true));
+
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★⑴ 대조군(무회귀): 정상 pane(줄이 계속 느는 셸)의 `--lines` 는 **scrollback 그대로**.
+    /// 이게 깨지면 `--lines 200` 같은 이력 요청이 화면 높이로 잘려 정보가 손실된다.
+    #[test]
+    fn read_text_lines_keeps_scrollback_when_fresh() {
+        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let (daemon, dir) = daemon_with_acl("readtext-fresh", r#"{"default":"allow","rules":[]}"#);
+        let sid = make_surface(&daemon, None);
+        let s = daemon.get_surface(sid).unwrap();
+        {
+            let mut sb = s.scrollback.lock().unwrap();
+            sb.push_back("HISTORY-LINE-1".into());
+            sb.push_back("HISTORY-LINE-2".into());
+        }
+        s.line_count.store(2, Ordering::Relaxed);
+        // 줄과 출력이 같이 신선 = 정지 아님.
+        let now = std::time::Instant::now();
+        *s.last_line_at.lock().unwrap() = Some(now);
+        *s.last_output.lock().unwrap() = now;
+        s.parser.lock().unwrap().process(b"GRID-ONLY");
+
+        let resp = read_text(&daemon, json!({"surface_id": sid, "lines": 30}));
+        let text = resp["result"]["text"].as_str().unwrap_or("");
+        assert!(text.contains("HISTORY-LINE-1"), "이력이 잘렸다: {text:?}");
+        assert!(
+            !text.contains("GRID-ONLY"),
+            "정지하지 않은 pane 인데 grid 로 갈아탔다(이력 손실 경로): {text:?}"
+        );
+        assert_eq!(resp["result"]["source"], json!("scrollback"));
+        assert_eq!(resp["result"]["scrollback_stale"], json!(false));
+
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★⑴ 델타(--since) 경로: 의미상 grid 로 갈아탈 수 없으므로 **정지 사실을 실어 보낸다**.
+    /// 0건이 "아무 일 없음"으로 읽히던 침묵을 끊는 유일한 신호다.
+    #[test]
+    fn read_text_delta_flags_frozen_scrollback() {
+        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let (daemon, dir) = daemon_with_acl("readtext-delta", r#"{"default":"allow","rules":[]}"#);
+        let (sid, _s) = make_frozen_scrollback_pane(&daemon);
+
+        let resp = read_text(&daemon, json!({"surface_id": sid, "since_line": 2}));
+        assert_eq!(resp["result"]["line_count"], json!(0), "새 라인은 실제로 0건");
+        assert_eq!(
+            resp["result"]["scrollback_stale"],
+            json!(true),
+            "0건의 사유(제자리 재그리기)를 응답이 말하지 않는다"
+        );
+        assert_eq!(resp["result"]["source"], json!("scrollback"));
+
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★⑴ 데몬 감지기 대조: `check_approvals` 가 보는 소스(vt100 그리드)와
+    /// 수리된 read-screen 의 소스가 **같은 사실**을 낸다. 두 눈이 갈라지면 master 는
+    /// "감지기는 봤다는데 화면엔 없다"는 상태로 돌아간다(오늘 11:28 실사고).
+    #[test]
+    fn read_text_matches_approval_detector_source() {
+        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let (daemon, dir) = daemon_with_acl("readtext-detector", r#"{"default":"allow","rules":[]}"#);
+        let (sid, s) = make_frozen_scrollback_pane(&daemon);
+
+        // 감지기가 보는 것과 정확히 같은 표현식(governance::check_approvals).
+        let detector_view = s
+            .parser
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .screen()
+            .contents();
+        let needle = "LIVE-TUI-FRAME approval prompt";
+        assert!(detector_view.contains(needle), "전제 위반: 감지기 시야에 없다");
+
+        for params in [
+            json!({"surface_id": sid}),            // 무옵션(그리드)
+            json!({"surface_id": sid, "lines": 30}), // 수리된 --lines
+        ] {
+            let resp = read_text(&daemon, params.clone());
+            assert!(
+                resp["result"]["text"].as_str().unwrap_or("").contains(needle),
+                "read-screen({params}) 이 감지기와 다른 사실을 냈다"
+            );
+        }
+
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // ⑵ 주입 거부의 침묵 — 거부는 사유와 함께 남아야 한다
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// ★⑵ 재현 핀: 타이핑 가드로 거부된 send 가 **버스에 사유를 남긴다**.
+    /// 종전엔 데몬 로그·이벤트·배달 원장 어디에도 흔적이 없어(실측), 발신자는 rc=1 만
+    /// 받고 관측자는 그 침묵을 다른 원인으로 오귀속했다.
+    #[test]
+    fn rejected_send_publishes_reason() {
+        let _g = ACL_ENV_LOCK.lock().unwrap();
+        let (daemon, dir) = daemon_with_acl("send-reject-event", r#"{"default":"allow","rules":[]}"#);
+        let sid = make_surface(&daemon, Some("worker-1"));
+        let s = daemon.get_surface(sid).unwrap();
+        *s.last_human_input.lock().unwrap() = Some(std::time::Instant::now());
+
+        let req = Request {
+            id: json!(1),
+            method: "surface.send_text".into(),
+            params: json!({"surface_id": sid, "text": "master 판정 …"}),
+        };
+        let Reply::Single(resp) = dispatch(&daemon, req, None) else {
+            panic!("expected single reply");
+        };
+        assert_eq!(resp.pointer("/error/code"), Some(&json!("typing_guard")));
+
+        let rejected: Vec<Value> = daemon
+            .bus
+            .replay_after(0)
+            .into_iter()
+            .filter(|e| e["event"] == json!("send.rejected") || e["name"] == json!("send.rejected"))
+            .collect();
+        assert_eq!(
+            rejected.len(),
+            1,
+            "거부가 이벤트로 남지 않았다 — 사후 판정 불가(⑵ 재현): {:?}",
+            daemon.bus.replay_after(0)
+        );
+        let ev = &rejected[0];
+        let payload = ev.get("payload").unwrap_or(ev);
+        assert_eq!(payload["code"], json!("typing_guard"), "사유 코드 누락: {ev}");
+        assert_eq!(payload["method"], json!("surface.send_text"));
+
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 게이트 박제: clear_first(원자 Ctrl-U 선정리)는 launch-agent 등록 pane 한정 —
