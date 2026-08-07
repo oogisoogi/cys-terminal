@@ -6883,23 +6883,48 @@ fn statusline_to_report_params(v: &Value) -> Value {
     if let Some(t) = v.get("transcript_path").and_then(|x| x.as_str()) {
         params["session_file"] = json!(t);
     }
+    // 페인 제목의 모델 조각용(오너 2026-08-07). ★모델은 /model로 세션 중 바뀌므로 **매 관측마다**
+    // 실어 보낸다 — 기동 시 1회 기록이면 전환 후 제목이 조용히 거짓이 된다.
+    if let Some(m) = v
+        .get("model")
+        .and_then(|m| m.get("display_name"))
+        .and_then(|x| x.as_str())
+    {
+        params["model"] = json!(m);
+    }
     params
 }
 
-/// statusline JSON → 사람이 읽는 한 줄 (`<model>` — 모델명만).
-/// claude UI statusline에 그대로 표시된다(pane 헤더 배지와 별개·추가 표면).
-///
-/// ★오너 요청 2026-08-07: CTX·5h·7d는 이 줄에서 **삭제**하고 앱 사이드바 한 곳에 모아 표시한다
-/// (「한 곳에서 보는 것이 효율적」). 푸터에는 모델명만 남긴다.
-/// ⚠**데이터 배선은 이 변경과 무관하다** — usage.report push는 run_usage_report_stdin이 별도로
-/// 수행하므로(아래), 여기서 표시를 지워도 데몬의 surface별 ctx/5h/7d 수집은 그대로 계속된다.
-/// 지워지는 것은 *표시*이지 *관측*이 아니다.
-fn statusline_human_line(v: &Value) -> String {
-    v.get("model")
-        .and_then(|m| m.get("display_name"))
+/// statusline JSON → surface 없는 보고자용 파라미터. cwd로 데몬이 이름을 판별한다.
+/// ★판별은 데몬이 한다(매핑을 한 곳에 둔다) — CLI는 관측과 cwd만 싣고 이름을 짓지 않는다.
+fn statusline_to_named_params(v: &Value) -> Value {
+    let mut params = statusline_to_report_params(v);
+    // statusline JSON의 작업 디렉터리. 구버전 필드(cwd)도 함께 본다.
+    let cwd = v
+        .get("workspace")
+        .and_then(|w| w.get("current_dir"))
         .and_then(|x| x.as_str())
-        .unwrap_or("claude")
-        .to_string()
+        .or_else(|| v.get("cwd").and_then(|x| x.as_str()))
+        .unwrap_or_default();
+    params["cwd"] = json!(cwd);
+    params
+}
+
+/// statusline JSON → 사람이 읽는 한 줄. **지금은 빈 문자열이다**(출력 없음).
+///
+/// ★오너 요청 2026-08-07 2차: 「푸터에 모델만 있으니 어색하다. 모델은 제목에 넣자」.
+/// 1차에서 CTX·5h·7d를 사이드바로 옮기고 모델명만 남겼는데, 한 줄에 모델명 하나만 뜨는 모양이
+/// 어색하다는 판정이 나왔다. ⇒ 모델은 **페인 제목**의 조각으로 이사했고(cysd/panetitle.rs)
+/// 푸터는 비운다. 같은 정보를 두 곳에 두지 않는다.
+///
+/// ⚠**데이터 배선은 이 변경과 무관하다**(1차와 같은 계약) — usage.report push는
+/// run_usage_report_stdin이 별도로 수행하므로, 여기서 표시를 지워도 데몬의 ctx/5h/7d·model
+/// 수집은 그대로 계속된다. 지워지는 것은 *표시*이지 *관측*이 아니다.
+///
+/// ★빈 문자열을 반환하되 **출력 자체를 건너뛰는 것은 호출자의 몫**이다(println!("")은 빈 줄을
+/// 찍는다 — 지우려던 그 줄이 공백으로 남는다). 아래 run_usage_report_stdin 참조.
+fn statusline_human_line(_v: &Value) -> String {
+    String::new()
 }
 
 /// cys-statusline.sh 래퍼 전용 — stdin의 claude statusline JSON을 읽어 usage.report로 push하고,
@@ -6914,14 +6939,29 @@ fn run_usage_report_stdin(surface: &Option<String>, quiet: bool) -> i32 {
     let Ok(v) = serde_json::from_str::<Value>(&buf) else {
         return 0;
     };
-    // push (surface 미해결·데몬 부재는 조용히 스킵 — 사람용 줄은 여전히 출력한다)
-    if let Ok(sid) = target_surface(surface, &None) {
-        let mut params = statusline_to_report_params(&v);
-        params["surface_id"] = json!(sid);
-        let _ = request("usage.report", params);
+    // push (데몬 부재는 조용히 스킵 — statusline은 절대 claude를 막지 않는다)
+    match target_surface(surface, &None) {
+        Ok(sid) => {
+            let mut params = statusline_to_report_params(&v);
+            params["surface_id"] = json!(sid);
+            let _ = request("usage.report", params);
+        }
+        // ★surface가 없다고 관측을 버리지 않는다(오너 2026-08-07 티켓④).
+        //   master·CSO는 cmux 페인이라 CYS_SURFACE_ID가 없다 — 여기서 끊겨 있었기 때문에
+        //   이들의 ctx가 데몬에 **한 번도** 도달하지 못했다(env -u 재현으로 확인).
+        //   이름 판별은 데몬이 cwd로 한다. 판별 안 되면 데몬이 저장하지 않으므로
+        //   여기서 보내는 것 자체는 무해하다(유령 행이 생기지 않는다).
+        Err(_) => {
+            let _ = request("usage.report_named", statusline_to_named_params(&v));
+        }
     }
     if !quiet {
-        println!("{}", statusline_human_line(&v));
+        // ★빈 줄을 찍지 않는다 — println!("")은 지우려던 자리에 공백 한 줄을 남긴다.
+        //   사람용 줄이 비면 **아무것도 출력하지 않는 것**이 「표시 제거」의 정확한 구현이다.
+        let line = statusline_human_line(&v);
+        if !line.is_empty() {
+            println!("{line}");
+        }
     }
     0
 }
@@ -12138,11 +12178,15 @@ mod tests {
         );
     }
 
-    /// 사람용 statusline 한 줄 포맷 — **모델명만**(오너 요청 2026-08-07: CTX·rate는 앱 사이드바로 이관).
-    /// ★이 테스트는 「모델명이 나온다」만이 아니라 **「CTX·5h·7d가 들어 있어도 나오지 않는다」**를 함께 못박는다 —
-    /// 입력에 그 값들을 일부러 채워 두었으므로, 표시를 되살리는 변경은 여기서 적색이 된다(회귀 그물).
+    /// 사람용 statusline 한 줄 — **아무것도 출력하지 않는다**(오너 2026-08-07 2차: 모델은 제목으로 이관).
+    ///
+    /// ★이 테스트의 축이 바뀐 이력을 남긴다: 1차(CTX·rate를 사이드바로 이관)에서는 「모델명만 남고
+    /// 수치가 새지 않는다」가 그물이었다. 2차에서 모델까지 빠지면서 **그 그물은 공허해졌다** —
+    /// 빈 문자열은 무엇도 포함하지 않으므로 누출 검사가 자동 통과한다.
+    /// ⇒ 축을 다시 겨냥한다: 이제 지켜야 할 불변식은 **「표시는 사라져도 관측은 그대로」**다.
+    ///   그 축은 아래 statusline_display_removal_keeps_observation이 잰다(그쪽이 진짜 그물이다).
     #[test]
-    fn statusline_human_line_format() {
+    fn statusline_human_line_is_empty() {
         let v = json!({
             "model": {"display_name": "Opus 4.8"},
             "context_window": {"used_percentage": 42.0},
@@ -12151,15 +12195,68 @@ mod tests {
                 "seven_day": {"used_percentage": 12.0}
             }
         });
-        assert_eq!(statusline_human_line(&v), "Opus 4.8");
-        // 입력에 있던 수치가 한 조각도 새지 않는지 — 포맷이 바뀌어도 잡히도록 값 단위로 확인한다.
-        let line = statusline_human_line(&v);
-        for leaked in ["CTX", "42", "5h", "41", "7d", "12", "·"] {
-            assert!(!line.contains(leaked), "푸터에 {leaked}가 남았다: {line}");
-        }
-        // 모델명 부재 시 "claude" 폴백은 유지(statusline이 빈 줄이 되지 않게).
-        let v2 = json!({"context_window": {"used_percentage": 8.0}});
-        assert_eq!(statusline_human_line(&v2), "claude");
+        assert_eq!(statusline_human_line(&v), "", "푸터는 완전히 빈다(모델도 제목으로 갔다)");
+        // 모델명이 없어도 마찬가지 — 「claude」 폴백도 더 이상 찍지 않는다.
+        assert_eq!(statusline_human_line(&json!({"context_window": {"used_percentage": 8.0}})), "");
+    }
+
+    /// ★표시를 지운 것이 관측까지 지우지 않았는지 — 「지워지는 것은 표시이지 관측이 아니다」의 기계 증명.
+    /// 푸터가 비었다는 사실만 재면 배선이 통째로 끊겨도 초록이다(그 초록은 아무것도 말하지 않는다).
+    #[test]
+    fn statusline_display_removal_keeps_observation() {
+        let v = json!({
+            "model": {"display_name": "Opus 4.8"},
+            "transcript_path": "/Users/x/.claude/projects/-a/s.jsonl",
+            "context_window": {"context_window_size": 200000, "used_percentage": 42.0},
+            "rate_limits": {
+                "five_hour": {"used_percentage": 41.0, "resets_at": 1781314865},
+                "seven_day": {"used_percentage": 12.0}
+            }
+        });
+        assert_eq!(statusline_human_line(&v), "");
+        // 화면에서 사라진 값들이 push 파라미터에는 전부 살아 있어야 한다.
+        let p = statusline_to_report_params(&v);
+        assert_eq!(p["ctx_pct"].as_f64(), Some(42.0));
+        assert_eq!(p["ctx_window"].as_u64(), Some(200000));
+        assert_eq!(p["rate"].as_array().unwrap().len(), 2);
+        assert_eq!(p["session_file"], json!("/Users/x/.claude/projects/-a/s.jsonl"));
+    }
+
+    /// 페인 제목의 모델 조각용 — model.display_name이 usage.report 파라미터에 실린다.
+    /// ★매 관측마다 실려야 /model 전환을 제목이 따라간다(기동 1회 기록이면 전환 후 제목이 거짓이 된다).
+    #[test]
+    fn statusline_params_carry_model_for_title() {
+        let v = json!({
+            "model": {"display_name": "Opus 4.8"},
+            "context_window": {"used_percentage": 3.0}
+        });
+        assert_eq!(statusline_to_report_params(&v)["model"], json!("Opus 4.8"));
+        // 모델을 못 본 statusline(셸 등)은 필드를 만들지 않는다 — 데몬이 「미관측」으로 읽어야 한다.
+        let v2 = json!({"context_window": {"used_percentage": 3.0}});
+        assert!(
+            statusline_to_report_params(&v2).get("model").is_none(),
+            "모델 미관측이면 필드 생략 — 없는 값을 지어내지 않는다"
+        );
+    }
+
+    /// surface 없는 보고자(master·cso) 경로 — cwd를 실어 보내 데몬이 이름을 판별한다.
+    /// ★CLI는 이름을 짓지 않는다(매핑은 데몬 한 곳). 여기서 검사하는 것은 「cwd가 실렸는가」다.
+    #[test]
+    fn statusline_named_params_carry_cwd_and_observation() {
+        let v = json!({
+            "workspace": {"current_dir": "/Users/oogisoogi/axdev"},
+            "model": {"display_name": "Opus 4.8"},
+            "context_window": {"context_window_size": 200000, "used_percentage": 11.0}
+        });
+        let p = statusline_to_named_params(&v);
+        assert_eq!(p["cwd"], json!("/Users/oogisoogi/axdev"));
+        assert_eq!(p["ctx_pct"].as_f64(), Some(11.0));
+        assert_eq!(p["ctx_window"].as_u64(), Some(200000));
+        // 구버전 필드(cwd 최상위)도 읽는다 — statusline 스키마가 바뀐 이력이 있다.
+        let old = json!({"cwd": "/Users/oogisoogi/axdev/cso", "context_window": {"used_percentage": 7.0}});
+        assert_eq!(statusline_to_named_params(&old)["cwd"], json!("/Users/oogisoogi/axdev/cso"));
+        // cwd를 전혀 모르면 빈 문자열 — 데몬이 그것을 「판별 불가」로 처리한다(라벨을 짓지 않는다).
+        assert_eq!(statusline_to_named_params(&json!({}))["cwd"], json!(""));
     }
 
     /// T7 E1-4: hook stdin → usage.event 파라미터 매핑 핀.

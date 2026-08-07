@@ -41,6 +41,12 @@ export const RATE_LABEL_ORDER = ["5h", "7d"];
 export interface RateRow {
   socket: string;
   agent: string;
+  // ★계정 식별자 — 계정 저장소(usage.accounts) 유래 행에만 있다. "" = surface 관측 유래(계정 미상).
+  // rate limit이 걸리는 진짜 경계는 소켓도 에이전트도 아니고 **계정**이므로, 경계 혼합 금지
+  // 규율(codex 1R [High])의 키를 여기까지 넓힌다. 같은 claude라도 계정이 둘이면 두 줄이다.
+  accountId: string;
+  // 사람이 읽는 계정 이름(이메일 등). 범위 머리표에 쓴다 — 없으면 에이전트 이름만 나온다.
+  accountLabel: string;
   label: string;
   usedPct: number;
   // ★usedPct를 준 **바로 그 관측**의 리셋 시각. 다른 관측에서 가져오면 %와 시각의 짝이 깨진다.
@@ -82,6 +88,10 @@ export function aggregateRates(surfaces: SurfaceLike[], nowSecs: number): RateRo
       const cand: RateRow = {
         socket: s.socket,
         agent,
+        // surface 관측은 어느 계정에 걸린 한도인지 스스로 모른다 — 계정 귀속은 데몬(accounts.rs
+        // resolve)이 세션 파일 경로로 판정한다. 여기서 추측해 채우면 없는 신원을 지어내는 것이다.
+        accountId: "",
+        accountLabel: "",
         label: w.label,
         usedPct: used,
         resetsAt: w.resets_at ?? null, // ★같은 관측에서 함께 가져온다(짝 유지)
@@ -99,23 +109,105 @@ export function aggregateRates(surfaces: SurfaceLike[], nowSecs: number): RateRo
   }
   const rows: RateRow[] = [];
   for (const slot of best.values()) rows.push((slot.fresh ?? slot.stale) as RateRow);
-  // 정렬: 소켓 → 에이전트 → 라벨 순서(RATE_LABEL_ORDER 우선, 나머지는 사전순).
-  const labelRank = (l: string) => {
-    const i = RATE_LABEL_ORDER.indexOf(l);
-    return i < 0 ? RATE_LABEL_ORDER.length : i;
-  };
+  return sortRates(rows);
+}
+
+// 정렬: 소켓 → 에이전트 → 계정 → 라벨 순서(RATE_LABEL_ORDER 우선, 나머지는 사전순).
+// ★계정을 정렬 키에 넣는 이유: 같은 에이전트에 계정이 둘이면 두 계정의 5h·7d가 번갈아 나와
+// 머리표가 매 줄 바뀐다. 계정으로 묶어야 「계정 하나 = 연속된 블록」이 된다.
+const labelRank = (l: string) => {
+  const i = RATE_LABEL_ORDER.indexOf(l);
+  return i < 0 ? RATE_LABEL_ORDER.length : i;
+};
+function sortRates(rows: RateRow[]): RateRow[] {
   rows.sort(
     (a, b) =>
       a.socket.localeCompare(b.socket) ||
       a.agent.localeCompare(b.agent) ||
+      a.accountId.localeCompare(b.accountId) ||
       labelRank(a.label) - labelRank(b.label) ||
       a.label.localeCompare(b.label),
   );
   return rows;
 }
 
+// ── 계정 저장소 유래 rate (오너 육안 판정 2026-08-07 09:27 수리)
+//
+// ★결함 계보: 초판은 사이드바 「사용량」을 **살아 있는 surface의 usage만** 집계해 만들었다.
+// 그래서 페인이 0이면 rates가 0이 되어 절 전체가 사라졌다 — 오너 육안에서 「계정 사용량이
+// 안 보인다」로 드러난 결함이다. 그러나 5h·7d는 **페인의 속성이 아니라 계정의 속성**이다.
+// 페인이 없어도 계정의 한도는 그대로 소진돼 있다. ⇒ 원천을 계정 저장소로 옮긴다.
+//
+// ★왜 계정 저장소가 상위 집합인가(실측 근거): 페인 관측은 데몬이 usage.rs에서
+// `accounts::note_rate`로 계정에 귀속시킨다(usage.rs:328 codex rollout · usage.rs:1169 gemini ·
+// handlers.rs:3400 statusline). 즉 계정 저장소는 같은 관측을 받아 **페인이 죽어도 들고 있는** 곳이다.
+// 그러므로 계정 유래 행은 surface 유래 행을 대체할 수 있다(정보 손실 없음).
+export interface AccountLike {
+  provider: string;
+  account_id: string;
+  label: string;
+  rate: RateWindowLike[];
+  // 관측이 한 번도 없으면 null이다(계정은 등록됐으나 아직 못 봤다).
+  updated_at: number | null;
+}
+
+export function accountRates(accounts: AccountLike[] | null | undefined, nowSecs: number): RateRow[] {
+  const rows: RateRow[] = [];
+  for (const a of accounts ?? []) {
+    if (!a) continue;
+    const updatedAt = Number(a.updated_at);
+    // ★관측 시각이 없으면 그리지 않는다. 계정은 등록됐지만 아직 아무것도 못 본 상태이고,
+    //   이때 rate는 빈 배열이다. 나이를 0으로 채워 「방금 관측」처럼 보이게 만들면 거짓 신선이다.
+    if (!a.updated_at || !Number.isFinite(updatedAt) || updatedAt <= 0) continue;
+    const age = Math.max(0, Math.round(nowSecs - updatedAt));
+    const agent = a.provider || "?";
+    for (const w of a.rate ?? []) {
+      const used = Number(w?.used_pct);
+      if (!Number.isFinite(used)) continue;
+      rows.push({
+        // 계정 저장소는 부서 데몬까지 병합한 뷰라 특정 소켓에 속하지 않는다.
+        // ★""를 쓰는 것은 「기본 데몬」이라는 뜻이 아니라 「소켓 축이 이 행에 없다」는 뜻이다 —
+        //   계정 경계가 소켓 경계보다 넓기 때문이다(같은 계정을 여러 데몬이 함께 쓴다).
+        socket: "",
+        agent,
+        accountId: a.account_id || "",
+        accountLabel: a.label || "",
+        label: w.label,
+        usedPct: used,
+        resetsAt: w.resets_at ?? null, // ★같은 관측에서 함께 가져온다(짝 유지)
+        ageSecs: age,
+        updatedAt,
+        stale: age > USAGE_STALE_SECS,
+      });
+    }
+  }
+  return sortRates(rows);
+}
+
+// 계정 유래 + surface 유래 병합 — **계정이 이긴다.**
+//
+// ★중복 금지가 이 함수의 존재 이유다. 두 원천은 같은 관측을 담고 있으므로 그냥 이어 붙이면
+// 「claude 5h」가 두 줄 나온다. 사용자는 그것을 두 계정으로 읽는다 — 없는 계정을 만들어 보이는 것이다.
+// ⇒ (에이전트 × 창 라벨)이 계정 쪽에 이미 있으면 surface 행은 버린다.
+//
+// ★키에 소켓을 넣지 않는 이유: 계정 행에는 소켓 축이 없다(위 주석). 소켓까지 키로 삼으면
+// 계정 행과 surface 행이 영원히 안 만나 중복이 그대로 남는다.
+export function mergeRates(accountRows: RateRow[], surfaceRows: RateRow[]): RateRow[] {
+  const covered = new Set(accountRows.map((r) => JSON.stringify([r.agent, r.label])));
+  const merged = accountRows.slice();
+  for (const r of surfaceRows) {
+    if (covered.has(JSON.stringify([r.agent, r.label]))) continue;
+    merged.push(r);
+  }
+  return sortRates(merged);
+}
+
 export interface CtxRow {
   surfaceId: number;
+  // 이름 있는 보고자면 그 이름(master·cso). "" = 번호 페인.
+  // ★번호와 이름을 한 필드에 섞지 않는 이유: 정렬이 다르다(이름 먼저, 그 다음 번호 오름차순)
+  //   ─ 하나로 합치면 "master"와 372를 같은 축으로 비교해야 하고 그 비교는 뜻이 없다.
+  name: string;
   socket: string;
   // null = 아직 관측치가 없다. ★행을 지우지 않고 null로 남기는 이유는 아래 paneCtxRows 주석 참조.
   ctxPct: number | null;
@@ -142,7 +234,7 @@ export function paneCtxRows(surfaces: SurfaceLike[], nowSecs: number): CtxRow[] 
     if (s.exited || !s.adopted) continue;
     const u = s.usage;
     if (!u) {
-      rows.push({ surfaceId: s.surface_id, socket: s.socket, ctxPct: null, ageSecs: 0, updatedAt: 0, stale: false, source: "" });
+      rows.push({ surfaceId: s.surface_id, name: "", socket: s.socket, ctxPct: null, ageSecs: 0, updatedAt: 0, stale: false, source: "" });
       continue;
     }
     const raw = u.ctx_pct;
@@ -150,6 +242,7 @@ export function paneCtxRows(surfaces: SurfaceLike[], nowSecs: number): CtxRow[] 
     const age = Math.max(0, Math.round(nowSecs - u.updated_at));
     rows.push({
       surfaceId: s.surface_id,
+      name: "",
       socket: s.socket,
       ctxPct: pct,
       ageSecs: pct == null ? 0 : age,
@@ -158,8 +251,63 @@ export function paneCtxRows(surfaces: SurfaceLike[], nowSecs: number): CtxRow[] 
       source: pct == null ? "" : (u.source ?? ""),
     });
   }
-  rows.sort((a, b) => a.socket.localeCompare(b.socket) || a.surfaceId - b.surfaceId);
+  return sortCtxRows(rows);
+}
+
+// 정렬: **이름 있는 보고자 먼저**, 그 다음 소켓 → 페인 번호 오름차순(오너 지정 순서).
+// ★이름 행을 위에 두는 이유: master·cso는 상시 존재하는 고정 항목이고 번호 페인은 오가는 것이다.
+//   고정 항목이 변동 항목 사이에 끼면 볼 때마다 자리가 달라져 눈이 못 따라간다.
+function sortCtxRows(rows: CtxRow[]): CtxRow[] {
+  rows.sort(
+    (a, b) =>
+      Number(!a.name) - Number(!b.name) || // 이름 있는 행이 먼저
+      a.name.localeCompare(b.name) ||
+      a.socket.localeCompare(b.socket) ||
+      a.surfaceId - b.surfaceId,
+  );
   return rows;
+}
+
+// 이름 있는 보고자(master·cso 등 surface 없는 Claude) → CTX 행.
+//
+// ★이들은 cys surface가 아니라 cmux 페인의 Claude다. 그래서 번호가 없고, 번호를 지어내면
+// 화면의 페인 번호와 대조할 대상이 없는 가짜 번호가 된다 ⇒ 라벨을 이름으로 둔다.
+// 신선도·stale·출처 등급은 번호 행과 **같은 규율**을 쓴다(오너 지시) — 한 표 안에서 판정 기준이
+// 갈리면 같은 색이 두 뜻을 갖는다.
+export interface NamedReporterLike {
+  name: string;
+  ctx_pct: number | null;
+  source: string;
+  updated_at: number;
+}
+
+export function namedCtxRows(named: NamedReporterLike[] | null | undefined, nowSecs: number): CtxRow[] {
+  const rows: CtxRow[] = [];
+  for (const n of named ?? []) {
+    if (!n || !n.name) continue; // 이름 없는 행은 만들지 않는다(지어낸 라벨 금지)
+    const updatedAt = Number(n.updated_at);
+    if (!n.updated_at || !Number.isFinite(updatedAt) || updatedAt <= 0) continue;
+    const raw = n.ctx_pct;
+    const pct = raw == null || !Number.isFinite(Number(raw)) ? null : Number(raw);
+    // ★관측 시각은 있는데 ctx가 없는 경우 — 번호 행과 같이 「—」로 남긴다(행을 지우지 않는다).
+    const age = Math.max(0, Math.round(nowSecs - updatedAt));
+    rows.push({
+      surfaceId: 0, // 번호 없음 — 이 행의 신원은 name이다
+      name: n.name,
+      socket: "",
+      ctxPct: pct,
+      ageSecs: pct == null ? 0 : age,
+      updatedAt: pct == null ? 0 : updatedAt,
+      stale: pct == null ? false : age > USAGE_STALE_SECS,
+      source: pct == null ? "" : (n.source ?? ""),
+    });
+  }
+  return sortCtxRows(rows);
+}
+
+// 두 원천을 합쳐 한 표로 — 이름 행이 위, 번호 행이 아래.
+export function mergeCtxRows(namedRows: CtxRow[], paneRows: CtxRow[]): CtxRow[] {
+  return sortCtxRows([...namedRows, ...paneRows]);
 }
 
 // 소켓 → 사람이 읽는 짧은 부서 이름.
@@ -225,6 +373,26 @@ export function fableObserved(byModel: ByModelRow[] | null | undefined, totalTok
   return { tokens, sharePct: Math.round((tokens / total) * 1000) / 10 };
 }
 
+// control.analytics 응답 → Fable 관측치. **응답의 필드 위치를 아는 유일한 자리**다.
+//
+// ★결함 계보(오너 육안 2026-08-07 「Fable 자체 집계 줄이 안 보인다」): 초판은 main.ts에서
+// `s.by_model` · `s.totals.tokens`를 읽었다. 그런데 control.analytics의 실제 응답은
+//   {now, since, window, summary: {by_model, totals, by_agent, by_tier, ...}}
+// 라서 그 두 접근은 **항상 undefined**였다 ⇒ fableObserved([], 0) ⇒ null ⇒ 줄이 한 번도 안 떴다.
+// 페인 유무와 무관한 무조건 결함이었다(「빈 함대라서」가 아니다 — RPC 실측으로 갈랐다).
+//
+// ★왜 이 함수를 새로 파서 여기 두는가: 결함이 난 곳은 「필드 경로를 아는 지식」이었는데 그 지식이
+// DOM·invoke와 뒤엉킨 main.ts에 있어 **테스트가 닿지 못했다.** 옆 소비자(renderEfficiency)는
+// 처음부터 summary를 거쳐 옳게 읽고 있었으니 코드가 틀린 게 아니라 **검증이 못 미치는 자리에
+// 지식이 놓여 있던 것**이다. 순수 함수로 옮겨 회귀 테스트가 응답 형태를 붙잡게 한다.
+export function fableFromAnalytics(resp: unknown): FableObserved | null {
+  const summary = (resp as { summary?: unknown } | null | undefined)?.summary as
+    | { by_model?: ByModelRow[]; totals?: { tokens?: unknown } }
+    | undefined;
+  if (!summary) return null;
+  return fableObserved(summary.by_model ?? [], Number(summary.totals?.tokens ?? 0));
+}
+
 // 큰 토큰 수 → 짧은 표기(1.2M · 340K). 사이드바 폭이 좁아 원수치는 줄을 넘긴다.
 // 정확한 원수치는 툴팁에 남긴다 — 줄이는 것과 잃는 것은 다르다.
 export function compactTokens(n: number): string {
@@ -284,15 +452,20 @@ export function renderSignature(
   const r = rates
     .map(
       (x) =>
-        `${showScope ? x.socket + "/" + x.agent : ""}|${x.label}|${Math.round(x.usedPct)}|${x.resetsAt ?? ""}|${
-          x.stale ? 1 : 0
-        }`,
+        // ★범위 머리표에 실제로 찍히는 문자열(에이전트 + 계정 라벨)을 그대로 넣는다.
+        //   계정 라벨이 바뀌면 화면 글자가 바뀌므로 서명도 바뀌어야 한다 —
+        //   식별자(accountId)만 넣으면 라벨 변경이 화면에 반영되지 않는다.
+        `${showScope ? x.socket + "/" + x.agent + "/" + x.accountLabel : ""}|${x.label}|${Math.round(x.usedPct)}|${
+          x.resetsAt ?? ""
+        }|${x.stale ? 1 : 0}`,
     )
     .join(";");
   const c = ctxRows
     .map(
       (x) =>
-        `${showSocket ? shortSocketTag(x.socket) : ""}|${x.surfaceId}|${
+        // 이름 행은 번호가 없으므로 라벨을 서명에 넣는다 — 안 넣으면 master·cso가 둘 다
+        // surfaceId 0으로 같은 서명이 되어 한쪽 값이 바뀌어도 화면이 안 갱신된다.
+        `${showSocket ? shortSocketTag(x.socket) : ""}|${x.name || x.surfaceId}|${
           x.ctxPct == null ? "-" : Math.round(x.ctxPct)
         }|${x.source}|${x.stale ? 1 : 0}`,
     )

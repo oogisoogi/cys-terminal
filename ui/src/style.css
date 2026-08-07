@@ -108,6 +108,11 @@ body.wsbar-resizing { cursor: col-resize; -webkit-user-select: none; user-select
 .wsu-rate-name { flex: none; width: 2.2em; color: #8b949e; }
 /* 페인 번호는 오른쪽 정렬 — 자릿수가 달라도(2 / 15 / 370) 게이지 시작선이 맞는다. */
 .wsu-ctx-sid { flex: none; width: 2.6em; text-align: right; color: #6e7681; }
+/* 이름 있는 보고자(master·cso)가 표에 있으면 **모든 행**의 라벨 열을 함께 넓힌다.
+   ★그 행만 넓히면 안 된다 — 열 너비가 행마다 달라지면 게이지 바의 시작 x가 어긋나 표가 계단이 된다.
+   넓이는 열 전체의 속성이지 한 칸의 속성이 아니다. */
+#ws-usage.has-named .wsu-ctx-sid { width: 4.2em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wsu-ctx-sid.named { color: var(--text, #c9d1d9); }
 .wsu-rate-pct, .wsu-ctx-pct { flex: none; width: 2.6em; text-align: right; color: var(--text, #c9d1d9); }
 .wsu-rate-pct.warn, .wsu-ctx-pct.warn { color: var(--warn); }
 .wsu-rate-pct.crit, .wsu-ctx-pct.crit { color: var(--error); font-weight: 600; }
