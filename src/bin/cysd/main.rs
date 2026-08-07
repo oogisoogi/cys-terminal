@@ -78,6 +78,13 @@ async fn main() {
     );
     scrub_claude_session_env();
 
+    // 티켓⑤ 강제발화 — 데몬을 띄우지 않고 OAuth usage 프로브만 1회 돌고 끝난다(accounts 주석 참조).
+    // ★소켓 락보다 **먼저** 분기한다: 이 모드는 데몬이 아니므로 락을 잡으면 안 되고(라이브 데몬과
+    //   경합), 상태 디렉터리에도 손대지 않아야 한다.
+    if std::env::args().any(|a| a == "--oauth-usage-probe") {
+        std::process::exit(accounts::oauth_probe_report().await);
+    }
+
     // ★W1(조기 단일 인스턴스 게이트): 소켓 경로 확정 직후·pack 설치보다 먼저 단일 인스턴스 게이트를
     // 통과시킨다. 목적 — 락/싱글턴 경쟁의 **패자**가 상태를 오염시키는 부트 부수효과 전에 죽게 하는 것.
     // (게이트 뒤 부수효과: Daemon::new 의 operator.token 디스크 덮어쓰기·feed.jsonl compaction, 워치독·
@@ -268,6 +275,9 @@ async fn main() {
     // 전부 fail-open(파일 부재·파싱 실패=빈 뷰) — 부트체인 비치명.
     accounts::seed_known(&daemon);
     accounts::spawn_custom_adapters(Arc::clone(&daemon));
+    // 티켓⑤: Claude OAuth usage API 주기 조회 — statusline이 못 주는 모델 스코프 주간 게이지(Fable)와,
+    // 페인이 하나도 없을 때도 늙지 않는 5h·7d. 실패는 조용한 원천 소실이라 부트체인 비치명.
+    accounts::spawn_claude_oauth_probe(Arc::clone(&daemon));
     // CC v2 WS-B: 스킬 run 생애주기 — 이전 데몬의 열린 run 정리 후 전이 워처 기동.
     skillrun::reconcile_boot(&daemon);
     skillrun::spawn_watcher(Arc::clone(&daemon));

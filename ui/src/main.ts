@@ -34,12 +34,14 @@ import {
   aggregateRates,
   compactTokens,
   fableFromAnalytics,
+  filterDisplayRates,
   hasMultipleSockets,
   mergeCtxRows,
   mergeRates,
   namedCtxRows,
   paneCtxRows,
   renderSignature,
+  scopedRates,
   sevClassFor,
   shortSocketTag,
   sourceGrade,
@@ -281,7 +283,15 @@ function renderSidebarUsage(surfaces: SurfaceLike[]) {
   // ★rate의 원천은 **계정 저장소가 먼저**다(오너 육안 판정 수리). 페인이 0이어도 계정의 한도
   //   소진율은 그대로 있으므로 페인 유무와 무관하게 뜬다. surface 관측은 계정이 아직 그 창을
   //   모를 때만 메우는 보조 원천이고, 겹치면 mergeRates가 버린다(중복 줄 = 가짜 계정으로 읽힌다).
-  const rates = mergeRates(accountRates(accountsCache, nowSecs), aggregateRates(surfaces, nowSecs));
+  //   ★모델 스코프 게이지(「7d·Fable」)는 계정 유래 쪽에 함께 싣는다 — 서버가 준 한도 대비 소진율이라
+  //   5h·7d와 같은 종류의 수이고, 같은 계정 블록 아래 붙어야 「누구의 한도인지」가 유지된다.
+  //   ★filterDisplayRates는 **병합 뒤**에 건다(codex 행 비표시 — wsusage 주석의 덮개 논리).
+  const rates = filterDisplayRates(
+    mergeRates(
+      [...accountRates(accountsCache, nowSecs), ...scopedRates(accountsCache, nowSecs)],
+      aggregateRates(surfaces, nowSecs),
+    ),
+  );
   // CTX 표 = 이름 있는 보고자(master·cso — surface 없는 cmux 페인) + 화면에 붙은 번호 페인.
   const ctxRows = mergeCtxRows(namedCtxRows(namedCache, nowSecs), paneCtxRows(surfaces, nowSecs));
   if (!rates.length && !ctxRows.length && !fableCache) {
@@ -292,6 +302,10 @@ function renderSidebarUsage(surfaces: SurfaceLike[]) {
   }
   // 라벨 열 너비는 표 전체의 속성이다 — 이름 행이 하나라도 있으면 모든 행을 함께 넓힌다(CSS 주석 참조).
   host.classList.toggle("has-named", ctxRows.some((c) => !!c.name));
+  // 모델 스코프 게이지의 긴 라벨(「7d·Fable」)이 있으면 rate 라벨 열을 함께 넓힌다(CSS 주석 참조).
+  // ★판정을 라벨 길이로 한다 — 「Fable」이라는 이름을 표지로 삼으면 스코프가 다른 모델로 옮겨 간 날
+  //   같은 문제가 표지 없이 되돌아온다(모델 이름은 응답이 정한다).
+  host.classList.toggle("has-scoped", rates.some((r) => r.label.length > 3));
   // 계정 경계(소켓×에이전트×계정)가 둘 이상일 때만 범위 라벨을 붙인다 — 하나뿐이면 잡음이다.
   const scopes = new Set(rates.map((r) => JSON.stringify([r.socket, r.agent, r.accountId])));
   const showScope = scopes.size > 1;
@@ -355,8 +369,10 @@ function renderSidebarUsage(surfaces: SurfaceLike[]) {
         if (r.resetsAt) {
           const d = new Date(r.resetsAt * 1000);
           const p2 = (x: number) => String(x).padStart(2, "0");
+          // ★주간 창은 며칠 뒤라 날짜까지 적어야 한다. 판정을 `=== "7d"`로 두면 모델 스코프
+          //   게이지(「7d·Fable」)가 시:분만 찍혀 **오늘 리셋되는 것처럼** 보인다(티켓⑤ 수리).
           tip.push(
-            r.label === "7d"
+            r.label.startsWith("7d")
               ? `리셋 ${p2(d.getMonth() + 1)}/${p2(d.getDate())} ${p2(d.getHours())}:${p2(d.getMinutes())}`
               : `리셋 ${p2(d.getHours())}:${p2(d.getMinutes())}`,
           );

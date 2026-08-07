@@ -1495,6 +1495,19 @@ async fn usage_accounts_all() -> Result<Value, String> {
                 Some(cur) => {
                     let cur_ts = cur["updated_at"].as_f64().unwrap_or(0.0);
                     let new_ts = a["updated_at"].as_f64().unwrap_or(0.0);
+                    // ★모델 스코프 게이지(scoped)는 **자기 시각으로 따로 겨룬다.** 계정의 updated_at은
+                    // rate 슬롯의 시각이라, 그것으로 승자를 고르면 statusline만 받는 부서 데몬이
+                    // 이기는 순간 OAuth 프로브가 붙인 게이지가 통째로 사라진다(profiles와 같은 이유).
+                    let scoped_ts = |o: &Value| {
+                        o["scoped"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|g| g["updated_at"].as_f64())
+                            .fold(0.0_f64, f64::max)
+                    };
+                    let keep_scoped =
+                        if scoped_ts(a) > scoped_ts(cur) { a["scoped"].clone() } else { cur["scoped"].clone() };
                     // profiles 합집합은 승자와 무관하게 유지
                     let mut profs: Vec<String> = cur["profiles"]
                         .as_array()
@@ -1509,6 +1522,7 @@ async fn usage_accounts_all() -> Result<Value, String> {
                         *cur = a.clone();
                     }
                     cur["profiles"] = json!(profs);
+                    cur["scoped"] = keep_scoped;
                 }
             }
         }
