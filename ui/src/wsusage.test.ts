@@ -9,12 +9,17 @@ const DEPT_A = "/Users/x/.local/state/cys-dept-a/cys.sock";
 const DEPT_B = "/Users/x/.local/state/cys-dept-b/cys.sock";
 const MAIN_SOCK = "/Users/x/.local/state/cys/cys.sock";
 import {
+  accountRates,
   ageText,
   ageAt,
   aggregateRates,
   compactTokens,
+  fableFromAnalytics,
   fableObserved,
   hasMultipleSockets,
+  mergeCtxRows,
+  mergeRates,
+  namedCtxRows,
   paneCtxRows,
   RATE_LABEL_ORDER,
   renderSignature,
@@ -22,6 +27,8 @@ import {
   shortSocketTag,
   sourceGrade,
   USAGE_STALE_SECS,
+  type AccountLike,
+  type NamedReporterLike,
   type SurfaceLike,
 } from "./wsusage";
 
@@ -282,6 +289,226 @@ describe("renderSignature", () => {
     const a = paneCtxRows([sf(1, { socket: DEPT_A, usage: fresh({ ctx_pct: 10 }) })], NOW);
     const b = paneCtxRows([sf(1, { socket: DEPT_B, usage: fresh({ ctx_pct: 10 }) })], NOW);
     expect(renderSignature([], a, null, false, true)).not.toBe(renderSignature([], b, null, false, true));
+  });
+});
+
+// ── 계정 저장소 유래 rate (오너 육안 판정 2026-08-07 09:27 수리)
+//
+// ★픽스처는 **실물 usage.accounts 응답 형태**다(라이브 RPC 실측본을 줄여 옮겼다).
+// 실물에 있는 필드를 빠뜨린 픽스처는 초록불이 거짓이 된다 —
+// 이 파일 맨 위 소켓 픽스처가 정확히 그 이유로 한 번 무너졌다(codex 2R).
+const ACCT_CLAUDE: AccountLike = {
+  provider: "claude",
+  account_id: "66e877cb-727f-4fb1-8ec9-8f2e8fa68f18",
+  label: "oogisoogi@gmail.com",
+  rate: [
+    { label: "5h", used_pct: 53, resets_at: 1786068600 },
+    { label: "7d", used_pct: 10, resets_at: 1786654800 },
+  ],
+  updated_at: 1786062874,
+};
+const ACCT_CODEX: AccountLike = {
+  provider: "codex",
+  account_id: "default",
+  label: "OpenAI Codex",
+  rate: [{ label: "7d", used_pct: 52, resets_at: 1786431165 }],
+  updated_at: 1786062874,
+};
+// 등록만 되고 아직 한 번도 관측되지 않은 계정 — 실물에서 antigravity가 이 모양이다.
+const ACCT_UNOBSERVED: AccountLike = {
+  provider: "antigravity",
+  account_id: "default",
+  label: "Antigravity (agy)",
+  rate: [],
+  updated_at: null,
+};
+const ANOW = 1786062880; // ACCT_* 관측 6초 뒤
+
+describe("accountRates — 페인이 없어도 계정 사용량은 있다", () => {
+  test("★★surface 0개인데 계정 데이터가 있으면 rate 행이 나온다 (오너 육안 결함의 정본 회귀)", () => {
+    // 결함: 초판은 사이드바 사용량을 살아 있는 surface의 usage만으로 만들었다.
+    // ⇒ 페인 0 ⇒ rates 0 ⇒ 「사용량」 절이 통째로 사라졌다. 5h·7d는 페인이 아니라 계정의 속성이다.
+    const rows = mergeRates(accountRates([ACCT_CLAUDE, ACCT_CODEX], ANOW), aggregateRates([], ANOW));
+    expect(rows.length).toBe(3);
+    expect(rows.map((r) => `${r.agent}/${r.label}/${r.usedPct}`)).toEqual([
+      "claude/5h/53",
+      "claude/7d/10",
+      "codex/7d/52",
+    ]);
+    // 계정 신원이 실려 있어야 범위 머리표가 계정별로 갈린다.
+    expect(rows[0].accountLabel).toBe("oogisoogi@gmail.com");
+    expect(rows[0].accountId).toBe("66e877cb-727f-4fb1-8ec9-8f2e8fa68f18");
+  });
+
+  test("★관측된 적 없는 계정(updated_at=null)은 그리지 않는다 — 나이 0은 「방금 봤다」로 읽힌다", () => {
+    expect(accountRates([ACCT_UNOBSERVED], ANOW)).toEqual([]);
+    // rate 배열이 비어 있지 않은데 updated_at만 없는 경우에도 같다(거짓 신선 금지).
+    const forged: AccountLike = { ...ACCT_UNOBSERVED, rate: [{ label: "5h", used_pct: 99, resets_at: null }] };
+    expect(accountRates([forged], ANOW)).toEqual([]);
+  });
+
+  test("나이·stale은 계정 관측 시각으로 잰다 — 폴링 주기가 아니라", () => {
+    const fresh6 = accountRates([ACCT_CLAUDE], ANOW);
+    expect(fresh6[0].ageSecs).toBe(6);
+    expect(fresh6[0].stale).toBe(false);
+    const late = accountRates([ACCT_CLAUDE], ACCT_CLAUDE.updated_at! + USAGE_STALE_SECS + 1);
+    expect(late[0].stale).toBe(true);
+    // 경계값은 아직 stale이 아니다(aggregateRates와 같은 문턱을 써야 한 화면에서 판정이 갈리지 않는다).
+    expect(accountRates([ACCT_CLAUDE], ACCT_CLAUDE.updated_at! + USAGE_STALE_SECS)[0].stale).toBe(false);
+  });
+
+  test("used_pct가 숫자가 아니면 그 창만 버린다 — 계정 전체를 버리지 않는다", () => {
+    const mixed: AccountLike = {
+      ...ACCT_CLAUDE,
+      rate: [
+        { label: "5h", used_pct: NaN as unknown as number, resets_at: null },
+        { label: "7d", used_pct: 10, resets_at: 1786654800 },
+      ],
+    };
+    const rows = accountRates([mixed], ANOW);
+    expect(rows.map((r) => r.label)).toEqual(["7d"]);
+  });
+
+  test("같은 provider라도 계정이 둘이면 두 블록 — 계정별로 묶여 나온다", () => {
+    const second: AccountLike = { ...ACCT_CLAUDE, account_id: "zz-second", label: "work@example.com" };
+    const rows = accountRates([second, ACCT_CLAUDE], ANOW);
+    // 계정 id 순으로 묶인다 — 한 계정의 5h·7d가 붙어 있어야 머리표가 매 줄 뒤집히지 않는다.
+    expect(rows.map((r) => `${r.accountId}/${r.label}`)).toEqual([
+      "66e877cb-727f-4fb1-8ec9-8f2e8fa68f18/5h",
+      "66e877cb-727f-4fb1-8ec9-8f2e8fa68f18/7d",
+      "zz-second/5h",
+      "zz-second/7d",
+    ]);
+  });
+});
+
+describe("mergeRates — 계정이 이긴다(중복 줄 = 가짜 계정)", () => {
+  test("★같은 (에이전트,창)이 양쪽에 있으면 한 줄만 — 두 줄이면 사용자가 두 계정으로 읽는다", () => {
+    const surface = aggregateRates(
+      [sf(1, { usage: mkUsage({ agent: "claude", updated_at: ANOW, rate: [{ label: "5h", used_pct: 41, resets_at: null }] }) })],
+      ANOW,
+    );
+    const rows = mergeRates(accountRates([ACCT_CLAUDE], ANOW), surface);
+    const fiveH = rows.filter((r) => r.agent === "claude" && r.label === "5h");
+    expect(fiveH).toHaveLength(1);
+    // 이긴 쪽은 계정이다 — 41(페인 관측)이 아니라 53(계정 저장소).
+    expect(fiveH[0].usedPct).toBe(53);
+    expect(fiveH[0].accountId).not.toBe("");
+  });
+
+  test("계정이 모르는 창은 surface 관측이 메운다 — 원천 전환이 곧 데이터 손실이면 안 된다", () => {
+    const surface = aggregateRates(
+      [sf(1, { usage: mkUsage({ agent: "gemini", updated_at: ANOW, rate: [{ label: "5h", used_pct: 7, resets_at: null }] }) })],
+      ANOW,
+    );
+    const rows = mergeRates(accountRates([ACCT_CLAUDE], ANOW), surface);
+    const gem = rows.filter((r) => r.agent === "gemini");
+    expect(gem).toHaveLength(1);
+    expect(gem[0].usedPct).toBe(7);
+    expect(gem[0].accountId).toBe(""); // surface 유래 — 계정 신원을 지어내지 않는다
+  });
+
+  test("양쪽 다 비면 빈 배열 — 패널이 숨는 조건이 그대로 유지된다", () => {
+    expect(mergeRates(accountRates([], ANOW), aggregateRates([], ANOW))).toEqual([]);
+  });
+});
+
+// ── 이름 있는 보고자(master·cso) — surface 없는 Claude의 CTX (오너 2026-08-07 티켓④)
+describe("namedCtxRows / mergeCtxRows — 번호 대신 이름", () => {
+  const NR = (o: Partial<NamedReporterLike> = {}): NamedReporterLike => ({
+    name: "master",
+    ctx_pct: 11,
+    source: "statusline",
+    updated_at: NOW,
+    ...o,
+  });
+
+  test("★이름 라벨로 행을 만든다 — 번호를 지어내지 않는다", () => {
+    const rows = namedCtxRows([NR()], NOW);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].name).toBe("master");
+    expect(rows[0].ctxPct).toBe(11);
+    // 번호가 없다는 사실이 데이터에 남아 있어야 렌더가 라벨을 고른다.
+    expect(rows[0].surfaceId).toBe(0);
+  });
+
+  test("★이름 행이 번호 행보다 먼저 온다 (오너 지정 순서) — 그 다음은 번호 오름차순", () => {
+    const panes = paneCtxRows(
+      [sf(7, { usage: fresh({ ctx_pct: 30 }) }), sf(3, { usage: fresh({ ctx_pct: 20 }) })],
+      NOW,
+    );
+    const rows = mergeCtxRows(namedCtxRows([NR({ name: "master" }), NR({ name: "cso", ctx_pct: 7 })], NOW), panes);
+    expect(rows.map((r) => r.name || r.surfaceId)).toEqual(["cso", "master", 3, 7]);
+  });
+
+  test("이름 없는 보고자는 행을 만들지 않는다 — 지어낸 라벨 금지", () => {
+    expect(namedCtxRows([NR({ name: "" })], NOW)).toEqual([]);
+  });
+
+  test("★관측된 적 없는 보고자(updated_at 없음)는 그리지 않는다 — 나이 0은 「방금」으로 읽힌다", () => {
+    expect(namedCtxRows([NR({ updated_at: 0 })], NOW)).toEqual([]);
+  });
+
+  test("신선도·stale 규율은 번호 행과 같은 문턱을 쓴다 — 한 표에서 판정이 갈리면 안 된다", () => {
+    expect(namedCtxRows([NR({ updated_at: NOW - USAGE_STALE_SECS })], NOW)[0].stale).toBe(false);
+    expect(namedCtxRows([NR({ updated_at: NOW - USAGE_STALE_SECS - 1 })], NOW)[0].stale).toBe(true);
+  });
+
+  test("ctx가 없으면 행은 남기되 「—」로 — 미관측과 부재를 구별한다(번호 행과 같은 규율)", () => {
+    const rows = namedCtxRows([NR({ ctx_pct: null })], NOW);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].ctxPct).toBeNull();
+    expect(rows[0].stale).toBe(false);
+  });
+
+  test("★서명이 이름을 본다 — 안 보면 master와 cso가 둘 다 surfaceId 0이라 갱신이 멈춘다", () => {
+    const a = mergeCtxRows(namedCtxRows([NR({ name: "master", ctx_pct: 11 })], NOW), []);
+    const b = mergeCtxRows(namedCtxRows([NR({ name: "cso", ctx_pct: 11 })], NOW), []);
+    expect(renderSignature([], a, null, false, false)).not.toBe(renderSignature([], b, null, false, false));
+  });
+
+  test("빈 함대 + named 만 있어도 표가 선다 — 티켓④의 목적 그 자체", () => {
+    const rows = mergeCtxRows(namedCtxRows([NR()], NOW), paneCtxRows([], NOW));
+    expect(rows).toHaveLength(1);
+    expect(rows[0].name).toBe("master");
+  });
+});
+
+describe("fableFromAnalytics — 응답 필드 위치를 아는 유일한 자리", () => {
+  // ★픽스처는 control.analytics 라이브 응답의 실제 형태다(RPC 실측본).
+  // 초판 결함은 by_model·totals를 **최상위에서** 읽은 것이었다 — 실제로는 summary 아래에 있다.
+  const REAL = {
+    now: 1786062898.73,
+    since: 1785458098.73,
+    window: "7d",
+    summary: {
+      by_model: [
+        { model: "claude-fable-5", tokens: 1_880_624_582 },
+        { model: "claude-opus-5", tokens: 3_787_689_869 },
+      ],
+      totals: { tokens: 5_838_120_878, msgs: 17626 },
+    },
+  };
+
+  test("★★summary 홉을 거쳐 읽는다 — 최상위에서 읽으면 줄이 영원히 안 뜬다(오너 육안 결함)", () => {
+    const f = fableFromAnalytics(REAL);
+    expect(f).not.toBeNull();
+    expect(f!.tokens).toBe(1_880_624_582);
+    expect(f!.sharePct).toBe(32.2);
+  });
+
+  test("summary가 없는 응답이면 null — 없는 것을 0으로 그리지 않는다", () => {
+    expect(fableFromAnalytics({ now: 1, since: 0, window: "7d" })).toBeNull();
+    expect(fableFromAnalytics(null)).toBeNull();
+    expect(fableFromAnalytics(undefined)).toBeNull();
+  });
+
+  test("집계가 비었으면(totals 0) null, Fable만 없으면 0 — 「모름」과 「안 씀」은 다르다", () => {
+    expect(fableFromAnalytics({ summary: { by_model: [], totals: { tokens: 0 } } })).toBeNull();
+    const none = fableFromAnalytics({
+      summary: { by_model: [{ model: "claude-opus-5", tokens: 100 }], totals: { tokens: 100 } },
+    });
+    expect(none).toEqual({ tokens: 0, sharePct: 0 });
   });
 });
 

@@ -4953,6 +4953,41 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             json!({"accounts": crate::accounts::local_json(daemon, crate::state::now_epoch())}),
         )),
 
+        // ─── surface 없는 보고자(master·cso 등 cmux 페인)의 ctx 관측 (오너 2026-08-07) ───
+        //
+        // ★이 문이 없으면 값이 영원히 비어 있다: 이들은 cys surface가 아니라서 usage.report의
+        //   surface 조회를 통과할 수 없다(실측 근거는 named.rs 머리주석). 저장·노출만 만들고
+        //   전송로를 안 내면 「표는 있는데 0행」이 된다 — 인프라 존재를 기록 존재로 착각하게 만든다.
+        //
+        // ⚠판별 불가는 **조용한 무시**가 아니라 명시적 무시다: named=null로 답해 호출자가
+        //   「보냈는데 안 잡혔다」를 알 수 있게 한다(성공으로 위장하지 않는다).
+        "usage.report_named" => {
+            let cwd = param_str(&params, "cwd").unwrap_or_default();
+            let Some(name) = crate::named::resolve_name(&cwd) else {
+                // 이름을 지어내지 않는다(오너 지시) — 모르는 보고자는 화면에 만들지 않는다.
+                return Reply::Single(ok_response(&id, json!({"named": Value::Null})));
+            };
+            let f = |k: &str| params.get(k).and_then(|x| x.as_f64());
+            let u = |k: &str| params.get(k).and_then(|x| x.as_u64());
+            crate::named::note(
+                &mut daemon.named.lock().unwrap(),
+                &name,
+                crate::named::NamedReport {
+                    ctx_pct: f("ctx_pct"),
+                    ctx_tokens: u("ctx_tokens"),
+                    ctx_window: u("ctx_window"),
+                    source: "statusline".into(),
+                    updated_at: crate::state::now_epoch(),
+                },
+            );
+            Reply::Single(ok_response(&id, json!({"named": name})))
+        }
+
+        "usage.named_reporters" => Reply::Single(ok_response(
+            &id,
+            json!({"named": crate::named::to_json(&daemon.named.lock().unwrap())}),
+        )),
+
         // ─── CC v2 WS-B: 스킬보드 run 생애주기 ───
         "skill.run_started" => match crate::skillrun::run_started(daemon, &params) {
             Ok(v) => Reply::Single(ok_response(&id, v)),
@@ -5485,6 +5520,17 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     "statusline",
                     crate::state::now_epoch(),
                 );
+            }
+            // 페인 제목의 모델 조각 추종(오너 2026-08-07 「모델은 제목에 넣자」).
+            // ★정적 1회가 아니라 매 관측 갱신이다 — /model 전환 뒤에도 제목이 참이어야 한다.
+            //   retitle_with_model이 무변경이면 None을 주므로 rename 폭풍이 나지 않는다(멱등 계약).
+            //   번호 규칙 밖 제목(사용자가 지은 이름·자동 제목)은 그 함수가 스스로 비켜 간다.
+            {
+                let model = param_str(&params, "model");
+                let mut title = surface.title.lock().unwrap();
+                if let Some(next) = crate::panetitle::retitle_with_model(&title, model.as_deref()) {
+                    *title = next;
+                }
             }
             let role = surface.role.lock().unwrap().clone();
             daemon.bus.publish(

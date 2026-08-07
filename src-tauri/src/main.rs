@@ -349,6 +349,15 @@ async fn control_skills(window: Option<String>) -> Result<Value, String> {
     rpc("control.skills", json!({ "window": window })).await
 }
 
+/// 이름 있는 보고자(master·cso 등 surface 없는 Claude)의 ctx 관측 — 사이드바 CTX 절용.
+/// ★기본 데몬만 본다(usage_accounts_all과 달리 부서 fan-out을 하지 않는다): 이들은 cmux 페인이라
+/// 부서 소켓을 모르고 `cys usage-report-stdin`의 기본 경로(기본 데몬)로만 보고한다.
+/// 없는 경로를 위해 fan-out을 지어 넣으면 매 폴링마다 헛된 2초 타임아웃이 붙는다.
+#[tauri::command]
+async fn usage_named_reporters() -> Result<Value, String> {
+    rpc("usage.named_reporters", json!({})).await
+}
+
 #[tauri::command]
 async fn control_cost_baseline(window: Option<String>) -> Result<Value, String> {
     rpc("control.cost_baseline", json!({ "window": window })).await
@@ -5789,6 +5798,7 @@ fn main() {
             skill_runs,
             resource_gate_check,
             usage_accounts_all,
+            usage_named_reporters,
             skill_out_dir,
             check_update,
             check_pack_update,

@@ -1599,6 +1599,10 @@ pub struct Daemon {
     pub parser_panics_total: AtomicU64,
     /// CC v2 WS-A: 계정 단위 rate limit 집계 상태(뷰·신원 캐시·영속 스로틀) — accounts.rs 전담.
     pub accounts: Mutex<crate::accounts::AccountsState>,
+    /// 이름 있는 보고자(master·cso 등 surface 없는 Claude)의 ctx 관측 — named.rs 전담.
+    /// ★surface 저장소와 분리한 이유: 이들에겐 surface_id가 없다. 유령 surface를 만들어 끼우면
+    /// 페인 목록·입양·ACL이 전부 그것을 실재하는 창으로 취급한다(없는 창에 보내려 든다).
+    pub named: Mutex<crate::named::NamedState>,
     /// CC v2 WS-C: learn.status assets(기억·스킬·directives fs 스캔) 60s 캐시 — (계산 시각, 값).
     pub learn_assets_cache: Mutex<Option<(f64, serde_json::Value)>>,
     /// CC v2 WS-C: canonical 학습 상태(~/.cys/state/learn) 쓰기 직렬화 — 데몬 단일 writer 불변식.
@@ -2282,6 +2286,7 @@ impl Daemon {
             channels: Mutex::new(channels_conn),
             parser_panics_total: AtomicU64::new(0),
             accounts: Mutex::new(Default::default()),
+            named: Mutex::new(Default::default()),
             learn_assets_cache: Mutex::new(None),
             learn_write: Mutex::new(()),
             restore_roots: Mutex::new(Vec::new()),

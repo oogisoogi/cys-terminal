@@ -46,19 +46,25 @@ import {
   roleDotColor,
 } from "./appearance";
 import {
+  accountRates,
   ageAt,
   ageText,
   aggregateRates,
   compactTokens,
-  fableObserved,
+  fableFromAnalytics,
   hasMultipleSockets,
+  mergeCtxRows,
+  mergeRates,
+  namedCtxRows,
   paneCtxRows,
   renderSignature,
   sevClassFor,
   shortSocketTag,
   sourceGrade,
   USAGE_STALE_SECS,
+  type AccountLike,
   type FableObserved,
+  type NamedReporterLike,
   type SurfaceLike,
 } from "./wsusage";
 import { routeOnData } from "./mousefilter";
@@ -259,6 +265,47 @@ let usageAgeUpdaters: ((nowSecs: number) => void)[] = [];
 // 초판은 단일 catch가 전 루프를 삼켜 렌더 자체가 안 돌았고, now가 재계산되지 않아
 // 낡은 행이 영원히 fresh 모양으로 남았다(codex [High]).
 const lastSurfacesBySocket = new Map<string, SurfaceLike[]>();
+// 계정 rate 스냅샷 — ★페인이 0이어도 살아 있는 원천(오너 육안 판정 2026-08-07 09:27 수리).
+// 폴링이 사이드바(3초)보다 느린 이유: usage_accounts_all은 부서 데몬까지 fan-out(각 2초 타임아웃)
+// 하는 호출이라 3초마다 때릴 값이 아니다. ★그리고 그럴 필요도 없다 — 화면에 뜨는 신선도는
+// 우리 폴링 주기가 아니라 관측 자체의 updated_at으로 재기 때문에, 폴링을 늦춰도 나이는 정확하다.
+const ACCOUNTS_POLL_MS = 15_000;
+let accountsCache: AccountLike[] = [];
+let accountsFetchedAt = 0;
+let accountsFetching = false;
+async function refreshUsageAccounts() {
+  if (accountsFetching || Date.now() - accountsFetchedAt < ACCOUNTS_POLL_MS) return;
+  accountsFetching = true;
+  try {
+    accountsCache = ((await invoke("usage_accounts_all")) as any)?.accounts ?? [];
+  } catch {
+    /* 데몬 일시 미응답 — 직전 스냅샷을 유지한다. updated_at은 그대로이므로 나이가 자라
+       자연히 stale로 넘어간다(거짓 신선 방지 · fable 캐시와 같은 규율). */
+  } finally {
+    // ★성공·실패 모두 시각을 찍는다(실패 때 안 찍으면 매 틱 재시도가 나가 데몬을 때린다).
+    accountsFetchedAt = Date.now();
+    accountsFetching = false;
+  }
+}
+
+// 이름 있는 보고자(master·cso) — surface가 없으므로 list_surfaces에 안 잡힌다. 따로 물어야 한다.
+// 계정 스냅샷과 같은 주기·같은 실패 규율(직전 값 유지 → 나이가 자라 stale).
+let namedCache: NamedReporterLike[] = [];
+let namedFetchedAt = 0;
+let namedFetching = false;
+async function refreshNamedReporters() {
+  if (namedFetching || Date.now() - namedFetchedAt < ACCOUNTS_POLL_MS) return;
+  namedFetching = true;
+  try {
+    namedCache = ((await invoke("usage_named_reporters")) as any)?.named ?? [];
+  } catch {
+    /* 데몬 일시 미응답 — 직전 스냅샷 유지 */
+  } finally {
+    namedFetchedAt = Date.now();
+    namedFetching = false;
+  }
+}
+
 let fableCache: FableObserved | null = null;
 let fableFetchedAt = 0;
 let fableFetching = false;
@@ -268,7 +315,9 @@ async function refreshFableObserved() {
   try {
     // window "7d" — 7d rate 창과 같은 기간이라 나란히 놓고 읽기 좋다(값의 종류는 다르되 기간은 맞춘다).
     const s = (await invoke("control_analytics", { window: "7d" })) as any;
-    fableCache = fableObserved(s?.by_model ?? [], Number(s?.totals?.tokens ?? 0));
+    // 필드 경로 지식은 wsusage.fableFromAnalytics가 단독으로 진다(회귀 테스트가 붙어 있는 자리).
+    // 초판이 여기서 s.by_model·s.totals를 직접 읽다가 summary 홉을 빠뜨린 것이 결함이었다.
+    fableCache = fableFromAnalytics(s);
   } catch {
     /* 데몬 일시 미응답 — 직전 값을 유지하고 다음 주기에 */
   } finally {
@@ -283,16 +332,22 @@ function renderSidebarUsage(surfaces: SurfaceLike[]) {
   const host = document.getElementById("ws-usage");
   if (!host) return;
   const nowSecs = Date.now() / 1000;
-  const rates = aggregateRates(surfaces, nowSecs);
-  const ctxRows = paneCtxRows(surfaces, nowSecs);
+  // ★rate의 원천은 **계정 저장소가 먼저**다(오너 육안 판정 수리). 페인이 0이어도 계정의 한도
+  //   소진율은 그대로 있으므로 페인 유무와 무관하게 뜬다. surface 관측은 계정이 아직 그 창을
+  //   모를 때만 메우는 보조 원천이고, 겹치면 mergeRates가 버린다(중복 줄 = 가짜 계정으로 읽힌다).
+  const rates = mergeRates(accountRates(accountsCache, nowSecs), aggregateRates(surfaces, nowSecs));
+  // CTX 표 = 이름 있는 보고자(master·cso — surface 없는 cmux 페인) + 화면에 붙은 번호 페인.
+  const ctxRows = mergeCtxRows(namedCtxRows(namedCache, nowSecs), paneCtxRows(surfaces, nowSecs));
   if (!rates.length && !ctxRows.length && !fableCache) {
     host.hidden = true;
     host.replaceChildren();
     lastUsageSig = "";
     return;
   }
-  // 계정 경계(소켓×에이전트)가 둘 이상일 때만 범위 라벨을 붙인다 — 하나뿐이면 잡음이다.
-  const scopes = new Set(rates.map((r) => JSON.stringify([r.socket, r.agent])));
+  // 라벨 열 너비는 표 전체의 속성이다 — 이름 행이 하나라도 있으면 모든 행을 함께 넓힌다(CSS 주석 참조).
+  host.classList.toggle("has-named", ctxRows.some((c) => !!c.name));
+  // 계정 경계(소켓×에이전트×계정)가 둘 이상일 때만 범위 라벨을 붙인다 — 하나뿐이면 잡음이다.
+  const scopes = new Set(rates.map((r) => JSON.stringify([r.socket, r.agent, r.accountId])));
   const showScope = scopes.size > 1;
   const showSocket = hasMultipleSockets(ctxRows);
 
@@ -317,14 +372,17 @@ function renderSidebarUsage(surfaces: SurfaceLike[]) {
     frag.appendChild(head);
     let curScope = "";
     for (const r of rates) {
-      const scope = JSON.stringify([r.socket, r.agent]);
+      const scope = JSON.stringify([r.socket, r.agent, r.accountId]);
       if (showScope && scope !== curScope) {
         curScope = scope;
         const sh = document.createElement("div");
         sh.className = "wsu-scope";
         const tag = shortSocketTag(r.socket);
-        sh.textContent = tag ? `${r.agent} · ${tag}` : r.agent;
-        sh.title = `이 아래 값은 ${r.agent}${tag ? ` (데몬 ${tag})` : ""} 계정의 한도 소진율이다 — 다른 계정과 섞지 않는다.`;
+        // ★계정 라벨이 있으면 그것을 쓴다 — 같은 claude 계정이 둘일 때 「claude」만으로는
+        //   두 블록이 구별되지 않는다. 라벨이 없으면(surface 유래) 종전대로 에이전트 이름만.
+        const who = r.accountLabel ? `${r.agent} · ${r.accountLabel}` : r.agent;
+        sh.textContent = tag ? `${who} · ${tag}` : who;
+        sh.title = `이 아래 값은 ${who}${tag ? ` (데몬 ${tag})` : ""} 계정의 한도 소진율이다 — 다른 계정과 섞지 않는다.`;
         frag.appendChild(sh);
       }
       const row = document.createElement("div");
@@ -345,7 +403,8 @@ function renderSidebarUsage(surfaces: SurfaceLike[]) {
       row.append(name, track, pct);
       const mkRateTitle = (nowSecs2: number) => {
         const tag2 = shortSocketTag(r.socket);
-        const tip = [`${r.agent}${tag2 ? ` (데몬 ${tag2})` : ""} · ${r.label} ${Math.round(r.usedPct)}%`];
+        const who2 = r.accountLabel ? `${r.agent} · ${r.accountLabel}` : r.agent;
+        const tip = [`${who2}${tag2 ? ` (데몬 ${tag2})` : ""} · ${r.label} ${Math.round(r.usedPct)}%`];
         if (tag2) tip.push(`소켓 ${r.socket}`); // 태그가 겹칠 수 있으니 전체 경로를 남긴다
         if (r.resetsAt) {
           const d = new Date(r.resetsAt * 1000);
@@ -402,9 +461,11 @@ function renderSidebarUsage(surfaces: SurfaceLike[]) {
       const row = document.createElement("div");
       row.className = `wsu-ctx${c.stale ? " stale" : ""}${c.ctxPct == null ? " unobserved" : ""}`;
       const sid = document.createElement("span");
-      sid.className = "wsu-ctx-sid";
+      sid.className = `wsu-ctx-sid${c.name ? " named" : ""}`;
       const tag = showSocket ? shortSocketTag(c.socket) : "";
-      sid.textContent = tag ? `${tag}:${c.surfaceId}` : String(c.surfaceId);
+      // ★이름 있는 보고자는 번호 대신 이름(오너 지시: 「master」·「cso」).
+      //   이들에겐 surface_id가 없으므로 번호를 적으면 화면의 어떤 페인과도 대조되지 않는다.
+      sid.textContent = c.name ? c.name : tag ? `${tag}:${c.surfaceId}` : String(c.surfaceId);
       const track = document.createElement("span");
       track.className = "cc-tbar-track";
       if (c.ctxPct != null) {
@@ -424,7 +485,10 @@ function renderSidebarUsage(surfaces: SurfaceLike[]) {
       mark.textContent = g ? g.mark : "";
       row.append(sid, track, pct, mark);
       const mkCtxTitle = (nowSecs2: number) => {
-        const where = `페인 ${c.surfaceId}${tag ? ` (데몬 ${tag} · ${c.socket})` : ""}`;
+        // 이름 행은 「페인 N」이 아니다 — cys surface가 아니라 cmux 페인의 Claude다.
+        const where = c.name
+          ? `${c.name} (cmux 페인 · cys surface 없음)`
+          : `페인 ${c.surfaceId}${tag ? ` (데몬 ${tag} · ${c.socket})` : ""}`;
         if (c.ctxPct == null) return `${where} · 아직 관측치 없음\n(측정 전이라는 뜻이지 0% 라는 뜻이 아니다)`;
         return `${where} · CTX ${Math.round(c.ctxPct)}%\n${(g as { title: string }).title}\n관측 ${ageText(
           ageAt(c.updatedAt, nowSecs2),
@@ -2295,7 +2359,11 @@ async function refreshPaneTitles() {
     // ★렌더는 finally에 둔다 — 위쪽 어디서 예외가 나도 패널은 매 틱 다시 그려진다.
     //   초판은 예외 시 렌더 자체를 건너뛰어 now가 재계산되지 않았고, 그래서 낡은 행이
     //   영원히 「fresh 모양」으로 굳었다(codex [High]). 나이는 그릴 때 다시 계산된다.
-    // Fable 집계는 자체 주기(60초)로 갱신하고 여기서는 캐시된 값을 그린다(await로 렌더를 막지 않는다).
+    // 계정 rate(15초)·Fable 집계(60초)는 각자 자체 주기로 갱신하고 여기서는 캐시된 값을 그린다
+    // (await로 렌더를 막지 않는다 — 느린 fan-out 한 번이 패널 전체를 멈추면 안 된다).
+    // ★이 두 원천은 surface 목록과 무관하다. 그래서 페인이 0이어도 아래 렌더가 그릴 것이 남는다.
+    void refreshUsageAccounts();
+    void refreshNamedReporters();
     void refreshFableObserved();
     renderSidebarUsage([...lastSurfacesBySocket.values()].flat());
   }
