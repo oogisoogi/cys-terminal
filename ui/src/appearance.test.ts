@@ -3,6 +3,10 @@ import {
   composeFontFamily,
   DEFAULT_FONT_STACK,
   FONT_CHOICES,
+  MENU_SCALE_DEFAULT_PCT,
+  MENU_SCALE_MAX_PCT,
+  MENU_SCALE_MIN_PCT,
+  menuScaleFromPct,
   nodeWorking,
   OUTPUT_IDLE_SECS,
   ROLE_COLOR,
@@ -33,6 +37,36 @@ describe("composeFontFamily", () => {
       const fam = composeFontFamily(c.face);
       expect(fam.endsWith(DEFAULT_FONT_STACK)).toBe(true);
     }
+  });
+});
+
+describe("menuScaleFromPct", () => {
+  test("기본값 %가 style.css의 --ui-chrome-scale 1.25와 일치 — 두 곳이 어긋나면 여기서 잡힌다", () => {
+    expect(menuScaleFromPct(MENU_SCALE_DEFAULT_PCT)).toBe("1.25");
+  });
+
+  test("%를 배수로 옮긴다 (문자열 입력도 동일 — input.value가 문자열이라 실제 경로다)", () => {
+    expect(menuScaleFromPct(100)).toBe("1");
+    expect(menuScaleFromPct("150")).toBe("1.5");
+    expect(menuScaleFromPct(" 90 ")).toBe("0.9");
+  });
+
+  test("범위 밖은 잘린다 — 툴바가 사라지거나 화면을 덮는 값을 만들지 않는다", () => {
+    expect(menuScaleFromPct(1)).toBe(String(MENU_SCALE_MIN_PCT / 100));
+    expect(menuScaleFromPct(9999)).toBe(String(MENU_SCALE_MAX_PCT / 100));
+  });
+
+  test("null·빈칸·문자·NaN·Infinity·0 이하 = null(기본값 복원) — CSS에 NaN을 절대 넣지 않는다", () => {
+    // 빈칸은 예외가 아니다: 숫자 입력창을 지우는 중에 반드시 이 상태를 지난다.
+    for (const bad of [null, undefined, "", "   ", "abc", NaN, Infinity, -Infinity, 0, -50]) {
+      expect(menuScaleFromPct(bad as never)).toBeNull();
+    }
+  });
+
+  test("부동소수 꼬리를 남기지 않는다 — CSS 변수는 문자열로 그대로 박히므로", () => {
+    expect(menuScaleFromPct(125)).toBe("1.25");
+    expect(menuScaleFromPct(115)).toBe("1.15");
+    expect(menuScaleFromPct(133)).toBe("1.33");
   });
 });
 

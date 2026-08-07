@@ -30,6 +30,31 @@ export const FONT_CHOICES: { label: string; face: string | null }[] = [
   { label: "Courier New", face: "Courier New" },
 ];
 
+// ── 메뉴(상단 툴바) 글자 크기 — 오너 요청 2026-08-07 「페인 상단 메뉴바 글자가 작다」.
+//
+// 상단 툴바(#topbar)·사이드바 헤더·크롬 버튼은 전부 `calc(<기본px> * var(--ui-chrome-scale))`로
+// 그려진다(style.css). 즉 배율 변수는 이미 있었고 **그것을 조절할 UI만 없었다** — 이 함수가
+// 테마 팝오버의 「메뉴 크기」 입력(사람이 읽는 %)을 CSS 배수로 옮긴다.
+//
+// %를 쓰는 이유: 대상 요소들의 기본 크기가 11·12·13px로 제각각이라 「몇 px」로 물으면 답이 하나가
+// 아니다. 배율은 그 전부에 일관되게 걸리는 유일한 단위다.
+export const MENU_SCALE_DEFAULT_PCT = 125; // style.css :root의 --ui-chrome-scale: 1.25와 같은 값
+export const MENU_SCALE_MIN_PCT = 80;
+export const MENU_SCALE_MAX_PCT = 250;
+
+// %(문자열·숫자) → CSS 배수 문자열. null = 기본값으로 되돌림(변수 제거).
+// ★비정상 입력(빈칸·문자·NaN·Infinity)도 null로 접는다 — CSS에 NaN이 들어가면 툴바 글자가
+// 통째로 사라지고, 사용자는 그것을 「앱이 깨졌다」로 읽는다. 입력창은 지우는 중에 반드시 빈칸을
+// 거치므로 이 경로는 예외가 아니라 정상 경로다.
+export function menuScaleFromPct(pct: number | string | null | undefined): string | null {
+  if (pct === null || pct === undefined) return null;
+  const n = typeof pct === "number" ? pct : Number(String(pct).trim());
+  if (!Number.isFinite(n) || n <= 0) return null;
+  const clamped = Math.min(MENU_SCALE_MAX_PCT, Math.max(MENU_SCALE_MIN_PCT, n));
+  // 부동소수 꼬리(1.2500000000000002) 차단 — CSS 변수는 문자열로 남으므로 자릿수를 고정한다.
+  return String(Math.round((clamped / 100) * 1000) / 1000);
+}
+
 // 역할 → 신호 색 — Control Center(CC_ROLE_COLOR)와 pane 역할 점의 단일 출처.
 export const ROLE_COLOR: Record<string, string> = {
   master: "#3b82f6", cso: "#8b5cf6", worker: "#00e676",
