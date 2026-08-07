@@ -1,4 +1,4 @@
-// 사이드바 사용량 패널의 순수 계산 — rate 집계 + 페인별 CTX 목록 + 신선도 판정 + Fable 관측치.
+// 사이드바 사용량 패널의 순수 계산 — rate 집계 + 페인별 CTX 목록 + 신선도 판정.
 //
 // 오너 요청 2026-08-07: "주간 토큰 사용량과 페인별 CTX를 한 곳에 모아 보고 싶다"(페인 푸터 대신
 // 사이드바 빈 공간). main.ts의 renderSidebarUsage는 여기 결과를 DOM으로 옮기기만 한다 —
@@ -211,9 +211,11 @@ export function accountRates(accounts: AccountLike[] | null | undefined, nowSecs
 
 // 모델 스코프 게이지 → rate 행 (티켓⑤ · 오너 승인 2026-08-07).
 //
-// ★이것은 「자체 집계」 줄과 **다른 종류의 수**다. 자체 집계는 우리가 트랜스크립트를 세어 만든
-// 관측 절대치라 한도를 모르지만, 이 값은 서버가 준 **한도 대비 소진율**이다 — 그래서 게이지로
-// 그린다. 두 줄은 대체 관계가 아니라 보완 관계라 **함께 남긴다**(절대치는 게이지가 못 준다).
+// ★이 값은 서버가 준 **한도 대비 소진율**이다(OAuth usage API 원천) — 그래서 게이지로 그린다.
+// 초판에는 이것과 나란히 「자체 집계」 줄(우리가 트랜스크립트를 세어 만든 관측 절대치)이 있었고
+// 주석은 「두 줄은 보완 관계라 함께 남긴다」였다. **오너 판정으로 그 줄은 티켓⑥에서 삭제됐다**
+// (2026-08-07 육안: 「불확실한 것이니 삭제」 — 한도를 모르는 절대치는 옆의 게이지와 같은 눈금으로
+// 읽혀 오독을 만든다). 남는 것은 이 게이지 하나이므로 여기서 「다른 종류의 수」를 구별할 필요가 없다.
 //
 // 라벨 `7d·<모델>`: 기간이 주간이라 7d와 같은 축이고, 뒤에 모델 이름을 붙여 「전체 주간」과 구별한다.
 // ★모델 이름은 응답이 준 것을 그대로 쓴다(RATE_LABEL_ORDER 주석 참조 — 상수 금지).
@@ -409,73 +411,22 @@ export function hasMultipleSockets(items: { socket: string }[]): boolean {
   return new Set(items.map((i) => i.socket)).size > 1;
 }
 
-// ── Fable 관측치(오너 발주 3번의 「fable5」 · master 결정② B안 2026-08-07)
+// ── Fable 「자체 집계」 줄은 여기 있었다 — 티켓⑥(오너 육안 2026-08-07)에서 **삭제**했다.
 //
-// ★이 값은 5h·7d와 **종류가 다르다.** 5h·7d는 Anthropic이 준 「한도 대비 소진율」이고, 이것은
-// 우리가 트랜스크립트를 세어 만든 「관측 절대치」다. 한도가 얼마인지 우리는 모른다.
-// 그래서 master가 형태를 못박았다: ⑴게이지 바로 그리지 말 것(같은 눈금으로 보이면 안 된다)
-// ⑵%가 아니라 절대치 + 비중으로 적고 「자체 집계」를 명시할 것.
-// ⇒ 아래 반환값에 pct(한도 대비)가 아예 없다. 형태 규율을 주석이 아니라 **타입으로** 강제한다.
-export interface ByModelRow {
-  model: string;
-  tokens: number;
-}
-export interface FableObserved {
-  tokens: number; // 관측 절대치(input+output+cache 합)
-  sharePct: number; // 전체 관측 토큰 대비 비중 — 한도 대비가 아니다
-}
-
-const isFableModel = (model: string): boolean => model.toLowerCase().includes("fable");
-
-// by_model 집계 → Fable 관측치. 데이터 자체가 없으면 null(그리지 않는다).
+// 무엇이 있었나: `fableObserved` · `fableFromAnalytics` · `compactTokens` · `ByModelRow` ·
+// `FableObserved`. control.analytics의 by_model 집계를 60초마다 읽어 「Fable 1936M tok ·
+// 전체의 32% (자체 집계)」 한 줄을 사이드바에 그렸다.
 //
-// ★「Fable을 안 썼다(0)」와 「집계가 비었다(모름)」를 가른다 — 둘 다 0으로 보이지만 뜻이 정반대다.
-// totals가 0이면 아직 아무것도 못 셌다는 뜻이므로 null(표시 없음), totals가 있는데 fable 행이
-// 없으면 진짜로 0 쓴 것이므로 0을 표시한다(오너가 지켜보려는 값이라 「썼는지 안 썼는지」가 정보다).
-export function fableObserved(byModel: ByModelRow[] | null | undefined, totalTokens: number): FableObserved | null {
-  const total = Number(totalTokens);
-  if (!Number.isFinite(total) || total <= 0) return null;
-  let tokens = 0;
-  for (const m of byModel ?? []) {
-    if (!m || typeof m.model !== "string" || !isFableModel(m.model)) continue;
-    const t = Number(m.tokens);
-    if (Number.isFinite(t) && t > 0) tokens += t;
-  }
-  return { tokens, sharePct: Math.round((tokens / total) * 1000) / 10 };
-}
-
-// control.analytics 응답 → Fable 관측치. **응답의 필드 위치를 아는 유일한 자리**다.
+// ★왜 지웠나(오너 판정 원문): 「불확실한 것이니 삭제」. 이 수는 **한도 대비가 아니라 관측 절대치**라
+// 한도를 모른다. 형태(게이지 금지·「자체 집계」 태그)로 구별하려 했지만, 한도 게이지 바로 아래
+// 나란히 놓인 이상 사용자는 같은 눈금으로 읽는다. ⇒ 같은 자리에 종류가 다른 수를 두 개 두면
+// **라벨로는 구별이 안 된다**는 것이 이 줄의 교훈이다.
 //
-// ★결함 계보(오너 육안 2026-08-07 「Fable 자체 집계 줄이 안 보인다」): 초판은 main.ts에서
-// `s.by_model` · `s.totals.tokens`를 읽었다. 그런데 control.analytics의 실제 응답은
-//   {now, since, window, summary: {by_model, totals, by_agent, by_tier, ...}}
-// 라서 그 두 접근은 **항상 undefined**였다 ⇒ fableObserved([], 0) ⇒ null ⇒ 줄이 한 번도 안 떴다.
-// 페인 유무와 무관한 무조건 결함이었다(「빈 함대라서」가 아니다 — RPC 실측으로 갈랐다).
+// ★대체물은 이미 있다: 「7d·Fable」 실게이지(scopedRates — OAuth usage API가 준 한도 대비 소진율).
+// 그러므로 이 삭제는 정보 손실이 아니라 **불확실한 수를 확실한 수로 갈아 끼운 것**이다.
 //
-// ★왜 이 함수를 새로 파서 여기 두는가: 결함이 난 곳은 「필드 경로를 아는 지식」이었는데 그 지식이
-// DOM·invoke와 뒤엉킨 main.ts에 있어 **테스트가 닿지 못했다.** 옆 소비자(renderEfficiency)는
-// 처음부터 summary를 거쳐 옳게 읽고 있었으니 코드가 틀린 게 아니라 **검증이 못 미치는 자리에
-// 지식이 놓여 있던 것**이다. 순수 함수로 옮겨 회귀 테스트가 응답 형태를 붙잡게 한다.
-export function fableFromAnalytics(resp: unknown): FableObserved | null {
-  const summary = (resp as { summary?: unknown } | null | undefined)?.summary as
-    | { by_model?: ByModelRow[]; totals?: { tokens?: unknown } }
-    | undefined;
-  if (!summary) return null;
-  return fableObserved(summary.by_model ?? [], Number(summary.totals?.tokens ?? 0));
-}
-
-// 큰 토큰 수 → 짧은 표기(1.2M · 340K). 사이드바 폭이 좁아 원수치는 줄을 넘긴다.
-// 정확한 원수치는 툴팁에 남긴다 — 줄이는 것과 잃는 것은 다르다.
-export function compactTokens(n: number): string {
-  if (!Number.isFinite(n) || n < 0) return "?";
-  if (n < 1000) return String(Math.round(n));
-  if (n < 1_000_000) {
-    const k = n / 1000;
-    return `${k < 10 ? Math.round(k * 10) / 10 : Math.round(k)}K`;
-  }
-  const m = n / 1_000_000;
-  return `${m < 10 ? Math.round(m * 10) / 10 : Math.round(m)}M`;
-}
+// ⚠데몬의 by_model 집계 자체는 건드리지 않았다 — 다른 소비자(renderEfficiency)가 쓴다.
+// 끊은 것은 **화면으로 나가는 마지막 한 걸음**뿐이다(RATE_HIDDEN_AGENTS와 같은 규율).
 
 // 임계 단계 — CTX는 60%(/clear 사이클 임계)·80%, rate는 70%·90%. renderUsage와 동일 기준.
 export const sevClassFor = (pct: number, warn: number, crit: number): string =>
@@ -513,10 +464,14 @@ export function sourceGrade(source: string): { mark: string; title: string } {
 // ⇒ 서명에는 **구조와 값, 그리고 stale 경계 전이만** 넣는다. 나이 텍스트는 DOM을 다시 만들지 않고
 // 해당 노드만 갱신한다(main.ts의 나이 갱신 클로저). 경계를 넘는 순간(fresh↔stale)은 stale 플래그가
 // 바뀌므로 서명이 달라져 전체 재생성이 정확히 그때만 일어난다.
+//
+// ★티켓⑥: 인자에서 `fable`을 뺐다(자체 집계 줄 삭제). 서명 문자열도 그 칸이 사라져
+//   `<rates>#<ctx>#<footer>` 3칸이 된다 — 빈 칸을 남겨 두지 않는다. 남겨 두면 다음 사람이
+//   「무엇이 들어가던 칸인지」를 코드에서 알 수 없고, 서명은 짝을 맞춰 읽는 값이라 유령 칸이
+//   생기면 대조가 어긋난다.
 export function renderSignature(
   rates: RateRow[],
   ctxRows: CtxRow[],
-  fable: FableObserved | null,
   showScope: boolean,
   showSocket: boolean,
 ): string {
@@ -541,10 +496,9 @@ export function renderSignature(
         }|${x.source}|${x.stale ? 1 : 0}`,
     )
     .join(";");
-  const f = fable ? `${fable.tokens}|${fable.sharePct}` : "";
   // 푸터의 존재 여부만 넣는다(문구는 나이라서 노드 갱신 대상이다).
   const foot = ctxRows.some((x) => x.ctxPct != null) ? "1" : "0";
-  return `${r}#${c}#${f}#${foot}`;
+  return `${r}#${c}#${foot}`;
 }
 
 // 나이 재계산 — 저장된 updated_at으로 언제든 다시 잰다(재생성 없이 텍스트만 갱신하기 위함).

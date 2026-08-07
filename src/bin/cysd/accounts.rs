@@ -516,8 +516,9 @@ const OAUTH_PROBE_CMD_TIMEOUT_SECS: u64 = 10;
 /// OAuth usage 응답 → (rate 창들, 모델 스코프 게이지들). **응답 형태를 아는 유일한 자리**다.
 ///
 /// ★순수 함수로 뽑아 둔 이유: 결함이 나는 곳은 늘 「필드 경로를 아는 지식」인데, 그 지식이
-/// 네트워크·프로세스와 뒤엉킨 자리에 있으면 테스트가 닿지 못한다(wsusage.fableFromAnalytics가
-/// 같은 이유로 뽑혀 나왔다). 아래 테스트는 **실물 응답 형태 그대로**를 픽스처로 쓴다.
+/// 네트워크·프로세스와 뒤엉킨 자리에 있으면 테스트가 닿지 못한다. (같은 이유로 뽑혀 나왔던
+/// UI 쪽 짝 `wsusage.fableFromAnalytics`는 티켓⑥에서 그 줄과 함께 삭제됐다 — 교훈만 남는다.)
+/// 아래 테스트는 **실물 응답 형태 그대로**를 픽스처로 쓴다.
 ///
 /// 형태가 바뀌면 rate가 비고, 호출자는 그것을 「원천 소실」로 다룬다(경보가 아니라 조용한 강등).
 pub fn parse_oauth_usage(v: &Value, now: f64) -> (Vec<RateWindow>, Vec<ScopedGauge>) {
