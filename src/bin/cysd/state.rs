@@ -1349,6 +1349,8 @@ impl Daemon {
         let analytics_conn = crate::analytics::open(&socket_path);
         // C0: 채널 계층 DB(channels.db)도 move 전에 연다. 무결 필수 — open 실패 시 None(모듈 비활성).
         let channels_conn = crate::channels::open(&socket_path);
+        // ★티켓⑥: 이름 보고자 관측도 socket_path가 struct로 move되기 전에 읽는다(위 두 줄과 같은 이유).
+        let named_restored = crate::named::load_from_disk(&socket_path);
         let daemon = Arc::new(Daemon {
             surfaces: Mutex::new(HashMap::new()),
             // 영속 트랜스크립트(transcripts.db)의 최대 id 이후부터 발급 — 재시작 시
@@ -1401,7 +1403,11 @@ impl Daemon {
             channels: Mutex::new(channels_conn),
             parser_panics_total: AtomicU64::new(0),
             accounts: Mutex::new(Default::default()),
-            named: Mutex::new(Default::default()),
+            // ★티켓⑥(오너 육안 2026-08-07 「cso ctx가 없다」): 이름 보고자 관측을 기동 시 디스크에서
+            //   되살린다. 메모리에만 두면 **발화가 드문 보고자일수록 먼저 사라진다** — CSO는 조용히
+            //   있다가 필요할 때 말하는 노드라, 데몬이 한 번 재기동하면 다음 발화까지 행 자체가 없다.
+            //   (복원본은 관측 시각을 함께 들고 오므로 낡았으면 낡은 대로 stale 표시된다.)
+            named: Mutex::new(named_restored),
             learn_assets_cache: Mutex::new(None),
             learn_write: Mutex::new(()),
             restore_roots: Mutex::new(Vec::new()),

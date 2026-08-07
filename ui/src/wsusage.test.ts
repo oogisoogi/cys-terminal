@@ -13,9 +13,6 @@ import {
   ageText,
   ageAt,
   aggregateRates,
-  compactTokens,
-  fableFromAnalytics,
-  fableObserved,
   filterDisplayRates,
   hasMultipleSockets,
   mergeCtxRows,
@@ -256,13 +253,13 @@ describe("renderSignature", () => {
   test("같은 값이면 같은 서명 — 무변경 스킵의 근거", () => {
     const rows = paneCtxRows([sf(1, { usage: fresh({ ctx_pct: 10 }) })], NOW);
     const rates = aggregateRates([sf(1, { usage: fresh({ rate: [{ label: "5h", used_pct: 10, resets_at: null }] }) })], NOW);
-    expect(renderSignature(rates, rows, null, false, false)).toBe(renderSignature(rates, rows, null, false, false));
+    expect(renderSignature(rates, rows, false, false)).toBe(renderSignature(rates, rows, false, false));
   });
 
   test("★연속 폴링(now 1000 → 1003)에서 서명이 같아야 한다 — 나이가 들어가면 스킵이 무력이다 (codex 2R)", () => {
     const mk = (now: number) => {
       const surfaces = [sf(1, { usage: mkUsage({ ctx_pct: 10, updated_at: 980 }) })];
-      return renderSignature(aggregateRates(surfaces, now), paneCtxRows(surfaces, now), null, false, false);
+      return renderSignature(aggregateRates(surfaces, now), paneCtxRows(surfaces, now), false, false);
     };
     // 20초 → 23초 (둘 다 60초 미만 = 초 단위 표시 구간). 초판은 여기서 매번 달라졌다.
     expect(mk(1000)).toBe(mk(1003));
@@ -274,23 +271,34 @@ describe("renderSignature", () => {
   test("★stale 경계를 넘는 순간에는 서명이 바뀐다 — 그때는 전체 재생성이 맞다", () => {
     const mk = (now: number) => {
       const surfaces = [sf(1, { usage: mkUsage({ ctx_pct: 10, updated_at: 1000 }) })];
-      return renderSignature(aggregateRates(surfaces, now), paneCtxRows(surfaces, now), null, false, false);
+      return renderSignature(aggregateRates(surfaces, now), paneCtxRows(surfaces, now), false, false);
     };
     expect(mk(1000 + USAGE_STALE_SECS)).not.toBe(mk(1000 + USAGE_STALE_SECS + 1));
   });
 
-  test("화면에 보이는 값이 바뀌면 서명도 바뀐다 — 값·미관측·Fable", () => {
+  test("화면에 보이는 값이 바뀌면 서명도 바뀐다 — 값·미관측", () => {
     const base = paneCtxRows([sf(1, { usage: fresh({ ctx_pct: 10 }) })], NOW);
-    const sig = renderSignature([], base, null, false, false);
-    expect(renderSignature([], paneCtxRows([sf(1, { usage: fresh({ ctx_pct: 11 }) })], NOW), null, false, false)).not.toBe(sig);
-    expect(renderSignature([], paneCtxRows([sf(1, { usage: null })], NOW), null, false, false)).not.toBe(sig);
-    expect(renderSignature([], base, { tokens: 1, sharePct: 1 }, false, false)).not.toBe(sig);
+    const sig = renderSignature([], base, false, false);
+    expect(renderSignature([], paneCtxRows([sf(1, { usage: fresh({ ctx_pct: 11 }) })], NOW), false, false)).not.toBe(sig);
+    expect(renderSignature([], paneCtxRows([sf(1, { usage: null })], NOW), false, false)).not.toBe(sig);
+  });
+
+  // ★티켓⑥ 회귀: 자체 집계 줄이 사라졌으니 서명의 칸도 3개다(rates#ctx#footer).
+  //   빈 칸이 남아 있으면(`…##0`) 「아직 무언가 들어갈 자리」로 읽혀 다음 사람이 되살린다 —
+  //   삭제는 값만이 아니라 **자리까지** 없애야 끝난다.
+  test("★삭제 후 서명 칸은 정확히 3개 — 유령 칸(자체 집계 자리)이 남지 않는다", () => {
+    const rows = paneCtxRows([sf(1, { usage: fresh({ ctx_pct: 10 }) })], NOW);
+    const rates = aggregateRates([sf(1, { usage: fresh({ rate: [{ label: "5h", used_pct: 10, resets_at: null }] }) })], NOW);
+    const sig = renderSignature(rates, rows, false, false);
+    expect(sig.split("#")).toHaveLength(3);
+    expect(sig.endsWith("#1")).toBe(true); // 마지막 칸 = 푸터 존재 여부
+    expect(sig).not.toContain("##"); // 비어 있는 중간 칸 = 삭제가 덜 된 흔적
   });
 
   test("★부서가 달라 태그가 갈리면 서명도 갈린다 — 실물 경로 형태로 검증", () => {
     const a = paneCtxRows([sf(1, { socket: DEPT_A, usage: fresh({ ctx_pct: 10 }) })], NOW);
     const b = paneCtxRows([sf(1, { socket: DEPT_B, usage: fresh({ ctx_pct: 10 }) })], NOW);
-    expect(renderSignature([], a, null, false, true)).not.toBe(renderSignature([], b, null, false, true));
+    expect(renderSignature([], a, false, true)).not.toBe(renderSignature([], b, false, true));
   });
 });
 
@@ -486,15 +494,20 @@ describe("scopedRates — 「7d·Fable」 실게이지", () => {
     expect(rows.map((r) => r.label)).toEqual(["5h", "7d", "7d·Fable"]);
   });
 
-  test("★게이지 행과 「자체 집계」 줄은 함께 산다 — 종류가 다른 두 수라 하나가 다른 하나를 대체하지 않는다", () => {
+  // ★티켓⑥ 회귀(삭제 후 렌더): 「자체 집계」 줄이 없어져도 **이 게이지는 그대로 산다.**
+  //   초판 테스트는 「두 줄이 함께 산다」를 지켰는데, 삭제 국면에서 진짜 위험은 그 반대다 —
+  //   같은 「Fable」이라는 낱말을 지우다가 살려야 할 실게이지까지 함께 지우는 것.
+  //   ⇒ 남는 쪽을 단언한다.
+  test("★자체 집계 줄 삭제 후에도 「7d·Fable」 실게이지는 남는다 — 지울 것과 남길 것을 낱말로 가르지 않는다", () => {
     const rates = mergeRates(
       [...accountRates([ACCT_WITH_SCOPED], ANOW), ...scopedRates([ACCT_WITH_SCOPED], ANOW)],
       aggregateRates([], ANOW),
     );
-    const observed = fableObserved([{ model: "claude-fable-5", tokens: 400 }], 1000);
-    const sig = renderSignature(rates, [], observed, false, false);
-    expect(sig).toContain("7d·Fable|6"); // 한도 대비 게이지(서버 진실)
-    expect(sig).toContain("400|40"); // 자체 집계(관측 절대치 + 비중)
+    expect(rates.map((r) => r.label)).toContain("7d·Fable");
+    const sig = renderSignature(rates, [], false, false);
+    expect(sig).toContain("7d·Fable|6"); // 한도 대비 게이지(서버 진실)만 남는다
+    // 자체 집계(관측 절대치 400 tok · 비중 40%)는 서명 어디에도 없다.
+    expect(sig).not.toContain("400|40");
   });
 });
 
@@ -579,7 +592,7 @@ describe("namedCtxRows / mergeCtxRows — 번호 대신 이름", () => {
   test("★서명이 이름을 본다 — 안 보면 master와 cso가 둘 다 surfaceId 0이라 갱신이 멈춘다", () => {
     const a = mergeCtxRows(namedCtxRows([NR({ name: "master", ctx_pct: 11 })], NOW), []);
     const b = mergeCtxRows(namedCtxRows([NR({ name: "cso", ctx_pct: 11 })], NOW), []);
-    expect(renderSignature([], a, null, false, false)).not.toBe(renderSignature([], b, null, false, false));
+    expect(renderSignature([], a, false, false)).not.toBe(renderSignature([], b, false, false));
   });
 
   test("빈 함대 + named 만 있어도 표가 선다 — 티켓④의 목적 그 자체", () => {
@@ -589,43 +602,11 @@ describe("namedCtxRows / mergeCtxRows — 번호 대신 이름", () => {
   });
 });
 
-describe("fableFromAnalytics — 응답 필드 위치를 아는 유일한 자리", () => {
-  // ★픽스처는 control.analytics 라이브 응답의 실제 형태다(RPC 실측본).
-  // 초판 결함은 by_model·totals를 **최상위에서** 읽은 것이었다 — 실제로는 summary 아래에 있다.
-  const REAL = {
-    now: 1786062898.73,
-    since: 1785458098.73,
-    window: "7d",
-    summary: {
-      by_model: [
-        { model: "claude-fable-5", tokens: 1_880_624_582 },
-        { model: "claude-opus-5", tokens: 3_787_689_869 },
-      ],
-      totals: { tokens: 5_838_120_878, msgs: 17626 },
-    },
-  };
-
-  test("★★summary 홉을 거쳐 읽는다 — 최상위에서 읽으면 줄이 영원히 안 뜬다(오너 육안 결함)", () => {
-    const f = fableFromAnalytics(REAL);
-    expect(f).not.toBeNull();
-    expect(f!.tokens).toBe(1_880_624_582);
-    expect(f!.sharePct).toBe(32.2);
-  });
-
-  test("summary가 없는 응답이면 null — 없는 것을 0으로 그리지 않는다", () => {
-    expect(fableFromAnalytics({ now: 1, since: 0, window: "7d" })).toBeNull();
-    expect(fableFromAnalytics(null)).toBeNull();
-    expect(fableFromAnalytics(undefined)).toBeNull();
-  });
-
-  test("집계가 비었으면(totals 0) null, Fable만 없으면 0 — 「모름」과 「안 씀」은 다르다", () => {
-    expect(fableFromAnalytics({ summary: { by_model: [], totals: { tokens: 0 } } })).toBeNull();
-    const none = fableFromAnalytics({
-      summary: { by_model: [{ model: "claude-opus-5", tokens: 100 }], totals: { tokens: 100 } },
-    });
-    expect(none).toEqual({ tokens: 0, sharePct: 0 });
-  });
-});
+// 「fableFromAnalytics — 응답 필드 위치를 아는 유일한 자리」 describe가 여기 있었다.
+// 티켓⑥에서 그 함수(와 fableObserved·compactTokens)를 지우면서 함께 삭제했다 —
+// ★사라진 코드의 테스트를 남겨 두면 그것이 「아직 있는 기능」의 증거처럼 보인다.
+// 삭제 자체의 회귀 그물은 위 renderSignature 절(칸 3개·유령 칸 없음)과
+// scopedRates 절(실게이지 생존)이 대신 진다.
 
 describe("ageAt", () => {
   test("저장된 updated_at으로 언제든 나이를 다시 잰다(재생성 없이 갱신하기 위함)", () => {

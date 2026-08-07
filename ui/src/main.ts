@@ -32,8 +32,6 @@ import {
   ageAt,
   ageText,
   aggregateRates,
-  compactTokens,
-  fableFromAnalytics,
   filterDisplayRates,
   hasMultipleSockets,
   mergeCtxRows,
@@ -47,7 +45,6 @@ import {
   sourceGrade,
   USAGE_STALE_SECS,
   type AccountLike,
-  type FableObserved,
   type NamedReporterLike,
   type SurfaceLike,
 } from "./wsusage";
@@ -199,10 +196,12 @@ function renderUsage(el: HTMLElement, u: ObservedUsage | null | undefined) {
 //
 // 발주 1~3번: 페인 푸터 대신 사이드바 아래 빈 공간에 모아 보여 준다.
 // 계산은 전부 wsusage.ts(순수·테스트 대상)에 있고 여기서는 DOM만 만든다.
-// Fable 관측치(master 결정② B안) — 데몬의 기존 by_model 집계를 **소비만** 한다(신규 수집 없음).
-// ★폴링 주기가 사이드바(3초)와 다른 이유: control_analytics는 DB를 훑는 집계 질의라 3초마다
-// 때리면 관측이 관측 대상을 방해한다. 7일 누적치는 초 단위로 변하지 않으므로 60초면 충분하다.
-const FABLE_POLL_MS = 60_000;
+//
+// ★티켓⑥(오너 육안 2026-08-07 「불확실한 것이니 삭제」): Fable 「자체 집계」 줄과 그 데이터 경로
+//   (FABLE_POLL_MS 60초 폴 · control_analytics 호출 · fableCache)를 여기서 **전부 걷어냈다**.
+//   남은 Fable 표시는 「7d·Fable」 실게이지 하나이고, 그것은 계정 스냅샷(usage_accounts_all)에
+//   실려 오므로 이 파일에 별도 폴링이 없다. ⇒ 사이드바가 때리는 데몬 RPC가 하나 줄었다.
+//   삭제 이유·계보는 wsusage.ts의 같은 자리 주석에 남겼다.
 // 직전 렌더 서명 — 같으면 DOM을 다시 만들지 않는다(codex [Medium] 수리).
 let lastUsageSig = "";
 // ★나이 표시는 서명에서 뺐으므로(codex 2R) DOM 재생성 없이 여기 클로저로만 갱신한다.
@@ -254,28 +253,6 @@ async function refreshNamedReporters() {
   }
 }
 
-let fableCache: FableObserved | null = null;
-let fableFetchedAt = 0;
-let fableFetching = false;
-async function refreshFableObserved() {
-  if (fableFetching || Date.now() - fableFetchedAt < FABLE_POLL_MS) return;
-  fableFetching = true;
-  try {
-    // window "7d" — 7d rate 창과 같은 기간이라 나란히 놓고 읽기 좋다(값의 종류는 다르되 기간은 맞춘다).
-    const s = (await invoke("control_analytics", { window: "7d" })) as any;
-    // 필드 경로 지식은 wsusage.fableFromAnalytics가 단독으로 진다(회귀 테스트가 붙어 있는 자리).
-    // 초판이 여기서 s.by_model·s.totals를 직접 읽다가 summary 홉을 빠뜨린 것이 결함이었다.
-    fableCache = fableFromAnalytics(s);
-  } catch {
-    /* 데몬 일시 미응답 — 직전 값을 유지하고 다음 주기에 */
-  } finally {
-    // ★성공·실패 모두 시각을 찍는다. 실패 때 안 찍으면 다음 3초 틱마다 재시도가 나가
-    // 힘들어하는 데몬을 집계 질의로 계속 때린다(관측이 대상을 방해한다).
-    fableFetchedAt = Date.now();
-    fableFetching = false;
-  }
-}
-
 function renderSidebarUsage(surfaces: SurfaceLike[]) {
   const host = document.getElementById("ws-usage");
   if (!host) return;
@@ -294,7 +271,7 @@ function renderSidebarUsage(surfaces: SurfaceLike[]) {
   );
   // CTX 표 = 이름 있는 보고자(master·cso — surface 없는 cmux 페인) + 화면에 붙은 번호 페인.
   const ctxRows = mergeCtxRows(namedCtxRows(namedCache, nowSecs), paneCtxRows(surfaces, nowSecs));
-  if (!rates.length && !ctxRows.length && !fableCache) {
+  if (!rates.length && !ctxRows.length) {
     host.hidden = true;
     host.replaceChildren();
     lastUsageSig = "";
@@ -312,7 +289,7 @@ function renderSidebarUsage(surfaces: SurfaceLike[]) {
   const showSocket = hasMultipleSockets(ctxRows);
 
   // 값이 안 변했으면 DOM을 다시 만들지 않는다(codex [Medium] 수리).
-  const sig = renderSignature(rates, ctxRows, fableCache, showScope, showSocket);
+  const sig = renderSignature(rates, ctxRows, showScope, showSocket);
   if (sig === lastUsageSig && !host.hidden) {
     // 값·구조는 그대로 — 나이 문구만 제자리에서 고친다(노드 재생성 0).
     for (const up of usageAgeUpdaters) up(nowSecs);
@@ -386,29 +363,9 @@ function renderSidebarUsage(surfaces: SurfaceLike[]) {
     }
   }
 
-  // ①-b Fable 관측치(master 결정② B안 2026-08-07) — 위 5h·7d와 **다른 종류의 수**다.
-  // ★형태 규율(master 강제): 게이지 바를 쓰지 않고, 한도 대비 %가 아니라 절대치 + 비중으로 적고,
-  //   「자체 집계」를 명시한다. 구분선을 넣어 위 한도 게이지와 시각적으로 끊는다 —
-  //   나란히 두면 아무리 라벨을 달아도 같은 눈금으로 읽힌다.
-  if (fableCache) {
-    const row = document.createElement("div");
-    row.className = "wsu-obs";
-    const name = document.createElement("span");
-    name.className = "wsu-obs-name";
-    name.textContent = "Fable";
-    const val = document.createElement("span");
-    val.className = "wsu-obs-val";
-    val.textContent = `${compactTokens(fableCache.tokens)} tok · 전체의 ${fableCache.sharePct}%`;
-    const tag = document.createElement("span");
-    tag.className = "wsu-obs-tag";
-    tag.textContent = "자체 집계";
-    row.append(name, val, tag);
-    row.title =
-      `Fable 관측 ${Math.round(fableCache.tokens).toLocaleString()} tokens · 전체 관측의 ${fableCache.sharePct}% (최근 7일)\n` +
-      "★한도 대비 소진율이 아니다 — 우리가 트랜스크립트를 세어 만든 관측 절대치이고, Fable의 한도는 알 수 없다.\n" +
-      "위 5h·7d(한도 대비)와는 종류가 다른 수라 게이지로 그리지 않는다.";
-    frag.appendChild(row);
-  }
+  // ①-b 자리에 Fable 「자체 집계」 줄이 있었다 — 티켓⑥에서 삭제(오너 육안 2026-08-07).
+  //   그 자리를 비워 두는 대신 아무것도 그리지 않는다. Fable 표시는 위 ①의 「7d·Fable」
+  //   실게이지가 전담한다(한도 대비 소진율 — 서버가 준 수).
 
   // ② 페인별 CTX — 「페인 번호 + %」. 신선도·출처 등급을 함께 적는다(ⓓ).
   // ★푸터에서 CTX가 사라지므로 이 표가 그 자리를 대신한다. 그래서 「언제 관측한 값인지」와
@@ -2152,12 +2109,12 @@ async function refreshPaneTitles() {
     // ★렌더는 finally에 둔다 — 위쪽 어디서 예외가 나도 패널은 매 틱 다시 그려진다.
     //   초판은 예외 시 렌더 자체를 건너뛰어 now가 재계산되지 않았고, 그래서 낡은 행이
     //   영원히 「fresh 모양」으로 굳었다(codex [High]). 나이는 그릴 때 다시 계산된다.
-    // 계정 rate(15초)·Fable 집계(60초)는 각자 자체 주기로 갱신하고 여기서는 캐시된 값을 그린다
+    // 계정 rate·이름 보고자(각 15초)는 자체 주기로 갱신하고 여기서는 캐시된 값을 그린다
     // (await로 렌더를 막지 않는다 — 느린 fan-out 한 번이 패널 전체를 멈추면 안 된다).
     // ★이 두 원천은 surface 목록과 무관하다. 그래서 페인이 0이어도 아래 렌더가 그릴 것이 남는다.
+    //   (티켓⑥ 전에는 여기에 Fable 자체 집계 60초 폴이 하나 더 있었다 — 줄과 함께 걷어냈다.)
     void refreshUsageAccounts();
     void refreshNamedReporters();
-    void refreshFableObserved();
     renderSidebarUsage([...lastSurfacesBySocket.values()].flat());
   }
   updateFtRoot(); // cd 추적 — 파일 트리 루트도 따라간다

@@ -2982,17 +2982,28 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             };
             let f = |k: &str| params.get(k).and_then(|x| x.as_f64());
             let u = |k: &str| params.get(k).and_then(|x| x.as_u64());
-            crate::named::note(
-                &mut daemon.named.lock().unwrap(),
-                &name,
-                crate::named::NamedReport {
-                    ctx_pct: f("ctx_pct"),
-                    ctx_tokens: u("ctx_tokens"),
-                    ctx_window: u("ctx_window"),
-                    source: "statusline".into(),
-                    updated_at: crate::state::now_epoch(),
-                },
-            );
+            // ★티켓⑥: 적재와 디스크 기록을 한 문에서 끝낸다. note()가 「지금 써야 하는가」를
+            //   판정하고, 판정이 참일 때만 파일을 쓴다(스로틀 규칙은 named.rs가 단독으로 진다).
+            //   ⚠락을 쥔 채로 파일을 쓰지 않는다 — fsync가 도는 동안 다른 요청이 named를 못 읽으면
+            //   보고 한 건이 조회 전체를 잡아 세운다. 그래서 본문을 락 안에서 만들고 쓰기는 밖에서 한다.
+            let due = {
+                let mut st = daemon.named.lock().unwrap();
+                crate::named::note(
+                    &mut st,
+                    &name,
+                    crate::named::NamedReport {
+                        ctx_pct: f("ctx_pct"),
+                        ctx_tokens: u("ctx_tokens"),
+                        ctx_window: u("ctx_window"),
+                        source: "statusline".into(),
+                        updated_at: crate::state::now_epoch(),
+                    },
+                )
+                .then(|| crate::named::persist_body_of(&st))
+            };
+            if let Some(body) = due {
+                crate::named::write_state(&daemon.socket_path, &body);
+            }
             Reply::Single(ok_response(&id, json!({"named": name})))
         }
 
@@ -7956,6 +7967,59 @@ mod tests {
             !daemon.tombstones.lock().unwrap().contains("reviewer-codex"),
             "살아있는(B 소유) 역할이 옛 surface close로 묘비에 올랐다 — 부활 오차단"
         );
+    }
+
+    /// ★티켓⑥ 배선 회귀 — 「저장 코드는 있는데 아무도 안 부른다」를 막는다(2026-08-07).
+    ///
+    /// named.rs 단위 테스트는 write_state·load_from_disk **자체**를 잰다. 이 테스트가 재는 것은
+    /// 다른 것이다: **usage.report_named RPC 한 번이 실제로 디스크를 만드는가.** 둘 중 하나만
+    /// 있으면 배선이 끊긴 채로도 초록이 유지된다(이 저장소가 이미 겪은 부류의 결함 —
+    /// 「표는 있는데 0행」은 전송로가 없어서였고, 그때도 저장·노출 코드는 멀쩡했다).
+    ///
+    /// ⚠env(CYS_NAMED_REPORTERS)를 읽는 경로라 named::ENV_LOCK으로 직렬화한다.
+    #[test]
+    fn usage_report_named_persists_across_restart() {
+        let _guard = crate::named::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("CYS_NAMED_REPORTERS"); // 기본 매핑(axdev/cso=cso)으로 판정하게 둔다
+        let daemon = isolated_daemon();
+        let req = Request {
+            id: json!(1),
+            method: "usage.report_named".into(),
+            params: json!({"cwd": "/Users/oogisoogi/axdev/cso", "ctx_pct": 7.0, "ctx_tokens": 14_000}),
+        };
+        let Reply::Single(resp) = dispatch(&daemon, req, None) else {
+            panic!("expected single reply");
+        };
+        assert_eq!(resp["result"]["named"], "cso", "이름 판별이 안 되면 이 테스트는 아무것도 안 잰다");
+
+        // ① 디스크에 실제로 떨어졌는가(파일 존재 = 배선이 이어져 있다는 증거).
+        let path = crate::named::state_path(&daemon.socket_path);
+        assert!(path.exists(), "RPC를 처리했는데 {} 가 없다 — 기록 배선이 끊겼다", path.display());
+
+        // ② 재기동 = 상태를 버리고 디스크만으로 다시 세우기. 그때 행이 살아 있어야 한다.
+        let restored = crate::named::load_from_disk(&daemon.socket_path);
+        let v = crate::named::to_json(&restored);
+        assert_eq!(v.as_array().unwrap().len(), 1);
+        assert_eq!(v[0]["name"], "cso");
+        assert_eq!(v[0]["ctx_pct"], 7.0);
+        assert!(v[0]["updated_at"].as_f64().unwrap_or(0.0) > 0.0, "나이를 잴 근거(관측 시각)가 없다");
+
+        // ③ 민감치는 디스크에 없다(오너 지시) — RPC가 ctx_tokens를 실어 보냈어도 파일엔 안 남는다.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("14000") && !raw.contains("ctx_tokens"), "토큰 수가 디스크에 남았다:\n{raw}");
+
+        // ④ 판별 불가 cwd는 파일을 건드리지 않는다 — 지어낸 라벨이 디스크까지 가면 더 오래 남는다.
+        let before = std::fs::read_to_string(&path).unwrap();
+        let req2 = Request {
+            id: json!(2),
+            method: "usage.report_named".into(),
+            params: json!({"cwd": "/Users/oogisoogi/cys-terminal-src", "ctx_pct": 99.0}),
+        };
+        let Reply::Single(resp2) = dispatch(&daemon, req2, None) else {
+            panic!("expected single reply");
+        };
+        assert!(resp2["result"]["named"].is_null(), "판별 불가는 null로 답한다(성공 위장 금지)");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before, "판별 불가 보고가 파일을 바꿨다");
     }
 
     /// system.topology RPC가 묘비를 노출해 raw `cys restore` 심층방어(run_restore skip)의
