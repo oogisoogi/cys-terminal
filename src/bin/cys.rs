@@ -6886,34 +6886,20 @@ fn statusline_to_report_params(v: &Value) -> Value {
     params
 }
 
-/// statusline JSON → 사람이 읽는 한 줄 (`<model> · CTX n% · 5h n% · 7d n%`). rate는 있을 때만.
+/// statusline JSON → 사람이 읽는 한 줄 (`<model>` — 모델명만).
 /// claude UI statusline에 그대로 표시된다(pane 헤더 배지와 별개·추가 표면).
+///
+/// ★오너 요청 2026-08-07: CTX·5h·7d는 이 줄에서 **삭제**하고 앱 사이드바 한 곳에 모아 표시한다
+/// (「한 곳에서 보는 것이 효율적」). 푸터에는 모델명만 남긴다.
+/// ⚠**데이터 배선은 이 변경과 무관하다** — usage.report push는 run_usage_report_stdin이 별도로
+/// 수행하므로(아래), 여기서 표시를 지워도 데몬의 surface별 ctx/5h/7d 수집은 그대로 계속된다.
+/// 지워지는 것은 *표시*이지 *관측*이 아니다.
 fn statusline_human_line(v: &Value) -> String {
-    let model = v
-        .get("model")
+    v.get("model")
         .and_then(|m| m.get("display_name"))
         .and_then(|x| x.as_str())
-        .unwrap_or("claude");
-    let mut parts = vec![model.to_string()];
-    if let Some(p) = v
-        .get("context_window")
-        .and_then(|c| c.get("used_percentage"))
-        .and_then(|x| x.as_f64())
-    {
-        parts.push(format!("CTX {p:.0}%"));
-    }
-    if let Some(rl) = v.get("rate_limits") {
-        for (key, label) in [("five_hour", "5h"), ("seven_day", "7d")] {
-            if let Some(u) = rl
-                .get(key)
-                .and_then(|w| w.get("used_percentage"))
-                .and_then(|x| x.as_f64())
-            {
-                parts.push(format!("{label} {u:.0}%"));
-            }
-        }
-    }
-    parts.join(" · ")
+        .unwrap_or("claude")
+        .to_string()
 }
 
 /// cys-statusline.sh 래퍼 전용 — stdin의 claude statusline JSON을 읽어 usage.report로 push하고,
@@ -12152,7 +12138,9 @@ mod tests {
         );
     }
 
-    /// 사람용 statusline 한 줄 포맷 — rate는 있을 때만, 모델명 부재 시 "claude" 폴백.
+    /// 사람용 statusline 한 줄 포맷 — **모델명만**(오너 요청 2026-08-07: CTX·rate는 앱 사이드바로 이관).
+    /// ★이 테스트는 「모델명이 나온다」만이 아니라 **「CTX·5h·7d가 들어 있어도 나오지 않는다」**를 함께 못박는다 —
+    /// 입력에 그 값들을 일부러 채워 두었으므로, 표시를 되살리는 변경은 여기서 적색이 된다(회귀 그물).
     #[test]
     fn statusline_human_line_format() {
         let v = json!({
@@ -12163,9 +12151,15 @@ mod tests {
                 "seven_day": {"used_percentage": 12.0}
             }
         });
-        assert_eq!(statusline_human_line(&v), "Opus 4.8 · CTX 42% · 5h 41% · 7d 12%");
+        assert_eq!(statusline_human_line(&v), "Opus 4.8");
+        // 입력에 있던 수치가 한 조각도 새지 않는지 — 포맷이 바뀌어도 잡히도록 값 단위로 확인한다.
+        let line = statusline_human_line(&v);
+        for leaked in ["CTX", "42", "5h", "41", "7d", "12", "·"] {
+            assert!(!line.contains(leaked), "푸터에 {leaked}가 남았다: {line}");
+        }
+        // 모델명 부재 시 "claude" 폴백은 유지(statusline이 빈 줄이 되지 않게).
         let v2 = json!({"context_window": {"used_percentage": 8.0}});
-        assert_eq!(statusline_human_line(&v2), "claude · CTX 8%");
+        assert_eq!(statusline_human_line(&v2), "claude");
     }
 
     /// T7 E1-4: hook stdin → usage.event 파라미터 매핑 핀.

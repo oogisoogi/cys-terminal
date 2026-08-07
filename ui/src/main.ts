@@ -16,7 +16,33 @@ import { deptPlaceholderLabel } from "./deptlabel";
 import { purgeNameMatches, purgeMismatchHint, PURGE_INPUT_GUARDS } from "./purgeconfirm";
 import { ccEffectiveZoom } from "./ccscale";
 import { clampWsbarWidth, clampWsbarFont, WSBAR_W_DEFAULT, WSBAR_FONT_STEP } from "./wsbar";
-import { composeFontFamily, FONT_CHOICES, nodeWorking, ROLE_COLOR, roleDotColor } from "./appearance";
+import {
+  composeFontFamily,
+  FONT_CHOICES,
+  MENU_SCALE_DEFAULT_PCT,
+  MENU_SCALE_MAX_PCT,
+  MENU_SCALE_MIN_PCT,
+  menuScaleFromPct,
+  nodeWorking,
+  ROLE_COLOR,
+  roleDotColor,
+} from "./appearance";
+import {
+  ageAt,
+  ageText,
+  aggregateRates,
+  compactTokens,
+  fableObserved,
+  hasMultipleSockets,
+  paneCtxRows,
+  renderSignature,
+  sevClassFor,
+  shortSocketTag,
+  sourceGrade,
+  USAGE_STALE_SECS,
+  type FableObserved,
+  type SurfaceLike,
+} from "./wsusage";
 import { routeOnData } from "./mousefilter";
 import {
   toastTtl,
@@ -154,9 +180,222 @@ function renderUsage(el: HTMLElement, u: ObservedUsage | null | undefined) {
     tip.push(`rate ${w.label}: ${w.used_pct}%${reset}`);
   }
   const age = Math.max(0, Math.round(Date.now() / 1000 - u.updated_at));
-  if (age > 120) tip.push(`⚠ ${Math.round(age / 60)}분 전 관측 (stale)`);
+  // 문턱은 사이드바 패널과 **같은 상수**를 쓴다 — 갈라지면 같은 페인이 한쪽에선 stale,
+  // 다른 쪽에선 정상으로 보여 어느 쪽을 믿을지 알 수 없게 된다.
+  if (age > USAGE_STALE_SECS) tip.push(`⚠ ${Math.round(age / 60)}분 전 관측 (stale)`);
   el.title = tip.join("\n");
-  el.classList.toggle("stale", age > 120);
+  el.classList.toggle("stale", age > USAGE_STALE_SECS);
+}
+
+// ── 사이드바 사용량 패널(오너 요청 2026-08-07) — 주간 토큰 사용량 + 페인별 CTX를 한 곳에.
+//
+// 발주 1~3번: 페인 푸터 대신 사이드바 아래 빈 공간에 모아 보여 준다.
+// 계산은 전부 wsusage.ts(순수·테스트 대상)에 있고 여기서는 DOM만 만든다.
+// Fable 관측치(master 결정② B안) — 데몬의 기존 by_model 집계를 **소비만** 한다(신규 수집 없음).
+// ★폴링 주기가 사이드바(3초)와 다른 이유: control_analytics는 DB를 훑는 집계 질의라 3초마다
+// 때리면 관측이 관측 대상을 방해한다. 7일 누적치는 초 단위로 변하지 않으므로 60초면 충분하다.
+const FABLE_POLL_MS = 60_000;
+// 직전 렌더 서명 — 같으면 DOM을 다시 만들지 않는다(codex [Medium] 수리).
+let lastUsageSig = "";
+// ★나이 표시는 서명에서 뺐으므로(codex 2R) DOM 재생성 없이 여기 클로저로만 갱신한다.
+//   각 클로저는 자기 노드 하나의 텍스트/툴팁만 건드린다 — 행·게이지 노드는 그대로 산다.
+let usageAgeUpdaters: ((nowSecs: number) => void)[] = [];
+// 소켓별 마지막 성공 조회 결과. ★한 소켓이 실패해도 그 소켓의 직전 값을 계속 그린다 —
+// updated_at은 그대로이므로 나이가 자라 자연히 stale로 넘어간다(거짓 신선 방지).
+// 초판은 단일 catch가 전 루프를 삼켜 렌더 자체가 안 돌았고, now가 재계산되지 않아
+// 낡은 행이 영원히 fresh 모양으로 남았다(codex [High]).
+const lastSurfacesBySocket = new Map<string, SurfaceLike[]>();
+let fableCache: FableObserved | null = null;
+let fableFetchedAt = 0;
+let fableFetching = false;
+async function refreshFableObserved() {
+  if (fableFetching || Date.now() - fableFetchedAt < FABLE_POLL_MS) return;
+  fableFetching = true;
+  try {
+    // window "7d" — 7d rate 창과 같은 기간이라 나란히 놓고 읽기 좋다(값의 종류는 다르되 기간은 맞춘다).
+    const s = (await invoke("control_analytics", { window: "7d" })) as any;
+    fableCache = fableObserved(s?.by_model ?? [], Number(s?.totals?.tokens ?? 0));
+  } catch {
+    /* 데몬 일시 미응답 — 직전 값을 유지하고 다음 주기에 */
+  } finally {
+    // ★성공·실패 모두 시각을 찍는다. 실패 때 안 찍으면 다음 3초 틱마다 재시도가 나가
+    // 힘들어하는 데몬을 집계 질의로 계속 때린다(관측이 대상을 방해한다).
+    fableFetchedAt = Date.now();
+    fableFetching = false;
+  }
+}
+
+function renderSidebarUsage(surfaces: SurfaceLike[]) {
+  const host = document.getElementById("ws-usage");
+  if (!host) return;
+  const nowSecs = Date.now() / 1000;
+  const rates = aggregateRates(surfaces, nowSecs);
+  const ctxRows = paneCtxRows(surfaces, nowSecs);
+  if (!rates.length && !ctxRows.length && !fableCache) {
+    host.hidden = true;
+    host.replaceChildren();
+    lastUsageSig = "";
+    return;
+  }
+  // 계정 경계(소켓×에이전트)가 둘 이상일 때만 범위 라벨을 붙인다 — 하나뿐이면 잡음이다.
+  const scopes = new Set(rates.map((r) => JSON.stringify([r.socket, r.agent])));
+  const showScope = scopes.size > 1;
+  const showSocket = hasMultipleSockets(ctxRows);
+
+  // 값이 안 변했으면 DOM을 다시 만들지 않는다(codex [Medium] 수리).
+  const sig = renderSignature(rates, ctxRows, fableCache, showScope, showSocket);
+  if (sig === lastUsageSig && !host.hidden) {
+    // 값·구조는 그대로 — 나이 문구만 제자리에서 고친다(노드 재생성 0).
+    for (const up of usageAgeUpdaters) up(nowSecs);
+    return;
+  }
+  lastUsageSig = sig;
+  usageAgeUpdaters = [];
+
+  host.hidden = false;
+  const frag = document.createDocumentFragment();
+
+  // ① 계정 사용량 — 5h · 7d. 계정(소켓×에이전트)마다 따로 낸다.
+  if (rates.length) {
+    const head = document.createElement("div");
+    head.className = "wsu-head";
+    head.textContent = "사용량";
+    frag.appendChild(head);
+    let curScope = "";
+    for (const r of rates) {
+      const scope = JSON.stringify([r.socket, r.agent]);
+      if (showScope && scope !== curScope) {
+        curScope = scope;
+        const sh = document.createElement("div");
+        sh.className = "wsu-scope";
+        const tag = shortSocketTag(r.socket);
+        sh.textContent = tag ? `${r.agent} · ${tag}` : r.agent;
+        sh.title = `이 아래 값은 ${r.agent}${tag ? ` (데몬 ${tag})` : ""} 계정의 한도 소진율이다 — 다른 계정과 섞지 않는다.`;
+        frag.appendChild(sh);
+      }
+      const row = document.createElement("div");
+      row.className = `wsu-rate${r.stale ? " stale" : ""}`;
+      const name = document.createElement("span");
+      name.className = "wsu-rate-name";
+      name.textContent = r.label;
+      const track = document.createElement("span");
+      track.className = "cc-tbar-track";
+      const fill = document.createElement("span");
+      const sev = sevClassFor(r.usedPct, 70, 90);
+      fill.className = `cc-tbar-fill${sev ? " " + sev : ""}`;
+      fill.style.width = `${Math.min(100, Math.max(0, r.usedPct))}%`;
+      track.appendChild(fill);
+      const pct = document.createElement("span");
+      pct.className = `wsu-rate-pct${sev ? " " + sev : ""}`;
+      pct.textContent = `${Math.round(r.usedPct)}%`;
+      row.append(name, track, pct);
+      const mkRateTitle = (nowSecs2: number) => {
+        const tag2 = shortSocketTag(r.socket);
+        const tip = [`${r.agent}${tag2 ? ` (데몬 ${tag2})` : ""} · ${r.label} ${Math.round(r.usedPct)}%`];
+        if (tag2) tip.push(`소켓 ${r.socket}`); // 태그가 겹칠 수 있으니 전체 경로를 남긴다
+        if (r.resetsAt) {
+          const d = new Date(r.resetsAt * 1000);
+          const p2 = (x: number) => String(x).padStart(2, "0");
+          tip.push(
+            r.label === "7d"
+              ? `리셋 ${p2(d.getMonth() + 1)}/${p2(d.getDate())} ${p2(d.getHours())}:${p2(d.getMinutes())}`
+              : `리셋 ${p2(d.getHours())}:${p2(d.getMinutes())}`,
+          );
+        }
+        tip.push(`관측 ${ageText(ageAt(r.updatedAt, nowSecs2))}${r.stale ? " ⚠ stale — 이 계정에 최근 관측이 없다" : ""}`);
+        return tip.join("\n");
+      };
+      row.title = mkRateTitle(nowSecs);
+      usageAgeUpdaters.push((n) => { row.title = mkRateTitle(n); });
+      frag.appendChild(row);
+    }
+  }
+
+  // ①-b Fable 관측치(master 결정② B안 2026-08-07) — 위 5h·7d와 **다른 종류의 수**다.
+  // ★형태 규율(master 강제): 게이지 바를 쓰지 않고, 한도 대비 %가 아니라 절대치 + 비중으로 적고,
+  //   「자체 집계」를 명시한다. 구분선을 넣어 위 한도 게이지와 시각적으로 끊는다 —
+  //   나란히 두면 아무리 라벨을 달아도 같은 눈금으로 읽힌다.
+  if (fableCache) {
+    const row = document.createElement("div");
+    row.className = "wsu-obs";
+    const name = document.createElement("span");
+    name.className = "wsu-obs-name";
+    name.textContent = "Fable";
+    const val = document.createElement("span");
+    val.className = "wsu-obs-val";
+    val.textContent = `${compactTokens(fableCache.tokens)} tok · 전체의 ${fableCache.sharePct}%`;
+    const tag = document.createElement("span");
+    tag.className = "wsu-obs-tag";
+    tag.textContent = "자체 집계";
+    row.append(name, val, tag);
+    row.title =
+      `Fable 관측 ${Math.round(fableCache.tokens).toLocaleString()} tokens · 전체 관측의 ${fableCache.sharePct}% (최근 7일)\n` +
+      "★한도 대비 소진율이 아니다 — 우리가 트랜스크립트를 세어 만든 관측 절대치이고, Fable의 한도는 알 수 없다.\n" +
+      "위 5h·7d(한도 대비)와는 종류가 다른 수라 게이지로 그리지 않는다.";
+    frag.appendChild(row);
+  }
+
+  // ② 페인별 CTX — 「페인 번호 + %」. 신선도·출처 등급을 함께 적는다(ⓓ).
+  // ★푸터에서 CTX가 사라지므로 이 표가 그 자리를 대신한다. 그래서 「언제 관측한 값인지」와
+  //   「서버가 준 값인지 우리가 추정한 값인지」를 값 옆에 붙인다.
+  // ★관측이 없는 pane도 「—」로 남긴다 — 지워 버리면 「미관측」과 「그런 pane 없음」이 구별되지 않는다.
+  if (ctxRows.length) {
+    const head = document.createElement("div");
+    head.className = "wsu-head";
+    head.textContent = "페인 CTX";
+    frag.appendChild(head);
+    for (const c of ctxRows) {
+      const row = document.createElement("div");
+      row.className = `wsu-ctx${c.stale ? " stale" : ""}${c.ctxPct == null ? " unobserved" : ""}`;
+      const sid = document.createElement("span");
+      sid.className = "wsu-ctx-sid";
+      const tag = showSocket ? shortSocketTag(c.socket) : "";
+      sid.textContent = tag ? `${tag}:${c.surfaceId}` : String(c.surfaceId);
+      const track = document.createElement("span");
+      track.className = "cc-tbar-track";
+      if (c.ctxPct != null) {
+        const fill = document.createElement("span");
+        const sev = sevClassFor(c.ctxPct, 60, 80);
+        fill.className = `cc-tbar-fill${sev ? " " + sev : ""}`;
+        fill.style.width = `${Math.min(100, Math.max(0, c.ctxPct))}%`;
+        track.appendChild(fill);
+      }
+      const pct = document.createElement("span");
+      const sev = c.ctxPct == null ? "" : sevClassFor(c.ctxPct, 60, 80);
+      pct.className = `wsu-ctx-pct${sev ? " " + sev : ""}`;
+      pct.textContent = c.ctxPct == null ? "—" : `${Math.round(c.ctxPct)}%`;
+      const mark = document.createElement("span");
+      mark.className = "wsu-src";
+      const g = c.ctxPct == null ? null : sourceGrade(c.source);
+      mark.textContent = g ? g.mark : "";
+      row.append(sid, track, pct, mark);
+      const mkCtxTitle = (nowSecs2: number) => {
+        const where = `페인 ${c.surfaceId}${tag ? ` (데몬 ${tag} · ${c.socket})` : ""}`;
+        if (c.ctxPct == null) return `${where} · 아직 관측치 없음\n(측정 전이라는 뜻이지 0% 라는 뜻이 아니다)`;
+        return `${where} · CTX ${Math.round(c.ctxPct)}%\n${(g as { title: string }).title}\n관측 ${ageText(
+          ageAt(c.updatedAt, nowSecs2),
+        )}${c.stale ? " ⚠ stale" : ""}`;
+      };
+      row.title = mkCtxTitle(nowSecs);
+      usageAgeUpdaters.push((n) => { row.title = mkCtxTitle(n); });
+      frag.appendChild(row);
+    }
+    // 패널 전체의 신선도 — 가장 오래된 **관측된** 값 기준(미관측 행은 나이가 없다).
+    const observed = ctxRows.filter((c) => c.ctxPct != null);
+    if (observed.length) {
+      const foot = document.createElement("div");
+      foot.className = `wsu-foot${observed.some((c) => c.stale) ? " stale" : ""}`;
+      // ★푸터 문구는 통째로 나이다 — 서명에서 뺐으므로 여기서만 갱신된다(노드는 계속 산다).
+      const mkFoot = (nowSecs2: number) =>
+        `갱신 ${ageText(Math.max(...observed.map((c) => ageAt(c.updatedAt, nowSecs2))))}`;
+      foot.textContent = mkFoot(nowSecs);
+      usageAgeUpdaters.push((n) => { foot.textContent = mkFoot(n); });
+      foot.title = "가장 오래된 페인 관측 기준 — ● 서버 진실 / ○ 추정(트랜스크립트 tail) / — 미관측";
+      frag.appendChild(foot);
+    }
+  }
+
+  host.replaceChildren(frag);
 }
 
 // ---------- T6 Control Center (전용 풀 패널 — 네이티브 실시간 모니터링) ----------
@@ -1529,6 +1768,14 @@ function setDocVar(cssVar: string, lsKey: string, value: string | null) {
 function applyTitleSize(px: string | null) { setDocVar("--pane-title-size", "cys-title-size", px ? px + "px" : null); }
 function applyTitleWeight(w: string | null) { setDocVar("--pane-title-weight", "cys-title-weight", w); }
 function applyMenuWeight(w: string | null) { setDocVar("--menu-weight", "cys-menu-weight", w); }
+// 메뉴(상단 툴바) 크기 — 저장은 사람이 읽는 %, 적용은 CSS 배수(--ui-chrome-scale).
+// ★localStorage에 %를 넣는 이유: 나중에 기본 배율이 바뀌어도 사용자가 고른 "125%"의 뜻이 안 변한다.
+function applyMenuScale(pct: string | null) {
+  const ratio = menuScaleFromPct(pct);
+  if (!ratio) { localStorage.removeItem("cys-menu-scale"); document.documentElement.style.removeProperty("--ui-chrome-scale"); return; }
+  localStorage.setItem("cys-menu-scale", String(pct));
+  document.documentElement.style.setProperty("--ui-chrome-scale", ratio);
+}
 let titleColorRole = localStorage.getItem("cys-title-color-role") !== "0"; // 기본 ON(제목 글자=역할 점색)
 function applyTitleColorRole(on: boolean) { titleColorRole = on; localStorage.setItem("cys-title-color-role", on ? "1" : "0"); }
 function applyTermWeight(w: string | null) {
@@ -1541,6 +1788,9 @@ function applyTermWeight(w: string | null) {
   const ts = localStorage.getItem("cys-title-size"); if (ts) document.documentElement.style.setProperty("--pane-title-size", ts + "px");
   const tw = localStorage.getItem("cys-title-weight"); if (tw) document.documentElement.style.setProperty("--pane-title-weight", tw);
   const mw = localStorage.getItem("cys-menu-weight"); if (mw) document.documentElement.style.setProperty("--menu-weight", mw);
+  // 메뉴 크기는 %로 저장돼 있으므로 배수로 되돌려 적용한다(저장 단위 ≠ 적용 단위).
+  const ms = menuScaleFromPct(localStorage.getItem("cys-menu-scale"));
+  if (ms) document.documentElement.style.setProperty("--ui-chrome-scale", ms);
 })();
 
 // Control Center 본문 전용 zoom — 터미널 fontSize와 분리(배율 단위).
@@ -1743,7 +1993,11 @@ async function refreshPaneTitles() {
     // 멀티마스터 F4: workspace별 소켓을 순회 — 각 데몬의 surface를 그 소켓 ws에만 귀속시킨다.
     const sockets = [...new Set(workspaces.map((w) => w.socket))];
     let adopted = false;
+    // 사이드바 사용량 패널용 수집 — 이미 도는 폴링에 얹는다(새 폴링을 만들지 않는다).
+    // 이번 틱에 성공한 소켓만 담고, 실패한 소켓은 lastSurfacesBySocket의 직전 값으로 메운다.
+    const socketRows = new Map<string, SurfaceLike[]>();
     for (const sk of sockets) {
+     try {
       const r = (await invoke("list_surfaces", { socket: sk })) as {
         surfaces: {
           surface_id: number;
@@ -1754,6 +2008,20 @@ async function refreshPaneTitles() {
           usage?: ObservedUsage | null;
         }[];
       };
+      // ★패널 수집은 pane 입양 여부와 무관하게 한다 — 계정 사용량(rate)은 UI에 아직 안 붙은
+      //   노드까지 봐야 참이 된다. 다만 「어느 pane이 화면에 있는가」(adopted)를 함께 실어
+      //   보내, CTX 목록은 화면에 있는 pane으로만 좁힌다(범위 둘을 일부러 다르게 둔다).
+      const sockKey = sk ?? "";
+      socketRows.set(
+        sockKey,
+        r.surfaces.map((s) => ({
+          surface_id: s.surface_id,
+          socket: sockKey,
+          exited: s.exited,
+          adopted: panes.has(paneKey(s.surface_id, sk)),
+          usage: s.usage ?? null,
+        })),
+      );
       for (const s of r.surfaces) {
         const rt = panes.get(paneKey(s.surface_id, sk));
         if (!rt) continue;
@@ -1779,6 +2047,16 @@ async function refreshPaneTitles() {
           : { type: "pane", sid: s.surface_id };
         adopted = true;
       }
+     } catch {
+       // ★소켓 하나의 실패가 다른 소켓의 갱신·렌더를 막지 않는다(codex [High] 수리).
+       //   이 소켓 몫은 아래에서 직전 값으로 메워지고, 나이가 자라 stale로 표시된다.
+     }
+    }
+    // 이번 틱 성공분으로 캐시를 갱신하고, 실패한 소켓은 직전 값을 그대로 쓴다.
+    for (const [k, v] of socketRows) lastSurfacesBySocket.set(k, v);
+    for (const k of [...lastSurfacesBySocket.keys()]) {
+      // 워크스페이스에서 사라진 소켓의 잔재는 버린다(유령 행 방지).
+      if (!sockets.some((sk) => (sk ?? "") === k)) lastSurfacesBySocket.delete(k);
     }
     if (adopted) {
       render();
@@ -1791,6 +2069,12 @@ async function refreshPaneTitles() {
     /* 데몬 일시 미응답은 다음 틱에 */
   } finally {
     refreshing = false;
+    // ★렌더는 finally에 둔다 — 위쪽 어디서 예외가 나도 패널은 매 틱 다시 그려진다.
+    //   초판은 예외 시 렌더 자체를 건너뛰어 now가 재계산되지 않았고, 그래서 낡은 행이
+    //   영원히 「fresh 모양」으로 굳었다(codex [High]). 나이는 그릴 때 다시 계산된다.
+    // Fable 집계는 자체 주기(60초)로 갱신하고 여기서는 캐시된 값을 그린다(await로 렌더를 막지 않는다).
+    void refreshFableObserved();
+    renderSidebarUsage([...lastSurfacesBySocket.values()].flat());
   }
   updateFtRoot(); // cd 추적 — 파일 트리 루트도 따라간다
 }
@@ -3291,6 +3575,13 @@ function openThemePopover(anchor: HTMLElement) {
   tcCb.addEventListener("change", () => applyTitleColorRole(tcCb.checked)); titleColorRow.appendChild(tcCb);
   const termWeightRow = mkWeightRow("본문 굵기", "cys-term-weight", "400", applyTermWeight);
   const menuWeightRow = mkWeightRow("메뉴 굵기", "cys-menu-weight", "600", applyMenuWeight);
+  // 메뉴 크기(오너 요청 2026-08-07) — 상단 툴바·사이드바 헤더·크롬 버튼 일괄 배율. 단위는 %.
+  const menuSizeRow = document.createElement("label"); menuSizeRow.className = "theme-pop-row"; menuSizeRow.textContent = "메뉴 크기(%)";
+  const msInp = document.createElement("input");
+  msInp.type = "number"; msInp.min = String(MENU_SCALE_MIN_PCT); msInp.max = String(MENU_SCALE_MAX_PCT);
+  msInp.step = "5"; msInp.style.width = "56px";
+  msInp.value = localStorage.getItem("cys-menu-scale") || String(MENU_SCALE_DEFAULT_PCT);
+  msInp.addEventListener("input", () => applyMenuScale(msInp.value)); menuSizeRow.appendChild(msInp);
 
   const reset = document.createElement("button");
   reset.className = "theme-pop-reset";
@@ -3305,9 +3596,10 @@ function openThemePopover(anchor: HTMLElement) {
     applyTitleColorRole(true); tcCb.checked = true;
     applyTermWeight(null); (termWeightRow.querySelector("select") as HTMLSelectElement).value = "400";
     applyMenuWeight(null); (menuWeightRow.querySelector("select") as HTMLSelectElement).value = "600";
+    applyMenuScale(null); msInp.value = String(MENU_SCALE_DEFAULT_PCT);
   });
 
-  pop.append(row, fontRow, titleSizeRow, titleWeightRow, titleColorRow, termWeightRow, menuWeightRow, reset);
+  pop.append(row, fontRow, titleSizeRow, titleWeightRow, titleColorRow, termWeightRow, menuWeightRow, menuSizeRow, reset);
 
   // 앵커(테마 버튼) 하단에 배치 후 화면 밖으로 나가면 안쪽으로 보정.
   const r = anchor.getBoundingClientRect();
