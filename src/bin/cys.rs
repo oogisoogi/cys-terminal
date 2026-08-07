@@ -1091,6 +1091,16 @@ fn is_typing_guard_err(e: &str) -> bool {
     e.contains(cys::MSG_TYPING_GUARD) || e.contains(cys::ERR_TYPING_GUARD)
 }
 
+/// ★(⑵) 타이핑 가드에 막혔을 때 **직접 전송을 재시도하며 기다리는** 상한(초).
+/// 기본 6초 = 데몬 가드 창(기본 3초)의 2배 — 마우스 보고·터미널 자동응답처럼 순간적으로
+/// 찍히는 입력 표식은 반드시 지나가고, 사람이 실제로 타이핑 중이면 지나가지 않는다.
+/// 0 이면 대기 없이 즉시 큐 전환(종전 inject_text 규약과 동형). `CYS_SEND_GUARD_WAIT_SECS`.
+fn send_guard_wait_secs() -> u64 {
+    cys::env_compat("CYS_SEND_GUARD_WAIT_SECS")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(6)
+}
+
 /// 지침·과업 텍스트의 표준 주입: bracketed paste → 0.8s → Return
 ///
 /// ★T-0147-6(사람 입력 경합 · W4): `authoritative:true` 는 타이핑 가드를 면제하지만 **무조건이
@@ -1679,10 +1689,69 @@ fn run(command: Command) -> i32 {
                     // T3-13 권위 전달: clear_first는 데몬이 원자적으로(Ctrl-U 선정리 → paste → CR)
                     // 집행한다. 클라측 C-u·150ms sleep·게이트는 제거 — 비원자 split·race를 없앤다.
                     // agent 등록 pane 게이트는 데몬 send_text가 집행(clear_first_unsupported).
-                    let r = request(
-                        "surface.send_text",
-                        json!({"surface_id": sid, "text": text.join(" "), "from": from, "queued": queued, "clear_first": clear_first}),
-                    )?;
+                    let body = text.join(" ");
+                    let direct = json!({"surface_id": sid, "text": body, "from": from,
+                                        "queued": queued, "clear_first": clear_first});
+                    let mut attempt = request("surface.send_text", direct.clone());
+                    // ★(⑵ 수리 1단) 타이핑 가드는 **3초짜리 창**이다(데몬 기본). 그 창에 걸렸다고
+                    //   즉시 포기하면, 마우스 보고·터미널 자동응답 같은 순간적 입력 표식 하나가
+                    //   master 의 발신 전체를 죽인다. 창이 닫힐 때까지 **정직하게 기다렸다가**
+                    //   다시 직접 보낸다 — 가드를 우회하지 않는다(사람이 계속 치면 계속 거부된다).
+                    //   직접 전송이 성공해야 발신자의 「입력줄에 실렸나」 관측이 종전대로 성립한다.
+                    if !queued {
+                        let deadline = std::time::Instant::now()
+                            + std::time::Duration::from_secs(send_guard_wait_secs());
+                        while attempt
+                            .as_ref()
+                            .err()
+                            .map(|e| is_typing_guard_err(e))
+                            .unwrap_or(false)
+                            && std::time::Instant::now() < deadline
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(700));
+                            attempt = request("surface.send_text", direct.clone());
+                        }
+                    }
+                    let r = match attempt {
+                        Ok(r) => r,
+                        // ★(⑵ 수리 2단) 대기해도 사람이 계속 치고 있으면 **본문을 잃지 않는다** —
+                        //   `--queued` 로 1회 전환한다. 종전엔 그대로 Err→rc=1 로 죽었고, 발신자(master-send
+                        //   래퍼 등)는 그 rc 를 삼킨 채 "입력줄이 비었다"만 관측해 **발신 자체가
+                        //   증발**했다(2026-08-07 원장 실측 3건: 09:31·13:02·13:23 · send_rc=1 ·
+                        //   배달 원장 기록 0). 이미 `inject_text` 가 같은 전환을 하고 있었고
+                        //   가드 메시지 자체가 `--queued` 를 권한다 — 여기만 그 규약 밖이었다.
+                        // ★큐 배달은 조용해질 때 CR 까지 포함해 주입하므로(deliver_queued) 사람의
+                        //   미완성 입력에 이어붙는 최악 경로가 구조적으로 불가능하다. 전환은
+                        //   **정확히 1회**이고, 실패하면 그대로 올린다(멱등 재시도는 상위 책임).
+                        Err(e) if !queued && is_typing_guard_err(&e) => {
+                            eprintln!(
+                                "[send] {} 사람 입력 감지(타이핑 가드) — 본문을 잃지 않도록 \
+                                 --queued 로 1회 전환한다. 조용해지면 데몬이 배달하며 **제출(CR)까지** \
+                                 포함한다(별도 send-key Return 불필요).{}",
+                                surface_ref(sid),
+                                if clear_first {
+                                    " ⚠clear_first 는 큐 배달과 결합할 수 없어 생략된다."
+                                } else {
+                                    ""
+                                }
+                            );
+                            request(
+                                "surface.send_text",
+                                json!({"surface_id": sid, "text": body, "from": from,
+                                       "queued": true, "clear_first": false}),
+                            )
+                            .map(|r| {
+                                println!(
+                                    "QUEUED (depth {}){}",
+                                    r["depth"],
+                                    if multi { format!(" → surface:{sid}") } else { String::new() }
+                                );
+                                r
+                            })?;
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    };
                     let tag = if multi { format!(" → surface:{sid}") } else { String::new() };
                     if queued {
                         println!("QUEUED (depth {}){tag}", r["depth"]);
@@ -2074,13 +2143,37 @@ fn run(command: Command) -> i32 {
                             println!("{text}");
                         }
                         eprintln!(
-                            "[next_cursor={} latest={} truncated={}]",
-                            r["next_cursor"], r["latest_cursor"], r["truncated"]
+                            "[next_cursor={} latest={} truncated={} scrollback_stale={}]",
+                            r["next_cursor"], r["latest_cursor"], r["truncated"],
+                            r["scrollback_stale"]
                         );
+                        // ★(⑴) 델타 경로는 grid 로 갈아탈 수 없다(라인 커서 의미 보존) — 대신
+                        // **0건의 뜻**을 말해준다. 이 안내가 없으면 TUI pane 의 델타 폴링이
+                        // "아무 일 없음"으로 읽혀 낡은 화면을 근거로 판단하게 된다.
+                        if r["scrollback_stale"].as_bool() == Some(true) {
+                            eprintln!(
+                                "[read-screen] 이 pane 은 제자리 재그리기(TUI)라 scrollback 이 \
+                                 정지해 있다 — 델타(--since)로는 새 라인이 영원히 0건이다. \
+                                 현재 화면은 `cys read-screen --surface {}`(옵션 없이)로 읽어라.",
+                                surface_ref(sid)
+                            );
+                        }
                     });
                 }
                 request("surface.read_text", json!({"surface_id": sid, "lines": lines}))
-                    .map(|r| println!("{}", r["text"].as_str().unwrap_or("")))
+                    .map(|r| {
+                        println!("{}", r["text"].as_str().unwrap_or(""));
+                        // 무음 대체 금지 — 어느 소스로 답했는지 밝힌다(§handlers surface.read_text).
+                        if r["source"].as_str() == Some("grid")
+                            && r["scrollback_stale"].as_bool() == Some(true)
+                            && lines.is_some()
+                        {
+                            eprintln!(
+                                "[read-screen] scrollback 이 정지한 pane(제자리 재그리기 TUI)이라 \
+                                 화면 그리드의 마지막 줄들로 응답했다(source=grid)."
+                            );
+                        }
+                    })
             })
         }
 

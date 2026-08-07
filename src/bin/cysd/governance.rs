@@ -273,6 +273,76 @@ fn poison_surface_ledger(daemon: &Arc<Daemon>, surface_id: u64) {
 /// T2-5 에이전트 사망 감지: 셸은 살았는데 그 위의 에이전트 프로세스만 죽은 상태를
 /// 즉시 잡는다 (기존엔 pane.idle 300초가 최초 신호 — '생각 중'과 구분 불가).
 /// 판정: 자식 트리에서 agents.json 등록 바이너리가 '한 번 보였다가 사라짐' 전이.
+/// ★(⑶) 에이전트 사망 후 role 딱지를 회수하기까지의 **유예초**.
+/// 60초인 이유: 자가 업데이트·재로그인·플러그인 재기동 같은 「잠깐 죽음」은 수 초 안에
+/// 자식 프로세스가 되살아난다(그 경우 아래 `alive` 분기가 타이머를 0으로 되돌린다).
+/// 반대로 사람이 `exit` 한 좌석은 영원히 안 돌아오므로, 1분이면 함대 생존 판정이
+/// 실무상 충분히 빨리 정정된다. 시험·운영 조정은 `CYS_ROLE_RELEASE_GRACE_SECS`.
+const ROLE_RELEASE_GRACE_SECS: f64 = 60.0;
+
+fn role_release_grace_secs() -> f64 {
+    std::env::var("CYS_ROLE_RELEASE_GRACE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| *v >= 0.0)
+        .unwrap_or(ROLE_RELEASE_GRACE_SECS)
+}
+
+/// ★(⑶) role 회수 시점 판정 — **순수 함수**(결정론 테스트 대상).
+///
+/// 배경(2026-08-07 실측 · surface:382·384): 워커의 claude 가 종료돼 셸만 남아도 surface 의
+/// `role=worker` 딱지가 그대로 남아, `cys list`·topology·orchestra check 가 **없는 노드를
+/// 살아있다고** 보고했다(함대 0 판정 불능). 반대로 죽음 **1회 관측**으로 즉시 회수하면
+/// 자가 업데이트류 잠깐 죽음에서 멀쩡한 노드의 주소가 사라진다 — 그래서 회수 근거는
+/// 「죽어 있었다」가 아니라 **「유예를 넘겨 계속 죽어 있다」**여야 한다(관측 1회 ≠ 근거).
+///
+/// `dead_since`=연속 사망이 **처음** 관측된 epoch초(살아나면 호출부가 None 으로 되돌린다).
+pub fn role_release_due(dead_since: Option<f64>, now: f64, grace_secs: f64) -> bool {
+    match dead_since {
+        Some(t) => now - t >= grace_secs,
+        None => false, // 죽음 관측 자체가 없다 = 회수 근거 없음
+    }
+}
+
+/// ★(⑶) role 딱지 회수 — 에이전트가 유예를 넘겨 사라진 좌석을 '역할 없는 pane'으로 되돌린다.
+/// 셸은 건드리지 않는다(좌석은 남고 주소만 내린다 — 승계·재기동은 claim_role 의 몫).
+/// 멱등: 이미 role 이 없으면 아무것도 하지 않고 false.
+///
+/// 락 순서는 claim_role 승계 마무리와 동일하다(roles → surface 리프 락). `surfaces` 맵은
+/// 잡지 않는다 — 호출부가 이미 Arc 를 들고 있다.
+fn release_role_after_agent_death(daemon: &Arc<Daemon>, s: &Arc<crate::state::Surface>) -> bool {
+    let released = {
+        let mut roles = daemon.roles.lock().unwrap();
+        let mut srole = s.role.lock().unwrap();
+        let Some(role) = srole.clone() else {
+            return false; // 이미 무역할 — 멱등
+        };
+        // 다른 좌석이 그 역할을 승계한 뒤라면 roles 맵은 그쪽 것이다(내 것만 지운다).
+        if roles.get(&role) == Some(&s.id) {
+            roles.remove(&role);
+        }
+        *srole = None;
+        *s.caps.lock().unwrap() = crate::caps::Caps::for_role(None);
+        role
+    };
+    // master 가 비워졌으면 쿨다운 기준도 함께 내린다(claim_role 의 master_before/after 규약과 동형).
+    if released == "master" {
+        *daemon.master_claimed_at.lock().unwrap() = None;
+    }
+    persist_topology(daemon);
+    daemon.bus.publish(
+        "role.released",
+        "surface",
+        Some(s.id),
+        json!({"role": released, "surface_ref": cys::surface_ref(s.id),
+               "reason": "agent_exited",
+               "grace_secs": role_release_grace_secs(),
+               "note": "에이전트가 유예를 넘겨 사라져 role 딱지를 회수했다 — 좌석(셸)은 그대로다. \
+                        재등록은 claim_role/launch-agent 로 한다."}),
+    );
+    true
+}
+
 fn check_agent_death(
     daemon: &Arc<Daemon>,
     sys: &System,
@@ -298,6 +368,9 @@ fn check_agent_death(
             .any(|(_, cmdline)| cmdline_matches_agent(cmdline, &bin_base));
         if alive {
             s.agent_seen.store(true, Ordering::Relaxed);
+            // ★(⑶ 재확인) 되살아났으면 사망 타이머를 0으로 되돌린다 — 자가 업데이트류
+            // 「잠깐 죽음」이 유예를 누적해 role 회수로 번지지 못하게 하는 유일한 지점이다.
+            *s.agent_dead_since.lock().unwrap() = None;
             if s.agent_exit_notified.swap(false, Ordering::Relaxed) {
                 // 재기동 성공 — 카운터 유지(수명 내 상한 3회), 복귀 이벤트
                 daemon.bus.publish(
@@ -311,6 +384,20 @@ fn check_agent_death(
         }
         if !s.agent_seen.load(Ordering::Relaxed) {
             continue; // 아직 기동 전 (launch-agent 진행 중)
+        }
+        // ★(⑶) 연속 사망의 **최초 관측 시각** 래치 — 살아나면 위 alive 분기가 None 으로 되돌리므로
+        // 이 값은 언제나 "지금까지 끊기지 않고 죽어 있는 구간의 시작"이다.
+        let dead_since = *s.agent_dead_since.lock().unwrap().get_or_insert(now);
+        // role 회수는 **매 틱** 판정한다 — 아래 통지 래치(agent_exit_notified)는 1회성이라
+        // 그 뒤에 두면 유예가 지난 시점에 영영 도달하지 못한다(통지와 회수는 다른 층위다).
+        if role_release_due(Some(dead_since), now, role_release_grace_secs())
+            && release_role_after_agent_death(daemon, &s)
+        {
+            eprintln!(
+                "[cysd] {} role 회수 — {agent} 가 {:.0}초 이상 사라져 있다(좌석 셸은 유지).",
+                cys::surface_ref(s.id),
+                now - dead_since
+            );
         }
         if s.agent_exit_notified.swap(true, Ordering::Relaxed) {
             continue; // 이미 통지
@@ -2892,6 +2979,143 @@ mod tests {
         std::fs::write(&sfile, "{corrupt").unwrap();
         assert!(super::load_learn_stuck_debounce(&sock).is_empty());
         let _ = std::fs::remove_file(&sfile);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // ⑶ 워커 종료 후 role 딱지 잔존 (2026-08-07 실측 · surface:382·384)
+    //
+    // 증상: claude 가 종료돼 셸만 남아도 `role=worker` 가 유지돼 `cys list`·topology·
+    //   orchestra check 가 없는 노드를 살아있다고 봤다(함대 0 판정 불능).
+    // 함정: 죽음 **1회 관측**으로 회수하면 자가 업데이트류 「잠깐 죽음」에 멀쩡한 노드의
+    //   주소가 사라진다 — 그래서 근거는 「유예를 넘겨 계속 죽어 있다」여야 한다.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// ★⑶ 유예 판정(순수): 관측 없음·유예 이내·유예 경과 3상태.
+    #[test]
+    fn role_release_requires_sustained_death() {
+        // 죽음 관측 자체가 없다 = 회수 근거 없음.
+        assert!(!super::role_release_due(None, 1_000.0, 60.0));
+        // 잠깐 죽음(자가 업데이트) — 유예 이내는 회수하지 않는다.
+        assert!(!super::role_release_due(Some(1_000.0), 1_005.0, 60.0));
+        assert!(!super::role_release_due(Some(1_000.0), 1_059.9, 60.0));
+        // 유예 경과(경계 포함) — 그때부터 회수.
+        assert!(super::role_release_due(Some(1_000.0), 1_060.0, 60.0));
+        assert!(super::role_release_due(Some(1_000.0), 9_999.0, 60.0));
+    }
+
+    /// ★⑶ 오탐 0 핀: 「죽음 → 되살아남 → 다시 죽음」에서 유예는 **다시 0부터** 센다.
+    /// check_agent_death 의 alive 분기가 `agent_dead_since` 를 None 으로 되돌리는 계약을
+    /// 시각 산술로 박제한다(누적되면 자가 업데이트 두 번에 role 이 날아간다).
+    #[test]
+    fn revival_resets_the_grace_window() {
+        let grace = 60.0;
+        let mut dead_since: Option<f64> = None;
+        // t=1000 사망 관측
+        dead_since.get_or_insert(1_000.0);
+        assert!(!super::role_release_due(dead_since, 1_030.0, grace), "30초 = 유예 이내");
+        // t=1035 부활 관측 → 타이머 리셋(alive 분기)
+        dead_since = None;
+        // t=1040 다시 사망
+        dead_since.get_or_insert(1_040.0);
+        assert!(
+            !super::role_release_due(dead_since, 1_095.0, grace),
+            "부활로 리셋됐으므로 55초째다 — 누적(95초)으로 세면 멀쩡한 노드의 role 을 뺏는다"
+        );
+        assert!(super::role_release_due(dead_since, 1_100.0, grace));
+    }
+
+    /// ★⑶ 회수 실물: role 이 surface·roles 맵 **양쪽에서** 내려가고 caps 가 재도출되며
+    /// 이벤트가 사유와 함께 남는다. 두 번째 호출은 멱등(false).
+    #[test]
+    fn release_role_clears_both_registries_and_is_idempotent() {
+        let dir = std::env::temp_dir().join(format!("cys_role_release_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let daemon = crate::state::Daemon::new(dir.join("cysd.sock"));
+        let s = daemon
+            .create_surface(None, Some("sleep 30".into()), None, Some("worker-1".into()), 24, 80)
+            .expect("create surface");
+        daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        daemon.roles.lock().unwrap().insert("worker-1".into(), s.id);
+        assert!(s.caps.lock().unwrap().allows(crate::caps::Cap::Edit), "전제: worker 는 변형 가능");
+
+        assert!(super::release_role_after_agent_death(&daemon, &s), "첫 회수는 true");
+        assert!(s.role.lock().unwrap().is_none(), "surface.role 이 남았다");
+        assert!(
+            !daemon.roles.lock().unwrap().contains_key("worker-1"),
+            "roles 맵에 딱지가 남아 함대 판정이 계속 유령을 센다"
+        );
+        assert!(
+            !s.caps.lock().unwrap().allows(crate::caps::Cap::Edit),
+            "role 을 내렸는데 능력이 남았다(권한 잔존)"
+        );
+        assert!(
+            !s.exited.load(std::sync::atomic::Ordering::Relaxed),
+            "좌석(셸)까지 죽이면 안 된다"
+        );
+        assert!(
+            !super::release_role_after_agent_death(&daemon, &s),
+            "두 번째 회수는 멱등 false 여야 한다"
+        );
+
+        let ev: Vec<serde_json::Value> = daemon
+            .bus
+            .replay_after(0)
+            .into_iter()
+            .filter(|e| e["event"] == serde_json::json!("role.released")
+                || e["name"] == serde_json::json!("role.released"))
+            .collect();
+        assert_eq!(ev.len(), 1, "회수는 정확히 1회 통지된다: {ev:?}");
+        let payload = ev[0].get("payload").unwrap_or(&ev[0]);
+        assert_eq!(payload["role"], serde_json::json!("worker-1"));
+        assert_eq!(payload["reason"], serde_json::json!("agent_exited"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★⑶ master 좌석 회수는 쿨다운 기준(master_claimed_at)까지 함께 내린다 —
+    /// 남겨두면 이후 승계 판정이 '방금 교대한 master'가 있다고 오독한다.
+    #[test]
+    fn releasing_master_clears_claim_timestamp() {
+        let dir = std::env::temp_dir().join(format!("cys_role_release_m_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let daemon = crate::state::Daemon::new(dir.join("cysd.sock"));
+        let s = daemon
+            .create_surface(None, Some("sleep 30".into()), None, Some("master".into()), 24, 80)
+            .expect("create surface");
+        daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        daemon.roles.lock().unwrap().insert("master".into(), s.id);
+        *daemon.master_claimed_at.lock().unwrap() = Some(crate::state::now_epoch());
+
+        assert!(super::release_role_after_agent_death(&daemon, &s));
+        assert!(
+            daemon.master_claimed_at.lock().unwrap().is_none(),
+            "master 가 비었는데 쿨다운 기준이 남았다"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★⑶ 남의 좌석이 이미 그 역할을 승계했으면 **내 것만** 내린다(맵을 훔치지 않는다).
+    #[test]
+    fn release_does_not_steal_role_taken_over_by_another_seat() {
+        let dir = std::env::temp_dir().join(format!("cys_role_release_t_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let daemon = crate::state::Daemon::new(dir.join("cysd.sock"));
+        let dead = daemon
+            .create_surface(None, Some("sleep 30".into()), None, Some("worker-1".into()), 24, 80)
+            .expect("create surface");
+        daemon.surfaces.lock().unwrap().insert(dead.id, dead.clone());
+        // 승계자가 이미 roles 맵을 가져갔다(claim_role 이 먼저 돈 상태).
+        daemon.roles.lock().unwrap().insert("worker-1".into(), dead.id + 999);
+
+        assert!(super::release_role_after_agent_death(&daemon, &dead));
+        assert_eq!(
+            daemon.roles.lock().unwrap().get("worker-1").copied(),
+            Some(dead.id + 999),
+            "승계자의 등록을 죽은 좌석의 회수가 지웠다"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
