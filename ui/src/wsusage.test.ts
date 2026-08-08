@@ -10,9 +10,11 @@ const DEPT_B = "/Users/x/.local/state/cys-dept-b/cys.sock";
 const MAIN_SOCK = "/Users/x/.local/state/cys/cys.sock";
 import {
   accountRates,
+  ageShort,
   ageText,
   ageAt,
   aggregateRates,
+  oldestFootText,
   CTX_NAME_ORDER,
   filterDisplayRates,
   hasMultipleSockets,
@@ -675,6 +677,67 @@ describe("ageText", () => {
   test("비정상 값은 물음표 — 숫자처럼 보이는 거짓을 만들지 않는다", () => {
     expect(ageText(NaN)).toBe("?");
     expect(ageText(-5)).toBe("?");
+  });
+});
+
+// ── 행별 나이 + 푸터 재라벨 (오너 발의 2026-08-08)
+describe("ageShort — 행 안에 붙는 나이", () => {
+  test("「전」만 뺀다 — 구간(초·분·시간)은 ageText와 한 글자도 갈리지 않는다", () => {
+    // ★두 함수를 따로 검사하면 「분 문턱이 한쪽만 바뀐 날」을 못 잡는다.
+    //   그래서 값을 나열하지 않고 ageText와의 관계 자체를 단언한다.
+    for (const s of [0, 1, 59, 60, 61, 1800, 3599, 3600, 7200, 86_400]) {
+      expect(ageShort(s)).toBe(ageText(s).replace(" 전", ""));
+      expect(ageShort(s)).not.toContain("전");
+    }
+  });
+  test("비정상 값은 ageText와 같이 물음표 — 접미 제거가 「?」를 갉아먹지 않는다", () => {
+    expect(ageShort(NaN)).toBe("?");
+    expect(ageShort(-5)).toBe("?");
+  });
+});
+
+describe("oldestFootText — 푸터 라벨", () => {
+  test("★라벨은 「가장 낡음」이다 — 「갱신」은 패널 전체가 멈춘 것으로 읽혀 오너 오독을 낳았다", () => {
+    expect(oldestFootText(1860)).toBe("가장 낡음 31분 전");
+    // 옛 문구가 되돌아오면 여기서 걸린다(라벨은 계산이 아니라 약속이므로 문자열로 고정한다).
+    expect(oldestFootText(1860).startsWith("가장 낡음 ")).toBe(true);
+    expect(oldestFootText(1860)).not.toContain("갱신");
+  });
+  test("나이 표기는 ageText를 그대로 쓴다 — 푸터는 문장이라 「전」을 남긴다(행과 다른 점)", () => {
+    for (const s of [30, 90, 7200]) {
+      expect(oldestFootText(s)).toBe(`가장 낡음 ${ageText(s)}`);
+      expect(oldestFootText(s)).not.toBe(`가장 낡음 ${ageShort(s)}`); // 행 표기와 섞이지 않았다
+    }
+  });
+});
+
+describe("★행별 나이는 서명에 들어가지 않는다 — 행 표기를 붙인 뒤에도 (codex 2R 규율 유지)", () => {
+  // 브리프의 핵심 제약: 나이를 서명에 넣으면 60초 미만 구간에서 매 틱 서명이 바뀌어
+  // 표 전체가 재생성되고 툴팁·호버가 죽는다. 행에 나이를 **표시**하게 된 뒤에도 그대로여야 한다.
+  test("행 나이 문구는 매 틱 달라지는데 서명은 그대로다 — 둘을 한 테스트에서 함께 단언한다", () => {
+    const surfaces = [sf(1, { usage: mkUsage({ ctx_pct: 10, updated_at: 980 }) })];
+    const sigAt = (now: number) =>
+      renderSignature(aggregateRates(surfaces, now), paneCtxRows(surfaces, now), false, false);
+    const rowAgeAt = (now: number) => ageShort(ageAt(paneCtxRows(surfaces, now)[0]!.updatedAt, now));
+
+    // ★대조군 — 표시 문구는 실제로 매 틱 변한다. 이걸 안 재면 「서명이 같다」가
+    //   그냥 아무 일도 안 일어난 것(vacuous)일 수 있다.
+    expect(new Set([1000, 1003, 1006, 1009].map(rowAgeAt)).size).toBe(4);
+    expect(rowAgeAt(1000)).toBe("20초");
+    // 그런데 서명은 한 개뿐이다 = DOM 재생성 0회.
+    expect(new Set([1000, 1003, 1006, 1009].map(sigAt)).size).toBe(1);
+  });
+
+  test("stale 경계 전이만 서명을 바꾼다 — 행 나이가 늘어난 것만으로는 안 바뀐다", () => {
+    const surfaces = [sf(1, { usage: mkUsage({ ctx_pct: 10, updated_at: 1000 }) })];
+    const sigAt = (now: number) =>
+      renderSignature(aggregateRates(surfaces, now), paneCtxRows(surfaces, now), false, false);
+    // 초 → 분으로 표기 단위가 넘어가도(행 문구는 바뀐다) 서명은 그대로다.
+    expect(ageShort(ageAt(1000, 1059))).toBe("59초");
+    expect(ageShort(ageAt(1000, 1060))).toBe("1분");
+    expect(sigAt(1059)).toBe(sigAt(1060));
+    // stale 경계에서만 갈린다.
+    expect(sigAt(1000 + USAGE_STALE_SECS)).not.toBe(sigAt(1000 + USAGE_STALE_SECS + 1));
   });
 });
 

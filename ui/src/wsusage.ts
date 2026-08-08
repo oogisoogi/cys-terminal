@@ -461,6 +461,23 @@ export function ageText(ageSecs: number): string {
   return `${Math.round(ageSecs / 3600)}시간 전`;
 }
 
+// 행 안에 붙는 나이 — 열 폭이 좁아 「전」 접미를 뺀다(푸터는 문장이라 그대로 둔다).
+// ★구간 판정(초/분/시간)은 ageText를 그대로 재사용한다 — 여기서 다시 나누면 같은 나이가
+//   행과 푸터에서 다른 단위로 찍히는 날이 온다(문턱이 두 곳에 생기면 반드시 갈라진다).
+export function ageShort(ageSecs: number): string {
+  const t = ageText(ageSecs);
+  return t === "?" ? t : t.replace(/ 전$/, "");
+}
+
+// 패널 푸터 문구 — 「가장 낡음」이 이 값의 정의다(관측된 행들 중 **가장 오래된** 관측의 나이).
+// ★초판 문구는 「갱신 N분 전」이었다. 그 말은 패널 전체가 그때 멈춘 것처럼 읽혀서, 방금 관측된
+//   행까지 낡아 보였다(오너 실문의 2026-08-08 「갱신 31분 전이 뭐냐」). 이름을 값의 정의로 바꾼다.
+// ★문자열을 main.ts가 아니라 여기 두는 이유: 라벨이 테스트 밖에 있으면 오독을 고친 문구가
+//   조용히 되돌아가도 아무 그물에도 안 걸린다.
+export function oldestFootText(ageSecs: number): string {
+  return `가장 낡음 ${ageText(ageSecs)}`;
+}
+
 // 출처 등급 — ⓓ 요구(출처 등급 병기).
 // "statusline" = Claude가 보고한 서버 진실. 그 외(transcript/rollout tail)는 우리가 파일을 읽어
 // 추정한 값이다. ★두 값을 같은 눈금으로 나란히 두면 추정치를 실측으로 오독하므로 등급을 표시한다.

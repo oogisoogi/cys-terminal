@@ -128,6 +128,19 @@ body.wsbar-resizing { cursor: col-resize; -webkit-user-select: none; user-select
 
 /* 출처 등급 — ● 서버 진실 / ○ 추정. 값 옆에 붙어 추정치를 실측으로 오독하는 것을 막는다. */
 .wsu-src { flex: none; width: 1em; text-align: center; color: #57606a; font-size: .85em; }
+/* 행별 관측 나이(오너 발의 2026-08-08) — 푸터의 「가장 낡음」이 **어느 행 것인지**를 행에서 바로 읽게 한다.
+   ★출처 마크와 같은 저채도·같은 축소 글자로 둔다 — %와 같은 무게로 읽히면 표의 초점(값)이 흐려진다.
+   ★flex:none + 고정폭이라 축소는 track(flex:1)이 흡수한다 — 번호·%·출처 마크를 밀어내지 않는다.
+   2.9em(축소 글자 기준)은 가장 긴 실제 표기인 「12시간」(헤드리스 실측 31px)까지 담는 폭이다 —
+   2.6em은 그 한 표기에서만 1px 잘렸다. 그래도 넘치면 줄바꿈 대신 자른다(행이 2단이 되면 표가 무너진다). */
+.wsu-ctx-age {
+  flex: none; width: 2.9em; text-align: right; color: #57606a; font-size: .85em;
+  overflow: hidden; white-space: nowrap;
+}
+/* 좁은 폭·큰 메뉴 배율에서는 나이 칸을 내준다 — 판정은 wsbar.showsRowAge(실측 산식), 토글은 main.ts.
+   ★자리가 없으면 트랙바가 0px 이 되고 행이 넘쳐 잘린다(실측 176px에서 4.1px 넘침). 그때는
+   새로 붙인 칸이 물러나는 것이 맞다 — 나이는 툴팁과 푸터에 그대로 남아 정보가 사라지지는 않는다. */
+#ws-usage.no-row-age .wsu-ctx-age { display: none; }
 /* 낡은 관측은 흐리게 — 「지금 값」으로 읽히지 않게. 판정 문턱은 wsusage.ts의 USAGE_STALE_SECS.
    rate 행에도 같은 규율을 적용한다 — 초판은 rate에 stale 표시가 없어 낡은 95%가 최신처럼 보였다. */
 .wsu-ctx.stale, .wsu-rate.stale { opacity: .45; }

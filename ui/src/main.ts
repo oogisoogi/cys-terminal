@@ -15,7 +15,7 @@ import { classifyDrainVerifyFallback, drainVerifyFallbackToast } from "./drainve
 import { deptPlaceholderLabel } from "./deptlabel";
 import { purgeNameMatches, purgeMismatchHint, PURGE_INPUT_GUARDS } from "./purgeconfirm";
 import { ccEffectiveZoom } from "./ccscale";
-import { clampWsbarWidth, clampWsbarFont, WSBAR_W_DEFAULT, WSBAR_FONT_STEP } from "./wsbar";
+import { clampWsbarWidth, clampWsbarFont, showsRowAge, WSBAR_W_DEFAULT, WSBAR_FONT_STEP } from "./wsbar";
 import {
   composeFontFamily,
   FONT_CHOICES,
@@ -30,6 +30,7 @@ import {
 import {
   accountRates,
   ageAt,
+  ageShort,
   ageText,
   aggregateRates,
   filterDisplayRates,
@@ -37,6 +38,7 @@ import {
   mergeCtxRows,
   mergeRates,
   namedCtxRows,
+  oldestFootText,
   paneCtxRows,
   renderSignature,
   scopedRates,
@@ -283,6 +285,14 @@ function renderSidebarUsage(surfaces: SurfaceLike[]) {
   // ★판정을 라벨 길이로 한다 — 「Fable」이라는 이름을 표지로 삼으면 스코프가 다른 모델로 옮겨 간 날
   //   같은 문제가 표지 없이 되돌아온다(모델 이름은 응답이 정한다).
   host.classList.toggle("has-scoped", rates.some((r) => r.label.length > 3));
+  // 행별 나이 칸은 자리가 있을 때만 낸다 — 좁은 폭에서는 트랙바를 0으로 만들고 행을 넘치게 한다.
+  // ★서명 검사보다 **앞**에 둔다: 폭·배율은 값이 아니라 화면 설정이라 서명에 없다. 뒤에 두면
+  //   사이드바를 드래그해도 값이 그대로인 동안에는 칸이 안 바뀐다(스킵 경로로 빠진다).
+  // ★폭·배율의 진실원은 CSS 변수다(applyWsbar/applyMenuScale이 쓰는 그 값 — main.ts 하단 주석).
+  const rootCss = getComputedStyle(document.documentElement);
+  const wsbarPx = parseFloat(rootCss.getPropertyValue("--wsbar-w")) || WSBAR_W_DEFAULT;
+  const chromeScale = parseFloat(rootCss.getPropertyValue("--ui-chrome-scale")) || 1.25;
+  host.classList.toggle("no-row-age", !showsRowAge(wsbarPx, chromeScale));
   // 계정 경계(소켓×에이전트×계정)가 둘 이상일 때만 범위 라벨을 붙인다 — 하나뿐이면 잡음이다.
   const scopes = new Set(rates.map((r) => JSON.stringify([r.socket, r.agent, r.accountId])));
   const showScope = scopes.size > 1;
@@ -402,7 +412,16 @@ function renderSidebarUsage(surfaces: SurfaceLike[]) {
       mark.className = "wsu-src";
       const g = c.ctxPct == null ? null : sourceGrade(c.source);
       mark.textContent = g ? g.mark : "";
-      row.append(sid, track, pct, mark);
+      // ★행별 관측 나이(오너 발의 2026-08-08). 푸터의 「가장 낡음」 하나만으로는 **어느 행이**
+      //   낡았는지 알 수 없어, 방금 관측된 행까지 함께 낡아 보였다. 나이는 행마다 다른 값이므로
+      //   행에 적어야 한다 — 패널 하나의 수로는 그 차이를 표현할 방법이 없다.
+      // ★미관측 행(ctxPct == null)은 비워 둔다 — 관측이 없으면 나이도 없다. 여기에 무언가를
+      //   찍으면 「측정 전」이 「방금 측정됨」으로 읽힌다(거짓 신선 금지 — 표 전체의 규율).
+      const age = document.createElement("span");
+      age.className = "wsu-ctx-age";
+      const mkAge = (nowSecs2: number) => (c.ctxPct == null ? "" : ageShort(ageAt(c.updatedAt, nowSecs2)));
+      age.textContent = mkAge(nowSecs);
+      row.append(sid, track, pct, mark, age);
       const mkCtxTitle = (nowSecs2: number) => {
         // 이름 행은 「페인 N」이 아니다 — cys surface가 아니라 cmux 페인의 Claude다.
         const where = c.name
@@ -414,7 +433,9 @@ function renderSidebarUsage(surfaces: SurfaceLike[]) {
         )}${c.stale ? " ⚠ stale" : ""}`;
       };
       row.title = mkCtxTitle(nowSecs);
-      usageAgeUpdaters.push((n) => { row.title = mkCtxTitle(n); });
+      // ★나이 텍스트도 서명이 아니라 이 클로저로 갱신한다 — 서명에 넣으면 60초 미만 구간에서
+      //   매 틱 서명이 바뀌어 표 전체가 재생성되고 툴팁·호버가 죽는다(codex 2R 이력).
+      usageAgeUpdaters.push((n) => { row.title = mkCtxTitle(n); age.textContent = mkAge(n); });
       frag.appendChild(row);
     }
     // 패널 전체의 신선도 — 가장 오래된 **관측된** 값 기준(미관측 행은 나이가 없다).
@@ -423,11 +444,16 @@ function renderSidebarUsage(surfaces: SurfaceLike[]) {
       const foot = document.createElement("div");
       foot.className = `wsu-foot${observed.some((c) => c.stale) ? " stale" : ""}`;
       // ★푸터 문구는 통째로 나이다 — 서명에서 뺐으므로 여기서만 갱신된다(노드는 계속 산다).
+      // 라벨(「가장 낡음」)은 wsusage.oldestFootText가 만든다 — 값의 정의를 이름에 담은 문구라
+      // 테스트가 지키는 자리에 둔다(오너 실문의 2026-08-08 수리).
       const mkFoot = (nowSecs2: number) =>
-        `갱신 ${ageText(Math.max(...observed.map((c) => ageAt(c.updatedAt, nowSecs2))))}`;
+        oldestFootText(Math.max(...observed.map((c) => ageAt(c.updatedAt, nowSecs2))));
       foot.textContent = mkFoot(nowSecs);
       usageAgeUpdaters.push((n) => { foot.textContent = mkFoot(n); });
-      foot.title = "가장 오래된 페인 관측 기준 — ● 서버 진실 / ○ 추정(트랜스크립트 tail) / — 미관측";
+      foot.title =
+        "이 표에서 가장 오래된 페인 관측의 나이다 — 패널 전체가 그때 멈췄다는 뜻이 아니다.\n" +
+        "행마다의 나이는 각 행 오른쪽에 적혀 있다.\n" +
+        "● 서버 진실 / ○ 추정(트랜스크립트 tail) / — 미관측";
       frag.appendChild(foot);
     }
   }
