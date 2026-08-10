@@ -94,14 +94,22 @@ body.wsbar-resizing { cursor: col-resize; -webkit-user-select: none; user-select
 #ws-usage {
   flex: none; max-height: 45%; overflow-y: auto;
   padding: 6px 8px 8px; border-top: 1px solid var(--hairline);
-  font-size: calc(11px * var(--ui-chrome-scale));
+  /* ★글자 크기는 20px 고정 — 오너 지시 2026-08-10(「토큰량/ctx 표시 폰트를 20 정도로 고정하자」).
+     초판은 calc(11px * var(--ui-chrome-scale))이라 **메뉴 배율에만** 연동됐고, 사이드바 자체
+     글자 배율(--wsbar-font)은 목록(.ws-tab)에만 걸려 있었다 — 목록을 키워도 이 패널만 작게
+     남는 구조였다. 어느 한쪽에 다시 매면 같은 어긋남이 방향만 바꿔 되돌아오므로 두 배율
+     어디에도 매지 않는다. 값의 단일 출처는 wsbar.ts의 WSU_FONT_PX이고(행 나이 칸 자리 산식이
+     이 수를 쓴다), 둘이 어긋나면 wsbar.test.ts의 드리프트 가드가 적색이 된다 — 여기만 고치지 마라. */
+  font-size: 20px;
   font-variant-numeric: tabular-nums; /* 숫자 폭 고정 — 값이 바뀌어도 열이 흔들리지 않는다 */
   color: #8b949e;
 }
 .wsu-head {
   margin: 4px 0 3px; font-weight: 700; letter-spacing: .04em;
   color: #6e7681; text-transform: uppercase;
-  font-size: calc(10px * var(--ui-chrome-scale));
+  /* 패널 글자에 비례(초판 10px : 11px = .9) — 패널이 고정되면 머리글도 함께 고정돼야
+     한 덩어리로 읽힌다. 절대값으로 두면 패널만 커지고 머리글이 뒤에 남는다. */
+  font-size: .9em;
 }
 .wsu-head:first-child { margin-top: 0; }
 .wsu-rate, .wsu-ctx { display: flex; align-items: center; gap: 6px; padding: 1px 0; min-width: 0; }
@@ -152,7 +160,10 @@ body.wsbar-resizing { cursor: col-resize; -webkit-user-select: none; user-select
   margin: 3px 0 1px; color: #6e7681; font-size: .9em;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.wsu-foot { margin-top: 4px; color: #57606a; font-size: calc(10px * var(--ui-chrome-scale)); }
+/* 푸터도 머리글과 같은 비례(.9em) — 패널 안에서 유일하게 크롬 배율에 매인 칸으로 남으면
+   「20px 고정」이 절반만 참이 된다(배율을 올리면 이 줄만 따로 커진다). 브리프가 이름을 든
+   것은 .wsu-head 하나였지만, 같은 절에 같은 이유로 걸린 칸이라 함께 옮긴다 — 워커 판단(보고 대상). */
+.wsu-foot { margin-top: 4px; color: #57606a; font-size: .9em; }
 .wsu-foot.stale { color: var(--warn); }
 .ws-tab {
   display: flex; flex-direction: column; gap: 2px;

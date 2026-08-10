@@ -340,13 +340,14 @@ function renderSidebarUsage(surfaces: SurfaceLike[]) {
   //   같은 문제가 표지 없이 되돌아온다(모델 이름은 응답이 정한다).
   host.classList.toggle("has-scoped", rates.some((r) => r.label.length > 3));
   // 행별 나이 칸은 자리가 있을 때만 낸다 — 좁은 폭에서는 트랙바를 0으로 만들고 행을 넘치게 한다.
-  // ★서명 검사보다 **앞**에 둔다: 폭·배율은 값이 아니라 화면 설정이라 서명에 없다. 뒤에 두면
+  // ★서명 검사보다 **앞**에 둔다: 폭은 값이 아니라 화면 설정이라 서명에 없다. 뒤에 두면
   //   사이드바를 드래그해도 값이 그대로인 동안에는 칸이 안 바뀐다(스킵 경로로 빠진다).
-  // ★폭·배율의 진실원은 CSS 변수다(applyWsbar/applyMenuScale이 쓰는 그 값 — main.ts 하단 주석).
+  // ★폭의 진실원은 CSS 변수다(applyWsbar가 쓰는 그 값 — main.ts 하단 주석).
+  // ★메뉴 배율은 더 이상 읽지 않는다 — 패널 글자가 20px 고정이 되면서(오너 지시 2026-08-10)
+  //   이 판정의 인자에서 빠졌다. 값을 읽어 두고 안 쓰면 아직 연동된 것처럼 읽힌다.
   const rootCss = getComputedStyle(document.documentElement);
   const wsbarPx = parseFloat(rootCss.getPropertyValue("--wsbar-w")) || WSBAR_W_DEFAULT;
-  const chromeScale = parseFloat(rootCss.getPropertyValue("--ui-chrome-scale")) || 1.25;
-  host.classList.toggle("no-row-age", !showsRowAge(wsbarPx, chromeScale));
+  host.classList.toggle("no-row-age", !showsRowAge(wsbarPx));
   // 계정 경계(소켓×에이전트×계정)가 둘 이상일 때만 범위 라벨을 붙인다 — 하나뿐이면 잡음이다.
   const scopes = new Set(rates.map((r) => JSON.stringify([r.socket, r.agent, r.accountId])));
   const showScope = scopes.size > 1;
