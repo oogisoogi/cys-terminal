@@ -9,7 +9,10 @@
   --warn: #d29922;
   --error: #f85149;
   --ok: #3fb950;
-  --ui-chrome-scale: 1.25; /* UI 크롬(툴바·사이드바 헤더·버튼) 글자 배율 — 테마 팝오버 「메뉴 크기」로 조절 */
+  /* ★적용 범위가 좁아졌다(2026-08-11): 이제 **툴바(상단바)** 전용이다. 사이드바(#wsbar)의
+     헤더·버튼·목록·사용량 패널은 전부 --wsbar-font(A−/A＋) 한 축으로 옮겼다 — 오너 지시.
+     두 축을 섞으면 같은 사이드바 안에서 덩어리마다 다른 크기가 되는 원 사고가 되돌아온다. */
+  --ui-chrome-scale: 1.25; /* UI 크롬(툴바) 글자 배율 — 테마 팝오버 「메뉴 크기」로 조절 */
   /* ★topbar 높이는 메뉴 배율을 따라간다(codex [Medium] 수리 2026-08-07).
      초판은 38px 고정이라 메뉴 250%에서 버튼(약 52px)이 위아래로 넘쳐 본문과 겹쳤다.
      기준점을 1.25로 잡아 **기본값에서는 정확히 38px**이 되게 했다(기존 화면 무회귀).
@@ -69,18 +72,32 @@ html, body {
 #wsbar-drag:hover, body.wsbar-resizing #wsbar-drag { background: rgba(88,166,255,.35); }
 body.wsbar-resizing { cursor: col-resize; -webkit-user-select: none; user-select: none; }
 #btn-ws-font-minus, #btn-ws-font-plus {
-  background: none; border: none; color: #8b949e; cursor: pointer; font-size: calc(13px * var(--ui-chrome-scale)); padding: 0 2px;
+  background: none; border: none; color: #8b949e; cursor: pointer; padding: 0 2px;
 }
 #btn-ws-font-minus:hover, #btn-ws-font-plus:hover { color: var(--text, #e2e8f0); }
 #wsbar-head {
-  display: flex; align-items: center; justify-content: space-between;
+  display: flex; align-items: center; justify-content: flex-start;
+  /* ★한 줄 고정에서 **줄바꿈 허용**으로 바꿨다(오너 지시 2026-08-11 — 버튼을 키운 귀결).
+     버튼 6개(A−·A＋·▶CEO·▶부서장·＋부서·＋)를 키우면 기본 폭 216px 한 줄에는 들어가지 않는다.
+     한 줄을 고집하면 #wsbar의 overflow:hidden에 **뒤쪽 버튼이 잘려 눌리지 않는다** —
+     실제로 지금(라벨 있던 시절)도 기본 폭에서 ＋부서 31.4px·＋ 47.5px이 잘리고 있었다(헤드리스
+     실측 2026-08-11 · 버튼이 4개에서 6개로 늘어난 뒤 생긴 미보고 결함).
+     ⇒ 잘림(도달 불가)보다 줄바꿈(세로로 길어짐)이 낫다. 목록은 스크롤되므로 세로는 흡수된다. */
+  flex-wrap: wrap; gap: 3px 6px;
   padding: 10px 12px 6px;
-  font-size: calc(11px * var(--ui-chrome-scale)); font-weight: 700; letter-spacing: .04em;
+  font-weight: 700; letter-spacing: .04em;
   color: #6e7681; text-transform: uppercase;
 }
-/* 제목이 축소를 흡수(ellipsis) — 좁은 폭에서 헤더가 2단으로 랩되지 않게(폭 불변식: 헤더는 항상 1줄) */
-#wsbar-head > span { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-#wsbar-head button { flex: none; }
+/* ← 「제목이 축소를 흡수(ellipsis)」 규칙이 여기 있었다. 제목(span) 자체를 지웠으므로(index.html)
+     가리킬 것이 없는 선택자가 되어 함께 지운다 — 남겨 두면 「쓰이는 줄 알았는데 아무 일도 안 하는 것」이 된다. */
+/* ★사이드바 헤더 버튼 6종의 글자 크기를 **한 자리에서** 정한다(오너 지시 2026-08-11 ⑵⑶).
+   ① 그 전에는 세 종류가 제각각이었다(헤드리스 실측): A−/A＋ = 13px×메뉴배율 = 16.25px ·
+      ▶CEO/▶부서장/＋부서 = **규칙이 아예 없어 브라우저 기본 13.33px** · ＋ = 14px 고정.
+      버튼에는 font 상속이 기본으로 걸리지 않으므로 헤더의 font-size를 키워도 이들은 안 커졌다 —
+      「너무 작다」의 실제 원인이 이것이다(추정 아님 · 실측치 위 참조).
+   ② 기준 16px으로 올리고 축을 --wsbar-font 하나로 통일한다. 목록·사용량 패널과 같은 변수라
+      A−/A＋ 한 쌍이 **사이드바 전체**를 함께 키우고 줄인다. 메뉴 배율과는 계속 분리한다. */
+#wsbar-head button { flex: none; font-size: calc(16px * var(--wsbar-font, 1)); }
 #ws-tabs {
   flex: 1; display: flex; flex-direction: column; gap: 2px;
   overflow-y: auto; padding: 2px 8px 10px;
@@ -94,13 +111,18 @@ body.wsbar-resizing { cursor: col-resize; -webkit-user-select: none; user-select
 #ws-usage {
   flex: none; max-height: 45%; overflow-y: auto;
   padding: 6px 8px 8px; border-top: 1px solid var(--hairline);
-  /* ★글자 크기는 20px 고정 — 오너 지시 2026-08-10(「토큰량/ctx 표시 폰트를 20 정도로 고정하자」).
-     초판은 calc(11px * var(--ui-chrome-scale))이라 **메뉴 배율에만** 연동됐고, 사이드바 자체
-     글자 배율(--wsbar-font)은 목록(.ws-tab)에만 걸려 있었다 — 목록을 키워도 이 패널만 작게
-     남는 구조였다. 어느 한쪽에 다시 매면 같은 어긋남이 방향만 바꿔 되돌아오므로 두 배율
-     어디에도 매지 않는다. 값의 단일 출처는 wsbar.ts의 WSU_FONT_PX이고(행 나이 칸 자리 산식이
-     이 수를 쓴다), 둘이 어긋나면 wsbar.test.ts의 드리프트 가드가 적색이 된다 — 여기만 고치지 마라. */
-  font-size: 20px;
+  /* ★글자 크기 = 기준 20px × **사이드바** 글자 배율(--wsbar-font · A−/A＋ · 0.8~2.2).
+     오너 판정 2026-08-11: 「글자 크기 바꿀 때마다 재설치는 아니다 — 조절이 되게 하자」.
+     ① 기준 20px은 오너 지시 2026-08-10(c48dbdf)의 값 그대로다 — 배율 1.0이면 정확히 20px이라
+        지금 라이브인 화면과 같다. 조작부는 새로 만들지 않고 이미 있는 A−/A＋를 쓴다.
+     ② ★c48dbdf가 「두 배율 어디에도 매지 않는다」로 못박았던 것과의 관계: 그때 고친 사고는
+        이 패널이 **메뉴 배율(--ui-chrome-scale)** 을 따라가면서 사이드바 목록(.ws-tab)과 따로
+        놀던 것이었다. 지금 매는 축은 그 축이 아니라 **목록이 매여 있는 바로 그 축**이다 —
+        같은 사이드바 안의 두 덩어리가 같은 배율을 공유하므로 원 사고(따로 노는 것)의 재발이
+        아니라 그 사고의 반대편 해소다. 메뉴 배율과는 **계속 비연동**이며 그 단언은 테스트가 진다.
+     값의 단일 출처는 wsbar.ts의 WSU_FONT_PX이고(행 나이 칸 자리 산식이 이 수를 쓴다), 이 수식과
+     상수가 어긋나면 wsbar.test.ts의 드리프트 가드가 적색이 된다 — 여기만 고치지 마라. */
+  font-size: calc(20px * var(--wsbar-font, 1));
   font-variant-numeric: tabular-nums; /* 숫자 폭 고정 — 값이 바뀌어도 열이 흔들리지 않는다 */
   color: #8b949e;
 }
@@ -113,9 +135,22 @@ body.wsbar-resizing { cursor: col-resize; -webkit-user-select: none; user-select
 }
 .wsu-head:first-child { margin-top: 0; }
 .wsu-rate, .wsu-ctx { display: flex; align-items: center; gap: 6px; padding: 1px 0; min-width: 0; }
-.wsu-rate-name { flex: none; width: 2.2em; color: #8b949e; }
+/* ★고정 칸들은 「자기 폭을 원하되, 정 안 되면 줄어든다」로 바꿨다(오너 지시 2026-08-11의 귀결).
+   ① 왜 필요해졌나 — 패널 글자가 배율을 타면서 **행의 고정 칸이 통째로 배율을 탄다**.
+      배율 2.2·폭 216px에서 고정 칸 합계가 컨테이너를 170.6px 넘겨(헤드리스 실측) 행이 잘렸다.
+      배율 1.0에서는 12px(폭 176px)이라 눈에 안 띄던 것이 배율과 함께 14배로 커진 것이다.
+   ② flex:none(=0 0 auto)은 「절대 안 줄어든다」라서 남는 길이 **넘쳐서 잘리는 것**뿐이었다.
+      flex:0 1 auto로 바꾸면 트랙(flex:1·basis 0)이 0이 된 다음부터 고정 칸이 비례로 줄고,
+      줄어든 칸은 넘치는 대신 말줄임/자름으로 처리된다 — 정보는 툴팁에 그대로 있다.
+   ③ ★기본 화면은 그대로다: 자리가 남으면 shrink 계수는 쓰이지 않는다(폭 216·배율 1.0에서
+      수치 무변화를 실측으로 확인했다). 이 규칙은 자리가 없을 때만 발동한다.
+   ④ 열 정렬은 유지된다 — 모든 행이 같은 클래스·같은 basis라 같은 비율로 줄어든다. */
+.wsu-rate-name, .wsu-ctx-sid, .wsu-rate-pct, .wsu-ctx-pct, .wsu-src, .wsu-ctx-age {
+  flex: 0 1 auto; min-width: 0; overflow: hidden; white-space: nowrap;
+}
+.wsu-rate-name { width: 2.2em; color: #8b949e; }
 /* 페인 번호는 오른쪽 정렬 — 자릿수가 달라도(2 / 15 / 370) 게이지 시작선이 맞는다. */
-.wsu-ctx-sid { flex: none; width: 2.6em; text-align: right; color: #6e7681; }
+.wsu-ctx-sid { width: 2.6em; text-align: right; color: #6e7681; }
 /* 이름 있는 보고자(master·cso)가 표에 있으면 **모든 행**의 라벨 열을 함께 넓힌다.
    ★그 행만 넓히면 안 된다 — 열 너비가 행마다 달라지면 게이지 바의 시작 x가 어긋나 표가 계단이 된다.
    넓이는 열 전체의 속성이지 한 칸의 속성이 아니다. */
@@ -126,7 +161,7 @@ body.wsbar-resizing { cursor: col-resize; -webkit-user-select: none; user-select
    위 has-named와 **같은 이유·같은 방식**이다: 넓이는 열 전체의 속성이지 한 칸의 속성이 아니다. */
 #ws-usage.has-scoped .wsu-rate-name { width: 6em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .wsu-ctx-sid.named { color: var(--text, #c9d1d9); }
-.wsu-rate-pct, .wsu-ctx-pct { flex: none; width: 2.6em; text-align: right; color: var(--text, #c9d1d9); }
+.wsu-rate-pct, .wsu-ctx-pct { width: 2.6em; text-align: right; color: var(--text, #c9d1d9); }
 .wsu-rate-pct.warn, .wsu-ctx-pct.warn { color: var(--warn); }
 .wsu-rate-pct.crit, .wsu-ctx-pct.crit { color: var(--error); font-weight: 600; }
 /* Fable 「자체 집계」 줄(.wsu-obs / -name / -val / -tag)이 여기 있었다 — 티켓⑥에서 삭제.
@@ -135,15 +170,14 @@ body.wsbar-resizing { cursor: col-resize; -webkit-user-select: none; user-select
    ★규칙 없이 남은 클래스는 「쓰이는 줄 알았는데 아무 일도 안 하는 것」이 되므로 함께 지운다. */
 
 /* 출처 등급 — ● 서버 진실 / ○ 추정. 값 옆에 붙어 추정치를 실측으로 오독하는 것을 막는다. */
-.wsu-src { flex: none; width: 1em; text-align: center; color: #57606a; font-size: .85em; }
+.wsu-src { width: 1em; text-align: center; color: #57606a; font-size: .85em; }
 /* 행별 관측 나이(오너 발의 2026-08-08) — 푸터의 「가장 낡음」이 **어느 행 것인지**를 행에서 바로 읽게 한다.
    ★출처 마크와 같은 저채도·같은 축소 글자로 둔다 — %와 같은 무게로 읽히면 표의 초점(값)이 흐려진다.
    ★flex:none + 고정폭이라 축소는 track(flex:1)이 흡수한다 — 번호·%·출처 마크를 밀어내지 않는다.
    2.9em(축소 글자 기준)은 가장 긴 실제 표기인 「12시간」(헤드리스 실측 31px)까지 담는 폭이다 —
    2.6em은 그 한 표기에서만 1px 잘렸다. 그래도 넘치면 줄바꿈 대신 자른다(행이 2단이 되면 표가 무너진다). */
 .wsu-ctx-age {
-  flex: none; width: 2.9em; text-align: right; color: #57606a; font-size: .85em;
-  overflow: hidden; white-space: nowrap;
+  width: 2.9em; text-align: right; color: #57606a; font-size: .85em;
 }
 /* 좁은 폭·큰 메뉴 배율에서는 나이 칸을 내준다 — 판정은 wsbar.showsRowAge(실측 산식), 토글은 main.ts.
    ★자리가 없으면 트랙바가 0px 이 되고 행이 넘쳐 잘린다(실측 176px에서 4.1px 넘침). 그때는
@@ -196,7 +230,7 @@ body.wsbar-resizing { cursor: col-resize; -webkit-user-select: none; user-select
 .ws-dot.error { background: var(--error); }
 .ws-tab .ws-sub .sev-warn { color: var(--warn); }
 .ws-tab .ws-sub .sev-crit { color: var(--error); }
-.ws-approve-badge { margin-left: 6px; color: var(--error); font-weight: 700; font-size: 11px; }
+.ws-approve-badge { margin-left: 6px; color: var(--error); font-weight: 700; font-size: calc(11px * var(--wsbar-font, 1)); }
 #btn-ws-dept:disabled { opacity: .5; cursor: default; }
 .ws-tab .ws-close {
   flex: none; opacity: 0; cursor: pointer; color: inherit; font-size: calc(12px * var(--wsbar-font, 1));
@@ -208,26 +242,32 @@ body.wsbar-resizing { cursor: col-resize; -webkit-user-select: none; user-select
 .ws-tab .ws-close.close-armed, .ws-tab.active .ws-close.close-armed:hover { opacity: 1; color: var(--error); }
 /* svg가 클릭 target이 되면 mousedown 가드(e.target 비교)가 깨진다 — 이벤트는 span이 받게 */
 .close-armed svg { width: calc(11px * var(--wsbar-font, 1)); height: calc(11px * var(--wsbar-font, 1)); fill: currentColor; vertical-align: -1.5px; pointer-events: none; }
+/* 글자 크기는 위 #wsbar-head button 이 정한다(축 통일 2026-08-11) — 여기 14px 고정이 있었다. */
 #btn-ws-new {
-  background: none; border: none; color: #8b949e; cursor: pointer; font-size: 14px;
+  background: none; border: none; color: #8b949e; cursor: pointer;
   padding: 0 2px;
 }
 #btn-ws-new:hover { color: var(--accent); }
 
-/* 06: 워크스페이스 그룹 헤더·body (기존 .ws-tab 변수·팔레트 재사용) */
+/* 06: 워크스페이스 그룹 헤더·body (기존 .ws-tab 변수·팔레트 재사용)
+   ★글자 크기는 목록(.ws-tab)과 같은 축(--wsbar-font)에 맨다 — 오너 지시 2026-08-11 ⑶의
+     「목록이 함께 커진다」에 그룹 머리글이 빠지면, 배율 2.2에서 멤버는 28.6px인데 그것을
+     묶는 머리글만 12px로 남아 목록이 두 크기로 갈린다. 지시가 이름을 든 것은 「제목」이지만
+     같은 목록 안에서 같은 이유로 걸린 칸이라 함께 옮긴다 — 워커 판단(보고 대상).
+     같은 판단을 c48dbdf가 .wsu-foot 에 한 적이 있다(패널 안 유일하게 다른 축에 매인 줄). */
 .ws-group { display: flex; flex-direction: column; }
 .ws-group-head {
   display: flex; align-items: center; gap: 6px;
   padding: 6px 10px; border-radius: 7px; cursor: default;
   border-left: 3px solid transparent; /* 그룹 색 바 (JS가 색 지정) */
-  font-size: 12px; font-weight: 700; color: #adbac7;
+  font-size: calc(12px * var(--wsbar-font, 1)); font-weight: 700; color: #adbac7;
 }
 .ws-group-head:hover { background: #1c2128; }
 .ws-group-head.pinned .ws-group-name::after { content: " ·"; color: var(--accent); }
 .ws-group-chevron { flex: none; width: 12px; cursor: pointer; color: #6e7681; }
 .ws-group-name { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.ws-group-count { flex: none; font-size: 10px; color: #6e7681; }
-.ws-group-add { flex: none; opacity: 0; cursor: pointer; color: #8b949e; font-size: 14px; }
+.ws-group-count { flex: none; font-size: calc(10px * var(--wsbar-font, 1)); color: #6e7681; }
+.ws-group-add { flex: none; opacity: 0; cursor: pointer; color: #8b949e; font-size: calc(14px * var(--wsbar-font, 1)); }
 .ws-group-head:hover .ws-group-add { opacity: .7; }
 .ws-group-add:hover { color: var(--accent); }
 .ws-group.collapsed .ws-group-body { display: none; }

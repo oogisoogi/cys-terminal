@@ -342,12 +342,15 @@ function renderSidebarUsage(surfaces: SurfaceLike[]) {
   // 행별 나이 칸은 자리가 있을 때만 낸다 — 좁은 폭에서는 트랙바를 0으로 만들고 행을 넘치게 한다.
   // ★서명 검사보다 **앞**에 둔다: 폭은 값이 아니라 화면 설정이라 서명에 없다. 뒤에 두면
   //   사이드바를 드래그해도 값이 그대로인 동안에는 칸이 안 바뀐다(스킵 경로로 빠진다).
-  // ★폭의 진실원은 CSS 변수다(applyWsbar가 쓰는 그 값 — main.ts 하단 주석).
-  // ★메뉴 배율은 더 이상 읽지 않는다 — 패널 글자가 20px 고정이 되면서(오너 지시 2026-08-10)
-  //   이 판정의 인자에서 빠졌다. 값을 읽어 두고 안 쓰면 아직 연동된 것처럼 읽힌다.
+  // ★폭·배율의 진실원은 둘 다 CSS 변수다(applyWsbar가 쓰는 그 값 — main.ts 하단 주석).
+  // ★메뉴 배율(--ui-chrome-scale)은 여전히 읽지 않는다 — 패널 글자가 매인 축이 아니다.
+  //   읽는 배율은 **사이드바** 글자 배율이다(오너 판정 2026-08-11로 패널 글자가 여기 매였다).
+  //   폭과 함께 넘겨야 하는 이유는 wsbar.showsRowAge 주석 참조 — 같은 폭이라도 배율이 크면
+  //   행의 고정 칸이 함께 커져 트랙바가 0이 된다.
   const rootCss = getComputedStyle(document.documentElement);
   const wsbarPx = parseFloat(rootCss.getPropertyValue("--wsbar-w")) || WSBAR_W_DEFAULT;
-  host.classList.toggle("no-row-age", !showsRowAge(wsbarPx));
+  const wsbarFontScale = parseFloat(rootCss.getPropertyValue("--wsbar-font")) || 1;
+  host.classList.toggle("no-row-age", !showsRowAge(wsbarPx, wsbarFontScale));
   // 계정 경계(소켓×에이전트×계정)가 둘 이상일 때만 범위 라벨을 붙인다 — 하나뿐이면 잡음이다.
   const scopes = new Set(rates.map((r) => JSON.stringify([r.socket, r.agent, r.accountId])));
   const showScope = scopes.size > 1;
@@ -7494,6 +7497,11 @@ function applyWsbarFontStep(dir: number) {
   wsbarFont = clampWsbarFont(wsbarFont + dir * WSBAR_FONT_STEP);
   applyWsbarVars();
   localStorage.setItem("cys-wsbar-font", String(wsbarFont));
+  // ★배율이 사용량 패널의 행 폭까지 바꾸므로(오너 판정 2026-08-11) 나이 칸 자리 판정을 그 자리에서
+  //   다시 건다 — 안 걸면 다음 폴링 틱(3초)까지 큰 배율에서 행이 넘쳐 잘린 채로 보인다.
+  //   ★글자 크기 자체는 CSS 변수라 이미 즉시 반영됐다. 여기서 고치는 것은 **자리 판정**뿐이다.
+  //   (폭 드래그도 같은 지연을 갖지만 그것은 이 티켓 밖이라 손대지 않는다 — 워커 판단·보고 대상.)
+  renderSidebarUsage([...lastSurfacesBySocket.values()].flat());
 }
 document.getElementById("btn-ws-font-minus")?.addEventListener("click", () => applyWsbarFontStep(-1));
 document.getElementById("btn-ws-font-plus")?.addEventListener("click", () => applyWsbarFontStep(+1));
