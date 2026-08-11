@@ -111,10 +111,17 @@ body.wsbar-resizing { cursor: col-resize; -webkit-user-select: none; user-select
 #ws-usage {
   flex: none; max-height: 45%; overflow-y: auto;
   padding: 6px 8px 8px; border-top: 1px solid var(--hairline);
-  /* ★글자 크기 = 기준 20px × **사이드바** 글자 배율(--wsbar-font · A−/A＋ · 0.8~2.2).
+  /* ★글자 크기 = 기준 16px × **사이드바** 글자 배율(--wsbar-font · A−/A＋ · 0.8~2.2).
      오너 판정 2026-08-11: 「글자 크기 바꿀 때마다 재설치는 아니다 — 조절이 되게 하자」.
-     ① 기준 20px은 오너 지시 2026-08-10(c48dbdf)의 값 그대로다 — 배율 1.0이면 정확히 20px이라
-        지금 라이브인 화면과 같다. 조작부는 새로 만들지 않고 이미 있는 A−/A＋를 쓴다.
+     ① ★기준이 20 → 16으로 내려왔다(오너 캡처 판정 2026-08-11 후속 · 서열 교정).
+        재는 축이 「읽히는가」에서 **「무엇이 무엇보다 큰가」**로 옮겨졌다: 오너가 실기기에서 본 것은
+        목록 제목(13px)이 이 패널(20px)보다 **작은 역전**이었다(헤드리스 실측치 · 추정 아님).
+        요구는 셋의 서열이다 — 상단 버튼 = 이 패널 < 목록 제목. 버튼이 16px이므로 이 패널도 16px이고,
+        같아지는 방향을 「버튼을 20으로 올리기」가 아니라 「패널을 16으로 내리기」로 잡은 것은
+        사이드바 기본 폭(216px)에서 6버튼 행이 더 접히지 않게 하기 위해서다.
+        ⚠귀결(숨기지 않는다): 이 패널은 지금 라이브(20px)보다 **작아진다**. 8/10의 「20 정도로」는
+        읽기 어려움을 고친 지시였고, 이번 지시는 그 위에 얹힌 **서열** 지시다 — 뒤집은 것이 아니라
+        기준이 바뀐 것이며, 더 크게 보고 싶으면 A＋ 한 축이 패널·버튼·목록을 함께 올린다.
      ② ★c48dbdf가 「두 배율 어디에도 매지 않는다」로 못박았던 것과의 관계: 그때 고친 사고는
         이 패널이 **메뉴 배율(--ui-chrome-scale)** 을 따라가면서 사이드바 목록(.ws-tab)과 따로
         놀던 것이었다. 지금 매는 축은 그 축이 아니라 **목록이 매여 있는 바로 그 축**이다 —
@@ -122,7 +129,7 @@ body.wsbar-resizing { cursor: col-resize; -webkit-user-select: none; user-select
         아니라 그 사고의 반대편 해소다. 메뉴 배율과는 **계속 비연동**이며 그 단언은 테스트가 진다.
      값의 단일 출처는 wsbar.ts의 WSU_FONT_PX이고(행 나이 칸 자리 산식이 이 수를 쓴다), 이 수식과
      상수가 어긋나면 wsbar.test.ts의 드리프트 가드가 적색이 된다 — 여기만 고치지 마라. */
-  font-size: calc(20px * var(--wsbar-font, 1));
+  font-size: calc(16px * var(--wsbar-font, 1));
   font-variant-numeric: tabular-nums; /* 숫자 폭 고정 — 값이 바뀌어도 열이 흔들리지 않는다 */
   color: #8b949e;
 }
@@ -210,14 +217,24 @@ body.wsbar-resizing { cursor: col-resize; -webkit-user-select: none; user-select
 .ws-tab .ws-title-row {
   display: flex; align-items: center; gap: 6px; min-width: 0;
 }
-/* 사이드바 글자 배율(--wsbar-font·A−/A＋ 버튼·영속) — 고정 2배 하드코딩을 배율로 대체(오너 가독성 요청의 상위 호환 2026-07-12) */
+/* 사이드바 글자 배율(--wsbar-font·A−/A＋ 버튼·영속) — 고정 2배 하드코딩을 배율로 대체(오너 가독성 요청의 상위 호환 2026-07-12)
+   ★목록 블록의 기준값이 통째로 ×20/13 = 1.538 커졌다(오너 캡처 판정 2026-08-11 · 서열 교정).
+     제목 13px은 상단 버튼(16)·사용량 패널(20)보다 **작았다** — 목록이 사이드바의 본문인데
+     그것을 둘러싼 것들보다 작게 그려지고 있었던 것이 오너가 실기기에서 본 역전이다.
+     제목을 20px으로 올려 「제목 > 버튼 = 패널」을 세운다.
+   ★블록 안의 나머지 칸(보조행·닫기 ×·승인 배지·그룹 머리글 계열)도 **같은 비율로** 옮긴다.
+     지시가 이름을 든 것은 「제목」과 「보조행」이지만, 한 칸만 두고 가면 목록이 두 크기로 갈리고
+     특히 그룹 머리글(12px)은 이번 변경 뒤 **패널(16px)보다 작아져** 오너가 지적한 바로 그 역전을
+     다른 자리에서 새로 만든다. 비례 이동이 그 재발을 원천 봉쇄한다 — 워커 판단(보고 대상).
+     같은 판단의 선례 = 5930ddb(그룹 머리글 축 이동) · c48dbdf(.wsu-foot). */
 .ws-tab .ws-name {
   flex: 1; min-width: 0;
-  font-size: calc(13px * var(--wsbar-font, 1)); font-weight: var(--menu-weight, 600);
+  font-size: calc(20px * var(--wsbar-font, 1)); font-weight: var(--menu-weight, 600);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
+/* 보조행은 제목에 비례한 현행 비율을 유지한다 — 초판 11:13 = .846 → 20 × .846 = 16.92 ≈ 17px */
 .ws-tab .ws-sub {
-  font-size: calc(11px * var(--wsbar-font, 1)); color: #8b949e;
+  font-size: calc(17px * var(--wsbar-font, 1)); color: #8b949e;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .ws-tab.active .ws-name { color: #fff; }
@@ -230,10 +247,12 @@ body.wsbar-resizing { cursor: col-resize; -webkit-user-select: none; user-select
 .ws-dot.error { background: var(--error); }
 .ws-tab .ws-sub .sev-warn { color: var(--warn); }
 .ws-tab .ws-sub .sev-crit { color: var(--error); }
-.ws-approve-badge { margin-left: 6px; color: var(--error); font-weight: 700; font-size: calc(11px * var(--wsbar-font, 1)); }
+/* 제목과 같은 행에 있는 칸이라 제목 비율을 따라간다(초판 11 → 11 × 20/13 = 16.92 ≈ 17px) */
+.ws-approve-badge { margin-left: 6px; color: var(--error); font-weight: 700; font-size: calc(17px * var(--wsbar-font, 1)); }
 #btn-ws-dept:disabled { opacity: .5; cursor: default; }
+/* 닫기 ×도 제목 행의 칸이라 같은 비율(초판 12 → 12 × 20/13 = 18.46 ≈ 18px) */
 .ws-tab .ws-close {
-  flex: none; opacity: 0; cursor: pointer; color: inherit; font-size: calc(12px * var(--wsbar-font, 1));
+  flex: none; opacity: 0; cursor: pointer; color: inherit; font-size: calc(18px * var(--wsbar-font, 1));
 }
 .ws-tab:hover .ws-close { opacity: .55; }
 .ws-tab .ws-close:hover { opacity: 1; color: var(--error); }
@@ -241,7 +260,7 @@ body.wsbar-resizing { cursor: col-resize; -webkit-user-select: none; user-select
 /* 2-click 삭제 확인 armed 상태 — 위험색 유지(active 탭 hover의 #fff보다 우선), 2.5초 내 hover 이탈해도 노출 유지 */
 .ws-tab .ws-close.close-armed, .ws-tab.active .ws-close.close-armed:hover { opacity: 1; color: var(--error); }
 /* svg가 클릭 target이 되면 mousedown 가드(e.target 비교)가 깨진다 — 이벤트는 span이 받게 */
-.close-armed svg { width: calc(11px * var(--wsbar-font, 1)); height: calc(11px * var(--wsbar-font, 1)); fill: currentColor; vertical-align: -1.5px; pointer-events: none; }
+.close-armed svg { width: calc(17px * var(--wsbar-font, 1)); height: calc(17px * var(--wsbar-font, 1)); fill: currentColor; vertical-align: -1.5px; pointer-events: none; }
 /* 글자 크기는 위 #wsbar-head button 이 정한다(축 통일 2026-08-11) — 여기 14px 고정이 있었다. */
 #btn-ws-new {
   background: none; border: none; color: #8b949e; cursor: pointer;
@@ -254,20 +273,23 @@ body.wsbar-resizing { cursor: col-resize; -webkit-user-select: none; user-select
      「목록이 함께 커진다」에 그룹 머리글이 빠지면, 배율 2.2에서 멤버는 28.6px인데 그것을
      묶는 머리글만 12px로 남아 목록이 두 크기로 갈린다. 지시가 이름을 든 것은 「제목」이지만
      같은 목록 안에서 같은 이유로 걸린 칸이라 함께 옮긴다 — 워커 판단(보고 대상).
-     같은 판단을 c48dbdf가 .wsu-foot 에 한 적이 있다(패널 안 유일하게 다른 축에 매인 줄). */
+     같은 판단을 c48dbdf가 .wsu-foot 에 한 적이 있다(패널 안 유일하게 다른 축에 매인 줄).
+   ★기준값도 목록과 같은 비율(×20/13)로 함께 올렸다(서열 교정 2026-08-11 후속): 머리글 12→18 ·
+     개수 10→15 · ＋ 14→22. 여기를 안 올리면 머리글(12px)이 사용량 패널(16px)보다 작아져
+     오너가 지적한 역전이 **자리만 바꿔 되살아난다**. */
 .ws-group { display: flex; flex-direction: column; }
 .ws-group-head {
   display: flex; align-items: center; gap: 6px;
   padding: 6px 10px; border-radius: 7px; cursor: default;
   border-left: 3px solid transparent; /* 그룹 색 바 (JS가 색 지정) */
-  font-size: calc(12px * var(--wsbar-font, 1)); font-weight: 700; color: #adbac7;
+  font-size: calc(18px * var(--wsbar-font, 1)); font-weight: 700; color: #adbac7;
 }
 .ws-group-head:hover { background: #1c2128; }
 .ws-group-head.pinned .ws-group-name::after { content: " ·"; color: var(--accent); }
 .ws-group-chevron { flex: none; width: 12px; cursor: pointer; color: #6e7681; }
 .ws-group-name { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.ws-group-count { flex: none; font-size: calc(10px * var(--wsbar-font, 1)); color: #6e7681; }
-.ws-group-add { flex: none; opacity: 0; cursor: pointer; color: #8b949e; font-size: calc(14px * var(--wsbar-font, 1)); }
+.ws-group-count { flex: none; font-size: calc(15px * var(--wsbar-font, 1)); color: #6e7681; }
+.ws-group-add { flex: none; opacity: 0; cursor: pointer; color: #8b949e; font-size: calc(22px * var(--wsbar-font, 1)); }
 .ws-group-head:hover .ws-group-add { opacity: .7; }
 .ws-group-add:hover { color: var(--accent); }
 .ws-group.collapsed .ws-group-body { display: none; }

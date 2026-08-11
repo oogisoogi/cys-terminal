@@ -94,6 +94,12 @@ describe("WSU_FONT_PX — CSS와 산식이 같은 수를 쓰는가", () => {
     ".ws-tab .ws-sub", // 부제(페인 수·데몬)
     ".ws-group-head", // 그룹 머리글
     "#ws-usage", // 토큰/CTX 사용량 패널
+    // ↓ 서열 교정 2026-08-11에 제목 비율(×20/13)로 함께 옮긴 칸들. 여기 안 적으면 「사이드바가
+    //   통째로 움직인다」가 이름만 남고, 이 칸들만 조용히 뒤처져도 아무도 모른다.
+    ".ws-tab .ws-close", // 닫기 ×(제목 행)
+    ".ws-approve-badge", // 승인 대기 배지(제목 행)
+    ".ws-group-count", // 그룹 멤버 수
+    ".ws-group-add", // 그룹 ＋
   ];
   it.each(SIDEBAR_SELECTORS)("%s 의 글자 크기가 사이드바 배율에 매여 있다", (sel: string) => {
     const css = readFileSync(new URL("./style.css", import.meta.url), "utf8");
@@ -134,6 +140,69 @@ describe("WSU_FONT_PX — CSS와 산식이 같은 수를 쓰는가", () => {
     expect(css).not.toContain("#wsbar-head > span");
   });
 
+  // ── 기준 크기의 **서열** (오너 캡처 판정 2026-08-11 · 서열 교정)
+  //    ★재는 것이 값에서 **서열**로 바뀌었다. 오너의 요구는 「패널은 16px이다」가 아니라
+  //      「제목이 상단 버튼·패널보다 크고, 그 둘은 서로 같다」이다. 값을 박아 두면 나중에 셋을
+  //      다 같은 방향으로 옮길 때 요구가 지켜지는데도 적색이 나고(가짜 적색), 반대로 한 칸만
+  //      틀어졌을 때 값 대조는 그 칸만 잡고 **관계가 깨진 사실**은 말해 주지 않는다.
+  //      그래서 세 선언을 다 읽어 서로 비교한다 — 기대값은 부등호이지 수가 아니다.
+  const BASE_PX_OF = (css: string, sel: string): number => {
+    const esc = sel.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const block = css.match(new RegExp(`(?:^|\\n)${esc}\\s*\\{([\\s\\S]*?)\\}`));
+    expect(block).not.toBeNull(); // 선택자를 못 찾으면 「어긋남 0」이 아니라 **재지 못한 것**이다
+    const decls = block![1].replace(/\/\*[\s\S]*?\*\//g, "");
+    const m = decls.match(/font-size:\s*calc\(\s*([\d.]+)px\s*\*\s*var\(--wsbar-font,\s*1\)\s*\)/);
+    expect(m).not.toBeNull(); // 수식 모양이 바뀌면 기준값을 못 읽는다 — 조용히 0으로 떨어지지 않게
+    return parseFloat(m![1]);
+  };
+
+  it("★서열 — 목록 제목 > 상단 버튼 = 사용량 패널 (오너 요구의 본체)", () => {
+    const css = readFileSync(new URL("./style.css", import.meta.url), "utf8");
+    const title = BASE_PX_OF(css, ".ws-tab .ws-name");
+    const button = BASE_PX_OF(css, "#wsbar-head button");
+    const panel = BASE_PX_OF(css, "#ws-usage");
+    // ⑴ 상단 메뉴와 토큰/CTX 패널은 **같은** 기준 크기 (오너 요구 1)
+    expect(panel).toBe(button);
+    // ⑵ 목록 제목은 그 둘보다 **크다** (오너 요구 2 · 캡처가 잡은 역전의 반대 방향)
+    expect(title).toBeGreaterThan(button);
+  });
+
+  it("보조행은 제목보다 작고 상단 버튼보다는 크다 — 목록이 한 덩어리로 읽히는 폭", () => {
+    // ★보조행에 하한이 없으면 「제목만 키우기」로 위 서열을 통과시키면서 목록이 두 크기로 갈릴 수 있다.
+    //   지시가 「제목에 비례한 현행 비율 유지」라고 못박은 이유가 이것이라 부등호 둘로 가둔다.
+    const css = readFileSync(new URL("./style.css", import.meta.url), "utf8");
+    const title = BASE_PX_OF(css, ".ws-tab .ws-name");
+    const sub = BASE_PX_OF(css, ".ws-tab .ws-sub");
+    expect(sub).toBeLessThan(title);
+    expect(sub).toBeGreaterThan(BASE_PX_OF(css, "#wsbar-head button"));
+  });
+
+  it("★목록 안 어느 칸도 사용량 패널보다 작지 않다 — 역전이 자리만 바꿔 되살아나는 것을 막는다", () => {
+    // ★오너가 본 결함은 「제목이 패널보다 작다」였지만, 결함의 **부류**는 「목록이 패널보다 작다」이다.
+    //   제목만 고치면 그룹 머리글(12px)이 그 자리를 물려받는다 — 그래서 목록 전체를 훑는다.
+    const css = readFileSync(new URL("./style.css", import.meta.url), "utf8");
+    const panel = BASE_PX_OF(css, "#ws-usage");
+    const listSelectors = [
+      ".ws-tab .ws-name",
+      ".ws-tab .ws-sub",
+      ".ws-tab .ws-close",
+      ".ws-approve-badge",
+      ".ws-group-head",
+      ".ws-group-add",
+    ];
+    const smaller = listSelectors.filter((s) => BASE_PX_OF(css, s) < panel);
+    expect(smaller).toEqual([]);
+    // ★.ws-group-count(멤버 수)는 위 목록에서 뺐다 — 그룹 머리글 안의 **부속 수치**라 머리글보다
+    //   작은 것이 의도다(보조행이 제목보다 작은 것과 같은 관계). 뺀 것을 숨기지 않고 여기 적고,
+    //   대신 그 칸에는 **머리글에 대한 비율**로 하한을 건다(초판 10:12 = .833).
+    //   ⚠하한을 「패널의 절반」 같은 헐거운 수로 잡으면 이 칸만 옛 10px으로 되돌려도 통과한다
+    //     (10 > 8). 비율로 매어야 되돌림이 적색이 된다 — 자기감사에서 잡아 조인 자리다.
+    const count = BASE_PX_OF(css, ".ws-group-count");
+    const groupHead = BASE_PX_OF(css, ".ws-group-head");
+    expect(count).toBeLessThan(groupHead);
+    expect(count / groupHead).toBeGreaterThan(0.6);
+  });
+
   it("목록(.ws-tab)과 같은 배율 변수를 쓴다 — 「함께 커진다」의 기계 단언", () => {
     // ★이 단언이 없으면 패널이 **어떤** 배율에 매였는지가 위 테스트에서 이름으로만 확인된다.
     //   둘이 같은 변수를 쓰는 것이 오너 요구(목록과 패널이 함께 커진다)의 실제 내용이다.
@@ -147,19 +216,31 @@ describe("WSU_FONT_PX — CSS와 산식이 같은 수를 쓰는가", () => {
 // ── 페인 CTX 행별 나이 칸의 자리 판정
 //    (오너 발의 2026-08-08 · 20px 고정으로 재조준 2026-08-10 · 사이드바 배율 복귀 2026-08-11)
 describe("showsRowAge — 나이 칸을 낼 자리가 있는가", () => {
-  // 임계 폭 = (10.115 + 2.4)em × 20px × 배율 + 41px(경계선1 + padding16 + gap24).
-  //   배율 1.0 → 291.3px → 292px부터 참 · 배율 0.8 → 241.24px → 242px부터 참
-  //   배율 2.2 → 591.66px → **상한 520px을 넘어 어느 폭에서도 거짓**(패널이 커지면 자리가 없다).
+  // 임계 폭 = (10.115 + 2.4)em × 16px × 배율 + 41px(경계선1 + padding16 + gap24).
+  //   배율 1.0 → 241.24px → 242px부터 참 · 배율 0.8 → 201.19px → 202px부터 참
+  //   배율 2.2 → 481.53px → 482px부터 참 (**상한 520px 안으로 들어왔다** — 아래 ★ 참조)
   // ★이 수들은 상수에서 파생하지 않고 손으로 계산해 박는다 — 산식에서 유도하면 산식이 바뀔 때
   //   기대값도 같이 따라가 가드가 죽는다(같은 실수를 두 번 쓰는 셈이 된다).
-  // ★292는 헤드리스 실측과 일치한다(291에서 트랙 47.7px < 하한 48px, 292에서 48.7px).
-  const THRESHOLD_PX = 292; // 배율 1.0
-  const THRESHOLD_PX_MIN_FONT = 242; // 배율 0.8
+  // ★세 수가 전부 내려온 이유는 하나다: 패널 기준이 20 → 16px(서열 교정 2026-08-11 후속).
+  //   행의 고정 칸은 전부 em이라 **글자가 작아지면 행이 좁아지고 자리가 생긴다**. 즉 아래 기대값이
+  //   바뀐 것은 규칙이 흔들린 것이 아니라 규칙의 입력이 바뀐 것이다 — 그래서 케이스를 지우지 않고
+  //   같은 축(임계 경계·단조성)에 **다시 겨눴다**.
+  // ★배율 상한에서의 판정이 뒤집혔다(전량 거짓 → 482px부터 참). 이것은 기대값 조정이 아니라
+  //   **화면 사실의 변화**이므로 산식을 믿지 않고 헤드리스로 직접 확인했다 — 세 경계 전부 일치:
+  //     241px 트랙 38.19 < 하한 38.40(거짓) · 242px 39.19 ≥ 38.40(참)          [배율 1.0]
+  //     201px 트랙 30.56 < 하한 30.72(거짓) · 202px 31.56 ≥ 30.72(참)          [배율 0.8]
+  //     481px 트랙 83.98 < 하한 84.48(거짓) · 482px 84.98 ≥ 84.48(참)          [배율 2.2]
+  //   ⚠실측 fixture에는 `has-named`를 걸어야 한다 — CTX_ROW_FIXED_EM의 첫 항 4.2em이 바로 그
+  //     클래스의 라벨 열 폭이다. 안 걸면 2.6em짜리 **다른 화면**을 재게 되고(초판이 그랬다),
+  //     산식이 화면보다 보수적인 것처럼 보이는 거짓 불일치가 난다.
+  const THRESHOLD_PX = 242; // 배율 1.0
+  const THRESHOLD_PX_MIN_FONT = 202; // 배율 0.8
+  const THRESHOLD_PX_MAX_FONT = 482; // 배율 2.2
 
   // ★기본 폭에서의 기대가 뒤집혔던 자리다(참→거짓·2026-08-10). 규칙이 바뀐 게 아니라
   //   **글자가 커졌다** — 13.75px에서 216px는 자리가 됐지만 20px에서는 안 된다.
   //   나이는 툴팁·푸터에 그대로 남는다.
-  it("★기본 폭(216)·배율 1.0에서는 내주지 않는다 — 기준 20px으로 행이 커져 자리가 없다", () => {
+  it("★기본 폭(216)·배율 1.0에서는 내주지 않는다 — 기준 16px으로도 임계 242px에 26px 모자란다", () => {
     expect(showsRowAge(WSBAR_W_DEFAULT, 1)).toBe(false);
   });
 
@@ -173,7 +254,7 @@ describe("showsRowAge — 나이 칸을 낼 자리가 있는가", () => {
     expect(showsRowAge(WSBAR_W_MAX, 1)).toBe(true);
   });
 
-  it("임계 폭 경계(배율 1.0) — 291은 거짓, 292부터 참", () => {
+  it("임계 폭 경계(배율 1.0) — 241은 거짓, 242부터 참", () => {
     expect(showsRowAge(THRESHOLD_PX - 1, 1)).toBe(false);
     expect(showsRowAge(THRESHOLD_PX, 1)).toBe(true);
   });
@@ -193,28 +274,38 @@ describe("showsRowAge — 나이 칸을 낼 자리가 있는가", () => {
   //   「폭과 **사이드바** 배율」로 옮겨 왔고, 축이 갈린 것이 오너 판정 2026-08-11의 내용이다.
   it("판정은 폭과 사이드바 배율 둘이다 — 배율이 커지면 같은 폭이라도 내주지 않는다", () => {
     expect(showsRowAge.length).toBe(2); // 인자를 다시 떼면 여기서 잡힌다
-    // 같은 폭(상한)인데 배율만 다르면 판정이 갈린다 — 배율이 실제로 산식에 들어갔다는 증거.
-    expect(showsRowAge(WSBAR_W_MAX, 1)).toBe(true);
-    expect(showsRowAge(WSBAR_W_MAX, WSBAR_FONT_MAX)).toBe(false);
+    // ★같은 **한 폭**에서 배율만 달라 판정이 갈리는 것이 「배율이 산식에 들어갔다」의 증거다.
+    //   전에는 상한 폭(520)에서 이 대비가 났지만, 패널이 16px으로 작아지며 520은 배율 2.2에서도
+    //   자리가 남게 됐다 — 그래서 대비가 나는 폭(임계 242)으로 **겨냥을 옮겼다**(축은 그대로).
+    expect(showsRowAge(THRESHOLD_PX, 1)).toBe(true);
+    expect(showsRowAge(THRESHOLD_PX, WSBAR_FONT_MAX)).toBe(false);
   });
 
-  it("배율 하한(0.8)에서는 더 좁은 폭부터 낸다 — 임계 241은 거짓, 242부터 참", () => {
+  it("배율 하한(0.8)에서는 더 좁은 폭부터 낸다 — 임계 201은 거짓, 202부터 참", () => {
     expect(showsRowAge(THRESHOLD_PX_MIN_FONT - 1, WSBAR_FONT_MIN)).toBe(false);
     expect(showsRowAge(THRESHOLD_PX_MIN_FONT, WSBAR_FONT_MIN)).toBe(true);
   });
 
-  it("배율 상한(2.2)에서는 어느 폭에서도 내주지 않는다 — 임계 592px가 상한 520px 밖이다", () => {
-    for (let w = WSBAR_W_MIN; w <= WSBAR_W_MAX; w++) {
-      expect(showsRowAge(w, WSBAR_FONT_MAX)).toBe(false);
-    }
+  // ★옛 케이스는 「배율 2.2에서는 어느 폭에서도 안 낸다」였다. 그 답이 참이었던 이유는 임계 592px가
+  //   폭 상한 520px **밖**이었기 때문이고, 패널이 16px으로 작아지며 임계가 482px로 들어왔다.
+  //   지키던 축(배율 상한에서의 자리 판정)은 그대로 두고 **경계 케이스로 다시 겨눈다** —
+  //   케이스를 지우면 배율 상한 구간이 통째로 무검사가 된다.
+  it("배율 상한(2.2) 경계 — 481은 거짓, 482부터 참 (기본폭·최소폭에서는 계속 거짓)", () => {
+    expect(showsRowAge(THRESHOLD_PX_MAX_FONT - 1, WSBAR_FONT_MAX)).toBe(false);
+    expect(showsRowAge(THRESHOLD_PX_MAX_FONT, WSBAR_FONT_MAX)).toBe(true);
+    expect(showsRowAge(WSBAR_W_DEFAULT, WSBAR_FONT_MAX)).toBe(false);
+    expect(showsRowAge(WSBAR_W_MIN, WSBAR_FONT_MAX)).toBe(false);
   });
 
   it("배율에 대해 단조다 — 키울수록 거짓 쪽으로만 간다(뒤집히는 구간이 없다)", () => {
     // ★폭 단조성과 같은 이유의 검사다: 사용자가 A＋를 누르는 도중 칸이 사라졌다 나타났다 하면
     //   그것은 규칙이 아니라 고장으로 읽힌다.
+    // ★재는 폭을 상한(520)에서 임계(242)로 옮겼다 — 패널이 16px으로 작아진 뒤 상한 폭은 배율
+    //   전 구간에서 참이라 **뒤집히는 구간 자체가 없어** 단조성을 잴 수 없다(항상 초록 = 무검사).
+    //   폭을 바꾼 것은 기대값 완화가 아니라 **측정이 대상에 닿게 만든 것**이다.
     let seenFalse = false;
     for (let f = WSBAR_FONT_MIN; f <= WSBAR_FONT_MAX + 1e-9; f += 0.1) {
-      const v = showsRowAge(WSBAR_W_MAX, +f.toFixed(2));
+      const v = showsRowAge(THRESHOLD_PX, +f.toFixed(2));
       if (!v) seenFalse = true;
       else expect(seenFalse).toBe(false); // 거짓이었다가 다시 참이 되면 실패
     }
