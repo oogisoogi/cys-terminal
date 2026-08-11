@@ -88,8 +88,11 @@ describe("WSU_FONT_PX — CSS와 산식이 같은 수를 쓰는가", () => {
   //    「A−/A＋ 하나로 사이드바가 통째로 커지고 작아진다」를 이름이 아니라 **선언으로** 단언한다.
   //    ⚠이 목록은 손으로 관리한다 — 새 사이드바 요소를 추가하면서 여기 안 적으면 그 요소만
   //      옛 크기로 남는다. 그 누락을 잡는 것이 아래 「사이드바 전역 훑기」 케이스다.
+  const PILL_SELECTOR =
+    "#wsbar-head #btn-master-start, #wsbar-head #btn-dept-master, #wsbar-head #btn-ws-dept";
   const SIDEBAR_SELECTORS = [
     "#wsbar-head button", // 상단 버튼 6종(A−·A＋·▶CEO·▶부서장·＋부서·＋)을 한 자리에서
+    PILL_SELECTOR, // 알약 3종의 **재지정**(14px) — 위 6종 규칙을 이기는 자리라 여기도 배율 축이어야 한다
     ".ws-tab .ws-name", // 워크스페이스 제목
     ".ws-tab .ws-sub", // 부제(페인 수·데몬)
     ".ws-group-head", // 그룹 머리글
@@ -156,7 +159,7 @@ describe("WSU_FONT_PX — CSS와 산식이 같은 수를 쓰는가", () => {
     return parseFloat(m![1]);
   };
 
-  it("★서열 — 목록 제목 > 상단 버튼 = 사용량 패널 (오너 요구의 본체)", () => {
+  it("★서열 — 목록 제목 > 상단 버튼 = 사용량 패널 > 알약 3종 (오너 요구의 본체)", () => {
     const css = readFileSync(new URL("./style.css", import.meta.url), "utf8");
     const title = BASE_PX_OF(css, ".ws-tab .ws-name");
     const button = BASE_PX_OF(css, "#wsbar-head button");
@@ -165,6 +168,32 @@ describe("WSU_FONT_PX — CSS와 산식이 같은 수를 쓰는가", () => {
     expect(panel).toBe(button);
     // ⑵ 목록 제목은 그 둘보다 **크다** (오너 요구 2 · 캡처가 잡은 역전의 반대 방향)
     expect(title).toBeGreaterThan(button);
+    // ⑶ ★알약 3종(▶CEO·▶부서장·＋부서)은 그 둘보다 **작다** — 오너 실기기 판정 2026-08-11 후속.
+    //    ★이 줄이 새로 붙은 이유(축 재조준이지 축 삭제가 아니다): 이 케이스가 지키던 것은
+    //      「여섯 버튼이 전부 같다」가 아니라 **「상단 크롬과 패널이 같고 목록이 그보다 크다」**였고
+    //      그 둘(⑴⑵)은 그대로다. 알약만 한 단계 내려가는 것이 요구이므로 부등호를 하나 **더** 건다.
+    //    ★왜 알약만 작아야 하나 = 알약은 테두리+패딩을 두르므로 같은 글자 크기에서 상자가 더 크다
+    //      (실측 배율 1.0: 알약 25px ↔ A−/A＋ 18~19px). 글자를 한 단계 내려야 **시각 크기**가 맞는다.
+    const pill = BASE_PX_OF(css, PILL_SELECTOR);
+    expect(pill).toBeLessThan(button);
+    // ⚠하한이 없으면 「알약을 8px로」 같은 과잉 축소도 통과한다. 요구는 **한 단계**이므로
+    //   버튼의 8할 아래로는 못 내려가게 가둔다(16 → 14 = .875 · 16 → 12 = .75 는 적색).
+    expect(pill / button).toBeGreaterThan(0.8);
+  });
+
+  it("★알약 규칙이 상단 버튼 규칙을 **이긴다** — 특이도가 낮으면 14px 선언은 조용히 무효다", () => {
+    // ★이 케이스가 없으면 위 서열 단언은 **선언을 읽었을 뿐 적용을 재지 못한 채** 초록이 된다.
+    //   `#btn-master-start`(id 1개)는 `#wsbar-head button`(id 1 + 타입 1)에 지므로, 선택자를
+    //   짧게 고쳐 쓰는 순간 화면은 16px 그대로인데 테스트는 14px을 읽고 통과한다 —
+    //   「값은 맞는데 아무 데도 안 걸린 규칙」이 이 파일에서 가장 조용한 실패 방식이다.
+    //   CSS 텍스트로 잴 수 있는 최소 대리치는 **id 개수**다(계단식은 id 수가 타입 수를 압도한다).
+    const idCount = (s: string) => (s.match(/#/g) ?? []).length;
+    const parts = PILL_SELECTOR.split(",").map((s) => s.trim());
+    expect(parts.length).toBe(3); // 알약은 셋이다 — 하나라도 빠지면 그 버튼만 옛 크기로 남는다
+    for (const p of parts) expect(idCount(p)).toBeGreaterThan(idCount("#wsbar-head button"));
+    // 선택자 문자열이 style.css 에 **그대로** 있어야 위 계산이 화면 규칙을 가리킨다(대상 미도달 방지).
+    const css = readFileSync(new URL("./style.css", import.meta.url), "utf8");
+    expect(css).toContain(PILL_SELECTOR);
   });
 
   it("보조행은 제목보다 작고 상단 버튼보다는 크다 — 목록이 한 덩어리로 읽히는 폭", () => {
