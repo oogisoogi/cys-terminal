@@ -71,3 +71,7 @@ pack-files.txt
 pack-manifest.*
 pack.tar.gz
 REVIEW-multimaster-*.md
+
+# 로컬 세션 설정·작업 브리프(저장소 자산 아님 — 이 기계의 에이전트 운영물)
+.claude/
+.briefs/
