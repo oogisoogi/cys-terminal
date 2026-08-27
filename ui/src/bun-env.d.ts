@@ -79,6 +79,14 @@ declare module "bun:test" {
     skip(label: string, body: TestBody): void;
     only(label: string, body: TestBody): void;
     todo(label: string, body?: TestBody): void;
+    /**
+     * 표 구동 테스트 — `it.each(TABLE)("... %s ...", (row) => {...})`.
+     * (포크 2026-08-28 · v0.14.27 리베이스) `wsbar.test.ts` 의 사이드바 선택자 전수 대조가
+     * 이 형태를 쓴다. 이 파일 머리말·`tsconfig.check.json` 의 계약대로 **@types 설치가 아니라
+     * 여기 선언 추가**로 채운다(bun.lock 무접촉 = 오프라인 빌드 계약 보존).
+     * 범위 계약은 위 선언들과 같다 — 실제로 쓰는 한 형태(배열 1개 → 라벨 → 행 1개 콜백)만 적는다.
+     */
+    each<T>(table: readonly T[]): (label: string, body: (row: T) => void | Promise<void>) => void;
   }
 
   export function expect(actual: unknown): Matchers;
