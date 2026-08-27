@@ -28,7 +28,7 @@
       <!-- 「워크스페이스」 라벨은 오너 지시 2026-08-11로 삭제했다 — 사이드바가 무엇인지는 내용이
            말하고 있고, 그 자리를 버튼 글자를 키우는 데 쓴다(라벨 하나가 헤더 폭의 flex:1을 잡고
            있었다). 라벨을 지우면서 #wsbar-head > span 규칙도 함께 지웠다(가리킬 것이 없는 선택자). -->
-      <div id="wsbar-head"><button id="btn-ws-font-minus" title="사이드바 글자 축소">A−</button><button id="btn-ws-font-plus" title="사이드바 글자 확대">A＋</button><button id="btn-ws-dept" title="새 부서 — 클릭하면 부서 선택(미사용 부서 + 레거시 dept-N)">＋부서</button><button id="btn-ws-new" title="새 워크스페이스 — 같은 조직(현재 데몬)의 화면 그룹입니다. 마스터는 조직당 1명이라 여기서 두 번째 마스터 선언은 거부됩니다. 독립 부서장(별도 마스터)을 세우려면 ＋부서를 쓰세요.">＋</button></div>
+      <div id="wsbar-head"><button id="btn-ws-font-minus" title="사이드바 글자 축소">A−</button><button id="btn-ws-font-plus" title="사이드바 글자 확대">A＋</button><button id="btn-master-start" title="CEO 시작 — 본부(base)에 마스터 오브 마스터 노드를 기동합니다. 부서가 있으면 승인 후 CEO 규약으로 승격됩니다. 마스터는 조직(본부/부서) 단위 1명·부서장은 부서 탭의 ▶부서장으로.  대체 경로: pane 마스터 선언·cys launch-agent 로도 기동할 수 있습니다.">▶CEO</button><button id="btn-dept-master" title="부서장 시작 — 지금 보고 있는 부서 탭의 데몬에 마스터(부서장) 노드를 기동합니다(부서마다 독립 1명).  대체 경로: pane 마스터 선언·cys launch-agent 로도 기동할 수 있습니다.">▶부서장</button><button id="btn-ws-dept" title="새 부서 — 클릭하면 부서 선택(미사용 부서 + 레거시 dept-N)">＋부서</button><button id="btn-ws-new" title="새 워크스페이스 — 같은 조직(현재 데몬)의 화면 그룹입니다. 마스터는 조직당 1명이라 여기서 두 번째 마스터 선언은 거부됩니다. 독립 부서장(별도 마스터)을 세우려면 ＋부서를 쓰세요.">＋</button></div>
       <div id="ws-tabs"></div>
       <!-- 사용량 패널(오너 요청 2026-08-07): 주간 토큰 사용량 + 페인별 CTX를 한 곳에 모아 표시.
            워크스페이스 목록 아래 빈 공간에 상주한다. 데이터가 없으면 통째로 숨는다(hidden). -->

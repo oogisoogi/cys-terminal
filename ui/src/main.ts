@@ -7436,6 +7436,42 @@ document.getElementById("btn-ws-new")!.addEventListener("click", () => {
 // 배선은 #btn-cc-glance-face 리스너 직후, 판정은 clipath.ts(순수·clipath.test.ts). ▶CEO/▶부서장
 // 두 버튼은 **복원 대상이 아니다** — 위 이원 경로가 정본이다.
 
+// ★(포크 판정 2026-08-28 · master [master#8391ac] C 채택) 위 upstream 판단을 이 포크에서는
+//   따르지 않는다. 근거 3가지: ⑴ 이 포크의 최상위 전제가 「업데이트해도 커스터마이징은
+//   초기화되지 않는다」이고, 두 버튼은 오너가 2026-08-11 실기기에서 크기를 판정한 대상이다
+//   (a70b0d7 · 알약 3종 16→14px). ⑵ upstream 도 Rust 커맨드 `start_master`/`start_dept_master`
+//   와 그 소실 가드 테스트를 존치했다 — 기능을 죽인 것이 아니라 진입점만 정리한 것이므로
+//   진입점 유지가 upstream 목적과 충돌하지 않는다. ⑶ upstream 이 스스로 "HTML 2줄+핸들러
+//   재추가로 가역"이라 적어 둔 그 가역 경로를 그대로 쓴다.
+//   C안 = 복원 + 툴팁에 대체 경로 1줄 병기(upstream 의 「이원 경로가 정본」 취지를 버튼 위에 남긴다).
+function masterDeniedMsg(e: unknown, where: string): string {
+  const s = String(e);
+  if (/claim_denied|privileged role/i.test(s))
+    return `이미 ${where}에 마스터가 실행 중입니다 — 기존 마스터 탭(pane)을 사용하세요. (조직 단위당 마스터 1명 — 부서장은 각 부서 탭에서 세웁니다)`;
+  return s;
+}
+document.getElementById("btn-master-start")?.addEventListener("click", async () => {
+  try {
+    await invoke("start_master");
+    toast("feed", "▶ CEO 시작", "본부(base)에 마스터 오브 마스터 노드를 기동했습니다 — 잠시 후 pane이 자동으로 나타납니다. 부서가 있으면 승인 후 CEO 규약으로 승격됩니다.");
+  } catch (e) {
+    toast("health", "CEO 시작 실패", masterDeniedMsg(e, "본부(base)"));
+  }
+});
+document.getElementById("btn-dept-master")?.addEventListener("click", async () => {
+  const ws = workspaces[activeWs];
+  if (!ws?.socket) {
+    toast("health", "▶부서장은 부서 탭에서", "지금 보고 있는 탭이 본부입니다 — 부서 탭을 연 상태에서 누르세요(본부 마스터는 ▶CEO).");
+    return;
+  }
+  try {
+    await invoke("start_dept_master", { socket: ws.socket });
+    toast("feed", "▶ 부서장 시작", `${ws.name ?? "부서"}에 마스터(부서장) 노드를 기동했습니다 — 잠시 후 pane이 자동으로 나타납니다.`);
+  } catch (e) {
+    toast("health", "부서장 시작 실패", masterDeniedMsg(e, `이 부서(${ws.name ?? ws.socket})`));
+  }
+});
+
 // ★R8(WP-2): 시작 시 1회 CEO PENDING 고지 — cys-dept 알림이 가리키는 실존 컨트롤(팔레트
 // "CEO 승격 진행")로 안내. 폴링 없음(시작 1회+팔레트 온디맨드 — WINAUDIT 타이머 증식 방지).
 (async () => {
